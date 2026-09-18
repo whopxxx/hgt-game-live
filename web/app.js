@@ -316,6 +316,11 @@
   // 同一轨道上"还没走远"的弹幕数 -> 每条再往右错开 STAGGER_PX,
   // 否则同一批涌进来的弹幕会叠在一起(重连重放时最明显)。
   const STAGGER_PX = 260;
+  // 弹幕的**恒定**移动速度(px/s)。原来用固定时长(9~12s) + 变化的位移,
+  // 位移一涨速度就跟着涨 —— 见 renderDanmaku 里的说明。
+  // 110 ≈ 原首条弹幕的速度(舞台宽约 1080 / 约 10 秒), 刻意取中值,
+  // 保证这次改动不改变正常情况下的观感。
+  const DM_SPEED = 110;
   const batchSlots = new Array(LANES).fill(0);
   let lastDmAt = 0;
 
@@ -328,19 +333,33 @@
 
   function pushDanmaku(list) {
     if (!list || !list.length) return;
+
+    // 先挑出**真正没见过的** seq, 并推进水位。
+    // 服务端 seq 由引擎在锁内 `+1` 生成、窗口按序切 `[-40:]`, 所以它是
+    // **连续且升序**的 —— `seq > lastDmSeq` 就等价于"没见过", 不会漏。
     let top = lastDmSeq;
-    const now = performance.now();
-    // 距上一批超过 1.2 秒 -> 认为上一批已经散开, 错位计数归零
-    if (now - lastDmAt > 1200) batchSlots.fill(0);
-    lastDmAt = now;
+    const fresh = [];
     for (let i = 0; i < list.length; i++) {
-      const d = list[i];
-      const seq = d.seq || 0;
+      const seq = list[i].seq || 0;
       if (seq > top) top = seq;
-      if (seq <= lastDmSeq) continue;   // 已经放过了, 跳过
-      renderDanmaku(d);
+      if (seq > lastDmSeq) fresh.push(list[i]);
     }
     lastDmSeq = top;
+
+    // 关键: **没有新弹幕就不要碰批次的时钟**。
+    //
+    // 曾经的写法是无条件 `lastDmAt = now`, 而服务端在房间有人说过话之后,
+    // 每个 snapshot 都会带上最近 40 条 —— 即使这 1.2 秒里**根本没人说话**,
+    // 这个函数仍以约 4Hz 被调用, `lastDmAt` 一直被刷新, 下面那句
+    // `batchSlots.fill(0)` **永远不执行**。
+    // 于是 batchSlots 单调上涨 -> 位移越来越长而时长固定 -> **越播越快**。
+    if (!fresh.length) return;
+
+    const now = performance.now();
+    if (now - lastDmAt > 1200) batchSlots.fill(0);
+    lastDmAt = now;
+
+    for (let i = 0; i < fresh.length; i++) renderDanmaku(fresh[i]);
   }
 
   function renderDanmaku(d) {
@@ -349,7 +368,6 @@
     node.textContent = d.user_name + "：" + d.content;
     const lane = (dmSeq++) % LANES;
     node.style.top = lane * LANE_H + 4 + "px";
-    node.style.left = STAGE_W + "px";
     // 同一批进来的弹幕(重连重放时会一次涌进十几条)不能从同一个 x 出发,
     // 否则会**完全叠在一起**, 看起来像"没显示"。
     // 给同一轨道上还没走远的弹幕再错开一段。
@@ -357,8 +375,23 @@
     node.style.left = (STAGE_W + echo) + "px";
     batchSlots[lane] = echo + STAGGER_PX;
     el.danmaku.appendChild(node);
+    // ---- 固定**速度**, 不是固定时长 ----
+    //
+    // 曾经是 `dur = 9 + random*3`(固定时长), 而位移里含 `echo` ——
+    // 于是 echo 一涨, 同样的 9~12 秒要跑更远的路, 弹幕越飞越快。
+    //
+    // 改成按距离算时长, 速度才与 echo 无关。
+    // DM_SPEED 取的是原来**首条弹幕**的速度: 舞台宽约 1080、时长 9~12 秒
+    // -> 约 90~120 px/s, 取中值 110。**刻意不趁机调快** —— 这次只修 bug,
+    // 不混入观感调整。
     const w = node.offsetWidth + echo;
-    const dur = 9 + Math.random() * 3, t0 = performance.now();
+    const distance = STAGE_W + w;
+    const dur = distance / DM_SPEED;
+    // 测试探针: 把这一条的位移/时长暴露出来, 供离线用例断言
+    // "速度与 echo 无关"。**只读导出**, 不影响渲染逻辑。
+    node.dataset.dmDist = distance;
+    node.dataset.dmDur = dur;
+    const t0 = performance.now();
     (function step(t) {
       const p = (t - t0) / (dur * 1000);
       if (p >= 1) { node.remove(); return; }

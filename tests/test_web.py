@@ -102,6 +102,104 @@ window.addEventListener("load", async () => {
     check(dmNodes() === n2 + 1, "只应新增第 3 条, 实际新增 "
           + (dmNodes() - n2));
 
+    // ⓪b 回归: "越播越快"(P1)
+    //
+    // 曾经的 bug: `pushDanmaku` 在 list 非空时**无条件**刷新 `lastDmAt`,
+    // 而服务端在房间有人说过话之后每个 snapshot 都带最近 40 条 —— 于是
+    // 1.2 秒的 batch 清零**永远不触发**, `batchSlots` 单调上涨; 而动画
+    // 时长固定 9~12 秒、位移却含 `echo` -> 同一轨道越往后越快。
+    //
+    // 复现有三个必要条件。我前三版探针逐个漏掉, 记下来免得再犯:
+    //   ① 重复推送之间的间隔必须 **< 1.2s**(真实服务端 4Hz ≈ 250ms)。
+    //      间隔一旦超过 1.2s, 即使无条件刷新 lastDmAt, 下次来新消息时
+    //      `now - lastDmAt > 1200` 仍成立 -> fill(0) 照样执行 -> 不复现。
+    //   ② 必须落在**同一条轨道**上: `batchSlots` 是**按轨道**计数的, 而
+    //      `(dmSeq++) % LANES` 会轮换; 每次换新轨道时该轨道 echo 都是 0,
+    //      所以"每次只放一条"根本测不出累积。
+    //   ③ 无头 Chrome 的虚拟时间不能用来量速度 —— performance.now() 走
+    //      虚拟时间而 setTimeout 立刻触发, 量出来只有个位数 px/s。
+    //      必须打**受控时钟**。
+    {
+      const dmEl = document.getElementById("danmaku");
+      const nowOrig = performance.now;
+      let fakeT = 100000;
+      performance.now = () => fakeT;
+      try {
+        let seq = 7000;
+        // 放一条新弹幕, 返回起始位移/轨道/生产代码算出的时长
+        const pushOne = (label) => {
+          send({danmaku: [{seq: ++seq, user_name: "甲", content: label,
+                           is_command: false}]});
+          const nodes = dmEl.querySelectorAll(".dm");
+          const n = nodes[nodes.length - 1];
+          return n ? {left: parseFloat(n.style.left),
+                      lane: Math.round((parseFloat(n.style.top) - 4) / 44),
+                      dist: parseFloat(n.dataset.dmDist),
+                      dur: parseFloat(n.dataset.dmDur)}
+                   : null;
+        };
+
+        // ---- 断言 1: 4Hz 重复窗口不得让同轨道 echo 累积 ----
+        // 放满 5 条(命中全部 5 条轨道), 记轨道 0 的起始位移
+        const round1 = [];
+        for (let i = 0; i < 5; i++) round1.push(pushOne("同样的内容"));
+        const lane0a = round1.find((x) => x && x.lane === 0);
+
+        // 中间穿插 3 秒的"4Hz 重复推同一窗口"(seq 不变, 每 250ms 一次) ——
+        // 这期间**没有新消息**, 正确实现不该碰 batch 时钟。
+        for (let t = 250; t <= 3000; t += 250) {
+          fakeT = 100000 + t;
+          send({danmaku: [{seq: seq, user_name: "甲", content: "同样的内容",
+                           is_command: false}]});
+        }
+        // 时间推后到距上次**真实**批次 > 1.2s, 再放 5 条
+        fakeT = 100000 + 3250;
+        const round2 = [];
+        for (let i = 0; i < 5; i++) round2.push(pushOne("同样的内容"));
+        const lane0b = round2.find((x) => x && x.lane === 0);
+
+        if (!lane0a || !lane0b) {
+          check(false, "没拿到轨道 0 的节点");
+        } else {
+          check(lane0a.left === 1080 && lane0b.left === 1080,
+                "**4Hz 重复窗口不应让同轨道 echo 累积** (第1轮 left="
+                + lane0a.left + ", 第2轮 left=" + lane0b.left + ")");
+        }
+
+        // ---- 断言 2: 速度恒定, 与 echo 无关 ----
+        //
+        // 覆盖**另一个**独立修法: 时长从"固定 9~12 秒"改成"位移 / 恒定速度"。
+        // 必须在 **echo > 0** 时比较才有判别力 —— echo 归零时两种实现算出
+        // 的时长本来就相同(这正是前一版探针反向验证抓不到的原因)。
+        // 真实触发: 一批里连来几条, 同轨道第 2 条的位移含 STAGGER_PX。
+        // 连放 10 条(= 2 轮 5 轨道), 这样**同一条轨道**上必然有 2 条,
+        // 后一条的起始位移比前一条大 STAGGER_PX。
+        const burst = [];
+        for (let i = 0; i < 10; i++) burst.push(pushOne("同样的内容"));
+        const byLane = {};
+        burst.forEach((b) => {
+          if (b) (byLane[b.lane] = byLane[b.lane] || []).push(b);
+        });
+        const pairLane = Object.keys(byLane).find((k) => byLane[k].length >= 2);
+        if (pairLane === undefined) {
+          check(false, "本批没有同轨道相邻两条, 无法验证速度恒定");
+        } else {
+          const x = byLane[pairLane][0], y = byLane[pairLane][1];
+          const sx = x.dist / x.dur, sy = y.dist / y.dur;
+          check(Math.abs(sy / sx - 1) < 0.02,
+                "**速度应与位移无关** (第1条 " + sx.toFixed(1)
+                + " px/s @位移" + x.dist.toFixed(0) + ", 第2条 "
+                + sy.toFixed(1) + " px/s @位移" + y.dist.toFixed(0) + ")");
+          // 确认这两条确实处于"echo 不同"的状态, 否则上面那条断言是空的
+          check(y.dist > x.dist + 100,
+                "同轨道相邻两条的位移应相差约 STAGGER_PX ("
+                + x.dist.toFixed(0) + " -> " + y.dist.toFixed(0) + ")");
+        }
+      } finally {
+        performance.now = nowOrig;
+      }
+    }
+
     // ① 谜面 + 问答流追加
     send({qa_log: mkQa(3), qa_total: 3});
     check(document.querySelectorAll(".qa-row").length === 3, "应渲染 3 行问答");
