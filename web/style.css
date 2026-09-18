@@ -205,6 +205,11 @@ html, body {
 .qa-row.kind-nudge { border-left-color: rgba(140,160,200,.35); }
 .qa-row.kind-nudge .q { color: rgba(170,185,210,.75); font-style: italic; }
 
+/* 系统行: 非 QA 阶段观众发 #问题 的反馈(方案 §8)。
+   比 kind-nudge 更弱 —— 它是状态通知, 不是内容。 */
+.qa-row.kind-system { border-left-color: rgba(120,140,160,.3); opacity: .8; }
+.qa-row.kind-system .q { color: rgba(150,165,185,.7); font-size: .92em; }
+
 /* 折叠行: "前 N 条与谜底无关, 已折叠" */
 .qa-row.kind-fold { border-left-color: transparent; margin-bottom: 10px; }
 .qa-row.kind-fold .q {

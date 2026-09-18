@@ -1682,6 +1682,156 @@ def test_archive_records_source():
           rec2.get("source") == "live_generate", rec2.get("source"))
 
 
+# ======================================================================
+# Q11: 非 QA 阶段 ACK —— 不再静默吞掉 #问题
+# ======================================================================
+def _sys_rows(eng):
+    """快照里的系统行。`snapshot().qa_log` 是 dict(已 to_json), 不是 QARec。"""
+    return [r for r in eng.snapshot().qa_log if r.get("kind") == "system"]
+
+
+def test_setting_question_gets_ack():
+    """SETTING(出题中)收到 #问题 -> 一条系统提示, 不再静默。"""
+    print("\n[Q11] SETTING 阶段的 #问题 有反馈")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()                                   # -> SETTING
+    check("确实在 SETTING", eng.phase == Phase.SETTING, eng.phase)
+    # replay_burst_n=0(测试默认) -> submit_danmaku 直接处理并返回动作。
+    acts = eng.submit_danmaku("u1", "甲", "#他瞎了吗")
+    check("产出了动作", bool(acts), acts)
+    rows = _sys_rows(eng)
+    check("**有 1 条系统行**", len(rows) == 1, [r["text"] for r in rows])
+    check("文案是 SETTING 那条",
+          rows and "正在准备新题" in rows[0]["text"],
+          rows[0]["text"] if rows else None)
+    check("kind=system", rows and rows[0]["kind"] == "system")
+
+
+def test_revealing_question_gets_ack():
+    print("\n[Q11] REVEALING 阶段的 #问题 有反馈")
+    eng, clk = boot(mkcfg())
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    check("确实在 REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    eng.submit_danmaku("u1", "甲", "#到底为什么")
+    clk.advance(3)
+    eng.tick()
+    rows = _sys_rows(eng)
+    check("**有 1 条系统行**", len(rows) == 1, [r["text"] for r in rows])
+    check("文案是 REVEALING 那条",
+          rows and "正在揭晓" in rows[0]["text"],
+          rows[0]["text"] if rows else None)
+
+
+def test_revealed_question_gets_ack():
+    print("\n[Q11] REVEALED 阶段的 #问题 有反馈")
+    eng, clk = boot(mkcfg())
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底在此")
+    check("确实在 REVEALED", eng.phase == Phase.REVEALED, eng.phase)
+    eng.submit_danmaku("u1", "甲", "#那这样的话")
+    clk.advance(3)
+    eng.tick()
+    rows = _sys_rows(eng)
+    check("**有 1 条系统行**", len(rows) == 1, [r["text"] for r in rows])
+    check("文案是 REVEALED 那条",
+          rows and "已结束" in rows[0]["text"],
+          rows[0]["text"] if rows else None)
+
+
+def test_idle_and_stopped_get_no_ack():
+    """IDLE / STOPPED 不 ACK(还没开始 / 已结束, 反馈没意义), 且不能崩。"""
+    print("\n[Q11] IDLE/STOPPED 不 ACK")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    check("初始是 IDLE", eng.phase == Phase.IDLE, eng.phase)
+    eng._accept_danmaku("u1", "甲", "#问题", clk.t)
+    check("IDLE 无系统行", not _sys_rows(eng), [r["text"] for r in _sys_rows(eng)])
+    eng.start()
+    eng.stop("测试")
+    check("已停止", eng.phase == Phase.STOPPED, eng.phase)
+    eng._accept_danmaku("u1", "甲", "#问题", clk.t)
+    check("STOPPED 无系统行", not _sys_rows(eng))
+
+
+def test_ack_is_globally_throttled():
+    """全局节流: 同一时刻连发只出一条; 过了窗口又能出。"""
+    print("\n[Q11] ACK 全局节流")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(phase_ack_seconds=5.0), clock=clk)
+    eng.start()                                   # -> SETTING
+    for i in range(3):
+        eng._accept_danmaku(f"u{i}", f"观众{i}", "#问题", clk.t)
+    check("**连发 3 条只出 1 条系统行**", len(_sys_rows(eng)) == 1,
+          len(_sys_rows(eng)))
+    # 窗口内再加一条: 仍然只有 1 条
+    clk.advance(4)
+    eng._accept_danmaku("u9", "晚来的", "#问题", clk.t)
+    check("窗口内仍只有 1 条", len(_sys_rows(eng)) == 1, len(_sys_rows(eng)))
+    # 越过窗口: 第 2 条出现
+    clk.advance(2)
+    eng._accept_danmaku("u10", "更晚的", "#问题", clk.t)
+    check("**过窗口后出第 2 条**", len(_sys_rows(eng)) == 2,
+          len(_sys_rows(eng)))
+
+
+def test_ack_does_not_touch_stats_or_history():
+    """文档硬要求: 系统行**不**计 stat_questions / verdict_counts,
+    **不**进 _history(否则会被喂回 LLM)。"""
+    print("\n[Q11] ACK 不污染统计与 transcript")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    before_q = eng.snapshot().stat_questions
+    hist_before = len(eng._history)
+    eng._accept_danmaku("u1", "甲", "#问题", clk.t)
+    check("stat_questions 不变", eng.snapshot().stat_questions == before_q,
+          eng.snapshot().stat_questions)
+    check("**不进 _history**", len(eng._history) == hist_before,
+          len(eng._history))
+    check("不进 verdict_counts", not eng._verdict_counts, eng._verdict_counts)
+    check("_qa_total 不变", eng._qa_total == 0, eng._qa_total)
+
+
+def test_ack_does_not_fire_in_qa():
+    """QA 阶段行为完全不变: 正常入队, 没有系统行。"""
+    print("\n[Q11] QA 阶段行为不变")
+    eng, clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "甲", "#他瞎了吗")
+    clk.advance(3)
+    eng.tick()
+    check("**QA 里没有系统行**", not _sys_rows(eng), [r["text"] for r in _sys_rows(eng)])
+    check("提问正常入队", len(eng._pending) + len(eng._inflight) == 1,
+          (len(eng._pending), len(eng._inflight)))
+
+
+def test_ack_does_not_hijack_next_or_hint():
+    """#下一题 / #提示 的分支在自己的路径上提前 return, 不被 ACK 截胡。"""
+    print("\n[Q11] #下一题/#提示 不被 ACK 截胡")
+    eng, clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "甲", "#下一题")
+    clk.advance(3)
+    eng.tick()
+    check("**#下一题 仍然生效(进入 REVEALING)**",
+          eng.phase == Phase.REVEALING, eng.phase)
+    check("没被当成普通 #问题 出系统行", not _sys_rows(eng))
+
+
+def test_ack_action_is_pure_broadcast():
+    """ACK 是纯状态机: 只出 BROADCAST, 绝不触发 LLM 类动作。"""
+    print("\n[Q11] ACK 只出 BROADCAST")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    acts = eng._phase_ack_locked("甲", "#问题", clk.t)
+    check("有动作", bool(acts), acts)
+    check("**全是 BROADCAST**",
+          all(a.kind == ActionKind.BROADCAST for a in acts), kinds(acts))
+    for bad in (ActionKind.ANSWER, ActionKind.HINT, ActionKind.REVEAL,
+                ActionKind.RIDDLE):
+        check(f"不含 {bad.value}", bad not in kinds(acts), kinds(acts))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -1739,7 +1889,17 @@ def main():
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,
              test_first_and_retry_riddle_actions_match,
-             test_retry_payload_is_a_copy]
+             test_retry_payload_is_a_copy,
+             # ---- Q11: 非 QA 阶段 ACK ----
+             test_setting_question_gets_ack,
+             test_revealing_question_gets_ack,
+             test_revealed_question_gets_ack,
+             test_idle_and_stopped_get_no_ack,
+             test_ack_is_globally_throttled,
+             test_ack_does_not_touch_stats_or_history,
+             test_ack_does_not_fire_in_qa,
+             test_ack_does_not_hijack_next_or_hint,
+             test_ack_action_is_pure_broadcast]
     for t in tests:
         t()
     print()

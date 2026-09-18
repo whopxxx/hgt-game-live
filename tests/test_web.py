@@ -227,16 +227,38 @@ window.addEventListener("load", async () => {
     check(lastRow && lastRow.textContent.includes("问题300"),
           "最新一条必须上屏: " + (lastRow && lastRow.textContent));
 
-    // ⑩ 常驻互动提示: QA 阶段显示, 揭晓时隐藏
+    // ⑩ 常驻互动提示: **任何阶段都显示**, 只是文案不同。
+    //    (Q11 之前非 QA 阶段是整个隐藏的 —— 那正是"出题 30-45s 里
+    //     观众既没指引、打字也没反馈, 看起来像卡死"的一环)
     send({phase: "qa", puzzle_index: 5, story_index: 5, puzzle: "新谜面。",
           qa_log: [], qa_total: 0, hint_text: "", revealed_answer: ""});
     const prompt = document.getElementById("prompt");
     check(!prompt.classList.contains("hidden"), "QA 阶段应显示互动提示");
     check(prompt.textContent.includes("#你的问题"),
           "互动提示应说明发送格式: " + prompt.textContent);
+    // 出题阶段: 仍可见, 文案变成"正在出题"
+    send({phase: "setting", puzzle_index: 5, story_index: 5,
+          qa_log: [], qa_total: 0});
+    check(!prompt.classList.contains("hidden"), "**出题阶段提示条不应隐藏**");
+    check(prompt.textContent.includes("出题"),
+          "出题阶段应说明正在出题: " + prompt.textContent);
+    // 揭晓阶段: 仍可见, 文案换成换题类提示
     send({phase: "revealed", puzzle_index: 5, story_index: 5,
           revealed_answer: "谜底。", qa_log: [], qa_total: 0});
-    check(prompt.classList.contains("hidden"), "揭晓时应隐藏互动提示");
+    check(!prompt.classList.contains("hidden"), "**揭晓阶段提示条不应隐藏**");
+    check(prompt.textContent.includes("新谜题"),
+          "揭晓阶段应说明即将换题: " + prompt.textContent);
+    // 系统行(非 QA 阶段 #问题 的反馈)要能上屏
+    send({phase: "setting", puzzle_index: 6, story_index: 6, puzzle: "",
+          qa_log: [{qid: -1, user_name: "系统", text: "正在准备新题，谜面出现后再发 #问题。",
+                    verdict: "", comment: "", kind: "system"}],
+          qa_total: 0});
+    const sysRows = [...document.querySelectorAll(".qa-row.kind-system")];
+    check(sysRows.length === 1, "系统行应渲染 1 条, 实际 " + sysRows.length);
+    check(sysRows.length && sysRows[0].textContent.includes("正在准备新题"),
+          "系统行内容: " + (sysRows[0] && sysRows[0].textContent));
+    check(sysRows.length && !sysRows[0].textContent.includes("系统："),
+          "系统行**不该**带观众名前缀: " + (sysRows[0] && sysRows[0].textContent));
 
     // ⑩.5 单条「无关」不得把上一条重复画出来
     //     (实测 bug: 折叠起点算错, [是, 无关] 会把"是"那行画两遍)

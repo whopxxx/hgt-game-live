@@ -151,6 +151,10 @@ class Config:
     hint_seconds: float = 300.0           # 每条提示之间的间隔(也是最后等待揭晓的时间)
     max_hints: int = 3                    # 给几条提示(之后再过 hint_seconds 揭晓)
     restate_seconds: float = 120.0        # 长时间无人说话 -> 零成本重述谜面
+    # 非 QA 阶段观众发 #问题 时, 多久最多回一条"现在不能问"的提示。
+    # 全局节流(不是按观众): 多人同发时不刷屏。取小值 —— 窗口内其他人
+    # 仍然静默, 太长就等于又变回"我发的没反应"。
+    phase_ack_seconds: float = 5.0
     giveup_seconds: float = 1800.0        # 硬性兜底, 一般轮不到它
 
     # ---- 谜题循环 ----
@@ -305,6 +309,11 @@ class Config:
             warns.append(
                 f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "
                 f"补池失败后不会退避, 4Hz 的 tick 会打成失败风暴。"
+            )
+        if self.phase_ack_seconds <= 0:
+            warns.append(
+                f"phase_ack_seconds({self.phase_ack_seconds}) <= 0: "
+                f"非 QA 阶段的 #问题 提示不会节流, 多人同发时会刷屏。"
             )
         return warns
 

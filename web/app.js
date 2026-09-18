@@ -237,6 +237,11 @@
     } else if (r.kind === "nudge") {
       q.textContent = r.text;
       row.appendChild(q);
+    } else if (r.kind === "system") {
+      // 系统行: 非 QA 阶段观众发 #问题 时的确定性反馈(方案 §8)。
+      // 不显示观众名前缀 —— 它是对**这个阶段**的说明, 不是对某个人的回答。
+      q.textContent = r.text;
+      row.appendChild(q);
     } else {
       // 提问与裁决**同一行**: "观众甲：他瞎了吗  → 不是"
       const who = document.createElement("span");
@@ -274,17 +279,25 @@
     el.hintbar.classList.add("hidden");
   }
 
-  // 常驻互动提示: 只在问答阶段显示, 揭晓/换题时隐藏。
-  // 有提示(💡)时优先显示提示, 否则显示"发 #问题 提问"。
-  // 常驻互动提示: 只在问答阶段显示。
-  // 提示(💡)已经在问答流里作为一行显示了, 这里**不再重复** ——
-  // 否则同一条提示会上下各出现一次。
+  // 常驻互动提示: **任何阶段都显示**, 只是文案不同。
+  //
+  // 早先非 QA 阶段整个隐藏(`if (!inQA) return`), 于是观众在这个阶段
+  // 既没有操作指引、打字又收不到反馈 -> 看起来像卡死。出题要 30-45s,
+  // 那段空窗正是最需要"我在干活"信号的时候。
+  //
+  // 提示(💡)已经在问答流里作为一行显示了, 这里**不重复**。
   function renderPrompt(s) {
-    const inQA = s.phase === "qa";
-    el.prompt.classList.toggle("hidden", !inQA);
-    if (!inQA) return;
-    el.prompt.innerHTML =
-      "发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓";
+    el.prompt.classList.remove("hidden");
+    if (s.phase === "qa") {
+      el.prompt.innerHTML =
+        "发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓";
+    } else if (s.phase === "setting") {
+      el.prompt.textContent = "AI 正在出题，请稍候…";
+    } else if (s.phase === "revealing" || s.phase === "revealed") {
+      el.prompt.textContent = "本题已结束，稍候将开启新谜题…";
+    } else {
+      el.prompt.textContent = "直播准备中…";
+    }
   }
 
   function renderStats(s) {

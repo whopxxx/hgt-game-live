@@ -75,6 +75,21 @@ _NUDGES = (
     "别怕猜错，问错方向也没关系",
 )
 
+# 非 QA 阶段收到 `#问题` 时的反馈文案(方案 §8.1)。
+#
+# 为什么按 phase 分开: 观众的困惑不一样 ——
+#   SETTING   出题要 30-45s(含重试/审稿), 最容易被当成卡死
+#   REVEALING 正在生成揭晓措辞, 很短
+#   REVEALED  刚揭晓, 有人会接着追问, 而其实该等下一题
+# IDLE / STOPPED **不在表里**: 还没开始 / 已结束, 反馈没有意义。
+#
+# 这些都是 0 成本确定性文案, 不调 LLM。
+_ACK_BY_PHASE = {
+    Phase.SETTING: "正在准备新题，谜面出现后再发 #问题。",
+    Phase.REVEALING: "本题正在揭晓，稍后开启下一题。",
+    Phase.REVEALED: "本题已结束，下一题即将开始。",
+}
+
 
 class RoundEngine:
     """海龟汤引擎。纯逻辑, 无 I/O。"""
@@ -149,6 +164,7 @@ class RoundEngine:
         self._restate_at = 0.0
         self._restate_n = 0
         self._last_manual_hint = 0.0        # 观众 #提示 的节流
+        self._last_ack_at = float("-inf")   # 非 QA 阶段 #问题 的 ACK 节流
 
         # ---- 弹幕 / 观众 ----
         self._danmaku: list[DanmakuItem] = []
@@ -290,6 +306,40 @@ class RoundEngine:
                 log.error("弹幕处理异常: %s", e)
         return acts
 
+    def _phase_ack_locked(self, user_name: str, text: str,
+                          now: float) -> list[EngineAction]:
+        """非 QA 阶段收到 `#问题` 的**确定性反馈**(方案 §8)。须持锁。
+
+        走 `QARec(kind="system")` 进问答流, 而不是新造一条通道:
+          - `qa_log` 已有完整渲染链(`_append_qa_locked` -> `renderQa`
+            -> `buildRow` -> `.qa-row.kind-*`), 零新管线;
+          - `qid < 0` 分支天然满足文档硬要求: **不**计 `_qa_total`、
+            **不**进 `_history`(所以不会喂回 LLM)、**不**动
+            `verdict_counts` —— 它只是给观众看的状态提示。
+
+        为什么**不**写 `self._notice`: `notice` 是"屏幕上现在该显示什么"
+        的持久状态, 而这是一次性事件。混进去会让几秒后 snapshot 里还
+        挂着一条过期文案。而且 `notice` 目前前端根本没读
+        (`web/app.js` 零命中), 走它等于什么都不显示。
+
+        **全局节流**(不是按观众): 多人同时发时不至于刷屏。代价是窗口内
+        其他人仍然静默, 所以窗口取得小(默认 5s)。节流期内**不**刷新
+        时间戳, 让 ACK 按固定节奏出现, 而不是"最后一个人说了算"。
+        """
+        msg = _ACK_BY_PHASE.get(self.phase)
+        if not msg:
+            return []
+        if now - self._last_ack_at < self.cfg.phase_ack_seconds:
+            return []
+        self._last_ack_at = now
+        self._append_qa_locked(QARec(
+            qid=-1, user_name="系统", text=msg, verdict="", kind="system",
+            ts=now))
+        _detail("非 QA 阶段 ACK(%s): %s  <- %s", self.phase.value, msg,
+                user_name)
+        # 只更新状态/提示文案, 不调 LLM。phase 没变, 所以不带 phase_changed。
+        return [EngineAction(ActionKind.BROADCAST, {"phase_changed": False})]
+
     def _accept_danmaku(self, wid, user_name, content,
                         now) -> list[EngineAction]:
         """真正处理一条弹幕(调用方须持锁)。"""
@@ -350,6 +400,12 @@ class RoundEngine:
                 return []
 
             if self.phase != Phase.QA:
+                # 非 QA 阶段收到 #问题: **不再静默吞掉**(方案 §8)。
+                # 出题要 30-45s, 这段空窗里观众打字毫无反馈, 最容易被
+                # 当成"卡死了"。给一条 0 成本确定性文案。
+                ack = self._phase_ack_locked(user_name, content, now)
+                if ack:
+                    return ack
                 _detail("弹幕丢弃[非问答阶段 %s] %s: %s",
                         self.phase.value, user_name, content[:30])
                 return []
