@@ -45,6 +45,28 @@ def _detail(msg: str, *args) -> None:
         log.log(DETAIL, msg, *args)
 
 
+def _atom_dict(a: Any) -> Any:
+    """把 solve_atom 归一成 dict。
+
+    接受 `SolveAtom`(有 to_dict)、dict、以及老数据里的纯字符串。
+    Engine 内部只认 dict —— 见 `submit_riddle` 里的说明。
+    """
+    if hasattr(a, "to_dict"):
+        return a.to_dict()
+    if isinstance(a, dict):
+        return dict(a)
+    return a
+
+
+def _clue_dict(c: Any) -> Any:
+    """把 fair_clue 归一成 dict(同上)。"""
+    if hasattr(c, "to_dict"):
+        return c.to_dict()
+    if isinstance(c, dict):
+        return dict(c)
+    return c
+
+
 # 空闲重述时轮换的引导语(零成本, 让冷场画面"呼吸")
 _NUDGES = (
     "有人想问什么吗？发送 #你的问题 向我提问",
@@ -89,6 +111,14 @@ class RoundEngine:
         self._spec: Optional[PuzzleSpec] = None
         self._hints_shown: list[str] = []    # **实际展示过**的提示文本
         self._hints_given = 0
+        # 失败重试(第三轮 review P1)。语义:
+        #   `_hints_given` = 已**成功上屏**的提示数;
+        #   `_hint_pending` = 已发出请求、还没回调的槽位;
+        #   `_hint_retry_at` = 上一次失败后, 允许再次尝试的时刻。
+        # 早先 _hints_given 在**发出请求**时就 +1, 而 worker 失败时
+        # 什么都不提交 -> 那个槽位白白损失, 观众少一条提示。
+        self._hint_pending = False
+        self._hint_retry_at = 0.0
         self._hint_text = ""
         self._setting_attempts = 0
         self._setting_deadline: Optional[float] = None
@@ -303,11 +333,14 @@ class RoundEngine:
                 # 一直刷提示 = 剧透), 但观众自己发了就给。
                 # 节流: 别让一个人狂刷把提示刷光。
                 if (self.phase == Phase.QA
+                        and not self._hint_pending
                         and now - self._last_manual_hint > 20):
                     self._last_manual_hint = now
-                    self._hints_given += 1
+                    # 与定时提示同一纪律: 这里**不**预加 `_hints_given`,
+                    # 成功回调时才消耗槽位(第三轮 review P1)。
+                    self._hint_pending = True
                     return [EngineAction(ActionKind.HINT, {
-                        "level": self._hints_given,
+                        "level": self._hints_given + 1,
                         "puzzle": self._puzzle, "answer": self._answer,
                         "given": list(self._hints_shown),
                         "spec": self._spec,
@@ -377,8 +410,19 @@ class RoundEngine:
             self._answer = answer or ""
             self._title = title or ""
             self._hint_pool = list(hints or [])
-            self._solve_atoms = list(solve_atoms or [])
-            self._fair_clues = list(fair_clues or [])
+            # ---- 类型统一(第三轮 review P0) ----
+            # Engine 内部协议固定为 `list[dict]`。这个边界必须收口:
+            #   - AI 生成路径经 `_spec_to_riddle()` 传进来的是 dict;
+            #   - 结构化兜底传进来的是 `SolveAtom/FairClue` **对象**。
+            # 两种类型混在同一条链上会同时坏两件事:
+            #   ① `judge()` 的 `isinstance(a, dict)` 判不出 role, 于是
+            #      "必须同时命中 cause + mechanism" 这个代码层 gate 被
+            #      静默跳过 —— 兜底题又绕回了宽判;
+            #   ② REVEAL payload 带着 dataclass 对象落盘 -> json.dumps
+            #      直接 TypeError, "出题全挂"时反而把落盘也带崩。
+            # 在这里转一次, 后面 generated / fallback / pool 全都一样。
+            self._solve_atoms = [_atom_dict(a) for a in (solve_atoms or [])]
+            self._fair_clues = [_clue_dict(c) for c in (fair_clues or [])]
             self._spec = spec
             # 记下这题的指纹 —— 下一题的 blueprint 选择与跨题配额要用
             # (方案 §10)。只留最近 window 条, 不放进 Snapshot。
@@ -394,6 +438,8 @@ class RoundEngine:
             self._restate_at = now
             self._restate_n = 0
             self._hints_given = 0
+            self._hint_pending = False
+            self._hint_retry_at = 0.0
             self._hint_text = ""
             self._solved = False
             self._solved_by = ""
@@ -488,15 +534,29 @@ class RoundEngine:
         with self._lock:
             if self._stopped or self.phase != Phase.QA:
                 return []
+            self._hint_pending = False          # 在途结束(成功或失败)
+            # ---- 失败: 槽位**不消耗**, 退避后再试同一格 ----
+            #
+            # 第三轮 review P1: 早先 `_hints_given` 在发出请求时就 +1,
+            # 而失败回调什么都不做 -> 那一格永远补不回来, 观众少一条提示。
+            # (Q6 之后 hint() 在"三次全泄底"时也会返回 None, 这条路径
+            #  因此变成真实可达, 不再是理论问题。)
+            #
+            # 不能每 tick 立刻重试 —— 网关持续故障时会变成每秒一次的
+            # 失败风暴。所以退避 `hint_retry_seconds` 再试, 且仍然受
+            # 上面那个 `slot` 上限约束(时间轴走完就揭晓, 不会无限重试)。
             if error or not text:
                 self.last_error = error
+                self._hint_retry_at = now + self.cfg.hint_retry_seconds
+                log.info("提示生成失败(%s), %.0fs 后重试同一格",
+                         (error or "空提示")[:40], self.cfg.hint_retry_seconds)
                 return []
             text = text.strip()[:80]
-            # 注意: 这里**不递增** _hints_given —— 计数在 tick 发出 HINT
-            # 动作时已经加过了。回调只负责把文本放上屏。
             # 文本与上一条相同 -> 不重复上屏(否则冷场时同一句刷屏)
             if text and text == self._hint_text:
                 return []
+            # ---- 成功: 现在才真正消耗槽位 ----
+            self._hints_given += 1
             self._hint_text = text
             # 记进"实际给过"的历史 —— 下一条提示要靠它告诉 AI 别重复。
             # (以前这里传的是出题时的 _hint_pool, 那个从头到尾不变,
@@ -697,11 +757,22 @@ class RoundEngine:
                      elapsed)
             acts.extend(self._enter_revealing_locked(now, "giveup", ""))
             return acts
-        # 到点就给提示(1..max_hints 格各给一条)
-        if 1 <= slot <= self.cfg.max_hints and self._hints_given < slot:
-            self._hints_given += 1
+        # 到点就给提示(1..max_hints 格各给一条)。
+        #
+        # 关键(第三轮 review P1): 这里**不**再预先把 `_hints_given` +1 ——
+        # 那是"请求数"不是"展示数"。worker 失败时槽位会白白损失, 观众
+        # 少一条提示。改成:
+        #   `_hint_pending` 挡住重复派发(一次只允许一条在途),
+        #   成功回调时才 `_hints_given += 1`(见 submit_hint),
+        #   失败则设一个退避时间, 过一会儿再试同一格 —— 不是每 tick
+        #   重试(那会形成失败风暴, 每秒打一次 LLM)。
+        if (1 <= slot <= self.cfg.max_hints
+                and self._hints_given < slot
+                and not self._hint_pending
+                and now >= self._hint_retry_at):
+            self._hint_pending = True
             acts.append(EngineAction(ActionKind.HINT, {
-                "level": self._hints_given,
+                "level": self._hints_given + 1,
                 "puzzle": self._puzzle, "answer": self._answer,
                 "given": list(self._hints_shown),
                 # ---- Q6(方案 §31/§32): fact-aware hint 的三样输入 ----

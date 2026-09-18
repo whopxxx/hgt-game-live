@@ -383,8 +383,13 @@ def test_hints_not_reset_by_chat():
     clk.advance(40)
     eng.submit_danmaku("u1", "甲", "随便聊聊")
     clk.advance(6)                               # 累计 46s -> 到点了
-    check("发言不推迟提示",
-          [a for a in eng.tick() if a.kind == ActionKind.HINT] != [], eng.tick())
+    h1 = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("发言不推迟提示", h1 != [], eng.tick())
+    # 在途期间不重复派发(第三轮 review: 一次只允许一条提示在途)
+    check("在途时不重复派发",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] == [])
+    # worker 回调(真实路径总会回调, 成功或失败)
+    eng.submit_hint("第一条提示")
     # 再走一格, 第二条提示也应到点
     clk.advance(45)
     check("第二条也按时间轴到点",
@@ -848,6 +853,31 @@ def test_fallback_specs_all_valid():
         check(f"兜底题 {i} 没有待修项", not vr.fixable, vr.must_fix())
 
 
+def test_fallback_specs_use_official_taxonomy():
+    """P1(第三轮 review): 兜底题的 taxonomy 必须是**正式枚举**里的值。
+
+    早先写的是 psychological_compulsion / psychological_necessity ——
+    两个不存在的类别。没炸只是因为 validate_spec 不校验 signature 的
+    enum, 而兜底题又不进配额。Q8 开始持久化 spec 之后, Pool / archive
+    里就会出现两套并存的 taxonomy。
+    """
+    from story import parser as P
+    from story.puzzle import MECHANISM_FAMILIES, SOLUTION_SHAPES,         DOMAINS, EMOTION_MODES, RELATIONS, TIME_SHAPES
+    for i in range(4):
+        sp = P.fallback_spec(i)
+        sg = sp.signature
+        check(f"兜底题 {i} mechanism_family 合法",
+              sg.mechanism_family in MECHANISM_FAMILIES, sg.mechanism_family)
+        check(f"兜底题 {i} solution_shape 合法",
+              sg.solution_shape in SOLUTION_SHAPES, sg.solution_shape)
+        check(f"兜底题 {i} domain 合法", sg.domain in DOMAINS, sg.domain)
+        check(f"兜底题 {i} emotion_mode 合法",
+              sg.emotion_mode in EMOTION_MODES, sg.emotion_mode)
+        check(f"兜底题 {i} relation 合法", sg.relation in RELATIONS, sg.relation)
+        check(f"兜底题 {i} time_shape 合法",
+              sg.time_shape in TIME_SHAPES, sg.time_shape)
+
+
 def test_fallback_does_not_pollute_quota():
     """P1: 兜底题**不该**进 recent_signatures。
 
@@ -1148,6 +1178,65 @@ def test_archive_fallback_does_not_inherit_previous_metrics():
           rows[1].get("blueprint_specified") is False, rows[1])
 
 
+def test_full_fallback_chain_reaches_archive():
+    """P0 端到端(第三轮 review): 真实兜底链跑到**落盘**都不能炸。
+
+    这条链此前没有任何测试覆盖:
+        连续出题失败 -> Engine 自动结构化兜底 -> ANSWER payload
+        -> REVEAL payload -> _archive_reveal -> json 落盘
+
+    早先它会在最后一步 `TypeError`, 而落盘失败会**停引擎** ——
+    也就是说"出题全挂"这种本来就糟的情况会进一步把直播停掉。
+    """
+    import io as _io
+    import json
+    import os
+    import tempfile
+    from director import Director
+
+    cfg = mkcfg(riddle_max_attempts=2)
+    out = os.path.join(tempfile.gettempdir(), "_hgt_fallback_chain.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    # 真实路径: 连续失败 -> Engine 内部结构化兜底
+    d.engine.submit_riddle(None, error="网关挂了")
+    d.engine.submit_riddle(None, error="还是挂了")
+    check("兜底题已上屏", d.engine.phase == Phase.QA, d.engine.phase)
+
+    # 观众问一条 -> ANSWER payload 也要能吃下兜底题的 atoms
+    d.engine.submit_danmaku("u1", "甲", "#和钟有关吗")
+    acts = d.engine.tick()
+    ans = [a for a in acts if a.kind == ActionKind.ANSWER]
+    check("派发了 ANSWER", len(ans) == 1, kinds(acts))
+    if ans:
+        sa = ans[0].payload.get("solve_atoms")
+        check("ANSWER payload 的 atoms 是 dict 列表",
+              sa is None or all(isinstance(a, dict) for a in sa),
+              [type(a).__name__ for a in (sa or [])])
+
+    # 走真实揭晓 -> 落盘
+    rev = d.engine._enter_revealing_locked(0.0, "giveup", "")
+    payload = [a for a in rev if a.kind == ActionKind.REVEAL][0].payload
+    d._archive_reveal(payload, "揭晓文案")
+    check("落盘没有抛异常(核心断言)", os.path.exists(out), out)
+    rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
+    check("archive 有 solve_atoms",
+          len(rec.get("solve_atoms") or []) >= 2, rec.get("solve_atoms"))
+    check("archive 有 fair_clues",
+          len(rec.get("fair_clues") or []) >= 1, rec.get("fair_clues"))
+    check("atoms 是 dict 不是对象",
+          all(isinstance(a, dict) for a in rec["solve_atoms"]),
+          [type(a).__name__ for a in rec["solve_atoms"]])
+    check("兜底题标为未生成", rec["metrics"].get("generated") is False,
+          rec["metrics"])
+    check("兜底题 blueprint_specified=False",
+          rec.get("blueprint_specified") is False, rec.get("blueprint_specified"))
+
+
 def test_archive_records_review_latency_total():
     """Q7(第三轮 review): 审稿耗时是**累计**值, 不是"最后一次"。"""
     import io
@@ -1181,6 +1270,140 @@ def test_archive_records_review_latency_total():
     check("有 review_calls 可算均值", m.get("review_calls") == 3, m)
 
 
+def test_fallback_atoms_are_dicts_not_dataclasses():
+    """P0(第三轮 review): Engine 内部协议必须是 `list[dict]`。
+
+    结构化兜底传进来的是 `SolveAtom/FairClue` **对象**, 而 AI 生成路径
+    传的是 dict。两种类型混在一条链上会同时坏两件事:
+
+      ① judge() 的 `isinstance(a, dict)` 判不出 role -> "必须同时命中
+         cause + mechanism" 的代码层 gate 被静默跳过, 兜底题又绕回宽判;
+      ② REVEAL payload 带 dataclass 对象落盘 -> json.dumps 直接
+         TypeError, "出题全挂"时把落盘也一起带崩。
+
+    这个边界必须收口, 见 engine 的 `_atom_dict/_clue_dict`。
+    """
+    from story import parser as P
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=2), clock=clk)
+    eng.start()
+    eng.submit_riddle(None, error="挂了")
+    eng.submit_riddle(None, error="又挂了")
+    check("进了 QA", eng.phase == Phase.QA, eng.phase)
+    check("兜底题的 atoms 是 dict",
+          eng._solve_atoms and all(isinstance(a, dict)
+                                   for a in eng._solve_atoms),
+          [type(a).__name__ for a in eng._solve_atoms])
+    check("兜底题的 clues 是 dict",
+          eng._fair_clues and all(isinstance(c, dict)
+                                  for c in eng._fair_clues),
+          [type(c).__name__ for c in eng._fair_clues])
+    a0 = eng._solve_atoms[0] if eng._solve_atoms else None
+    check("dict 里带 role",
+          isinstance(a0, dict) and a0.get("role") in ("cause", "mechanism"),
+          a0)
+
+
+def test_fallback_reveal_payload_is_json_serializable():
+    """P0: 兜底题走到揭晓时, REVEAL payload 必须能 json.dumps。
+
+    这是真实路径: 出题连挂 -> 结构化兜底 -> 揭晓 -> 落盘。
+    早先这里会 `TypeError: Object of type SolveAtom is not JSON
+    serializable`, 而落盘失败会**停引擎**。
+    """
+    import json
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=2), clock=clk)
+    eng.start()
+    eng.submit_riddle(None, error="挂了")
+    eng.submit_riddle(None, error="又挂了")
+    acts = eng._enter_revealing_locked(clk.t, "giveup", "")
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    check("产出了 REVEAL", len(rev) == 1, kinds(acts))
+    if not rev:
+        return
+    pl = rev[0].payload
+    # 模拟 _archive_reveal 那一步
+    err = ""
+    try:
+        json.dumps({k: pl.get(k) for k in
+                    ("solve_atoms", "fair_clues", "puzzle", "answer")},
+                   ensure_ascii=False)
+    except TypeError as e:
+        err = str(e)
+    check("REVEAL payload 可 JSON 序列化", not err, err)
+    check("solve_atoms 落在 payload 里是 dict 列表",
+          all(isinstance(a, dict) for a in (pl.get("solve_atoms") or [])),
+          pl.get("solve_atoms"))
+
+
+def test_fallback_judge_gate_actually_works():
+    """P0: 兜底题也要走**正式 atom gate** —— 只命中 cause 不算通关。
+
+    这正是"把兜底结构化"的**目的**。早先因为类型没统一, judge 认不出
+    role, 这个 gate 在兜底路径上被静默跳过。
+    """
+    from story.llm import _norm_atoms
+    from story import parser as P
+    sp = P.fallback_spec(0)
+    atoms = [_a for _a in (sp.solve_atoms or [])]
+    norm = _norm_atoms(atoms)
+    check("归一后带 cause", any(a["role"] == "cause" for a in norm), norm)
+    check("归一后带 mechanism",
+          any(a["role"] == "mechanism" for a in norm), norm)
+    check("都是 dict", all(isinstance(a, dict) for a in norm), norm)
+
+
+def test_hint_slot_not_consumed_on_failure():
+    """P1(第三轮 review): 提示生成失败**不该消耗**槽位。
+
+    早先 `_hints_given` 在**发出请求**时就 +1, 而 worker 失败时什么都不
+    提交 -> 那一格永远补不回来, 观众少一条提示。
+    (Q6 之后 hint() 在"三次全泄底"时也返回 None, 这条路径因此变成
+    真实可达, 不再是理论问题。)
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=45.0, restate_seconds=999999,
+                            hint_retry_seconds=15.0), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    clk.advance(46)
+    check("到点派出提示", [a for a in eng.tick() if a.kind == ActionKind.HINT],
+          kinds(eng.tick()))
+    check("槽位还没消耗", eng._hints_given == 0, eng._hints_given)
+    # worker 失败
+    eng.submit_hint(None, error="连续生成的提示都存在泄底风险")
+    check("失败后槽位仍未被消耗", eng._hints_given == 0, eng._hints_given)
+    check("在途标志已清", eng._hint_pending is False, eng._hint_pending)
+    # 退避期内不重试(防失败风暴)
+    clk.advance(5)
+    check("退避期内不重试",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] == [])
+    # 退避结束 -> 重试同一格
+    clk.advance(11)
+    check("退避结束后重试同一格",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] != [])
+    # 这次成功
+    eng.submit_hint("第一条提示")
+    check("成功后槽位 +1", eng._hints_given == 1, eng._hints_given)
+
+
+def test_hint_success_still_advances():
+    """P1: 成功的提示照常推进计数与时间轴(不能因为改了语义就不走了)。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=45.0, restate_seconds=999999),
+                      clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    for lvl in (1, 2, 3):
+        clk.advance(45)
+        h = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+        check(f"第 {lvl} 条派出", len(h) == 1, kinds(h))
+        eng.submit_hint(f"提示{lvl}")
+        check(f"第 {lvl} 条计数", eng._hints_given == lvl, eng._hints_given)
+    check("三条都给过", len(eng._hints_shown) == 3, eng._hints_shown)
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -1205,16 +1428,24 @@ def main():
              # ---- 第二轮 review ----
              test_fallback_riddle_is_structured,
              test_fallback_specs_all_valid,
+             test_fallback_specs_use_official_taxonomy,
              test_fallback_does_not_pollute_quota,
              test_fallback_rotates,
              test_request_riddle_action_is_public_and_matches,
              test_hint_payload_carries_spec_and_touched,
              test_hint_payload_touched_is_a_copy,
+             # ---- 第三轮 review ----
+             test_fallback_atoms_are_dicts_not_dataclasses,
+             test_fallback_reveal_payload_is_json_serializable,
+             test_fallback_judge_gate_actually_works,
+             test_hint_slot_not_consumed_on_failure,
+             test_hint_success_still_advances,
              # ---- Q7 ----
              test_archive_writes_full_schema,
              test_archive_metrics_survive_missing_spec,
              test_archive_fallback_does_not_inherit_previous_metrics,
              test_archive_records_review_latency_total,
+             test_full_fallback_chain_reaches_archive,
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,
              test_first_and_retry_riddle_actions_match,

@@ -204,6 +204,10 @@ class Config:
     # 提示的温度略高一点点: 同一方向可以说出不同角度的引导语,
     # 完全不抖动会让第 2、3 条提示听起来像同一句(方案 §31)。
     hint_temperature: float = 0.5
+    # 提示生成失败后, 隔多久重试**同一格**(第三轮 review P1)。
+    # 不能设太小 —— 网关持续故障时会变成每秒一次的失败风暴。
+    # 也不能设太大 —— 那一格就赶不上时间轴了(走完就揭晓)。
+    hint_retry_seconds: float = 15.0
     review_temperature: float = 0.2
     generate_temperature: float = 0.8
 

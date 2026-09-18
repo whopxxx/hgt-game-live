@@ -633,13 +633,25 @@ def _fallback_specs():
     c3 = [dict(quote="把家里的钟全调快十分钟", supports_atoms=["a2"]),
           dict(quote="他跪下来求他们别动", supports_atoms=["a2"])]
 
+    # 注意: 这里的 taxonomy **必须**是正式枚举里的值。
+    # 早先这里写的是 psychological_compulsion / psychological_necessity
+    # —— 两个不存在的类别。当时没炸只是因为 validate_spec 不校验
+    # signature 的 enum, 而且兜底题不进 recent 配额。但 Q8 开始持久化
+    # PuzzleSpec 之后, Pool / archive 里就会出现"正式题一套 taxonomy、
+    # 兜底题另一套", 统计和对齐都会出问题。
+    #
+    # 映射回现有枚举:
+    #   ②电梯(被害妄想 -> 固定自查动作) = hidden_function +
+    #       hidden_function_explains_behavior(那个多余动作有真实用途)
+    #   ④调钟(赎罪 -> 长年仪式) = emotional_motive +
+    #       past_trauma_explains_current_ritual(妻子的死 + 固定仪式)
     sig0 = dict(mechanism_family="information_gap",
                 solution_shape="information_advantage", domain="workplace",
                 emotion_mode="guilt", relation="family",
                 time_shape="habitual")
-    sig1 = dict(mechanism_family="psychological_compulsion",
-                solution_shape="psychological_necessity",
-                domain="daily", emotion_mode="grief", relation="self",
+    sig1 = dict(mechanism_family="hidden_function",
+                solution_shape="hidden_function_explains_behavior",
+                domain="daily", emotion_mode="tense", relation="self",
                 time_shape="habitual")
     sig2 = dict(mechanism_family="emotional_motive",
                 solution_shape="past_trauma_explains_current_ritual",
@@ -647,9 +659,10 @@ def _fallback_specs():
                 time_shape="years_long", past_trauma=True,
                 repeated_ritual=True)
     sig3 = dict(mechanism_family="emotional_motive",
-                solution_shape="psychological_necessity", domain="family",
-                emotion_mode="guilt", relation="family",
-                time_shape="years_long", past_trauma=True)
+                solution_shape="past_trauma_explains_current_ritual",
+                domain="family", emotion_mode="guilt", relation="family",
+                time_shape="years_long", past_trauma=True,
+                repeated_ritual=True)
 
     return [
         mk(0, FALLBACK_RIDDLES[0][0], FALLBACK_RIDDLES[0][1], FALLBACK_HINTS,

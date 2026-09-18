@@ -498,8 +498,16 @@ class Director:
             reveal=text, qa=list(snap.qa_archive),
             # 出题时定下的原子事实与公平线索 —— 赛后复盘
             # "为什么这条没判中"时必须能对照它们。
-            solve_atoms=payload.get("solve_atoms", []),
-            fair_clues=payload.get("fair_clues", []),
+            #
+            # **优先从 spec 取**(第三轮 review): spec.to_archive() 出来
+            # 的一定是可 JSON 序列化的 dict。payload 那份是 Engine 传的,
+            # 类型由 Engine 保证(它也在边界统一成 dict 了), 但多这一层
+            # 兜底可以防"将来某个调用方又塞对象进来"把落盘打崩 ——
+            # 落盘失败会**停引擎**, 代价太大, 不值得省这一行。
+            solve_atoms=spec_d.get("solve_atoms",
+                                   payload.get("solve_atoms", [])),
+            fair_clues=spec_d.get("fair_clues",
+                                  payload.get("fair_clues", [])),
             # ---- 完整的结构化定义(方案 §34) ----
             facts=spec_d.get("facts", []),
             hints=spec_d.get("hints", []),
