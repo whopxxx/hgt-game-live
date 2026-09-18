@@ -1410,6 +1410,12 @@ class PuzzleWriter:
     client: AnthropicMessagesClient
     runtime_cfg: Optional[Any] = None
 
+    def __post_init__(self) -> None:
+        # 侧信道字段**每实例一份**。不写成类属性 —— 类属性是所有实例
+        # 共享的一份, 而 Q9 之后 live 与 prefetch 各有一个 writer。
+        self._last_review_decision: str = ""
+        self._last_review_issues: Optional[list] = None
+
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     def gen_spec(self, avoid: Optional[list] = None,
@@ -1614,9 +1620,18 @@ class PuzzleWriter:
             model=getattr(last, "model", None))
 
     # ------------------------------------------------------------------
-    #: 上一次 `_review_spec` 的决定与 issues(给 gen_spec 统计用)
-    _last_review_decision: str = ""
-    _last_review_issues: Optional[list] = None
+    #: 上一次 `_review_spec` 的决定与 issues(给 gen_spec 统计用)。
+    #:
+    #: ⚠️ 这是**实例**属性, 在 `__init__` 里初始化 —— 不要写成类属性:
+    #: 类属性是所有实例共享的一份, 而 Q9 之后同时存在 live 与 prefetch
+    #: 两个 writer, 共享会让一道题的审稿结果记到另一道题的 metrics 上。
+    #: (声明在类上时, 未赋值的实例读的是同一份类属性。)
+    #:
+    #: ⚠️ 这是**侧信道**。`_review_spec` 必须在**每一条**返回路径上都把
+    #: 它设成"本次调用"的结果(含早退的失败路径), 否则 `gen_spec` 会把
+    #: 上一次的决定/issues 记进本题的 metrics —— 见 `_review_spec` 开头
+    #: 的清理。更彻底的做法是改成返回值, 但返回值已经被
+    #: `(spec, why, rewrite)` 占满, 这次不扩大改动。
 
     def _cfg(self) -> Optional[Any]:
         """取**运行时 Config**(temperature / quota 都在这上面)。
@@ -1752,6 +1767,15 @@ class PuzzleWriter:
 
         第三个返回值是"要不要重出"。
         """
+        # ---- 侧信道清零(必须在**任何**返回之前) ----
+        # `gen_spec` 会把这俩记进本题 metrics。若某条早退路径(空 tool_input /
+        # 网关错误)没写它们就返回, 本题就会继承**上一次调用**留下的
+        # decision/issues —— 一道审稿失败的题, metrics 里却带着上一题的
+        # "pass" 和上一题的 issues。清零 + 每条路径都写, 才能保证
+        # metrics 里的东西**一定**是本题的。
+        self._last_review_decision = ""
+        self._last_review_issues = None
+
         bp = blueprint or spec.blueprint
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"

@@ -932,8 +932,13 @@ def test_director_prefetch_end_to_end():
         cfg.pool_target_size = 5
         dr = Director(cfg)
         check("Director 建了 prefetcher", dr._prefetcher is not None)
-        check("prefetcher 拿到了 writer",
-              dr._prefetcher.writer is dr.writer)
+        # 补池用**自己的** writer 实例(见 C9): Writer 的 _last_review_*
+        # 是实例级侧信道, 两条链并发审稿会互相覆盖。所以这里断言的是
+        # "它有自己的 writer", 而不是"和 live 同一个"。
+        check("prefetcher 有自己的 writer",
+              dr._prefetcher.writer is not None
+              and dr._prefetcher.writer is not dr.writer,
+              dr._prefetcher.writer)
 
         # 换成同步执行器 + 假 writer, 让补池确定地跑
         pf = dr._prefetcher
@@ -1096,6 +1101,155 @@ def test_pick_blueprint_actually_returns_one():
             dr._prefetcher.shutdown()
 
 
+
+def test_review_side_channel_is_per_instance():
+    """**回归**: `_last_review_*` 必须是每实例一份, 不能是类属性。
+
+    早先它声明在**类**上 —— 类属性是所有实例共享的一份。Q9 之后同时
+    存在 live 与 prefetch 两个 writer, 共享会让一道题的审稿结果被另一道
+    题读走。
+
+    ⚠️ 关键: 光"给 a 赋值再看 b"是**抓不到**这个回归的 —— 给实例赋值
+    会创建一个**实例**属性把类属性遮住, 于是 b 仍然读类属性默认值,
+    看起来一切正常。必须直接断言"类上没有这个可变默认", 或者断言
+    "未赋值的实例读不到别人写进去的值"。两条都写在这儿。
+    """
+    print("\n[C7] review 侧信道每实例一份")
+    from story.llm import PuzzleWriter
+    # ① 类上不该有这两个可变默认
+    check("**类上没有 _last_review_decision 默认**",
+          "_last_review_decision" not in vars(PuzzleWriter),
+          list(vars(PuzzleWriter)))
+    check("**类上没有 _last_review_issues 默认**",
+          "_last_review_issues" not in vars(PuzzleWriter),
+          [k for k in vars(PuzzleWriter) if "review" in k])
+    # ② 每个实例自己带着初始值(而不是靠类兜底)
+    a = PuzzleWriter(client=None)
+    b = PuzzleWriter(client=None)
+    check("实例自带初始 decision", a._last_review_decision == ""
+          and b._last_review_decision == "")
+    check("**在实例 __dict__ 里(不是靠类)**",
+          "_last_review_decision" in vars(a)
+          and "_last_review_issues" in vars(a), list(vars(a)))
+    # ③ 写 a 不影响 b
+    a._last_review_decision = "pass"
+    a._last_review_issues = ["甲"]
+    check("**a 的赋值没串到 b**", b._last_review_decision == ""
+          and b._last_review_issues is None,
+          f"{b._last_review_decision!r} {b._last_review_issues!r}")
+
+
+def test_review_side_channel_reset_on_entry():
+    """**回归**: `_review_spec` 一进来就清零侧信道。
+
+    早先它在**所有早退路径之后**才写 —— 空 tool_input / 网关错误那两条
+    直接 `return None`, 于是本题 metrics 会继承**上一次调用**留下的
+    decision/issues: 一道审稿失败的题, metrics 里却带着上一题的 "pass"
+    和上一题的 issues。这条不需要并发就能触发。
+    """
+    print("\n[C8] 审稿侧信道: 失败路径不继承上一次")
+    import inspect as _insp
+    from story.llm import PuzzleWriter
+    src = _insp.getsource(PuzzleWriter._review_spec)
+    body = src.split('"""')[-1]           # 去掉 docstring, 只看代码
+    i_reset = body.find("self._last_review_decision")
+    i_first_ret = None
+    for marker in ("return None,", "return spec"):
+        j = body.find(marker)
+        if j != -1 and (i_first_ret is None or j < i_first_ret):
+            i_first_ret = j
+    check("看得到清理语句", i_reset != -1)
+    check("**清理在任何 return 之前**",
+          i_reset != -1 and i_first_ret is not None and i_reset < i_first_ret,
+          f"reset@{i_reset} first_return@{i_first_ret}")
+
+    # 行为验证: 先造一个"上一次是 pass"的状态, 再走一次早退路径
+    class _BadClient:
+        class cfg:
+            model = "fake"
+
+        def messages(self, *a, **kw):
+            class _R:
+                tool_input = None          # 空 tool_input -> 早退
+                error = "网关抖动"
+            return _R()
+
+    w = PuzzleWriter(client=_BadClient())
+    w._last_review_decision = "pass"
+    w._last_review_issues = ["上一题的毛病"]
+    out, why, rw = w._review_spec(good_spec())
+    check("确实走了失败路径", out is None and rw is True, (out, why, rw))
+    check("**decision 被清零, 没继承 'pass'**",
+          w._last_review_decision == "", repr(w._last_review_decision))
+    check("**issues 被清零, 没继承上一题**",
+          not w._last_review_issues, repr(w._last_review_issues))
+
+
+def test_director_prefetch_has_own_writer():
+    """**回归**: 补池与 live 不共用 Writer 实例。
+
+    `PuzzleWriter` 不是无状态的(`_review_spec` 写 `_last_review_*`,
+    `gen_spec` 再读出来记进 metrics)。而 Q9 刻意让 prefetch 不拿
+    `_narrating`, 所以两条链会**同时**跑 gen_spec。共用实例就会:
+        prefetch 审稿 A -> 写 A -> live 审稿 B -> 覆盖成 B
+        -> prefetch 继续 -> 把 B 的 decision/issues 记进 A 的 metrics
+    谜题内容不串, 但 review provenance 被污染。
+
+    确定性做法: 直接断言"两个不同的 writer 实例 + 同一 client",
+    而不是起线程跑几次看撞不撞。
+    """
+    print("\n[C9] 补池有自己的 Writer 实例")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        dr = Director(cfg)
+        check("两个 writer 都在", dr.writer is not None
+              and dr._prefetcher is not None)
+        check("**prefetcher.writer 不是 live writer**",
+              dr._prefetcher.writer is not dr.writer)
+        check("**但共用同一个 client(纯传输层)**",
+              dr._prefetcher.writer.client is dr.writer.client)
+
+        # 确定性 interleave: 两个实例各写各的, 互不可见
+        dr.writer._last_review_decision = "pass"
+        dr.writer._last_review_issues = ["live 的毛病"]
+        check("**live 写了, 补池那边看不见**",
+              dr._prefetcher.writer._last_review_decision == ""
+              and not dr._prefetcher.writer._last_review_issues,
+              repr(dr._prefetcher.writer._last_review_decision))
+        dr._prefetcher.shutdown()
+
+
+def test_prefetch_writer_none_when_no_client():
+    """没有 client(理论上不该发生)时补池 writer 也得是 None, 别炸。"""
+    print("\n[C10] 没 client 时 prefetch writer 为 None")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=True)
+        dr = Director(cfg)
+        check("--no-llm 下 writer 与 prefetcher 都停",
+              dr.writer is None
+              and (dr._prefetcher is None
+                   or dr._prefetcher.writer is None))
+
+
+def test_shutdown_docstring_is_honest():
+    """**文档必须说真话**: `shutdown()` 自身立即返回, 但进程仍会等正在
+    跑的那一道(ThreadPoolExecutor + atexit join 的语义)。
+
+    这条测试不测线程行为(那会很脆), 只锁住"注释没在承诺做不到的事"。
+    """
+    print("\n[C11] shutdown 的承诺与事实一致")
+    import inspect as _insp
+    from story.prefetch import PoolPrefetcher
+    doc = PoolPrefetcher.shutdown.__doc__ or ""
+    check("**没有'绝不阻塞'这类空承诺**",
+          "绝不阻塞" not in doc, doc[:60])
+    check("说清了进程仍会等", "等" in doc, doc[:60])
+    check("提到了 executor 的真实语义",
+          "cancel_futures" in doc or "解释器" in doc or "atexit" in doc)
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -1136,6 +1290,12 @@ def main():
         test_director_pool_disabled_no_prefetcher,
         test_prefetch_does_not_change_live_blueprint_sequence,
         test_pick_blueprint_actually_returns_one,
+        # D. final concurrency
+        test_review_side_channel_is_per_instance,
+        test_review_side_channel_reset_on_entry,
+        test_director_prefetch_has_own_writer,
+        test_prefetch_writer_none_when_no_client,
+        test_shutdown_docstring_is_honest,
     ]
     for t in tests:
         t()
@@ -1143,7 +1303,7 @@ def main():
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} 项")
         return 1
-    print("PASS: 补池(零件 + 状态机 + 接线) 全部通过")
+    print("PASS: 补池(零件 + 状态机 + 接线 + 并发隔离) 全部通过")
     return 0
 
 

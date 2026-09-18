@@ -337,7 +337,24 @@ class PoolPrefetcher:
 
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
-        """收尾。**绝不阻塞** —— 在途生成可能长达 90s(gen_spec budget)。"""
+        """收尾。**这个方法本身立即返回, 但进程仍会等正在跑的那一道。**
+
+        ⚠️ 别把这里理解成"下播立刻退出":
+
+        标准 `ThreadPoolExecutor.shutdown(wait=False, cancel_futures=True)`
+        的语义是 —— **`shutdown()` 自己**立即返回; 它不会取消**已经在
+        执行**的任务, 而且 CPython 在**退出解释器**时会 join 线程池的
+        工作线程(`concurrent.futures.thread` 的 atexit 钩子)。所以若
+        `Ctrl-C` 的那一刻正好有一道 gen_spec 在跑, 进程仍会等它结束
+        ——那是几十秒量级(gen_spec 的 budget_s=90)。
+
+        这个行为是**接受**的, 不是疏忽: 补池同时最多只有一道在途, 而且
+        只在 QA 空闲时才开始, 所以"退出时正好在跑"是小概率; 为它换成
+        可强杀的隔离执行模型会显著复杂化线程模型, 不值得。
+
+        (想真正快速退出, 得让 worker 不依赖普通线程池的退出语义 —— 那是
+        另一个量级的改动, 本阶段明确不做。)
+        """
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:                       # noqa: BLE001

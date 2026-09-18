@@ -151,7 +151,16 @@ class Director:
         self.writer: PuzzleWriter | None = None
         self.client: AnthropicMessagesClient | None = None
         self._stop = threading.Event()
-        self._narrating = threading.Lock()          # RIDDLE/HINT/REVEAL 互斥
+        # ⚠️ 实际上**只有 `_riddle` 用它**(非阻塞 acquire, 失败则
+        # `_deferred_rddle=True` 交给下一拍补发)。`_hint` / `_reveal`
+        # **不碰**它 —— 早先这里的注释写着 "RIDDLE/HINT/REVEAL 互斥",
+        # 那是不成立的, 别照着它"修正"成三者共锁。
+        #
+        # 为什么这条注释很重要: Q9 的补池**刻意不共用这把锁**(补池持锁
+        # 会把 live 出题挤成"推迟到下一拍", 优先级正好倒过来)——
+        # 整个 Q9 的锁设计就建立在这个事实上。把三者真改成共锁会把
+        # 那个优先级反转重新引入。
+        self._narrating = threading.Lock()
         self.segment_counter = 0
         self.session_id = uuid.uuid4().hex
         self._archive_failed = False
@@ -199,8 +208,25 @@ class Director:
             pf_seed = getattr(cfg, "quality_seed", None)
             pf_rng = random.Random(None if pf_seed is None
                                    else pf_seed ^ 0x9E3779B9)
+            # ⚠️ 补池用**另一个 Writer 实例**。
+            #
+            # `PuzzleWriter` 不是无状态的: `_review_spec` 会把本次审稿的
+            # decision/issues 写进实例属性(`_last_review_*`), `gen_spec`
+            # 再读出来记进 metrics。而 Q9 刻意让 prefetch 不拿 `_narrating`,
+            # 所以 prefetch 与 live 会**同时**跑 gen_spec。共用一个实例
+            # 就会出现: prefetch 审稿 A -> 写 decision=A -> 切走 ->
+            # live 审稿 B -> 覆盖成 B -> prefetch 继续 -> 把 B 的
+            # decision/issues 记进 **A** 的 metrics。
+            #
+            # 谜题内容不会串, 但 Q7 好不容易建立的 generation/review
+            # provenance 会被污染(题以后播出时 archive 带着错误审稿指标)。
+            # 每边一个实例就切断了这条侧信道。
+            #
+            # `client` 仍然共用 —— 它是纯传输层, 无可变业务状态。
+            pf_writer = (PuzzleWriter(client=self.client, runtime_cfg=cfg)
+                         if self.client is not None else None)
             self._prefetcher = PoolPrefetcher(
-                cfg=cfg, pool=self.pool, writer=self.writer,
+                cfg=cfg, pool=self.pool, writer=pf_writer,
                 probe=self.engine.pressure,
                 probe_inputs=self.engine.snapshot_generation_inputs,
                 pick_blueprint=self._pick_blueprint,
@@ -499,7 +525,14 @@ class Director:
             # 调度失败不能让出题链断掉 —— 退化成"模型自由发挥"。
             # 这里返回的 None 会被调用方转成 enforce_blueprint=False,
             # 所以"不限形状"这次是真的(早先它其实会退回默认 blueprint)。
-            log.warning("blueprint 选择失败, 本题**真的**不限形状: %s", e)
+            #
+            # ⚠️ 用 `log.exception` **带堆栈**: `choose_blueprint` 是纯代码
+            # 调度器, 它抛异常基本只可能是**代码 bug**(早先那个漏传
+            # logger 的 `_detail` 就是这么藏了一整个季度的)。只打一行
+            # message 会让这类错误极难定位; 宽容处理是给"业务上可接受
+            # 的失败"的, 不是给 bug 的。C6 能挡"永远返回 None",
+            # 但挡不住"某一类 recent 状态才触发"。
+            log.exception("blueprint 选择失败, 本题退化为不限形状: %s", e)
             return None
 
     def _hint(self, payload: dict) -> None:
