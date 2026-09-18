@@ -1027,9 +1027,16 @@ def test_method_probe_counts_before_handler() -> None:
         check("无 handler 的进 unhandled",
               summ["unhandled"].get("WebcastGiftMessage") == 1,
               summ["unhandled"])
-        check("**探针不含 payload/昵称**",
-              set(summ) == {"ws_frames", "ws_messages", "methods",
-                            "unhandled", "parse_errors"}, sorted(summ))
+        # 断言的是**性质**(不含 payload/昵称), 不是固定 key 列表 ——
+        # 加新计数器不该让这条测试红, 但泄漏用户内容必须红。
+        allowed = {"connection_generation", "session_methods",
+                   "session_frames", "ws_frames", "ws_messages",
+                   "methods", "unhandled", "parse_errors"}
+        check("**探针只含计数类字段**", set(summ) <= allowed, sorted(summ))
+        import json as _json
+        blob = _json.dumps(summ, ensure_ascii=False)
+        check("**不含 payload/昵称内容**",
+              "payload" not in blob and "nick" not in blob, blob[:200])
     finally:
         f._fp.close()
         os.unlink(path)
@@ -1049,6 +1056,124 @@ def test_method_probe_records_parse_errors() -> None:
         check("解析失败被单独记录",
               summ["parse_errors"].get("WebcastGiftMessage", 0) >= 0,
               summ["parse_errors"])
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_bootstrap_dynamic_requires_both_fields() -> None:
+    """**B-smoke readiness**: 只有 cursor 与 internal_ext **同时**来自同一次
+    `/im/fetch/` 才算 dynamic。
+
+    只要一个存在就打印 dynamic, 会让日志写 dynamic 而 URL 其实是新旧混搭
+    (缺的那半截用 2024 fallback) —— B 实验就变成假 B。
+    这里直接验 `_fetch_bootstrap_state` 的返回值: 半截必须返回 None。
+    """
+    print("\n[12B-5] dynamic 必须两个字段同源")
+    import sys as _s
+    _s.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "vendor", "douyin_fetcher"))
+    import liveMan as LM
+    from protobuf.douyin import Response
+
+    class _Resp:
+        def __init__(self, body):
+            self.content = body
+
+    def make_fetcher(resp_body):
+        f = LM.DouyinLiveWebFetcher(live_id="1", abogus_file="x")
+        f._DouyinLiveWebFetcher__room_id = "12345"
+        f._DouyinLiveWebFetcher__ttwid = "t"
+        f.get_ac_nonce = lambda: "n"
+        f.get_ac_signature = lambda n=None: "s"
+        f.get_a_bogus = lambda p: "a"
+
+        class _Sess:
+            def get(self, *a, **k):
+                return _Resp(resp_body)
+        f.session = _Sess()
+        return f
+
+    def body_with(cursor=None, internal_ext=None, live_cursor=None):
+        r = Response()
+        r.cursor = cursor or ""
+        r.internal_ext = internal_ext or ""
+        r.live_cursor = live_cursor or ""
+        return bytes(r)
+
+    # ① 两者齐全 -> dynamic
+    got = make_fetcher(body_with(cursor="C", internal_ext="E"))._fetch_bootstrap_state()
+    check("两者齐全 -> 返回状态", got == {"cursor": "C", "internal_ext": "E"}, got)
+    # ② 只有 cursor -> 必须 None(不能半动态)
+    got2 = make_fetcher(body_with(cursor="C"))._fetch_bootstrap_state()
+    check("**只有 cursor -> None(不算 dynamic)**", got2 is None, got2)
+    # ③ 只有 internal_ext -> 必须 None
+    got3 = make_fetcher(body_with(internal_ext="E"))._fetch_bootstrap_state()
+    check("**只有 internal_ext -> None**", got3 is None, got3)
+    # ④ live_cursor **不能**冒充 internal_ext
+    got4 = make_fetcher(body_with(cursor="C", live_cursor="L"))._fetch_bootstrap_state()
+    check("**live_cursor 不冒充 internal_ext -> None**", got4 is None, got4)
+    # ⑤ 两个都空 -> None
+    got5 = make_fetcher(body_with())._fetch_bootstrap_state()
+    check("全空 -> None", got5 is None, got5)
+
+
+def test_probe_counters_are_per_connection() -> None:
+    """**B-smoke readiness**: 探针是**每连接**计数, 不是跨重连累计。
+
+    否则制造一次重连后, 无法判断"重连前 Gift 0 / 重连后 Gift 2"这种
+    关键差异 —— 累计值把两代混成一个数。
+    """
+    print("\n[12B-4] 探针每连接独立")
+    from danmaku import GiftMessage
+    f, path = _mk_ws_fetcher([], keep_all=True, interaction=True)
+    try:
+        class _WS:
+            def send(self, *a, **k):
+                pass
+
+        # 第一代: 先 open, 再收 2 条 Gift
+        f._wsOnOpen(_WS())
+        gen1 = f.connection_generation
+        for i in range(2):
+            gm = GiftMessage()
+            gm.gift_id = i
+            gm.gift.name = "x"
+            f._wsOnMessage(_WS(), _frame("WebcastGiftMessage",
+                                         gm.SerializeToString(),
+                                         envelope_msg_id=100 + i))
+        s1 = f.method_summary()
+        check("第一代 gen", s1["connection_generation"] == gen1, s1)
+        check("第一代本连接 Gift=2",
+              s1["methods"].get("WebcastGiftMessage") == 2, s1["methods"])
+        check("第一代 frames=2", s1["ws_frames"] == 2, s1["ws_frames"])
+
+        # 第二代(模拟重连): 再 open
+        f._wsOnOpen(_WS())
+        s2 = f.method_summary()
+        check("**新一代 gen 递增**",
+              s2["connection_generation"] == gen1 + 1, s2)
+        check("**新一代本连接计数归零**", s2["ws_frames"] == 0,
+              s2["ws_frames"])
+        check("**新一代本连接 Gift 归零**",
+              s2["methods"].get("WebcastGiftMessage", 0) == 0, s2["methods"])
+
+        # 第二代收 1 条 Gift
+        gm = GiftMessage()
+        gm.gift_id = 9
+        gm.gift.name = "y"
+        f._wsOnMessage(_WS(), _frame("WebcastGiftMessage",
+                                     gm.SerializeToString(),
+                                     envelope_msg_id=200))
+        s3 = f.method_summary()
+        check("第二代 Gift=1(与第一代分开)",
+              s3["methods"].get("WebcastGiftMessage") == 1, s3["methods"])
+        check("**session 累计保留 3**",
+              s3["session_methods"].get("WebcastGiftMessage") == 3,
+              s3["session_methods"])
+        check("session frames 累计 3", s3["session_frames"] == 3,
+              s3["session_frames"])
     finally:
         f._fp.close()
         os.unlink(path)
@@ -1156,6 +1281,8 @@ def main() -> int:
     test_method_probe_counts_before_handler()
     test_method_probe_records_parse_errors()
     test_bootstrap_is_refetched_per_connection()
+    test_probe_counters_are_per_connection()
+    test_bootstrap_dynamic_requires_both_fields()
     # ---- Q12 ----
     test_synth_msg_ids_are_distinct()
     test_first_frame_callback_fires_once()

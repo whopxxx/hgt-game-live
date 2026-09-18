@@ -202,6 +202,30 @@ def test_reservation_requires_all_three_identity_fields():
           led.reserve("t1", round_index=1, spec_key="k1") is True)
 
 
+def test_bool_round_index_rejected_everywhere():
+    """**合同一致性**: `reserve` 拒绝 `True`, commit/release 也必须拒绝。
+
+    `bool` 是 `int` 的子类: `int(True) == 1`。早先 `_identity_matches`
+    用 `int(round_index)` 比, 于是 `True` 能匹配第 1 题 —— 同一份契约在
+    reserve 拒绝、在 commit 放行, 那个不一致就是漏洞。
+    """
+    print("\n[S13-10d] bool round_index 两个入口都拒")
+    led = SummonLedger()
+    led.earn(1)
+    check("reserve(True) 被拒",
+          led.reserve("t", round_index=True, spec_key="k") is False)
+    check("没有产生预约", led.detective_reservation is None)
+    # 用一个真实的 1 建预约, 再用 True 去匹配 —— 必须失败
+    led.reserve("t1", round_index=1, spec_key="k1")
+    check("commit(True) 不能匹配第 1 题",
+          led.commit("t1", round_index=True, spec_key="k1") is False)
+    check("release(True) 也不能",
+          led.release("t1", round_index=True, spec_key="k1") is False)
+    check("预约仍在", led.detective_reservation is not None)
+    check("用真正的 1 可以兑现",
+          led.commit("t1", round_index=1, spec_key="k1") is True)
+
+
 def test_commit_and_release_require_all_three():
     """commit/release 也必须**三者全给**且全部匹配。"""
     print("\n[S13-10c] commit/release 三要素严格匹配")
@@ -418,6 +442,7 @@ def main():
         test_release_refunds,
         test_reservation_cannot_be_stolen_by_stale_callback,
         test_reservation_requires_all_three_identity_fields,
+        test_bool_round_index_rejected_everywhere,
         test_commit_and_release_require_all_three,
         test_one_reservation_consumes_exactly_one,
         test_cannot_double_reserve,

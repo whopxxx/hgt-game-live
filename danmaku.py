@@ -89,11 +89,19 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         # 位置很关键: 在 `handlers.get(msg.method)` **之前** —— 否则被丢弃的
         # 类型(没有 handler 的)根本不会出现在统计里, 而我们正是要靠它
         # 区分"服务端没给"与"给了但我们没处理"。
-        self.ws_frame_count = 0          # 收到的 WS 帧数
-        self.ws_message_count = 0        # 解出的内层消息数
-        self.method_counts = {}          # method -> 出现次数
-        self.unhandled_method_counts = {}  # method -> 没有 handler 的次数
-        self.parse_error_counts = {}     # method -> 解析抛异常的次数
+        #: 连接代际。每次 `_wsOnOpen` +1 —— 用来区分"重连前/后"。
+        #: B smoke 若制造一次重连, 就必须知道哪条 Gift 属于哪一代。
+        self.connection_generation = 0
+        # ---- 本连接计数器(每次 on_open 归零) ----
+        # 这是**主要**判据: 重连前后的差异只有靠它才看得出来。
+        self.ws_frame_count = 0          # 本连接收到的 WS 帧数
+        self.ws_message_count = 0        # 本连接解出的内层消息数
+        self.method_counts = {}          # method -> 本连接出现次数
+        self.unhandled_method_counts = {}  # method -> 本连接无 handler 次数
+        self.parse_error_counts = {}     # method -> 本连接解析异常次数
+        # ---- 整场累计(可选参考, 不用于 A/B 判定) ----
+        self.session_method_counts = {}  # method -> 整场累计
+        self.session_frame_count = 0
         self._fp = None
         self._counts = {}
         #: **永久终止**标志 —— 见 `terminate()`。与 `stop()` 是两件事:
@@ -235,6 +243,7 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
 
     # ---- 覆盖消息分发: 去掉噪音类型 + 让异常可见 ----
     def _probe_bump(self, attr: str, key=None) -> None:
+        """本连接计数器自增; 有对应的 session 累计也一并加。"""
         """探针自增。**惰性初始化** —— 测试常用 `__new__` 造半成品实例,
         直接访问属性会 AttributeError。生产路径也一起受益(不会因为
         漏初始化一个计数器就把整条弹幕链搞挂)。"""
@@ -246,6 +255,16 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
                 d = {}
                 setattr(self, attr, d)
             d[key] = d.get(key, 0) + 1
+        # session 侧只关心 method 分布与总帧数
+        if attr == "method_counts" and key is not None:
+            sd = getattr(self, "session_method_counts", None)
+            if not isinstance(sd, dict):
+                sd = {}
+                setattr(self, "session_method_counts", sd)
+            sd[key] = sd.get(key, 0) + 1
+        elif attr == "ws_frame_count":
+            setattr(self, "session_frame_count",
+                    getattr(self, "session_frame_count", 0) + 1)
 
     def _wsOnMessage(self, ws, message):
         self._probe_bump("ws_frame_count")
@@ -347,6 +366,10 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         ⚠️ 只含方法名与计数, **不含任何 payload/用户内容**。
         """
         return {
+            "connection_generation": getattr(self, "connection_generation", 0),
+            "session_methods": dict(sorted(
+                getattr(self, "session_method_counts", {}).items())),
+            "session_frames": getattr(self, "session_frame_count", 0),
             "ws_frames": getattr(self, "ws_frame_count", 0),
             "ws_messages": getattr(self, "ws_message_count", 0),
             "methods": dict(sorted(
@@ -361,8 +384,9 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         """把汇总打一行日志(连接建立/关闭时调用最有用)。"""
         try:
             s_ = self.method_summary()
-            print(f"【method 汇总{(' ' + tag) if tag else ''}】"
-                  f"frames={s_['ws_frames']} messages={s_['ws_messages']} "
+            print(f"【method 汇总(连接代际 #{s_['connection_generation']})"
+                  f"{(' ' + tag) if tag else ''}】"
+                  f"本连接 frames={s_['ws_frames']} messages={s_['ws_messages']} "
                   f"methods={s_['methods']} unhandled={s_['unhandled']} "
                   f"parse_errors={s_['parse_errors']}", flush=True)
         except Exception as e:                      # noqa: BLE001
@@ -370,7 +394,19 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
 
     # ---- 静音父类噪音(心跳/连接提示/关闭) ----
     def _wsOnOpen(self, ws):
-        print(">>> WebSocket 已连接", flush=True)
+        # 新一代连接: **本连接计数器归零**, session 累计保留。
+        # 顺序很重要 —— 先开新代际, 再让后续帧计入这一代。
+        # 用 setattr/getattr 兜底: 测试常用 `__new__` 造半成品实例
+        # (见 `_probe_bump` 的同一说明), 直接自增会 AttributeError。
+        setattr(self, "connection_generation",
+                getattr(self, "connection_generation", 0) + 1)
+        self.ws_frame_count = 0
+        self.ws_message_count = 0
+        self.method_counts = {}
+        self.unhandled_method_counts = {}
+        self.parse_error_counts = {}
+        print(f">>> WebSocket 已连接(连接代际 #{self.connection_generation})",
+              flush=True)
         threading.Thread(target=self._sendHeartbeat, daemon=True).start()
 
     def _sendHeartbeat(self):

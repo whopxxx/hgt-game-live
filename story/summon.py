@@ -169,7 +169,10 @@ class SummonLedger:
 
     @property
     def likes_progress(self) -> int:
-        """距离下一次 +1 还差多少赞(`high_water % 100`)。"""
+        """当前进度的**计数**(`high_water % 100`), 即已攒到第几赞。
+
+        例如 high_water=523 -> 23, 表示距离下一次 +1 还差 77 赞。
+        (早先注释写成"还差多少赞", 与返回值不符。)"""
         return self.likes_total_high_water % LIKES_PER_SUMMON
 
     # ------------------------------------------------------------------
@@ -264,10 +267,20 @@ class SummonLedger:
 
         抽成一个函数, 是因为 `commit` 与 `release` 必须用**同一套**判据 ——
         两份手写的比较迟早会漂移, 而漂移的方向必然是其中一处变松。
+
+        ⚠️ `round_index` 必须是**真整数**: `reserve()` 拒绝 `True`
+        (bool 是 int 的子类, 但"第 True 题"没有意义), 而这里早先用
+        `int(round_index)` —— `int(True) == 1`, 于是 `True` 能匹配第 1 题。
+        同一份契约在两个入口判定不一致, 就是漏洞。这里用与 reserve 完全
+        相同的判据。
         """
+        if not isinstance(round_index, int) or isinstance(round_index, bool):
+            return False
+        if not isinstance(r.round_index, int) or isinstance(r.round_index, bool):
+            return False
         try:
             return (r.token == str(token or "").strip()
-                    and int(round_index) == r.round_index
+                    and round_index == r.round_index
                     and r.spec_key == str(spec_key or "").strip())
         except (TypeError, ValueError):
             return False

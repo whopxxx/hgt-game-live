@@ -337,10 +337,22 @@ class DouyinLiveWebFetcher:
                 print("【bootstrap】/im/fetch body 解析不出 Response, 回退旧常量")
                 return None
             cursor = frame.cursor or ""
-            internal_ext = frame.internal_ext or frame.live_cursor or ""
-            if not (cursor or internal_ext):
-                print("【bootstrap】Response 里 cursor/internal_ext 都是空, "
-                      "回退旧常量")
+            # ⚠️ **只接受 internal_ext**。`liveCursor`(:11) 是**另一个字段**,
+            # 外部可行实现也只用 internalExt。把 liveCursor 塞进
+            # `internal_ext=` 会凭空造一个我们没有证据支持的协议假设。
+            # 它可以被采样记录(供 12B 观察), 但不能冒充。
+            internal_ext = frame.internal_ext or ""
+            if frame.live_cursor:
+                print(f"【bootstrap】观察到 live_cursor(仅记录, 不冒充 "
+                      f"internal_ext): {str(frame.live_cursor)[:40]}")
+            # ---- 严格要求**两者同时**存在 ----
+            # 只有一个时, 另一个会悄悄用 2024 fallback -> URL 变成新旧混搭。
+            # 那种连接不能算 dynamic, 也不能拿来比较 A/B。
+            if not (cursor and internal_ext):
+                print(f"【bootstrap】cursor/internal_ext 不齐 "
+                      f"(cursor={'有' if cursor else '无'}, "
+                      f"internal_ext={'有' if internal_ext else '无'}) "
+                      f"-> 整组回退, 本次不算 dynamic")
                 return None
             print(f"【bootstrap】cursor/internal_ext 取自 /im/fetch "
                   f"(cursor={'有' if cursor else '无'}, "
@@ -374,13 +386,16 @@ class DouyinLiveWebFetcher:
         # 日志说是动态, 实际用的是上一次(或回退值)。
         boot = self._fetch_bootstrap_state() or {}
         self.__bootstrap = boot
-        if boot.get("cursor") or boot.get("internal_ext"):
+        # ---- dynamic 的判据是**两者同时来自同一次 /im/fetch/** ----
+        # 只要一个存在就标 dynamic, 会让日志写 dynamic 而 URL 其实是
+        # 新旧混搭 —— B 实验就变成假 B。缺任意一个都整组 fallback。
+        if boot.get("cursor") and boot.get("internal_ext"):
             mode = "dynamic"
         else:
             mode = "fallback"
         print(f"【bootstrap】本次连接使用 {mode} "
-              f"({'动态取得' if mode == 'dynamic' else '回退旧常量'})",
-              flush=True)
+              f"({'动态取得(cursor+internal_ext 同源)' if mode == 'dynamic' else '回退旧常量'})"
+              f"   <<< B-smoke 有效性判据", flush=True)
         cursor = boot.get("cursor") or (
             "d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1")
         internal_ext = boot.get("internal_ext") or (
