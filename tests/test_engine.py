@@ -594,22 +594,32 @@ def test_reconnect_guard_only_after_reconnect():
     check("全部上屏", len(eng._danmaku) == 5, len(eng._danmaku))
 
 
+def _connect_then_reconnect(eng) -> None:
+    """模拟"先连上过、再断线重连"。
+
+    Q12b 之后 `on_reconnect()` 对**首次**建连是 no-op(那时没有"之前
+    那批弹幕"可重放), 所以要真正开 guard 必须先走过一次连接。
+    """
+    eng.on_reconnect()          # 首次: 只标记
+    eng.on_reconnect()          # 这次才是真的重连 -> 开 guard
+
+
 def test_reconnect_replay_suppressed():
-    """**§9.3 第三条**: 重连后重复刚才完全相同的 8 条 -> 全部抑制。"""
-    print("\n[Q12] 重连后重放被抑制")
+    """**§9.3 第三条**: 重连后重复刚才完全相同的 8 条 -> 全部抑制。
+
+    这 8 条**内容各不相同** —— 正是旧实现漏掉的形态(旧版数的是"单个
+    fingerprint 在历史里出现 >=3 次", 各不相同的话每条纹丝不动地漏过去)。
+    """
+    print("\n[Q12] 重连后重放被抑制(8 条各不相同)")
     eng, clk = boot(mkcfg())
-    msgs = [("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
-            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
-            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
-            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗")]
-    # 先正常收下这批(建立"最近历史"基线)。间隔 3s 避开 2s 成对判重。
+    msgs = [(f"u{i}", f"观众{i}", f"#问题{i}") for i in range(8)]
+    # 先正常收下这批(建立 baseline)。间隔 3s 避开 2s 成对判重。
     for uid, name, q in msgs:
         eng.submit_danmaku(uid, name, q)
         clk.advance(3.0)
     before = len(eng._danmaku)
-    check("基线已建立", before == len(msgs), before)
-    # 重连 -> 开 guard
-    eng.on_reconnect()
+    check("基线已建立(8 条各不相同)", before == 8, before)
+    _connect_then_reconnect(eng)
     clk.advance(1.0)
     # 同样的 8 条再来一遍
     for uid, name, q in msgs:
@@ -623,16 +633,15 @@ def test_reconnect_mixed_old_and_new():
     """**§9.3 第四条**: 重连后 6 条旧 + 2 条新 -> 旧抑制、新保留。"""
     print("\n[Q12] 重连后新旧混合")
     eng, clk = boot(mkcfg())
-    # 每条内容都不同, 且间隔 3s —— 避免撞上那条 2s 成对判重(那是另一道闸,
-    # 这里要单独考察 guard)。每条重复 3 次才够 guard 的 min_repeats。
-    old = [("u1", "甲", "#旧一"), ("u1", "甲", "#旧一"), ("u1", "甲", "#旧一"),
-           ("u2", "乙", "#旧二"), ("u2", "乙", "#旧二"), ("u2", "乙", "#旧二")]
+    # 6 条旧消息**各不相同**(Q12b: 旧版要求单指纹重复 3 次才能识别,
+    # 那个前提本身就是错的 —— 真实重放就是一批各不相同的旧消息)。
+    old = [(f"u{i}", f"观众{i}", f"#旧{i}") for i in range(6)]
     for uid, name, q in old:
         eng.submit_danmaku(uid, name, q)
         clk.advance(3.0)
     before = len(eng._danmaku)
     check("基线 6 条都上屏", before == 6, before)
-    eng.on_reconnect()
+    _connect_then_reconnect(eng)
     clk.advance(0.5)
     for uid, name, q in old:                   # 6 条旧的重来
         eng.submit_danmaku(uid, name, q)
@@ -640,11 +649,40 @@ def test_reconnect_mixed_old_and_new():
     after_old = len(eng._danmaku)
     check("**旧消息被抑制**", after_old == before, (before, after_old))
     # 2 条全新的
-    eng.submit_danmaku("u3", "丙", "#全新的问题一")
+    eng.submit_danmaku("u9", "丙", "#全新的问题一")
     clk.advance(0.2)
-    eng.submit_danmaku("u4", "丁", "#全新的问题二")
+    eng.submit_danmaku("u8", "丁", "#全新的问题二")
     check("**新消息保留**", len(eng._danmaku) == before + 2,
           (before, len(eng._danmaku)))
+
+
+def test_first_connect_does_not_arm_guard():
+    """Q12b: **首次建连不开 guard** —— 那时没有"之前那批"可重放。
+
+    开着只会让启动后的无 ID 消息白白进缓冲。
+    """
+    print("\n[Q12b] 首次建连不开 guard")
+    eng, clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "甲", "#先发一条")
+    clk.advance(3)
+    before = len(eng._danmaku)
+    eng.on_reconnect()                    # 首次建连
+    check("**guard 没开**", eng._guard_until == 0.0, eng._guard_until)
+    # 再发一条同样的: 不该被当作重放
+    eng.submit_danmaku("u1", "甲", "#先发一条")
+    check("**首次建连后不判重放**", eng._replays == 0, eng._replays)
+    check("正常上屏", len(eng._danmaku) == before + 1, len(eng._danmaku))
+
+
+def test_true_reconnect_arms_guard():
+    """第二次建连(真正的重连)才开 guard。"""
+    print("\n[Q12b] 真重连开 guard")
+    eng, clk = boot(mkcfg())
+    eng.on_reconnect()
+    check("首次: 未开", eng._guard_until == 0.0, eng._guard_until)
+    clk.advance(5)
+    eng.on_reconnect()
+    check("**第二次: 开了**", eng._guard_until > 0, eng._guard_until)
 
 
 def test_guard_expires():
@@ -653,13 +691,87 @@ def test_guard_expires():
     eng, clk = boot(mkcfg(replay_guard_seconds=10.0))
     for _ in range(5):
         eng.submit_danmaku("u1", "甲", "#同一句")
-        clk.advance(0.5)
+        clk.advance(3)          # 避开 2s 成对判重
     before = len(eng._danmaku)
-    eng.on_reconnect()
+    _connect_then_reconnect(eng)
     clk.advance(11)                            # 越过 guard 窗口
     eng.submit_danmaku("u1", "甲", "#同一句")
     check("**窗口外不判重放**", eng._replays == 0, eng._replays)
     check("正常上屏", len(eng._danmaku) == before + 1, len(eng._danmaku))
+
+
+def test_incoming_streak_retroactively_suppressed():
+    """**防自我增强**: 确认重放之前那几条"疑似"的消息**不能漏出去**。
+
+    旧实现数的是"单 fingerprint 在历史里出现次数", 于是重放的前几条
+    一旦写进 `_danmaku`, 后面的就能匹配到刚写进去的自己 —— 条件自我
+    增强。现在改成"incoming 连续命中冻结的 baseline", 且确认前先缓冲,
+    所以哪怕只差最后一条才到阈值, 前面几条也会被一起回收。
+    """
+    print("\n[Q12b] 重放批次整批回收(不自我增强)")
+    eng, clk = boot(mkcfg(replay_guard_min_repeats=3, replay_guard_seconds=5.0))
+    old = [(f"u{i}", f"观众{i}", f"#老问题{i}") for i in range(3)]
+    for uid, name, q in old:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(3)
+    before = len(eng._danmaku)
+    check("baseline 3 条", before == 3, before)
+    _connect_then_reconnect(eng)
+    clk.advance(0.5)
+    # 只重放 2 条 —— **不到阈值**, 应该**放行**(可能真是真人在问同样的事)
+    for uid, name, q in old[:2]:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(0.2)
+    check("**未达阈值 -> 不判重放**", eng._replays == 0, eng._replays)
+    # 缓冲里那 2 条要等"确认不是重放"才放行。两种释放路径: 后续新消息,
+    # 或 guard 到期。这里走**到期**那条(推到窗口外再 tick)。
+    clk.advance(11)
+    eng.tick()
+    check("**guard 到期后补上屏**", len(eng._danmaku) == before + 2,
+          (before, len(eng._danmaku)))
+
+
+def test_streak_broken_by_new_message():
+    """连续命中被一条**新消息**打断 -> 不是重放, 缓冲全部放行。"""
+    print("\n[Q12b] 新消息打断 streak")
+    eng, clk = boot(mkcfg(replay_guard_min_repeats=4))
+    old = [(f"u{i}", f"观众{i}", f"#老{i}") for i in range(3)]
+    for uid, name, q in old:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(3)
+    before = len(eng._danmaku)
+    _connect_then_reconnect(eng)
+    clk.advance(0.5)
+    # 2 条旧的(命中, 进缓冲) + 1 条全新的(打断)
+    eng.submit_danmaku("u0", "观众0", "#老0")
+    clk.advance(0.2)
+    eng.submit_danmaku("u1", "观众1", "#老1")
+    clk.advance(0.2)
+    eng.submit_danmaku("u7", "新人", "#从没见过的问题")
+    check("**判为非重放**", eng._replays == 0, eng._replays)
+    check("**缓冲里的 2 条补上屏 + 新的 1 条**",
+          len(eng._danmaku) == before + 3, (before, len(eng._danmaku)))
+
+
+def test_msg_id_bypasses_pairwise_dedupe():
+    """Q12b: **有 msg_id 时跳过 2s 成对判重**。
+
+    既然拿到了平台唯一 ID, 它就该是唯一的重复判据。否则"不同 ID =
+    不误杀"这个契约不成立: 同一人 2 秒内真的发了两次相同内容(平台给了
+    两个不同 ID), 第二条仍会被那条启发式吃掉。
+    """
+    print("\n[Q12b] 有 ID 时绕过 2s 成对判重")
+    eng, clk = boot(mkcfg())
+    # 同一人同一内容、2 秒内、**不同** ID -> 两条都要保留
+    eng.submit_danmaku("u1", "甲", "#同一句", message_id="x1")
+    eng.submit_danmaku("u1", "甲", "#同一句", message_id="x2")
+    check("**有 ID 时两条都上屏**", len(eng._danmaku) == 2,
+          len(eng._danmaku))
+    # 没有 ID 时, 那条启发式仍然生效(留给上游不给 ID 的情况)
+    eng.submit_danmaku("u2", "乙", "#另一句")
+    eng.submit_danmaku("u2", "乙", "#另一句")
+    check("**无 ID 时 2s 成对判重仍生效**", len(eng._danmaku) == 3,
+          len(eng._danmaku))
 
 
 def test_determinism():
@@ -1965,12 +2077,17 @@ def main():
              # ---- Q12: 重放识别重做 ----
              test_msg_id_dedupe,
              test_msg_id_cache_is_bounded,
+             test_msg_id_bypasses_pairwise_dedupe,
              test_distinct_viewers_burst_is_not_replay,
              test_ten_viewers_one_second_is_not_replay,
              test_reconnect_guard_only_after_reconnect,
              test_reconnect_replay_suppressed,
              test_reconnect_mixed_old_and_new,
+             test_first_connect_does_not_arm_guard,
+             test_true_reconnect_arms_guard,
              test_guard_expires,
+             test_incoming_streak_retroactively_suppressed,
+             test_streak_broken_by_new_message,
              test_determinism,
              test_llm_failure_never_drops, test_coverage_reaches_archive,
              test_reveal_payload_carries_atoms,

@@ -182,9 +182,18 @@ class RoundEngine:
         self._seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
         self._msg_id_cap = max(1, int(getattr(cfg, "msg_id_cache_size", 2000) or 2000))
         self._guard_until = 0.0             # replay guard 到期时刻
+        # guard 的三个内部状态(见 `_is_replay_locked`):
+        #   baseline  —— guard 开启瞬间快照的近期指纹(**冻结**, 防自我增强)
+        #   pending   —— 疑似但未确认的消息缓冲(确认前不上屏)
+        #   streak    —— incoming 连续命中 baseline 的条数
+        #   confirmed —— 已达阈值, 窗口内后续同类一律丢弃
+        self._guard_baseline: set = set()
+        self._guard_pending: list = []
+        self._guard_streak = 0
+        self._guard_confirmed = False
+        self._ever_connected = False        # 首次建连不算"重连"(Q12b)
         self._replays = 0                   # 判定为重放并抑制的条数
         self._dup_ids = 0                   # 因 msg_id 重复而丢弃的条数
-        self._pending_acts: list[EngineAction] = []   # 攒着待发的即时动作
         self._viewers: set[str] = set()
 
         # ---- 统计 ----
@@ -237,12 +246,20 @@ class RoundEngine:
             self._notice = "弹幕连接中断，正在重连…"
 
     def on_reconnect(self) -> None:
-        """新连接收到首帧 = 重连成功(Q12)。
+        """新连接**真的连上了** = 重连成功(Q12)。
 
         **开一个 replay guard 窗口**: 抖音是在重连之后把那批旧弹幕原样
         重发的, 所以"该防重放"这件事只在这个窗口内成立。出了窗口,
         哪怕内容真的一模一样, 也当真人发言 —— 一个人在几分钟后一字不差
         又说一遍, 本来就更可能是真的又问了。
+
+        **首次建连不算重连**(Q12b): 程序刚启动时收到首帧也会走到这里,
+        但那时根本没有"之前那批弹幕"可重放。开着 guard 只会白白让启动后
+        头 20 秒的无 ID 消息进缓冲。所以头一次只标记, 不开窗口。
+
+        (传输层 `LiveSource` 也会挡掉首次建连 —— 这里是**第二道**。
+        两道都留是有意的: 引擎不该假设调用方一定过滤过, 而且测试直接
+        调 `engine.on_reconnect()` 时也需要这个语义。)
 
         注意这只影响**降级路径**(没有 msg_id 的消息)。有 ID 的走精确
         去重, 任何时候都能识别, 不依赖这个窗口。
@@ -250,9 +267,24 @@ class RoundEngine:
         now = self._now(None)
         with self._lock:
             self._notice = "弹幕已重连"
+            if not self._ever_connected:
+                self._ever_connected = True
+                _detail("首次建连, 不开 replay guard")
+                return
             self._guard_until = now + self.cfg.replay_guard_seconds
-            _detail("重放 guard 开启 %.0fs(至 %.0f)",
-                    self.cfg.replay_guard_seconds, self._guard_until)
+            # baseline 在此**冻结**: 重放要和"重连前收到的那些"比。
+            # 冻结是必须的 —— 否则重放的前几条写进 `_danmaku` 之后,
+            # 后面的就能匹配到刚写进去的自己, 阈值形同虚设。
+            self._guard_baseline = {
+                (str(d.user_id), P.simplify_for_dedupe(d.content, 200))
+                for d in self._danmaku
+            }
+            self._guard_pending = []
+            self._guard_streak = 0
+            self._guard_confirmed = False
+            _detail("重放 guard 开启 %.0fs(至 %.0f), baseline %d 条",
+                    self.cfg.replay_guard_seconds, self._guard_until,
+                    len(self._guard_baseline))
 
     # ==================================================================
     # 输入: 弹幕(ws 线程 -> 消费线程)
@@ -297,42 +329,124 @@ class RoundEngine:
                 return self._accept_danmaku(str(user_id), user_name,
                                             content, now, message_id)
             # ---- 降级路径: 没有 ID, 只在 guard 窗口内查"历史重复" ----
-            if self._is_replay_locked(user_id, content, now):
-                self._replays += 1
+            # 注意 `_is_replay_locked` 会**自己**处理"疑似未确认"的缓冲,
+            # 所以它返回 True 时有两种含义: 确认丢弃, 或先押在缓冲里。
+            # 两者对调用方都是"这次不要上屏", 语义一致。
+            if self._is_replay_locked(user_id, content, now, message_id):
                 return []
-            return self._accept_danmaku(str(user_id), user_name, content, now)
+            return self._accept_danmaku(str(user_id), user_name, content,
+                                        now, message_id)
 
-    def _is_replay_locked(self, user_id, content: str, now: float) -> bool:
+    def _is_replay_locked(self, user_id, content: str, now: float,
+                          message_id: str = "") -> bool:
         """降级路径的判据(调用方须持锁)。返回 True = 判定为重放, 丢弃。
 
-        两个条件**同时**满足才算:
-          ① 现在处于 reconnect guard 窗口内 —— 重放只在刚重连后发生;
-          ② 这条与 `_danmaku`(最近 60 条)里的**同一指纹**已经出现过
-             >= `replay_guard_min_repeats` 次 —— 重放的特征是"与刚才
-             收到过的消息**大量精确重复**", 而不是"来得很密"。
+        ## 判据(方案 §9.2)
 
-        为什么要 ②: 重连之后**真人也会正常发言**。只看 ① 就等于
-        "刚重连就无差别丢弃", 只是把误杀换了个触发条件。
+        重放的特征是: **重连后到来的一连串消息, 逐条都能在"重连前的
+        最近历史"里找到完全匹配**。历史是 `A B C D E F`, 重连后又来
+        `A B C D E F` —— 这才是重放。
 
-        指纹 = (user_id, 归一化内容)。用归一化而不是原文, 是因为同一句
-        话在重放里可能带不同的空白/表情装饰。
+        所以这里数的是 **incoming 连续命中数**, 不是"某个 fingerprint
+        在历史里出现过几次"。这两者差别很大: 历史里 `A B C` 各只出现
+        一次时, 后者会全部漏过去(它们各只出现 1 次), 而前者能识别。
+
+        规则:
+          - 命中 baseline 里**任意**一条 -> 连续命中数 +1;
+          - 没命中 -> **清零**(一条真正的新消息说明这不是重放批次);
+          - 连续命中数 >= `replay_guard_min_repeats` -> 确认为重放。
+
+        ## 两个关键的防自我增强措施
+
+        1. **baseline 在 guard 开启时冻结**(`_guard_baseline`)。否则
+           重放的前几条一旦进了 `_danmaku`, 后面的就能"匹配到刚写进去的
+           自己", 阈值形同虚设。
+        2. **确认之前先缓冲**(`_guard_pending`), 不立刻写 `_danmaku` /
+           不上屏。否则那 N-1 条"疑似但还没确认"的消息已经漏出去了 ——
+           确认之后无法回收。
+
+        代价: 无 ID 的弹幕在 guard 期间会有最多 N 条的延迟(等确认)。
+        这是可接受的 —— guard 只在重连后开 20 秒, 而这段时间本来就要
+        防重放。
         """
         if now >= self._guard_until:
+            # guard 关着: 收尾。
+            # ⚠️ 必须**先放行缓冲**再清状态 —— 缓冲里那是"疑似但从未确认"
+            # 的消息(连续命中数没到阈值)。窗口都过完了还没确认, 说明它们
+            # 大概率就是真人发的, 押着不放了等于永久丢失。
+            if self._guard_pending:
+                log.info("guard 结束, 放行 %d 条未确认消息", len(self._guard_pending))
+                self._flush_guard_pending_locked()
+            if self._guard_baseline or self._guard_streak or self._guard_confirmed:
+                self._reset_guard_locked()
             return False
         try:
             fp = (str(user_id), P.simplify_for_dedupe(content, 200))
         except Exception:                       # noqa: BLE001
             return False
-        hits = 0
-        for d in self._danmaku:
-            if str(d.user_id) == fp[0] and \
-                    P.simplify_for_dedupe(d.content, 200) == fp[1]:
-                hits += 1
-        if hits >= self.cfg.replay_guard_min_repeats:
-            log.info("疑似重放(guard 内, 指纹已出现 %d 次): %s: %s",
-                     hits, user_id, content[:30])
+
+        # ---- 已确认重放: 窗口内**继续按 baseline**判定 ----
+        # 注意不能"一确认就无差别全丢": 重放批次过去之后, 真人还会接着
+        # 说话。那些没在 baseline 里出现过的新消息必须放行, 否则就是把
+        # 旧机制的误杀换了个触发条件(而且这次是整窗口 20 秒)。
+        if self._guard_confirmed:
+            if fp in self._guard_baseline:
+                self._replays += 1
+                return True
+            # 新消息: 确认态不再需要缓冲(重放批次已经过去了)
+            return False
+
+        # ---- 这一条命中 baseline 吗? ----
+        hit = fp in self._guard_baseline
+        if hit:
+            self._guard_streak += 1
+            # 先进缓冲, 等确认。缓冲本身不写 `_danmaku`, 所以不会
+            # 污染 baseline, 也不会自我增强。
+            self._guard_pending.append((user_id, content, now, message_id))
+        else:
+            # 一条真正的新消息 -> 这不是重放批次。把缓冲里那些"疑似"
+            # 的全部**放行**(它们确实可能是真人发的), 然后清零。
+            self._flush_guard_pending_locked()
+            self._guard_streak = 0
+            return False
+
+        if self._guard_streak >= self.cfg.replay_guard_min_repeats:
+            # 连续 N 条都命中历史 -> 确认为重放。缓冲里那 N 条**整批丢弃**。
+            n = len(self._guard_pending)
+            self._guard_pending.clear()
+            self._guard_confirmed = True
+            self._replays += n
+            log.info("疑似重放: guard 内连续 %d 条命中重连前历史, 整批抑制",
+                     n)
             return True
-        return False
+        # 还没到阈值: 这条先**不上屏**(在缓冲里等), 也不算丢弃
+        return True
+
+    def _flush_guard_pending_locked(self) -> None:
+        """把 guard 缓冲里那些"疑似但未确认"的消息真正放行。
+
+        它们是被误判候选 —— 一条新消息(或窗口到期)证明这不是重放批次,
+        所以要补上屏。**返回值丢弃**(只给"已在同一批处理里"的调用方);
+        tick 路径要用 `_flush_guard_pending_acts_locked` 拿动作。
+        """
+        self._flush_guard_pending_acts_locked()
+
+    def _flush_guard_pending_acts_locked(self) -> list:
+        """同上, 但把产生的动作返回给调用方(供 tick 汇总)。"""
+        pend, self._guard_pending = self._guard_pending, []
+        acts: list[EngineAction] = []
+        for wid, content, ts, mid in pend:
+            try:
+                acts.extend(self._accept_danmaku(wid, "", content, ts, mid))
+            except Exception as e:              # noqa: BLE001
+                log.error("guard 放行异常: %s", e)
+        return acts
+
+    def _reset_guard_locked(self) -> None:
+        self._guard_baseline = set()
+        self._guard_pending = []
+        self._guard_streak = 0
+        self._guard_confirmed = False
 
     def _phase_ack_locked(self, user_name: str, text: str,
                           now: float) -> list[EngineAction]:
@@ -378,7 +492,14 @@ class RoundEngine:
             # 视觉上像刷屏, 观众会以为系统坏了。
             # 只在"紧邻的 2 秒内、同一人、同一内容"才判重, 避免误杀
             # 观众隔一会儿真的又问了一遍。
-            if (self._danmaku
+            #
+            # ⚠️ Q12b: **有平台 msg_id 时跳过这条启发式**。
+            # 既然已经拿到平台唯一 ID, 它就该是唯一的重复判据 —— 否则
+            # "不同 ID = 不误杀"这个契约并不成立: 同一人 2 秒内真的发了
+            # 两次相同内容(平台给了两个不同 ID), 第二条仍会被这条吃掉。
+            # 这条启发式只留给**没有 ID** 的消息(上游没给 / stdin / sim)。
+            if (not message_id
+                    and self._danmaku
                     and self._danmaku[-1].user_id == wid
                     and self._danmaku[-1].content == content
                     and now - self._danmaku[-1].ts < 2.0):
@@ -717,10 +838,16 @@ class RoundEngine:
         with self._lock:
             if self._stopped:
                 return []
-            # 先把攒着的即时动作取出来, 和本次 tick 的动作合并后一起返回
-            # (Q12 之后没有缓冲窗口了, 所以 _pending_acts 的写入者只剩
-            #  极少数路径 —— 保留它是为了"tick 是唯一动作发出者"这条纪律)
-            carry, self._pending_acts = self._pending_acts, []
+            carry: list[EngineAction] = []
+            # ---- Q12: guard 到期时把未确认的缓冲放行 ----
+            # 放在 tick 里而不是只放在 submit 路径上: 否则重放/真人消息
+            # 之后**没人再说话**时, 那几条会一直押在缓冲里出不来。
+            if (self._guard_until and now >= self._guard_until
+                    and self._guard_pending):
+                log.info("guard 到期, 放行 %d 条未确认消息",
+                         len(self._guard_pending))
+                carry.extend(self._flush_guard_pending_acts_locked())
+                self._reset_guard_locked()
             ph = self.phase
             if ph == Phase.SETTING:
                 return carry + self._tick_setting_locked(now)

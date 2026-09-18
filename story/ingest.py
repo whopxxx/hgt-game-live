@@ -203,16 +203,13 @@ class CallbackFetcher(DanmakuFetcher):
         except Exception:
             pass
         # ---- Q12: "新连接真的连上了" ----
-        # 这一帧属于一个**刚建好的**连接, 而我们之前从没收到过它的帧 ——
-        # 说明重连成功。只在**每实例一次**地报出去。
+        # 只在**每连接一次**地报出去。
         #
-        # 为什么这个信号以前不存在、以及为什么现在必须有: websocket 在
-        # 上游内部自动重连这条快路径**完全不上报**(watchdog 只看"停摆
-        # 120 秒", 安静房间不会触发)。于是"抖音重连后把之前整批弹幕重放
-        # 一遍"这件事没有任何可观察的起点 —— 早年只能靠"1.5 秒 3 条"
-        # 这种流量启发式去猜, 那会误杀真人, Q12 把它换掉。
-        # (用 getattr 兜底: SimSource 用 __new__ 造半成品实例驱动解析路径,
-        #  没有走 __init__, 这些属性都不存在。)
+        # ⚠️ 关键: `_first_frame_seen` 必须由 `_wsOnOpen` **每个连接**
+        # 重置一次。上游 `DanmakuFetcher.start()` 里是 `while True` +
+        # `run_forever()`, 断线后会在**同一个 fetcher 实例**上重新建连 ——
+        # 若只在实例级置一次, 自动重连后的首帧就永远不会再报信号, 而这
+        # 恰恰是重放发生的地方(commit 早先那版就是错的)。
         if not getattr(self, "_first_frame_seen", True):
             self._first_frame_seen = True
             cb = getattr(self, "_on_first_frame", None)
@@ -222,6 +219,15 @@ class CallbackFetcher(DanmakuFetcher):
                 except Exception:
                     log.exception("首帧回调异常(忽略)")
         return super()._wsOnMessage(ws, message)
+
+    def _wsOnOpen(self, ws):
+        """每个 WebSocket 连接建立时调用(上游的钩子)。
+
+        在这里把"本连接还没收到过帧"重置 —— 于是**每次**重连成功后,
+        第一帧都会重新触发 `_on_first_frame`, 上层才拿得到重连信号。
+        """
+        self._first_frame_seen = False
+        return super()._wsOnOpen(ws)
 
     def _parseChatMsg(self, payload):
         # 代际检查: 这个回调可能来自**已经被废弃的旧连接** —— 旧线程卡在
@@ -314,6 +320,9 @@ class LiveSource:
         self._on_reconnected = on_reconnected
         self._stop = threading.Event()
         self._fetcher: Optional[CallbackFetcher] = None
+        #: 是否**曾经**连上过(Q12b)。首次建连不开 replay guard ——
+        #: 那时没有"之前那批弹幕"可重放。
+        self._ever_connected = False
         self._last_event = time.monotonic()   # 最后一条**弹幕**(业务用)
         self._last_frame = time.monotonic()   # 最后一个 **WS 帧**(判活用)
         self._restarts = 0
@@ -351,13 +360,21 @@ class LiveSource:
         return f
 
     def _on_first_frame(self) -> None:
-        """新连接的第一个真实帧 —— 这才是"重连成功"(Q12)。
+        """每个新连接的第一个真实帧 —— 这才是"重连成功"(Q12)。
+
+        ⚠️ **首次建连不算重连**: 程序刚启动时也会走到这里, 但那时根本
+        没有"之前那批弹幕"可重放。报出去只会让引擎白白开一个 20 秒的
+        guard, 把启动后的无 ID 消息押进缓冲。所以头一次只记标记。
 
         注意它**不替代** `_on_reconnect`: 那个是 watchdog 的"我要重建了"
-        (而且只在停摆 120s 后触发), 服务于 `reconnect_fails` 告警链。
+        (且只在停摆 120s 后触发), 服务于 `reconnect_fails` 告警链。
         这里纯粹是给引擎一个"重放可能马上要来了"的起点。
         """
-        log.info("弹幕连接已建立(收到首帧)")
+        if not self._ever_connected:
+            self._ever_connected = True
+            log.info("弹幕连接已建立(首次, 不算重连)")
+            return
+        log.info("弹幕连接已重建(收到首帧)")
         if self._on_reconnected:
             try:
                 self._on_reconnected()
@@ -699,6 +716,11 @@ class StdinSource:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._auto_id = 800000
+        #: 合成**消息** id 的计数器(Q12)。与 `_auto_id` 分属不同命名空间。
+        #: ⚠️ 必须在这里初始化 —— `_run()` 里会 `+= 1`, 漏了的话第一条
+        #: stdin 输入就 AttributeError(test_ingest 早先只驱动了 sim 路径,
+        #: 所以 CI 没抓到)。
+        self._msg_id = 800_000_000
 
     def _run(self) -> None:
         log.info("StdinSource: 每行输入弹幕(如 `#上楼`), Ctrl+D 结束")

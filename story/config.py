@@ -328,7 +328,8 @@ class Config:
         if self.msg_id_cache_size <= 0:
             warns.append(
                 f"msg_id_cache_size({self.msg_id_cache_size}) <= 0: "
-                f"去重表立刻被清空, msg_id 去重形同虚设。"
+                f"已按默认 2000 处理(引擎会钳回正数), 但显式设成 0 说明"
+                f"本意可能是想关掉去重 —— 那要改代码, 不是改这个值。"
             )
         return warns
 

@@ -302,6 +302,80 @@ def test_missing_common_means_empty_id() -> None:
               repr(got[0].message_id))
 
 
+def test_stdin_path_works() -> None:
+    """Q12 回归: `--stdin` 真的能跑, 且产出非空 msg_id。
+
+    **这条是补的漏测。** `_run()` 里会 `self._msg_id += 1`, 但
+    `__init__` 早先漏了初始化 —— 于是第一条 stdin 输入直接
+    AttributeError。CI 没抓到是因为 test_ingest 只驱动了 sim 路径。
+    这里真跑一遍 stdin 的读取循环(喂一个假 stdin)。
+    """
+    print("\n[9] stdin 路径: 不崩 + 有合成 ID(Q12)")
+    cfg = Config(sim_path="x", no_llm=True)
+    inbox: queue.Queue = queue.Queue()
+    src = StdinSource(cfg, inbox)
+    check("**__init__ 里有 _msg_id**", hasattr(src, "_msg_id"), dir(src))
+    fake = io.StringIO("甲:#第一个问题\n乙:#第二个问题\n")
+    orig = sys.stdin
+    sys.stdin = fake
+    try:
+        src._run()
+    except Exception as e:                      # noqa: BLE001
+        check("**stdin 循环不抛异常**", False, repr(e))
+    finally:
+        sys.stdin = orig
+    got = []
+    while not inbox.empty():
+        got.append(inbox.get_nowait())
+    check("收到 2 条", len(got) == 2, len(got))
+    check("**两条都有非空 msg_id**", all(e.message_id for e in got),
+          [e.message_id for e in got])
+    check("**ID 两两不同**",
+          len({e.message_id for e in got}) == len(got),
+          [e.message_id for e in got])
+
+
+def test_first_frame_resets_per_connection() -> None:
+    """Q12b: **每次** WebSocket 建连后首帧都要报信号, 不只是头一次。
+
+    上游 `DanmakuFetcher.start()` 是 `while True` + `run_forever()`,
+    断线后会在**同一个 fetcher 实例**上重新建连。若 `_first_frame_seen`
+    只在实例级置一次, 自动重连后的首帧就永远不会再报 —— 而那正是重放
+    发生的地方(重放识别会整个失效)。
+    """
+    print("\n[10] 首帧信号按连接 epoch 重置(Q12b)")
+    f = CallbackFetcher.__new__(CallbackFetcher)
+    f._expired = False
+    f._first_frame_seen = False
+    f._on_frame = None
+    hits = []
+    f._on_first_frame = lambda: hits.append(1)
+
+    class _WS:
+        pass
+
+    parent = CallbackFetcher.__mro__[1]
+    orig_msg = parent._wsOnMessage
+    orig_open = parent._wsOnOpen
+    parent._wsOnMessage = lambda self, ws, msg: None
+    parent._wsOnOpen = lambda self, ws: None
+    try:
+        # 连接 1: 两个帧 -> 只报一次
+        f._wsOnOpen(_WS())
+        f._wsOnMessage(_WS(), "a")
+        f._wsOnMessage(_WS(), "b")
+        check("连接1: 只报一次", len(hits) == 1, len(hits))
+        # 连接 2(自动重连, **同一实例**): 首帧要再报一次
+        f._wsOnOpen(_WS())
+        f._wsOnMessage(_WS(), "c")
+        check("**连接2: 又报了一次**", len(hits) == 2, len(hits))
+        f._wsOnMessage(_WS(), "d")
+        check("连接2 后续帧不重复报", len(hits) == 2, len(hits))
+    finally:
+        parent._wsOnMessage = orig_msg
+        parent._wsOnOpen = orig_open
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -317,6 +391,8 @@ def main() -> int:
     test_synth_msg_ids_are_distinct()
     test_first_frame_callback_fires_once()
     test_missing_common_means_empty_id()
+    test_stdin_path_works()
+    test_first_frame_resets_per_connection()
     print("\n" + "=" * 60)
     if FAIL:
         print(f"  {FAIL} 项失败")
