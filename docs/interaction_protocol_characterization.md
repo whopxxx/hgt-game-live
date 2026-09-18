@@ -383,10 +383,42 @@ WebcastGiftUpdateMessage
 - 若仍全部为 0 -> 下一层优先查 **真实 `user_unique_id`、WS signature
   参数/SDK version、host/身份订阅**, 而不是继续折腾 cursor。
 
+### 12B-Gift 事实表(2026-09-19, 4 轮直播, 用户确认每轮都送了小心心)
+
+| 轮次 | bootstrap | 时长 | GiftMessage | LightGift | GiftSort |
+|---|---|---|---|---|---|
+| 01:58 | fallback(2024) | ~75s | 0 | 未观测 | 未观测 |
+| 02:34 | fallback(2024) | ~21min | 0 | 0 | **2** |
+| 03:10 | local-generated | 23s+79s | 0 | 0 | 0 |
+| 03:17 | local-generated | 4m20s | 0 | 0 | 0 |
+
+**结论(cursor 假设正式证伪)**:
+
+1. `WebcastGiftMessage` 在**两种 bootstrap 模式**下都是 0。按预定判定树:
+   **bootstrap 假设降级** —— cursor 不是 Gift 缺失的原因。
+2. `GiftSort` 只在最长的一轮出现 2 次, 且是面板排序消息, 不是打赏本体。
+3. 综合: **打赏帧根本没有到达这条 WS 连接**, 与 cursor/前端会话状态无关。
+
+### 下一层排查方向(按优先级)
+
+cursor 已排除, 剩下的候选是"为什么这条连接不被视为可收礼物的观众":
+
+1. **`user_unique_id` 是写死的(`7319483754668557238`)** —— 这是上游
+   vendor 里一个 2024 年抓包时用的身份值。抖音完全可能对"未登录/游客
+   身份"的 IM 连接**不推礼物消息**(礼物涉及钱, 服务端通常只推给可信
+   身份)。这是当前**最可疑**的一项: like/member/chat 是公开广播,
+   gift 是涉及计费的事件, 推送策略完全可能不同。
+2. **WS `signature` 参数 / SDK version** —— `webcast_sdk_version=1.0.14`
+   也是 2024 的值。
+3. **身份/订阅条件** —— 可能需要特定的 cookie(登录态)或房间订阅请求。
+
+⚠️ 1 和 2 都属于"上游 vendor 的 2024 身份/版本假数据"这一类 —— 与
+cursor 同根, 但**不在 cursor 里**。
+
 ### 12B 当前状态(未关闭项)
 
-- **12B-Gift 未关闭**: 旧 bootstrap 下没有普通 Gift、没有 LightGift;
-  GiftSort 不是打赏本体。
+- **12B-Gift 未关闭**: cursor 已证伪并降级; 打赏帧未到达连接,
+  下一层排查 user_unique_id / signature / 身份订阅。
 - **12B-Like 未关闭**: 仍缺真正的双用户 A→B→A(room-wide/per-user 未判定);
   重连/reset 也未判定。
 - **13B(Gift accumulator)仍禁止实现**。
