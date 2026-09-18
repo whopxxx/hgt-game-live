@@ -2103,7 +2103,13 @@ class PuzzleWriter:
             log.info("纯疑问句被标为候选, 不送裁判: %r", text[:30])
             return results, res.error
 
-        jr = self.judge(puzzle, answer, text, solve_atoms, facts=spec.facts)
+        # 裁判也要吃**同一个** QA 预算。不传的话它会退回全局
+        # `AI_TIMEOUT=60` / 重试 3 次 —— 而这条路是 candidate 专属的,
+        # 直播里意味着"说中了谜底的观众要等最久", 且旧 worker 会一直
+        # 占着 answer pool 的槽位(引擎 25s 后已经 fail-fast 判了"未判定",
+        # 不会再派第二个 worker, 但这一格要等它自己超时才释放)。
+        jr = self.judge(puzzle, answer, text, solve_atoms, facts=spec.facts,
+                        timeout=timeout, max_retries=max_retries)
         _fill_coverage(r0, jr)
         if jr.solved:
             r0.verdict = P.SOLVE
@@ -2163,7 +2169,9 @@ class PuzzleWriter:
     # ------------------------------------------------------------------
     def judge(self, puzzle: str, answer: str, text: str,
               solve_atoms: Optional[list] = None,
-              facts: Optional[list] = None) -> JudgeResult:
+              facts: Optional[list] = None,
+              timeout: Optional[float] = None,
+              max_retries: Optional[int] = None) -> JudgeResult:
         """裁判: 观众的这条提问是否说中了核心谜底?
 
         单独一次**强制工具**调用 —— 实测拆出来问, 模型才肯判。
@@ -2200,7 +2208,9 @@ class PuzzleWriter:
         res = self.client.messages(JUDGE_SYSTEM, user, max_tokens=1200,
                                    tool=_TOOL_JUDGE,
                                    temperature=self._temperature(
-                                       "judge_temperature"))
+                                       "judge_temperature"),
+                                   timeout=timeout,
+                                   max_retries=max_retries)
         ti = _unwrap_tool_input(res.tool_input) if res.tool_input else None
         if isinstance(ti, dict) and "cause_hit" in ti:
             is_guess = bool(ti.get("is_guess", True))

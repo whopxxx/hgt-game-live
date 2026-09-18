@@ -1949,10 +1949,57 @@ def test_answer_passes_qa_budget_to_client():
           and got2.get("max_retries") is None, got2)
 
 
+def test_qa_budget_reaches_final_judge():
+    """candidate 的**第二层**(Final Judge)也必须吃 QA 预算(Hotfix B2)。
+
+    漏掉这条会留下一个真实缺口: 第一层 verdict 用了 8s, 但 candidate=True
+    时 `answer()` 会再调 `judge()`, 而 `judge()` 原先不接预算 -> 退回全局
+    60s/3 次重试。引擎 25s 后已 fail-fast 判"未判定"(不会再派第二个
+    worker), 但旧 worker 会一直卡在裁判上占着 answer pool 的槽位。
+
+    钉住的是**两次调用都拿到 8.0 / 0** —— 只断言其中一次会漏掉另一层。
+    """
+    from story.llm import PuzzleWriter
+
+    # 第一层: 声明 solution_candidate=True, 于是会进 Final Judge
+    cli = FakeClient([
+        LLMResult(tool_input={"answers": [
+            {"id": 1, "verdict": "是", "comment": "像是说中了",
+             "solution_candidate": True}]}),
+        # 第二层: 裁判结果
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                              "mechanism_hit": True}),
+    ])
+    w = PuzzleWriter(client=cli, runtime_cfg=runtime_cfg())
+    w.answer("谜面", "谜底", [], 1, "甲", "他是盲人所以每晚点灯",
+             timeout=8.0, max_retries=0)
+
+    check("**确实调了两次**(verdict + judge)", len(cli.calls) == 2,
+          len(cli.calls))
+    for i, c in enumerate(cli.calls):
+        layer = "verdict" if i == 0 else "judge"
+        check(f"**{layer} 拿到 timeout=8.0**", c.get("timeout") == 8.0,
+              c.get("timeout"))
+        check(f"**{layer} 拿到 max_retries=0**", c.get("max_retries") == 0,
+              c.get("max_retries"))
+
+    # 直接调 judge()(golden / 离线裁判 / Q10 的路)不传 -> 仍沿用全局
+    cli3 = FakeClient([LLMResult(tool_input={"is_guess": True,
+                                             "cause_hit": True,
+                                             "mechanism_hit": True})])
+    w3 = PuzzleWriter(client=cli3, runtime_cfg=runtime_cfg())
+    w3.judge("谜面", "谜底", "他是盲人", facts=None)
+    got3 = cli3.calls[-1]
+    check("直接调 judge() 时沿用全局(None)",
+          got3.get("timeout") is None and got3.get("max_retries") is None,
+          got3)
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_messages_timeout_override,
               test_answer_passes_qa_budget_to_client,
+              test_qa_budget_reaches_final_judge,
               test_hard_rule_asks_reviewer_to_fix,
               test_reviewer_no_fix_falls_back_to_regen,
               test_first_person_story_rejected,

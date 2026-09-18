@@ -212,11 +212,15 @@ def test_inflight_timeout():
 
 
 def test_no_duplicate_worker_per_qid():
-    """同一 qid 在任何时刻**最多一个**真实 worker(Hotfix B 的核心)。
+    """同一 qid 在任何时刻**最多一个** worker 派发(Hotfix B 的核心)。
 
     现有 `test_inflight_timeout` 的盲区: 它用 `clk.advance()` 快进, 但**没有
-    worker 在飞** —— 所以看不见"旧 worker 还活着又派了一个新的"。这里让
-    worker 真的在途(用真实 pool), 再推进时钟, 断言不再产生第二个 ANSWER。
+    worker 在飞** —— 所以看不见"旧 worker 还活着又派了一个新的"。
+
+    ⚠️ 这里是**模拟** worker 仍在途(不调 `submit_qa()`, 表示结果还没回来),
+    **不是**真的起了 Director 的线程池 —— 早先的注释写成"用真实 pool /
+    worker 真的在途", 与代码不符, 已改正。判别力不受影响: 重复 worker 的
+    唯一入口就是引擎为同一 qid **再发一个 ANSWER**, 本测试正是钉住这一点。
     """
     print("[同一 qid 不并发两个 worker]")
     from story.engine import ActionKind
@@ -225,7 +229,7 @@ def test_no_duplicate_worker_per_qid():
     first = [a for a in eng.tick() if a.kind == ActionKind.ANSWER]
     check("首次派发 1 个 ANSWER", len(first) == 1, len(first))
     qid = first[0].payload["qid"]
-    # 模拟"worker 卡住, 引擎等不到结果" —— 推进到超时之后
+    # 模拟"worker 卡住, 结果迟迟不回来" —— 推进到超时之后
     clk.advance(11)
     acts = eng.tick()
     more = [a for a in acts if a.kind == ActionKind.ANSWER]
