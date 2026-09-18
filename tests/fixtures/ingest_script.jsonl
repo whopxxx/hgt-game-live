@@ -1,0 +1,18 @@
+// SimSource 单元测试专用脚本。
+//
+// **不要**用 data/demo_script.jsonl —— 它被 .gitignore 排除(data/*.jsonl),
+// 只存在于开发机上, CI 上不存在。也不要复用 smoke_script.jsonl: 那个是
+// "装配冒烟"的输入, 职责不同, 以后改冒烟场景会连带弄坏这里。
+//
+// 这里只放这个测试**真正关心**的东西:
+//   - 走真实 protobuf / _parseChatMsg 解析路径
+//   - 自动分配 user_id
+//   - nickname 与 content 各自正确
+//   - loop 标记被识别
+//
+// 刻意**不**依赖总条数这类与业务无关的 magic number —— 那会让"加一条
+// 演示弹幕"变成一次测试失败。
+{"at_ms":0,"user_name":"路人甲","content":"这题有意思"}
+{"at_ms":100,"user_name":"观众甲","content":"#他是自己走进餐厅的吗"}
+{"at_ms":200,"user_name":"观众乙","content":"#汤里有毒吗"}
+{"loop":true}

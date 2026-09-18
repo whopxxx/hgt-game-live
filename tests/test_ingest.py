@@ -17,6 +17,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from story.config import Config
 from story.ingest import CallbackFetcher, ChatEvent, SimSource, StdinSource
 
+# 测试用的脚本一律放这里(受版本控制)。**绝不要**引用 data/ 下的文件:
+# data/*.jsonl 被 .gitignore 排除, 在干净的 checkout(CI)上不存在。
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
 FAIL = 0
 
 
@@ -31,13 +35,19 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 
 def test_sim_uses_real_parser() -> None:
     print("\n[1] SimSource 走真实解析路径")
-    cfg = Config(sim_path="data/demo_script.jsonl", sim_loop_gap=1, no_llm=True)
+    # 用仓库里的 fixture, **不要**用 data/demo_script.jsonl —— 那个被
+    # .gitignore 排除, 只存在于开发机上。CI 第一次跑就抓出了这个问题
+    # (FileNotFoundError), 因为它在本机永远是绿的。
+    script = os.path.join(FIXTURES, "ingest_script.jsonl")
+    cfg = Config(sim_path=script, sim_loop_gap=1, no_llm=True)
     inbox: queue.Queue = queue.Queue()
     src = SimSource(cfg, inbox)
 
     # 直接驱动一次, 不启线程
     src._load()
-    check("脚本载入", len(src._loop_items) == 17, f"got {len(src._loop_items)}")
+    # 断言**语义**而不是 magic number: 早先写死 `== 17`, 于是往演示
+    # 脚本里加一条弹幕就会弄挂这个测试 —— 而它想验的根本不是条数。
+    check("脚本载入", len(src._loop_items) >= 2, f"got {len(src._loop_items)}")
     check("loop 识别", src._loop_enabled is True)
 
     src._emit(src._loop_items[0])          # 第一条: 这题有意思
