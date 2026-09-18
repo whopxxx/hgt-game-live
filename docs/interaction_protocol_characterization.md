@@ -315,23 +315,82 @@ B: local-generated(JaneEyre 算法)                     <- 本轮
 有效性判据: 日志必须显示
 `【bootstrap】本次连接使用 local-generated now_ms=...`。
 
-### 另: method 探针已排除一个分支
+### method 探针的第一个真实结果(旧 fallback 连接, 838 帧 / 952 消息)
 
-上一轮 257 条消息的分布是:
+完整 method 表(按次数):
 
 ```text
-member 167 + chat 65 + like 24 + social 1 = 257
+WebcastMemberMessage                319
+WebcastChatMessage                  157
+WebcastRoomUserSeqMessage           143
+WebcastRoomStreamAdaptationMessage  124
+WebcastRoomStatsMessage             123
+WebcastLikeMessage                   28
+WebcastRoomRankMessage               34
+WebcastInRoomBannerMessage            9
+WebcastRanklistHourEntranceMessage    6
+WebcastGiftSortMessage                2   <- Gift-family, 无 handler
+WebcastResidentGuestMessage           2
+WebcastSocialMessage                  2
+WebcastLowPcuGuideMessage             1
+WebcastLowPcuGuideChatMessage         1
+WebcastControlMessage                 1
+WebcastGiftMessage                    0
+WebcastLightGiftMessage               0
+parse_errors: {} (空)
 ```
 
-四类**已经吃满** 257, 没有剩余空间给一个未知的新礼物 method。所以在那一轮
-连接里, **证据不支持**"礼物以另一个 method 名进来了、被 `continue` 静默
-丢弃"这个分支(前提是该轮 `method 汇总` 的 `unhandled` 为空)。
+三个直接结论:
 
-### 仍待做
+1. **`WebcastGiftMessage = 0`**: 在这条旧 bootstrap 连接里, 小心心没有以
+   普通 Gift method 出现。
+2. **`WebcastGiftSortMessage × 2` 是 Gift-family 里唯一出现的** —— 但它
+   **基本可以从"打赏本体候选"里排除**: 公开 proto 显示它的结构只有
+   `sort_type` / `scene_config` 一类字段, 被描述为"礼物排序/展示模式更新";
+   另一个实现也注释为"调整礼物列表展示优先级"。它的最大价值是
+   **证明 pre-handler probe 必须存在**(没有它我们根本不知道有这个类型)。
+   它只记录次数, **不进入 gift accounting 候选**。
+3. **新纳入观察的类型: `WebcastLightGiftMessage`**(当前公开 proto 里描述为
+   轻礼物/快捷礼物, 结构含 `gift_info` / `count`, 与普通
+   `WebcastGiftMessage` 是**两个独立 method**)。我们自己的 proto 目前
+   **没有**这个定义。所以**不能先验假定**小心心一定走普通
+   `WebcastGiftMessage`。
 
-**两用户 Like smoke** 回答 §12B-Like 的口径问题(room-wide vs per-user)。
+### method 分布推断法的教训
 
-**在拿到 12B-Gift 的真实样本之前, Gift delta accumulator 依然禁止实现。**
+> ⚠️ 早先基于"257 条四类吃满"得出"没有未知 method"的推断**方法是不可靠
+> 的** —— 那时只有 4 种 method 且恰好加总相等, 就差点把"没有别的类型"
+> 当成结论。真正的答案必须来自**全量 method 计数**(现在的探针), 而不是
+> "已知类型之和 == 总数"这种巧合。下面这一轮 952 条里有 **10+ 种** method,
+> 其中 `GiftSortMessage` 就是"已知四类"完全看不见的。
+
+### 下一轮 B smoke 看什么
+
+**不要只盯 `WebcastGiftMessage`。** method probe 本来就是全量的, 所以
+**无需提前实现任何新 parser**; 测完看整个 method 表里有没有:
+
+```text
+WebcastGiftMessage
+WebcastLightGiftMessage
+WebcastGiftPlayEventMessage
+WebcastGiftUpdateMessage
+以及任何其他新出现的 Gift* / 陌生 method
+```
+
+`GiftSortMessage` 继续记录次数, 但不进入 accounting 候选。
+
+- 若普通 Gift 或 LightGift 出现 -> stale bootstrap 假设得到很强支持;
+- 若仍全部为 0 -> 下一层优先查 **真实 `user_unique_id`、WS signature
+  参数/SDK version、host/身份订阅**, 而不是继续折腾 cursor。
+
+### 12B 当前状态(未关闭项)
+
+- **12B-Gift 未关闭**: 旧 bootstrap 下没有普通 Gift、没有 LightGift;
+  GiftSort 不是打赏本体。
+- **12B-Like 未关闭**: 仍缺真正的双用户 A→B→A(room-wide/per-user 未判定);
+  重连/reset 也未判定。
+- **13B(Gift accumulator)仍禁止实现**。
+- **Step 14 继续锁死**。
 
 ---
 
