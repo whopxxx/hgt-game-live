@@ -79,6 +79,38 @@ EMOTION_MODES = ("neutral", "absurd", "warm", "tense",
 #: 悲情基调 —— 这三档在配额里算一类(实测 58% 的题都落在里面)。
 GRIEF_MODES = frozenset({"grief", "guilt", "memorial"})
 
+#: 揭晓结构 —— "揭晓时观众重新理解了什么"。
+#:
+#: **与 `emotion_mode` 严格正交**, 这是任务书 §15 冻结的边界:
+#:
+#:     mechanism_family = 谜题靠什么机关成立
+#:     emotion_mode     = 整体是什么气氛
+#:     reveal_mode      = 揭晓时观众重新理解了什么
+#:
+#: 所以这里**没有** `eerie_recontextualization` / `absurd_logic` /
+#: `warm_reversal` 这类名字 —— 那些是把"结构"和"气氛"焊在一条轴上的
+#: 产物。焊起来之后 Scheduler 就没法分别导演这两件事: 它想要一个
+#: "身份翻转", 却被迫同时指定"诡异"; 或者它想要"温馨", 却被迫接受
+#: "身份翻转"。组合空间被虚假地压缩了(`eerie + identity_flip` 这种
+#: 完全合法的搭配在旧枚举里根本表达不出来)。
+#:
+#: `straight_explanation` 是"没有结构性翻转, 就是正面解释"那一档 ——
+#: 它也**必须**留在枚举里: 配额要能数出"最近 10 题里有几道是普通解释",
+#: 数不出来就没法限制它。它是默认值, 也是配额要压制的那一档。
+REVEAL_MODES = (
+    "recontextualization",   # 同一件事被放进新语境, 意义全变
+    "identity_flip",         # 某人/某物的身份与表面相反
+    "meaning_flip",          # 某件物品的真实意义与表面用途相反
+    "causal_flip",           # 因果被倒置(以为的因其实是果)
+    "goal_flip",             # 行为的目的与表面动机相反
+    "hidden_stakes",         # 表面平常, 真实的利害关系完全不同
+    "perspective_flip",      # 视角/时间/空间被错认
+    "straight_explanation",  # 没有翻转, 就是正面解释为什么会这样
+)
+
+#: 揭晓结构里**默认**那一档 —— 也是配额要压制的对象。
+REVEAL_DEFAULT = "straight_explanation"
+
 DOMAINS = (
     "daily", "commerce", "medical", "transport", "maritime", "aviation",
     "military", "education", "religion", "art", "sport", "nature",
@@ -229,6 +261,23 @@ class PuzzleBlueprint:
     long_term_profession: bool = False
     repeated_ritual: bool = False
 
+    # ---- Step 01 新增(只记录, 不改调度) ----
+    #: 揭晓结构。**只描述"揭晓时观众重新理解了什么"**, 不混情绪。
+    #: 默认 `straight_explanation` —— 此时它的语义与 Step 01 之前完全
+    #: 一致("一道没有结构性翻转的普通题"), 所以升级代码不会让存量题
+    #: 突然被算成"有翻转"。
+    reveal_mode: str = REVEAL_DEFAULT
+    #: 这道题是否**主要依赖**题面之外的组织规定 / 内部流程 / 设备白名单 /
+    #: 店规这类制度性设定。用来压制"隐藏规定题"重新成为题库主色。
+    #:
+    #: 它**不等价于** `mechanism_family == "rule_constraint"`:
+    #: `hidden_function + 某设备有内部白名单` 与
+    #: `information_gap + 某岗位有未公开流程` 都可能把这里标成 True。
+    #:
+    #: Step 01 只让它能被记录与统计(Reviewer 回传 observed 值),
+    #: 但**不要求** Blueprint 预先指定 true/false。
+    procedural_rule_dependency: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "mechanism_family": self.mechanism_family,
@@ -241,6 +290,8 @@ class PuzzleBlueprint:
             "past_trauma": bool(self.past_trauma),
             "long_term_profession": bool(self.long_term_profession),
             "repeated_ritual": bool(self.repeated_ritual),
+            "reveal_mode": self.reveal_mode,
+            "procedural_rule_dependency": bool(self.procedural_rule_dependency),
         }
 
     @classmethod
@@ -259,6 +310,9 @@ class PuzzleBlueprint:
             past_trauma=bool(d.get("past_trauma", False)),
             long_term_profession=bool(d.get("long_term_profession", False)),
             repeated_ritual=bool(d.get("repeated_ritual", False)),
+            reveal_mode=_pick(d.get("reveal_mode"), REVEAL_MODES, REVEAL_DEFAULT),
+            procedural_rule_dependency=bool(
+                d.get("procedural_rule_dependency", False)),
         )
 
     def describe(self) -> str:
@@ -272,6 +326,7 @@ class PuzzleBlueprint:
             f"- relation(人物关系): {self.relation}\n"
             f"- emotion_mode(情绪基调): {self.emotion_mode}\n"
             f"- time_shape(时间形态, 参考): {self.time_shape}\n"
+            f"- reveal_mode(揭晓结构, 参考): {self.reveal_mode}\n"
             f"- 必须为真的标记: {', '.join(flags) if flags else '(无)'}\n"
             f"- 必须为假的标记: "
             f"{', '.join(k for k in ('death', 'past_trauma', 'long_term_profession', 'repeated_ritual') if not getattr(self, k))}"
@@ -300,6 +355,14 @@ class PuzzleSignature:
     long_term_profession: bool = False
     repeated_ritual: bool = False
 
+    # ---- Step 01 新增(只统计, 不参与蓝图逐项比对) ----
+    #: 揭晓结构(observed)。与 blueprint 的 `reveal_mode` 同义, 但这里是
+    #: **审稿人读完之后如实回传**的值 —— 配额统计用它, 不用自报值。
+    reveal_mode: str = REVEAL_DEFAULT
+    #: 是否主要依赖题面之外的制度性设定(observed)。由 Reviewer 单题判断,
+    #: 代码只管最近窗口的配额。
+    procedural_rule_dependency: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "mechanism_family": self.mechanism_family,
@@ -312,6 +375,8 @@ class PuzzleSignature:
             "past_trauma": bool(self.past_trauma),
             "long_term_profession": bool(self.long_term_profession),
             "repeated_ritual": bool(self.repeated_ritual),
+            "reveal_mode": self.reveal_mode,
+            "procedural_rule_dependency": bool(self.procedural_rule_dependency),
         }
 
     @classmethod
@@ -328,10 +393,22 @@ class PuzzleSignature:
             past_trauma=bool(d.get("past_trauma", False)),
             long_term_profession=bool(d.get("long_term_profession", False)),
             repeated_ritual=bool(d.get("repeated_ritual", False)),
+            reveal_mode=_pick(d.get("reveal_mode"), REVEAL_MODES, REVEAL_DEFAULT),
+            procedural_rule_dependency=bool(
+                d.get("procedural_rule_dependency", False)),
         )
 
     def grief(self) -> bool:
         return self.emotion_mode in GRIEF_MODES
+
+    def strong_reveal(self) -> bool:
+        """有没有一个**明确的结构性翻转**(而不是正面解释)。
+
+        Step 02 的配额要用它数"最近 10 题里几道有强揭晓"。放在 Signature
+        上而不是各调用点自己写 `!= "straight_explanation"` —— 判据只有
+        一处, 将来加枚举值时不会漏。
+        """
+        return bool(self.reveal_mode) and self.reveal_mode != REVEAL_DEFAULT
 
     def trauma_ritual(self) -> bool:
         """既往创伤 + 长年怪规矩 —— 8 小时直播里 69% 的题都是这个形状。"""

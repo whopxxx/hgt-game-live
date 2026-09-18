@@ -16,8 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.puzzle import (  # noqa: E402
-    FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
-    SolveAtom, has_closing_question, is_first_person, quote_in_puzzle,
+    EMOTION_MODES, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
+    PuzzleSpec, REVEAL_MODES, SolveAtom, has_closing_question,
+    is_first_person, quote_in_puzzle,
 )
 from story.quality import (  # noqa: E402
     Quotas, check_signature, choose_blueprint, cross_puzzle_gate,
@@ -259,6 +260,147 @@ def test_puzzle_format_checks():
 
 
 # ======================================================================
+def test_reveal_mode_enum_is_reveal_only():
+    """Step 01: `reveal_mode` 只描述"揭晓结构", 不混情绪。
+
+    任务书 §15 冻结: `eerie / warm / absurd` 属于 `emotion_mode`, 不是
+    揭晓结构。v1.1 里那三个混轴名字(`eerie_recontextualization` /
+    `absurd_logic` / `warm_reversal`)必须**不在**枚举里 —— 它们是把两条轴
+    焊在一起的产物, 一旦混进来, Scheduler 就没法分别导演"结构"和"气氛"。
+    """
+    for m in ("recontextualization", "identity_flip", "meaning_flip",
+              "causal_flip", "goal_flip", "hidden_stakes",
+              "perspective_flip", "straight_explanation"):
+        check(f"reveal_mode 含 {m}", m in REVEAL_MODES, REVEAL_MODES)
+    for bad in ("eerie_recontextualization", "absurd_logic", "warm_reversal",
+                "eerie", "warm", "absurd", "neutral"):
+        check(f"reveal_mode 不含混轴名 {bad}", bad not in REVEAL_MODES,
+              REVEAL_MODES)
+    # 与 emotion_mode 严格正交: 两条枚举不许有交集
+    check("reveal_mode 与 emotion_mode 无交集",
+          not (set(REVEAL_MODES) & set(EMOTION_MODES)),
+          set(REVEAL_MODES) & set(EMOTION_MODES))
+
+
+def test_reveal_and_procedural_roundtrip():
+    """Step 01: 新字段要能过 JSON round trip, 且**默认值不改变老行为**。
+
+    `reveal_mode` 默认 `straight_explanation`(= 没有翻转结构), `procedural_
+    rule_dependency` 默认 False —— 这样一道**没写这两个字段**的题, 它的
+    语义与 Step 01 之前完全一致(旧的"普通解释题"), 不会因为升级代码
+    而突然被配额认成"有翻转"。
+    """
+    s = good_spec()
+    check("Blueprint 默认 reveal_mode",
+          s.blueprint.reveal_mode == "straight_explanation",
+          s.blueprint.reveal_mode)
+    check("Blueprint 默认 procedural_rule_dependency",
+          s.blueprint.procedural_rule_dependency is False,
+          s.blueprint.procedural_rule_dependency)
+    check("Signature 默认 reveal_mode",
+          s.signature.reveal_mode == "straight_explanation",
+          s.signature.reveal_mode)
+    check("Signature 默认 procedural_rule_dependency",
+          s.signature.procedural_rule_dependency is False,
+          s.signature.procedural_rule_dependency)
+
+    # 显式赋值 + round trip
+    s.blueprint.reveal_mode = "identity_flip"
+    s.blueprint.procedural_rule_dependency = True
+    s.signature.reveal_mode = "identity_flip"
+    s.signature.procedural_rule_dependency = True
+    d = s.to_dict()
+    check("to_dict 带 reveal_mode", d["blueprint"]["reveal_mode"] == "identity_flip",
+          d["blueprint"])
+    check("to_dict 带 procedural_rule_dependency",
+          d["blueprint"]["procedural_rule_dependency"] is True, d["blueprint"])
+    check("signature to_dict 带 reveal_mode",
+          d["signature"]["reveal_mode"] == "identity_flip", d["signature"])
+    s2 = PuzzleSpec.from_dict(d)
+    check("round trip 后 blueprint.reveal_mode 保持",
+          s2.blueprint.reveal_mode == "identity_flip", s2.blueprint.reveal_mode)
+    check("round trip 后 signature 两字段保持",
+          s2.signature.reveal_mode == "identity_flip"
+          and s2.signature.procedural_rule_dependency is True, s2.signature)
+    check("round trip 完全相等", s2.to_dict() == d, s2.to_dict())
+
+    # archive 也要带(复盘/配额都靠它)
+    a = s.to_archive()
+    check("archive 带 reveal_mode",
+          a["signature"]["reveal_mode"] == "identity_flip"
+          and a["blueprint"]["reveal_mode"] == "identity_flip", a["signature"])
+
+    # 非法值要回落到默认, 不能把坏值灌进配额桶
+    bad_d = {"blueprint": dict(d["blueprint"], reveal_mode="乱写的值"),
+             "signature": dict(d["signature"], reveal_mode="乱写的值")}
+    s3 = PuzzleSpec.from_dict(dict(d, **bad_d))
+    check("非法 reveal_mode 回落到默认",
+          s3.blueprint.reveal_mode == "straight_explanation"
+          and s3.signature.reveal_mode == "straight_explanation",
+          (s3.blueprint.reveal_mode, s3.signature.reveal_mode))
+
+
+def test_legacy_spec_gets_reveal_defaults():
+    """Step 01: 老 archive(完全没有这两个字段)读进来要有确定的默认值。
+
+    老记录不能因为"缺字段"就变成空字符串 —— 空串会掉进 `reveal:""` 这个
+    桶, 既不计入 `straight_explanation` 配额, 也不计入任何 quota, 于是
+    老题池整体**绕过**了 reveal 配额。必须显式回落。
+    """
+    old = PuzzleSpec.from_dict({
+        "puzzle": "老谜面。为什么?", "answer": "老谜底。",
+        "signature": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+        "blueprint": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"}})
+    check("老 signature 的 reveal_mode 有默认值",
+          old.signature.reveal_mode == "straight_explanation",
+          old.signature.reveal_mode)
+    check("老 signature 的 procedural_rule_dependency 是 False",
+          old.signature.procedural_rule_dependency is False,
+          old.signature.procedural_rule_dependency)
+    check("老 blueprint 同样有默认值",
+          old.blueprint.reveal_mode == "straight_explanation"
+          and old.blueprint.procedural_rule_dependency is False,
+          old.blueprint)
+    # 而且它仍然算 v2 spec(有 signature), 所以会进配额统计
+    from story.quality import _is_v2_spec
+    check("老 signature 仍被认作 v2", _is_v2_spec(old))
+
+
+def test_reveal_mode_is_not_a_blueprint_hard_constraint():
+    """Step 01 只加数据结构, **不动** blueprint 逐项比对。
+
+    任务书 §20 Step 01 明确"不修改 Scheduler"。`reveal_mode` 与
+    `procedural_rule_dependency` 在这一步只是**记录**, 不能立刻变成会
+    拒稿的硬约束 —— 否则生成器还没被教过怎么写, 出题成功率会先崩一段。
+
+    这条测试是**边界钉**: Step 02 改的是配额/调度, 仍然不该把
+    reveal_mode 加进 `validate_blueprint` 的逐项比对名单。
+    """
+    bp = PuzzleBlueprint(mechanism_family="hidden_function",
+                         solution_shape="hidden_function_explains_behavior",
+                         domain="maritime", relation="stranger",
+                         emotion_mode="neutral", time_shape="habitual",
+                         reveal_mode="identity_flip",
+                         procedural_rule_dependency=True)
+    sp = good_spec()
+    sp.blueprint = bp
+    # signature 在 reveal/procedural 上与 blueprint 不一致 —— 但既然这两项
+    # 不是硬约束, 就不该因此拒稿(其余维度保持一致)。
+    sp.signature = PuzzleSignature(
+        mechanism_family="hidden_function",
+        solution_shape="hidden_function_explains_behavior",
+        domain="maritime", relation="stranger", emotion_mode="neutral",
+        time_shape="habitual",
+        reveal_mode="straight_explanation", procedural_rule_dependency=False)
+    r = validate_blueprint(sp, bp)
+    check("reveal/procedural 不一致不拒稿(Step 01 边界)",
+          r.ok, r.errors)
+
+
 def test_legacy_atoms_migrate():
     print("[迁移: 老的字符串 atoms 能读进来]")
     # 老 RiddleResult 里 atoms 是 ["A1","A2"] 这种纯字符串
@@ -832,6 +974,11 @@ def main():
         test_atom_count_bounds,
         test_hints_must_be_three_and_short,
         test_puzzle_format_checks,
+        # ---- Step 01: reveal_mode / procedural_rule_dependency ----
+        test_reveal_mode_enum_is_reveal_only,
+        test_reveal_and_procedural_roundtrip,
+        test_legacy_spec_gets_reveal_defaults,
+        test_reveal_mode_is_not_a_blueprint_hard_constraint,
         test_legacy_atoms_migrate,
         test_validate_blueprint_flags,
         test_blueprint_mismatch_is_rejected_not_warned,
