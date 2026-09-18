@@ -480,6 +480,108 @@ def test_result_predicates():
           PlaytestResult(status=UNSOLVED).passed is False)
 
 
+def test_player_temperature_is_zero():
+    """**可复现性**: 试玩结果决定一道已生成好的题能否入池, 所以 Player
+    必须 temperature=0。同一份 spec 因采样抖动今天 pass 明天 unsolved
+    会让这个闸门没法 debug。
+    """
+    print("\n[F1] Player temperature 恒为 0.0")
+    pl = _FakePlayerClient(moves=[(MOVE_ASK, "问1"), (MOVE_SOLVE, "解")])
+    pt = mkpt(player=pl, host=_FakeHost(verdicts=["不是"], solved_at=2))
+    pt.run(mk_spec())
+    check("至少调了 2 次", len(pl.calls) >= 2, len(pl.calls))
+    temps = {c["temperature"] for c in pl.calls}
+    check("**全部 temperature=0.0**", temps == {0.0}, temps)
+
+
+def test_unsolved_reason_give_up():
+    print("\n[F2] give_up -> unsolved/reason=give_up")
+    pt = mkpt(player=_FakePlayerClient(moves=[(MOVE_GIVE_UP, "想不出")]),
+              host=_FakeHost())
+    r = pt.run(mk_spec())
+    check("unsolved", r.status == UNSOLVED, r.status)
+    check("reason=give_up", r.reason == "give_up", r.reason)
+
+
+def test_unsolved_reason_max_turns():
+    print("\n[F3] 轮数耗尽 -> unsolved/reason=max_turns")
+    pt = mkpt(player=_FakePlayerClient(moves=[(MOVE_ASK, "问1"),
+                                              (MOVE_ASK, "问2")]),
+              host=_FakeHost(verdicts=["不是", "不是"]), max_turns=2)
+    r = pt.run(mk_spec())
+    check("unsolved", r.status == UNSOLVED, r.status)
+    check("reason=max_turns", r.reason == "max_turns", r.reason)
+
+
+def test_policy_table_is_exactly_the_contract():
+    """四种结局的后台策略就是你定的那张表。"""
+    print("\n[F4] 结局 -> 策略表与契约逐格一致")
+    from story.playtest import OUTCOME_POLICY
+    want = {
+        PASS:        (False, False, False),
+        UNSOLVED:    (True,  True,  True),
+        UNAVAILABLE: (True,  True,  True),
+        INTERRUPTED: (True,  False, False),
+    }
+    for st, (drop, bo, cf) in want.items():
+        p = OUTCOME_POLICY.get(st)
+        check(f"{st} 在表里", p is not None, st)
+        if p:
+            check(f"**{st}: drop/backoff/fail = {drop}/{bo}/{cf}**",
+                  (p["drop"], p["backoff"], p["counted_fail"])
+                  == (drop, bo, cf), p)
+    check("**恰好 4 个结局**", len(OUTCOME_POLICY) == 4, list(OUTCOME_POLICY))
+
+
+def test_interrupted_is_not_counted_fail():
+    """INTERRUPTED 必须**不**计入失败、**不**退避 —— 否则运维数据会把
+    "直播很活跃"误读成"试玩大量失败"。"""
+    print("\n[F5] interrupted 不算失败/不退避")
+    from story.playtest import PlaytestResult
+    p = PlaytestResult(status=INTERRUPTED).policy()
+    check("不退避", p["backoff"] is False, p)
+    check("不计失败", p["counted_fail"] is False, p)
+    check("丢弃 candidate", p["drop"] is True, p)
+
+
+def test_policy_unknown_status_is_conservative():
+    print("\n[F6] 未知 status -> 保守(丢弃+退避+计失败)")
+    from story.playtest import PlaytestResult
+    p = PlaytestResult(status="某个没见过的值").policy()
+    check("**退避**", p["backoff"] is True, p)
+    check("**计失败**", p["counted_fail"] is True, p)
+    check("丢弃", p["drop"] is True, p)
+
+
+def test_run_only_returns_known_status():
+    """`run()` 只可能返回表里的四种之一。"""
+    print("\n[F7] run() 的 status 一定在表内")
+    from story.playtest import OUTCOME_POLICY
+    cases = [
+        (mkpt(player=_FakePlayerClient(moves=[(MOVE_SOLVE, "解")]),
+              host=_FakeHost(solved_at=1)), PASS),
+        (mkpt(player=_FakePlayerClient(moves=[(MOVE_GIVE_UP, "算了")]),
+              host=_FakeHost()), UNSOLVED),
+        (mkpt(player=_FakePlayerClient(error="网关"), host=_FakeHost()),
+         UNAVAILABLE),
+        (mkpt(player=_FakePlayerClient(), host=_FakeHost(),
+              cont=lambda: False), INTERRUPTED),
+    ]
+    for pt, want in cases:
+        got = pt.run(mk_spec()).status
+        check(f"**{want}**", got == want, got)
+        check(f"{got} 在表内", got in OUTCOME_POLICY, got)
+
+
+def test_metrics_carries_reason():
+    print("\n[F8] metrics 带 reason")
+    pt = mkpt(player=_FakePlayerClient(moves=[(MOVE_GIVE_UP, "算了")]),
+              host=_FakeHost())
+    r = pt.run(mk_spec())
+    check("metrics 里 reason=give_up",
+          r.to_metrics().get("reason") == "give_up", r.to_metrics())
+
+
 def main():
     tests = [
         # A. 隔离
@@ -511,6 +613,15 @@ def main():
         test_run_never_raises,
         test_run_requires_no_pool_or_engine,
         test_result_predicates,
+        # F. Q10b: 温度 / 结局细分 / 策略表
+        test_player_temperature_is_zero,
+        test_unsolved_reason_give_up,
+        test_unsolved_reason_max_turns,
+        test_policy_table_is_exactly_the_contract,
+        test_interrupted_is_not_counted_fail,
+        test_policy_unknown_status_is_conservative,
+        test_run_only_returns_known_status,
+        test_metrics_carries_reason,
     ]
     for t in tests:
         t()

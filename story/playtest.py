@@ -71,9 +71,25 @@ log = logging.getLogger("story.playtest")
 
 #: 试玩结局。**技术故障与"题烂"必须分开** —— 前者不该记进质量统计。
 PASS = "pass"                  # 在预算内说出完整解
-UNSOLVED = "unsolved"          # 用完轮数没猜中
+UNSOLVED = "unsolved"          # 用完轮数 / 主动放弃, 没猜中
 UNAVAILABLE = "unavailable"    # 技术故障(网关/解析), **不评价这道题**
 INTERRUPTED = "interrupted"    # 直播突然变忙, 主动让路
+
+#: 结局 -> 后台策略。**唯一定义处**, 补池(Q10c)直接读它, 不要各处
+#: 重推一遍 —— "四种结局要不要退避"这种表散在两处就一定会漂移。
+#:
+#: 为什么 UNSOLVED 也要退避: 关键不是"惩罚失败", 是**限流**。一次
+#: playtest 最坏会连打 2N 次 LLM 调用; 若 UNSOLVED 后下一拍立刻再生成
+#: 一题再试玩, 即使有 single-flight, 也会排成一条连续的昂贵调用链。
+#:
+#: 为什么 INTERRUPTED 不退避: 它只是"直播忙, 我主动让路", 不是失败。
+#: 计退避会让运维数据把"直播活跃"误读成"试玩大量失败"。
+OUTCOME_POLICY = {
+    PASS:        {"drop": False, "backoff": False, "counted_fail": False},
+    UNSOLVED:    {"drop": True,  "backoff": True,  "counted_fail": True},
+    UNAVAILABLE: {"drop": True,  "backoff": True,  "counted_fail": True},
+    INTERRUPTED: {"drop": True,  "backoff": False, "counted_fail": False},
+}
 
 #: Player 每轮的动作类型。**只用于日志与策略**, 不决定是否调裁判 ——
 #: ask 与 solve 的文本都走同一条生产 `answer()`。否则会出现"玩家其实
@@ -139,10 +155,23 @@ class PlaytestResult:
     duration_ms: int = 0
     transcript: list = field(default_factory=list)   # [{role, text, verdict}]
     error: str = ""
+    #: UNSOLVED 的细分原因: "give_up" / "max_turns"。**只进日志与 metrics,
+    #: 不参与策略** —— 两者的处理完全一样(丢弃 + 退避)。留着是因为
+    #: "玩家主动放弃"和"用光轮数"对读题的人意义不同。
+    reason: str = ""
 
     @property
     def passed(self) -> bool:
         return self.status == PASS
+
+    def policy(self) -> dict:
+        """本结局对应的后台策略。未知 status 一律按**最保守**处理:
+        丢弃 + 退避 + 计入失败 —— 出了表就说明代码有 bug, 此时宁可
+        当作失败停下, 也不要漏掉退避而开始连续烧调用。
+        """
+        return OUTCOME_POLICY.get(
+            self.status,
+            {"drop": True, "backoff": True, "counted_fail": True})
 
     def to_metrics(self) -> dict:
         """落进 `spec.metrics["playtest"]` 的形状。
@@ -159,6 +188,7 @@ class PlaytestResult:
             "duration_ms": self.duration_ms,
             "final_text": self.final_text[:200],
             "transcript": self.transcript,
+            "reason": self.reason,
         }
 
 
@@ -231,6 +261,7 @@ class Playtester:
 
             if kind == MOVE_GIVE_UP:
                 tr.status = UNSOLVED
+                tr.reason = "give_up"
                 return tr
 
             # ---- Host: **走生产 answer()**, 不直接调 judge ----
@@ -251,6 +282,7 @@ class Playtester:
                 return tr
 
         tr.status = UNSOLVED
+        tr.reason = "max_turns"
         return tr
 
     # ------------------------------------------------------------------
@@ -264,12 +296,25 @@ class Playtester:
 
     def _ask_player(self, puzzle: str,
                     transcript: list) -> Optional[tuple]:
-        """一次 Player 调用。返回 `(kind, text)` 或 None(技术失败)。"""
+        """一次 Player 调用。返回 `(kind, text)` 或 None(技术失败)。
+
+        `temperature=0.0`: 试玩结果**决定一道已生成好的题能不能入池**,
+        所以它必须可复现。同一份 spec 今天 pass 明天 unsolved(只因为
+        采样抖动)会让质量闸门没法 debug。
+
+        "每轮别问同一句"不靠温度解决: 每轮 transcript 都在变, 输入本身
+        就不同; 而且 system prompt 明确要求不复述。若 temperature=0 下
+        仍反复问同一句, 那**本身就是有价值的结论**(公开信息没能给出新
+        推理方向), 不该用随机采样掩盖掉。
+
+        以后要做多样化试玩, 正确做法是离线跑多个固定策略/角色, 而不是
+        把一个 Player 调到 0.7 —— 那样多样性不可复现。
+        """
         res = self.client.messages(
             system=_PLAYER_SYSTEM,
             user=_player_prompt(puzzle, _public_transcript(transcript)),
             tool=_PLAYER_TOOL,
-            temperature=0.7,
+            temperature=0.0,
         )
         ti = _unwrap(res.tool_input) if res is not None else None
         if res is None or res.error or not ti:
