@@ -882,6 +882,220 @@ def test_on_tick_never_raises():
         check("异常也计入失败数", pf2.fail_count == 1, pf2.fail_count)
 
 
+
+# ======================================================================
+# C. 接线(端到端)
+# ======================================================================
+def _inline_threads():
+    """把 director 里 import 的 Thread 换成同步执行器。
+
+    返回还原函数。用法: `restore = _inline_threads()` ... `restore()`。
+    """
+    import director as _D
+    real = _D.threading.Thread
+
+    class _Inline:
+        def __init__(self, target=None, daemon=None, name=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    _D.threading.Thread = _Inline
+    return lambda: setattr(_D.threading, "Thread", real)
+
+
+def _put_engine_in_qa(dr):
+    """让引擎进入 QA 阶段(补池的低压力门要求 phase == QA)。"""
+    dr.engine.start()
+    acts = dr.engine.submit_riddle(
+        "端到端测试用谜面，为什么？", "端到端测试用谜底。",
+        ["提示一", "提示二", "提示三"], title="接线题",
+        signature=good_spec().signature.to_dict(), source="live_generate")
+    dr._dispatch(acts)
+
+
+def test_director_prefetch_end_to_end():
+    """Q9c 验收: 补池生成的题**真的**落进池子, 随后能被 Q8 路径交付。
+
+    这条证明两件事: ① 补池接进了 tick; ② 它生产的库存走的是 Q8 原来
+    那条交付链, 一行没改。
+    """
+    print("\n[C1] Director 补池端到端")
+    import json as _json
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        cfg.puzzle_out_path = os.path.join(d, "arch.jsonl")
+        cfg.pool_min_size = 2
+        cfg.pool_target_size = 5
+        dr = Director(cfg)
+        check("Director 建了 prefetcher", dr._prefetcher is not None)
+        check("prefetcher 拿到了 writer",
+              dr._prefetcher.writer is dr.writer)
+
+        # 换成同步执行器 + 假 writer, 让补池确定地跑
+        pf = dr._prefetcher
+        pf._executor = _SyncExecutor()
+        w = _FakeWriter()
+        pf.writer = w
+
+        check("库存 0(池子空)", dr.pool.stock_count() == 0,
+              dr.pool.stock_count())
+        _put_engine_in_qa(dr)
+        check("已在 QA 阶段", dr.engine.pressure()["phase"] == Phase.QA)
+
+        pf.on_tick()                    # 提交 + 执行(同步)
+        pf.on_tick()                    # 应用结果
+        check("**补池真的生成了**", len(w.calls) >= 1, len(w.calls))
+        check("**池子里有题了**", dr.pool.size() >= 1, dr.pool.size())
+        check("latch 已启动(库存 0 < 低水位)", pf._refill_active is True)
+
+        # 补池入池的题必须带 added_by="prefetch"
+        rec = _json.loads(open(cfg.pool_path, encoding="utf-8").readline())
+        check("**池记录标了 added_by=prefetch**",
+              rec.get("added_by") == "prefetch", rec.get("added_by"))
+
+        # ---- 关键: 它随后能被 Q8 的交付路径取出来, 且 source 仍是 pool ----
+        got = dr.pool.pop_next(recent_signatures=[])
+        check("**Q8 路径能取到补池生产的题**", got is not None)
+        if got is not None:
+            dr.pool.mark_used(got, aired=True)
+        pf.shutdown()
+
+
+def test_scheduler_calls_prefetch():
+    """tick 必须**每拍**调用 on_tick —— 否则补池永远不会自己动。"""
+    print("\n[C2] 调度线程每拍调用补池")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        dr = Director(cfg)
+        calls = {"n": 0}
+
+        class _Rec:
+            def on_tick(self):
+                calls["n"] += 1
+
+            def shutdown(self):
+                pass
+
+        dr._prefetcher = _Rec()
+        # 让调度循环跑**正好一拍**再退出: 不能在进来之前就 set,
+        # 否则 `while not self._stop.is_set()` 压根不进循环。
+        import threading as _th
+        orig_wait = dr._stop.wait
+
+        def _wait_once(timeout=None):
+            dr._stop.set()
+            return True
+
+        dr._stop.wait = _wait_once
+        try:
+            dr._scheduler()
+        finally:
+            dr._stop.wait = orig_wait
+        check("调度跑过后补池被调用过", calls["n"] >= 1, calls["n"])
+
+
+def test_director_no_llm_disables_prefetch_generation():
+    """`--no-llm` 下 writer 为 None -> 补池**彻底不生成**。
+
+    绝不能落进假题分支把兜底题灌进真实题池 —— 那会污染池子。
+    """
+    print("\n[C3] --no-llm 下不生成")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=True)
+        dr = Director(cfg)
+        check("writer 是 None", dr.writer is None)
+        check("prefetcher 存在但会自我禁用",
+              dr._prefetcher is None or dr._prefetcher._enabled() is False,
+              dr._prefetcher)
+        if dr._prefetcher is not None:
+            _put_engine_in_qa(dr)
+            for _ in range(5):
+                dr._prefetcher.on_tick()
+            check("池子没被灌任何东西", dr.pool.size() == 0, dr.pool.size())
+
+
+def test_director_pool_disabled_no_prefetcher():
+    print("\n[C4] pool_enabled=False -> 不建 prefetcher")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_enabled=False)
+        dr = Director(cfg)
+        check("池子是 None", dr.pool is None)
+        check("**prefetcher 也是 None**", dr._prefetcher is None)
+
+
+def test_prefetch_does_not_change_live_blueprint_sequence():
+    """补池用独立 rng: 同一 seed 下, 补池开关不影响 live 的 blueprint 序列。
+
+    这不只是洁癖 —— 若共用 rng, "同 seed 可复现"会退化成
+    "同 seed + 同补池状态可复现", 复盘时根本说不清差异从哪来。
+    """
+    print("\n[C5] 补池不改变 live 的 blueprint 序列")
+    from director import Director
+    seq = {}
+    for prefetch_on in (True, False):
+        with tmpdir() as d:
+            cfg = mkcfg(d, no_llm=False, quality_seed=12345,
+                        pool_prefetch_enabled=prefetch_on)
+            dr = Director(cfg)
+            recent = []
+            out = []
+            for _ in range(5):
+                bp = dr._pick_blueprint(recent)
+                out.append((bp.mechanism_family, bp.solution_shape, bp.domain)
+                           if bp else None)
+                recent.append(bp)
+            seq[prefetch_on] = out
+            if dr._prefetcher is not None:
+                # 让补池也消耗它自己的 rng
+                dr._prefetcher._rng.random()
+            if dr._prefetcher is not None:
+                dr._prefetcher.shutdown()
+    check("**开关补池, live 序列一模一样**",
+          seq[True] == seq[False], f"{seq[True]} vs {seq[False]}")
+
+
+
+def test_pick_blueprint_actually_returns_one():
+    """**回归**: `_pick_blueprint` 必须真的返回 blueprint, 不能是 None。
+
+    这条测试是补上一个**缺失的守门人**。之前的代码里有一行
+    `_detail("blueprint 全文: %s", ...)` 漏传了 logger 参数, 而
+    `_detail` 的第一参数就是 logger —— 于是它每次必抛 AttributeError,
+    被下面那个宽 `except Exception` 吞掉, `_pick_blueprint` **每次都
+    返回 None**。
+
+    后果不是"少一条日志", 而是: 返回 None 会被调用方转成
+    `enforce_blueprint=False`, 也就是 **blueprint 调度(Q4/Q7 的核心)
+    整个静默失效**, 所有题都按"不限形状"生成。而当时没有任何测试
+    断言过"它得返回东西", 所以一直没人发现。
+    """
+    print("\n[C6] _pick_blueprint 真的返回 blueprint(**闭嘴失败回归**)")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, quality_seed=999)
+        dr = Director(cfg)
+        bp = dr._pick_blueprint([])
+        check("**返回的不是 None**", bp is not None,
+              "返回 None = blueprint 调度静默失效")
+        if bp is not None:
+            check("有 mechanism_family", bool(bp.mechanism_family),
+                  bp.mechanism_family)
+            check("有 domain", bool(bp.domain), bp.domain)
+        # 连选多次也要一直有(别是"第一次碰巧")
+        bps = [dr._pick_blueprint([]) for _ in range(5)]
+        check("**连续 5 次都非 None**", all(b is not None for b in bps),
+              [b is None for b in bps])
+        if dr._prefetcher is not None:
+            dr._prefetcher.shutdown()
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -915,6 +1129,13 @@ def main():
         test_disabled_prefetch_is_truly_off,
         test_no_writer_disables_prefetch,
         test_on_tick_never_raises,
+        # C. 接线(端到端)
+        test_director_prefetch_end_to_end,
+        test_scheduler_calls_prefetch,
+        test_director_no_llm_disables_prefetch_generation,
+        test_director_pool_disabled_no_prefetcher,
+        test_prefetch_does_not_change_live_blueprint_sequence,
+        test_pick_blueprint_actually_returns_one,
     ]
     for t in tests:
         t()
@@ -922,7 +1143,7 @@ def main():
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} 项")
         return 1
-    print("PASS: 补池(零件 + 状态机) 全部通过")
+    print("PASS: 补池(零件 + 状态机 + 接线) 全部通过")
     return 0
 
 

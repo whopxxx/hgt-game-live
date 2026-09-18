@@ -186,6 +186,26 @@ class Director:
             # (取到 None, 网关用默认值), 而测试因为 Fake 上有这些字段仍全绿。
             self.writer = PuzzleWriter(client=self.client, runtime_cfg=cfg)
 
+        # ---- Q9: 后台补池 ----
+        # 只在 QA 阶段、零压力、且库存低于低水位时才在后台预生成。
+        # 放在 writer 之后建 —— 它要拿 writer 的引用。(writer 为 None 时
+        # 它自我禁用, 所以 `--no-llm` 下不会去灌假题。)
+        #
+        # 独立的 rng: 与 live 出题分开, 这样"补池开不开"不影响 live 的
+        # blueprint 序列(否则同 seed 也复现不出来, 复盘时说不清)。
+        self._prefetcher = None
+        if self.pool is not None:
+            from story.prefetch import PoolPrefetcher
+            pf_seed = getattr(cfg, "quality_seed", None)
+            pf_rng = random.Random(None if pf_seed is None
+                                   else pf_seed ^ 0x9E3779B9)
+            self._prefetcher = PoolPrefetcher(
+                cfg=cfg, pool=self.pool, writer=self.writer,
+                probe=self.engine.pressure,
+                probe_inputs=self.engine.snapshot_generation_inputs,
+                pick_blueprint=self._pick_blueprint,
+                rng=pf_rng)
+
     # ------------------------------------------------------------------
     def _build_source(self):
         if self.cfg.live_id:
@@ -439,11 +459,16 @@ class Director:
             signature=spec.signature.to_dict(),
             spec=spec, source=source))
 
-    def _pick_blueprint(self, recent: list):
+    def _pick_blueprint(self, recent: list, rng=None):
         """选下一条 blueprint(方案 §11 的 weighted-LRU)。
 
         用固定 seed 的 Random 实例 —— 每次出题都换 seed 会让"同输入不同
         输出", 复盘时无法重现。这里用**进程级** rng, 只保证可注入、可测。
+
+        `rng`: 可选注入。后台补池(Q9)传**它自己的** rng, 这样补池开关
+        不会改变 live 路径的 blueprint 序列(否则"同 seed 可复现"会变成
+        "同 seed + 同补池状态可复现", 复盘时说不清)。默认 None = 用
+        进程级 rng, live 调用点因此完全不受影响。
 
         返回 None 表示**本轮不施加 blueprint 硬约束**(由调用方转成
         `enforce_blueprint=False`)。注意这与"用默认 blueprint"完全不同:
@@ -458,10 +483,17 @@ class Director:
         try:
             from story.quality import Quotas, choose_blueprint
             quotas = Quotas.from_config(self.cfg)
-            bp = choose_blueprint(recent, self._rng, quotas)
+            bp = choose_blueprint(recent, rng or self._rng, quotas)
             log.info("本题 blueprint: %s / %s / %s",
                      bp.mechanism_family, bp.solution_shape, bp.domain)
-            _detail("blueprint 全文: %s", bp.describe())
+            # ⚠️ `_detail(logger, msg, ...)` 的第一个参数是 **logger**。
+            # 早先这里漏传了 logger(只传了格式串), 于是这一行必抛
+            # AttributeError('str' object has no attribute 'isEnabledFor')
+            # —— 而它下面就是那个宽 `except Exception`, 所以后果是
+            # **每一道题的 _pick_blueprint 都返回 None**: blueprint 调度
+            # 整个静默失效, 所有题都按"不限形状"生成。修好之前,
+            # Q4/Q7 的题型分布控制实际上没在跑。
+            _detail(log, "blueprint 全文: %s", bp.describe())
             return bp
         except Exception as e:                       # noqa: BLE001
             # 调度失败不能让出题链断掉 —— 退化成"模型自由发挥"。
@@ -756,6 +788,13 @@ class Director:
                         log.info("补发被推迟的出题请求")
                         self._run_action(
                             self.engine.request_riddle_action("riddle_deferred"))
+                # ---- Q9: 后台补池 ----
+                # **只做决策 + 提交**, 生成在 prefetcher 自己的线程里跑。
+                # 放在 tick 循环之后: 这一拍的动作(可能刚结束一次 REVEAL、
+                # 也可能刚起了新 RIDDLE)已经生效, 再决定补不补。
+                # `on_tick` 契约上绝不抛 —— 补池不能影响直播主循环。
+                if self._prefetcher is not None:
+                    self._prefetcher.on_tick()
                 self.push()
                 pushes_since += 1
                 if self.engine.should_stop():
@@ -801,6 +840,19 @@ class Director:
             st = self.pool.stats()
             print(f"  题池        : {st['available']}/{st['size']} 道可用, "
                   f"已用 {st['used']} (已播 {st['aired']})")
+            # 库存 = 过得了准入门、且未用过的题数。它可能**小于** available
+            # (盘上有、但 signature 被改坏所以播不出来)—— 两个都打,
+            # 免得看到"可用 5 却一道都取不出来"时无从解释。
+            print(f"                库存(可播) {st['stock']} 道"
+                  + ("" if st.get("trustworthy", True)
+                     else "  ⚠️ used 账本不可信 -> 池子本次禁用!"))
+            if self._prefetcher is None:
+                print("  补池        : 关闭(不在 --no-llm 下生成)")
+            elif not getattr(cfg, "pool_prefetch_enabled", True):
+                print("  补池        : 已关闭(--no-prefetch)")
+            else:
+                print(f"  补池        : 低水位 {cfg.pool_min_size} -> "
+                      f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
             print(f"                {os.path.abspath(st['path'])}")
         if cfg.no_llm:
             print("  LLM         : 已禁用(--no-llm), 使用固定文案")
@@ -861,6 +913,10 @@ class Director:
                     pass
             if self._answer_pool:
                 self._answer_pool.shutdown(wait=False)
+            if self._prefetcher is not None:
+                # 不阻塞: 在途生成可能长达 90s(gen_spec 的 budget_s),
+                # 下播不该等它。
+                self._prefetcher.shutdown()
             if self.server:
                 self.server.stop()
             self._close_live_window()
