@@ -291,6 +291,9 @@ class PuzzleSignature:
     domain: str = ""
     emotion_mode: str = ""
     relation: str = ""
+    # 时间形态也进 signature —— 它是要跟 blueprint 严格比对的一维,
+    # 只放在 blueprint 上就没法验模型有没有真的照做。
+    time_shape: str = ""
 
     death: bool = False
     past_trauma: bool = False
@@ -304,6 +307,7 @@ class PuzzleSignature:
             "domain": self.domain,
             "emotion_mode": self.emotion_mode,
             "relation": self.relation,
+            "time_shape": self.time_shape,
             "death": bool(self.death),
             "past_trauma": bool(self.past_trauma),
             "long_term_profession": bool(self.long_term_profession),
@@ -319,6 +323,7 @@ class PuzzleSignature:
             domain=str(d.get("domain", "") or ""),
             emotion_mode=str(d.get("emotion_mode", "") or ""),
             relation=str(d.get("relation", "") or ""),
+            time_shape=str(d.get("time_shape", "") or ""),
             death=bool(d.get("death", False)),
             past_trauma=bool(d.get("past_trauma", False)),
             long_term_profession=bool(d.get("long_term_profession", False)),

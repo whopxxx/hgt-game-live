@@ -177,6 +177,13 @@ class Config:
     pool_target_size: int = 5
     pool_min_size: int = 2
 
+    # ---- Blueprint 调度(方案 §7) ----
+    # **与 pool_enabled 解耦** —— 关掉题池不该顺便关掉"控制题型分布"。
+    # 早先 _pick_blueprint 读的是 pool_enabled, 那是错误的职责耦合:
+    # 一旦将来为了别的理由关掉 pool, 题目多样性会跟着一起失效。
+    quality_scheduler_enabled: bool = True
+    quality_seed: Optional[int] = None    # 固定它可让出题可复现(默认随机)
+
     # ---- 题目分布配额(方案 §10) ----
     # **全部代码判断**, 不写进 reviewer prompt —— 它没有全局状态。
     quality_recent_window: int = 10       # 看最近多少题

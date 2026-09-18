@@ -31,6 +31,7 @@ from . import parser as P
 from .config import LLMConfig
 from .puzzle import (
     DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, SOLUTION_SHAPES,
+    TIME_SHAPES,
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec, SolveAtom,
 )
 from .quality import (
@@ -501,6 +502,12 @@ _HYPOTHESIS_RE = re.compile(
     r"是因为|是不是|说明|所以|因此|由于|为了|导致|"
     r"才会|一定|肯定|应该|等于|意味着|就是|"
     r"因为.{2,}所以|之所以")
+
+
+def _is_v2(spec: "PuzzleSpec") -> bool:
+    """是不是带 signature 的新版 spec。老数据不做严格比对。"""
+    sig = getattr(spec, "signature", None)
+    return bool(sig and (sig.mechanism_family or sig.solution_shape))
 
 
 def _facts_block(spec: "PuzzleSpec") -> str:
@@ -1014,16 +1021,21 @@ _TOOL_RIDDLE = {
                     "domain": {"type": "string", "enum": list(DOMAINS)},
                     "emotion_mode": {"type": "string", "enum": list(EMOTION_MODES)},
                     "relation": {"type": "string", "enum": list(RELATIONS)},
+                    "time_shape": {"type": "string", "enum": list(TIME_SHAPES)},
                     "death": {"type": "boolean"},
                     "past_trauma": {"type": "boolean"},
                     "long_term_profession": {"type": "boolean"},
                     "repeated_ritual": {"type": "boolean"},
                 },
                 "required": ["mechanism_family", "solution_shape", "domain",
-                             "relation", "death"],
+                             "relation", "emotion_mode", "time_shape",
+                             "death", "past_trauma", "long_term_profession",
+                             "repeated_ritual"],
                 "description": (
                     "这道题**实际**是什么形状。必须如实回传 —— 代码会拿它"
-                    "跟 blueprint 硬约束比对, 不一致会被拒。"),
+                    "跟 blueprint **逐项严格比对**, 任何一项不一致都会被拒。"
+                    "别为了通过而照抄 blueprint: 那样最终登记的是假指纹, "
+                    "跨题配额会被污染。"),
             },
         },
         "required": ["puzzle", "answer", "hints", "facts", "solve_atoms",
@@ -1106,51 +1118,90 @@ _TOOL_REVEAL = {
 
 _TOOL_CHECK = {
     "name": "emit_review",
-    "description": "审阅这个谜题: 合格就通过, 不合格就**直接改好**",
+    "description": (
+        "审阅这个谜题, 并给出 **pass / fix / rewrite** 三选一的决定。"
+        "改动核心机制时, 必须把 facts / solve_atoms / fair_clues / "
+        "observed_signature **一起重出** —— 它们是一套, 不能只改谜底。"),
     "input_schema": {
         "type": "object",
         "properties": {
-            "ok": {"type": "boolean", "description": "谜题是否已经合格"},
+            "decision": {
+                "type": "string",
+                "enum": ["pass", "fix", "rewrite"],
+                "description": (
+                    "pass    = 结构与逻辑都没明显问题, 原样通过。\n"
+                    "fix     = 只做**局部修复**(第一人称/没结尾问句/某句泄底/"
+                    "提示剧透/措辞不清/小范围 fact-atom 不一致)。\n"
+                    "rewrite = **推倒重出**。这些情况只能 rewrite: "
+                    "没有公平推理路径 / 谜底依赖题面完全不存在的私人历史 / "
+                    "核心机关本身不成立 / 多个互不相关机关硬拼 / "
+                    "违反 Blueprint / 机制与最近题高度重复 / "
+                    "答案不能唯一稳定解释反常点。\n"
+                    "⚠ 选 rewrite 时**不要**试图修补 —— 交回生成器重出。"),
+            },
+            "issues": {
+                "type": "array", "items": {"type": "string"},
+                "description": "发现的问题清单(每条一句)。pass 时留空。",
+            },
+            "rewrite_reason": {
+                "type": "string",
+                "description": (
+                    "decision=rewrite 时必填: 为什么必须推倒重出"
+                    "(生成器会照着它换一个骨架)。"),
+            },
             "puzzle": {"type": "string",
-                       "description": "修好的谜面。合格时原样回传"},
+                       "description": "修好的谜面。pass 时原样回传"},
             "answer": {"type": "string",
-                       "description": "修好的谜底。合格时原样回传"},
+                       "description": "修好的谜底。pass 时原样回传"},
             "hints": {"type": "array", "items": {"type": "string"},
-                      "description": "修好的 3 条提示。合格时原样回传"},
+                      "description": "修好的 3 条提示。pass 时原样回传"},
+            "facts": {
+                "type": "array", "minItems": 4, "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "原样回传"},
+                        "text": {"type": "string"},
+                        "kind": {"type": "string",
+                                 "enum": ["core", "support", "exclusion"]},
+                        "visibility": {"type": "string",
+                                       "enum": ["public", "hidden"]},
+                        "hintable": {"type": "boolean"},
+                    },
+                    "required": ["id", "text", "kind"],
+                },
+                "description": (
+                    "事实表 —— **正式 Q&A 的判定依据**。改了 answer 或核心机制"
+                    "就必须重出这一整组, 否则主持人会依据**过期事实**回答观众"
+                    "(比以前'只看文学谜底'更危险, 因为现在会非常自信)。"
+                    "没动核心就原样回传。"),
+            },
             "solve_atoms": {
                 "type": "array", "minItems": 2, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string",
-                               "description": "原样回传。改了谜底要重出时, "
-                                              "重新编 a1/a2… 但要与 fact_ids 自洽"},
+                               "description": "原样回传; 重出时重编 a1/a2…"},
                         "role": {
                             "type": "string",
                             "enum": ["cause", "mechanism", "support"],
                             "description": "cause = 反常的起因; "
-                                           "mechanism = 这个起因如何导致那个反常行为; "
-                                           "support = 补充事实(可选)",
+                                           "mechanism = 这个起因如何导致那个反常行为",
                         },
-                        "text": {"type": "string",
-                                 "description": "这条原子事实, 一句话"},
+                        "text": {"type": "string"},
                         "fact_ids": {
                             "type": "array", "items": {"type": "string"},
-                            "description": "这条 atom 依据的 fact id(必须存在于 facts)",
+                            "description": "依据的 fact id(必须存在于 facts)",
                         },
-                        "required": {
-                            "type": "boolean",
-                            "description": "是否通关必需(默认 true)",
-                        },
+                        "required": {"type": "boolean"},
                     },
                     "required": ["role", "text"],
                 },
                 "description": (
-                    "玩家必须说中的 2-4 条原子事实。**结构与生成器完全一致**"
-                    "(role + text, 可带 id/fact_ids) —— 以前这里是 string[], "
-                    "审稿人一回传 role 就退化了。必须恰好有一条 cause 和一条 "
-                    "mechanism。只要改动了 answer 或核心机制, 必须**重新生成**"
-                    "这组; 没动就原样回传(含 id 与 fact_ids)。"),
+                    "玩家必须说中的 2-4 条原子事实。**必须恰好一条 cause 和"
+                    "一条 mechanism**。改了核心就重出这一组; 没动就原样回传"
+                    "(含 id 与 fact_ids)。"),
             },
             "fair_clues": {
                 "type": "array", "minItems": 1, "maxItems": 4,
@@ -1160,63 +1211,95 @@ _TOOL_CHECK = {
                         "quote": {
                             "type": "string",
                             "description": "谜面里**逐字**摘录的原文"
-                                           "(代码会验证它真的在谜面里)",
+                                           "(代码会验证它真的在改后的谜面里)",
                         },
                         "supports_atoms": {
                             "type": "array", "items": {"type": "string"},
-                            "description": "这段原文指向哪条 atom 的 id",
+                            "description": "指向哪条 atom 的 id(必填)",
                         },
                     },
-                    "required": ["quote"],
+                    "required": ["quote", "supports_atoms"],
                 },
                 "description": (
                     "谜面原文里已经写着、回看能指向谜底的具体事实。"
-                    "修改后**必须至少保留一条**, 而且要**逐字**出自改后的谜面"
-                    "(代码会验证, 不通过就重出); 不许为了'避免泄底'而"
-                    "把可回溯的线索全删光。"),
+                    "改完后**必须至少保留一条**, 且**必须支持某条 required "
+                    "atom** —— 否则这道题就没有公平推理路径, 应该 rewrite。"),
+            },
+            "observed_signature": {
+                "type": "object",
+                "properties": {
+                    "mechanism_family": {"type": "string",
+                                         "enum": list(MECHANISM_FAMILIES)},
+                    "solution_shape": {"type": "string",
+                                       "enum": list(SOLUTION_SHAPES)},
+                    "domain": {"type": "string", "enum": list(DOMAINS)},
+                    "emotion_mode": {"type": "string", "enum": list(EMOTION_MODES)},
+                    "relation": {"type": "string", "enum": list(RELATIONS)},
+                    "time_shape": {"type": "string", "enum": list(TIME_SHAPES)},
+                    "death": {"type": "boolean"},
+                    "past_trauma": {"type": "boolean"},
+                    "long_term_profession": {"type": "boolean"},
+                    "repeated_ritual": {"type": "boolean"},
+                },
+                "description": (
+                    "**改完之后**这道题实际是什么形状。必须**如实重新判断**, "
+                    "不要照抄原稿 —— 如果你把一道 hidden_function 的题改成了"
+                    "创伤题材, 这里就要写 past_trauma_explains_current_ritual。"
+                    "代码会用它做跨题配额, 报假的会污染全局分布。"),
             },
             "note": {"type": "string",
-                     "description": "改了什么、为什么(合格则留空)"},
+                     "description": "改了什么、为什么(一句话)"},
         },
-        "required": ["ok", "solve_atoms", "fair_clues"],
+        "required": ["decision", "observed_signature"],
     },
 }
 
-CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读一遍, 有问题就**直接改好**。
+CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix / rewrite** 三选一。
 
-三条标准:
-① 谜面是**第三人称**陈述的一件具体的事, **结尾有一个问句**。
-   第一人称叙事("深夜我独自在家, 座机响了") -> 改成第三人称。
-   只叙述、不问 -> 末尾补一个问句。
-② 谜底**直接解释**了谜面的反常点。换个原因也说得通(靠"恰好") -> 改成只能是这样。
-   谜底讲的是"另一段情节"、答非所问 -> 改成正面回答。
-③ **盖住谜底, 只读谜面, 自己猜一遍。**
-   一读就猜出答案 -> 谜面写得太白, 删掉那些**直接把答案说出口**的词。
-   (典型泄露: 谜面末句把结果演完了; 谜面里出现了答案的关键词;
-    提示直接指向谜底核心)
+═══ pass: 通过 ═══
+结构和逻辑都没明显问题。原样回传, 别为了改而改。
 
-   ⚠ **但不要连"可回溯的线索"一起删掉。**
-   删的是"答案本身", 留的是"知道答案后回看能指向它的事实"。
-   改完后谜面里**必须至少还剩一条这样的线索**(见 fair_clues)——
-   否则题目会变成"答案完全依赖题面外的私人往事", 观众无从推理, 只能
-   靠猜套路。这两者的区别:
-     ✗ 该删: "他明白同伴把水换成了沙子"      (答案说出口了)
-     ✓ 该留: "他倒过水壶, 一滴水都没有"      (回看才知道为什么要倒)
+═══ fix: 局部修复 ═══
+**只改该改的地方, 其余一律保留原样。** 适合这些:
+- 第一人称叙事 -> 改成第三人称
+- 只叙述、结尾没有问句 -> 末尾补一个问句
+- 某句把答案说出口了 -> 删掉那一句(但见下面 ⚠)
+- 提示剧透了 -> 换成方向性的
+- 措辞不清 -> 说清楚
+- 小范围 fact/atom 不一致 -> 对齐
 
-**只看这一道题本身:**
-④ 这道题只有悲情、没有意外吗? 观众要的是"啊？？"然后"哦——原来如此",
-   不是"哦…挺惨的"。**只判断这一道**, 并在 note 里说明。
-   ⚠ **不要**去评判"最近连续几题都是……" —— 你**看不到**别的题,
-   全局分布由代码层控制(见方案 §19)。凭猜测去改只会改错。
+⚠ **不要连"可回溯的线索"一起删掉。**
+删的是"答案本身", 留的是"知道答案后回看能指向它的事实"。
+改完后谜面里**必须至少还剩一条这样的线索**(见 fair_clues):
+  ✗ 该删: "他明白同伴把水换成了沙子"   (答案说出口了)
+  ✓ 该留: "他倒过水壶, 一滴水都没有"   (回看才知道为什么要倒)
 
-**你的任务是改, 不是退。** 只在原稿上动该动的地方, 其余一律保留原样。
-改完在 note 里用一句话说明改了什么。
+═══ rewrite: 推倒重出 ═══
+**这些情况不要试图修补 —— 交回生成器换一个骨架:**
+- 没有公平推理路径(谜面里找不到任何能指向谜底的抓手)
+- 谜底依赖**题面完全不存在的私人往事**
+- 核心机关本身不成立(物理/逻辑上讲不通)
+- 多个互不相关的机关硬拼在一起
+- 违反本题的 Blueprint 硬约束
+- 答案不能唯一、稳定地解释那个反常点
 
-⚠ **改动 answer 或核心机制时**: solve_atoms / fair_clues 必须**重新生成**
-并且彼此自洽(atoms 的 fact_ids 要指向真实存在的 fact; clues 的 quote 要
-**逐字**来自改后的谜面)。没动核心就原样带回, 包括 id 与 fact_ids。
+选 rewrite 时填 `rewrite_reason`, **不要**给 puzzle/answer。
 
-合格的稿子(包括设定离奇、信息隐藏、需要猜的)就 ok=true 并原样回传。"""
+═══ 改了核心就必须重出整套 ═══
+facts / solve_atoms / fair_clues / observed_signature 是**一套**。
+只要你改动了 answer 或核心机制:
+- `facts` 必须重出 —— 它是**正式 Q&A 的判定依据**。留着旧事实表
+  会让主持人依据**过期事实**回答观众, 比以前更危险, 因为现在很自信。
+- `solve_atoms` 必须重出, 且 fact_ids 要指向**新的** fact id。
+- `fair_clues` 的 quote 必须**逐字**出自**改后的**谜面(代码会验)。
+- `observed_signature` 必须**如实重新判断** —— 你把题改成了什么形状
+  就写什么。**不要照抄原稿**, 那是给跨题配额用的, 报假的会污染全局分布。
+
+没动核心就原样回传它们(含 id 与 fact_ids)。
+
+**只看这一道题。** 不要去评判"最近连续几题都是……" —— 你**看不到**
+别的题, 全局分布由代码层控制。凭猜测去改只会改错。
+"""
 
 
 _TOOL_JUDGE = {
@@ -1279,9 +1362,20 @@ class PuzzleWriter:
 
     全部走**强制工具调用**: 模型必须返回 schema 校验过的 JSON, 因此
     **不再需要宽容解析**(只在工具调用不可用时才回退到文本解析)。
+
+    `runtime_cfg` 必须是**运行时的 `Config`**(不是 `LLMConfig`)。
+
+    为什么要单独一个字段: temperature 与 quota 都定义在 `Config` 上, 而
+    `client.cfg` 是 `LLMConfig`。早先直接读 `client.cfg`, 于是生产环境里
+    `getattr(llm_cfg, "generate_temperature", None)` 恒为 `None` ——
+    参数**静默失效**, 而测试因为 Fake 替身上恰好有这些字段而全绿。
+    这正是"Fake 比 production 更完整"的典型。现在显式分开:
+        client.cfg   -> 传输层(base_url/key/model/timeout/retry)
+        runtime_cfg  -> 业务层(temperature/quota/window)
     """
 
     client: AnthropicMessagesClient
+    runtime_cfg: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -1368,15 +1462,18 @@ class PuzzleWriter:
             # ---- ③ reviewer(需要语义理解的才交给它) ----
             # 格式问题(人称/问句/meta)作为 must_fix 点名让它改 ——
             # 这三样都是"改一句话", 重出整题是浪费。
-            spec, why, gave_up = self._review_spec(
+            reviewed, why, need_rewrite = self._review_spec(
                 spec, bp, must_fix=vr.must_fix())
-            if gave_up:
-                log.info("出题第 %d 稿审稿没给出可用结果: %s", attempts, why[:80])
-                _remember(seen_why, why[:120])
+            if reviewed is None:
+                # 审稿人说 rewrite(或没给出可用结果) -> 换骨架重出。
+                # **不修补** —— 这才是"结构性烂题"的出口(方案 §18)。
+                log.info("出题第 %d 稿被要求重出: %s", attempts, why[:100])
+                _remember(seen_why, "推倒重出: " + why[:120])
                 bad.append(spec.puzzle)
                 last = spec
-                last.error = f"审稿未通过: {why}"
+                last.error = f"审稿要求重出: {why}"
                 continue
+            spec = reviewed
             # ---- ④ 改完之后**再走一遍硬校验**(方案 §20) ----
             # 这一遍必须**完全干净**: 上一轮 fixable 的问题若还在, 说明
             # 审稿人没改掉, 不能再放行(否则第一人称会一路溜到直播上)。
@@ -1391,9 +1488,14 @@ class PuzzleWriter:
                 last.error = f"改稿后仍不合格: {why2}"
                 continue
             # ---- ⑤ 跨题门(全局分布, 方案 §20) ----
-            xbad = cross_puzzle_gate(spec, recent,
-                                     Quotas.from_config(self._cfg()) if self._cfg()
-                                     else None, bp)
+            # quota 必须从 **runtime Config** 读。早先读的是 LLMConfig,
+            # 于是用户在 Config 里调 quota_death 之类**完全不生效** ——
+            # 而且同一题会出现两套 policy(director 选 blueprints 用真的,
+            # 这里 gate 用默认的)。
+            rcfg = self._cfg()
+            xbad = cross_puzzle_gate(
+                spec, recent,
+                Quotas.from_config(rcfg) if rcfg is not None else None, bp)
             if xbad:
                 log.info("出题第 %d 稿不过跨题门: %s", attempts, xbad[:120])
                 _remember(seen_why, "跨题重复: " + "; ".join(xbad)[:120])
@@ -1415,14 +1517,47 @@ class PuzzleWriter:
                      attempts, _t.monotonic() - t0, spec.puzzle[:40])
             return spec
 
-        if last is None:
-            last = PuzzleSpec(error="未尝试")
-        return last
+        # ---- 重试耗尽: **绝不能**把被拒的稿子当结果返回 ----
+        #
+        # 这是最危险的一条路径(方案 review Blocker 1): 早先这里 `return last`,
+        # 而 last 带着 puzzle/answer 和一个 error 字符串。director 只看
+        # `spec.puzzle` 非空就上直播 —— 于是"连续 4 稿都因跨题重复被拒"
+        # 的最后那稿会**照常播出**, Q4 的跨题去重等于形同虚设。
+        #
+        # 质量系统明确拒绝的题, 绝不能反过来变成兜底。
+        # "永不开天窗"的职责在 engine: 它有自己的重试 + 固定兜底谜题。
+        err = (last.error if last is not None else None) or "没有生成合格谜题"
+        log.warning("出题失败(%d 稿均未通过), 交回引擎走兜底: %s",
+                    attempts, err[:120])
+        return PuzzleSpec(
+            error=err,
+            usage=getattr(last, "usage", None),
+            model=getattr(last, "model", None))
 
     # ------------------------------------------------------------------
     def _cfg(self) -> Optional[Any]:
-        """取 LLMConfig(只用于读 quota 字段, 没有就返回 None)。"""
-        return getattr(self.client, "cfg", None)
+        """取**运行时 Config**(temperature / quota 都在这上面)。
+
+        绝不要退回 `client.cfg` —— 那是 `LLMConfig`, 没有这些字段,
+        取到的会是 `None` 并静默使用网关默认值。
+        """
+        return self.runtime_cfg
+
+    def _temperature(self, name: str,
+                     default: Optional[float] = None) -> Optional[float]:
+        """读一个 temperature 配置。
+
+        **未配置时返回 None**(而不是静默用 0) —— `messages()` 见到 None
+        就不把该参数发出去, 网关行为保持原样。这样"没配"和"配成 0"是
+        两件不同的事, 不会被混为一谈。
+        """
+        cfg = self._cfg()
+        if cfg is None:
+            log.warning("temperature(%s) 未生效: PuzzleWriter 没拿到 runtime "
+                        "Config —— Director 装配时漏了 runtime_cfg=cfg", name)
+            return default
+        v = getattr(cfg, name, None)
+        return default if v is None else float(v)
 
     # ------------------------------------------------------------------
     def gen_riddle(self, avoid: Optional[list] = None, check: bool = True,
@@ -1471,8 +1606,8 @@ class PuzzleWriter:
         user += "\n\n直接给出新谜题。"
         res = self.client.messages(RIDDLE_SYSTEM, user, max_tokens=3500,
                                    tool=_TOOL_RIDDLE,
-                                   temperature=getattr(
-                                       self._cfg(), "generate_temperature", None))
+                                   temperature=self._temperature(
+                                       "generate_temperature"))
         if res.tool_input:
             d = _unwrap_tool_input(res.tool_input)
             spec = _spec_from_tool(d, blueprint=bp)
@@ -1511,16 +1646,23 @@ class PuzzleWriter:
     def _review_spec(self, spec: PuzzleSpec,
                      blueprint: Optional[PuzzleBlueprint] = None,
                      must_fix: str = ""
-                     ) -> tuple[PuzzleSpec, str, bool]:
-        """交给审稿人。返回 (spec, 说明, 是否放弃)。
+                     ) -> tuple[Optional[PuzzleSpec], str, bool]:
+        """交给审稿人。返回 (新 spec 或 None, 说明, 是否要推倒重出)。
 
-        Q2 阶段 reviewer 仍是 ok=True/False 协议(Q3 才升级成
-        pass/fix/rewrite), 但**已经把 spec 整体喂进去、整体收回来** ——
-        所以 facts/blueprint 不会在这一步丢。
+        审稿人是 **pass / fix / rewrite** 三选一(方案 §17/§18):
+
+        - `pass`   -> 原样返回 spec, 第三个返回值为 False。
+        - `fix`    -> 用改稿, 但要**整套同步**: facts / atoms / clues /
+          signature 若审稿人给了就用它的。改了 answer 而 facts 不跟着变,
+          正式 Q&A 会依据**过期事实**回答观众 —— 比"只看文学谜底"更危险,
+          因为现在系统会非常自信。
+        - `rewrite` -> 返回 (None, reason, True), 上层**重新生成一道新题**。
+          这是"结构性烂题"的唯一出口: 没有公平推理路径、依赖题面外的
+          私人往事、违反 blueprint 等。不修补, 直接换骨架。
+
+        第三个返回值是"要不要重出"。
         """
         bp = blueprint or spec.blueprint
-        atoms = spec.atom_lines()
-        clues = _clue_quotes(spec.fair_clues)
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"
                 f"【提示】{' / '.join(spec.hints) or '(空)'}")
@@ -1528,72 +1670,121 @@ class PuzzleWriter:
             user += "\n【facts(判定依据)】\n" + "\n".join(
                 f"{f.id} [{f.kind}/{f.visibility}] {f.text}" for f in spec.facts)
         if spec.solve_atoms:
-            # 带上 id 与 fact_ids —— 审稿人要**原样回传**它们, 只给 role/text
-            # 的话它无从知道 id 是什么, 回传时只能编新的(或干脆不写)。
-            user += ("\n【现有 solve_atoms(改了谜底就重出, 否则原样带回, "
+            # 带上 id 与 fact_ids —— 审稿人要**原样回传**它们
+            user += ("\n【现有 solve_atoms(改了核心就重出, 否则原样带回, "
                      "**含 id 与 fact_ids**)】\n"
                      + "\n".join(
                          f"{i}. [{a.role}] {a.text}  "
                          f"(id={a.id}, facts={a.fact_ids or '[]'})"
                          for i, a in enumerate(spec.solve_atoms)))
-        if clues:
+        if spec.fair_clues:
             user += ("\n【现有 fair_clues(必须至少保留一条, quote 要逐字出自谜面)】\n"
-                     + "\n".join(
-                         f"- \"{c.quote}\" → {c.supports_atoms or []}"
-                         for c in spec.fair_clues))
+                     + "\n".join(f'- "{c.quote}" -> {c.supports_atoms or []}'
+                                  for c in spec.fair_clues))
+        if spec.signature and _is_v2(spec):
+            user += ("\n【现有 observed_signature(改完核心就**如实重判**, "
+                     "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
+                                                   ensure_ascii=False))
         user += ("\n\n【本题 Blueprint 硬约束(题若违反它就是不合格)】\n"
                  + bp.describe())
 
         # 代码已经确定的毛病, 直接点名让它改
-        hard = ""
-        if _is_first_person_story(spec.puzzle):
-            hard = "谜面是第一人称叙事, 改成第三人称客观事实"
-        elif not _has_closing_question(spec.puzzle):
-            hard = "谜面结尾没有问句, 末尾补一句'为什么?'之类的提问"
+        hard = must_fix or ""
+        if not hard:
+            if _is_first_person_story(spec.puzzle):
+                hard = "谜面是第一人称叙事, 改成第三人称客观事实"
+            elif not _has_closing_question(spec.puzzle):
+                hard = "谜面结尾没有问句, 末尾补一句'为什么?'之类的提问"
         if hard:
             user += f"\n\n【已知问题, 必须改掉】{hard}"
 
         res = self.client.messages(CHECK_SYSTEM, user, max_tokens=3500,
                                    tool=_TOOL_CHECK,
-                                   temperature=getattr(
-                                       self._cfg(), "review_temperature", None))
+                                   temperature=self._temperature(
+                                       "review_temperature"))
         ti = _unwrap_tool_input(res.tool_input)
-        if not isinstance(ti, dict) or "ok" not in ti:
-            return spec, res.error or "审稿拿到空/无效 tool_input", True
-        note = str(ti.get("note", "") or "")
-        new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
-        if ti.get("ok") and not hard:
-            return spec, note, False
-        if ti.get("ok") and hard:
-            # 硬规则点名要改: 审稿人说 ok 也不算, 必须给出改后的谜面
-            if not new_p or new_p == spec.puzzle:
-                return spec, f"审稿未处理已知问题: {hard}", True
-        if not new_p or not _looks_chinese(new_p):
-            return spec, note or "审稿未给出改稿", True
+        if not isinstance(ti, dict) or not ti.get("decision"):
+            # 老网关可能仍回 ok=bool —— 兼容一下, 别让整条链断掉
+            if isinstance(ti, dict) and "ok" in ti:
+                ti = dict(ti)
+                ti["decision"] = "pass" if ti.get("ok") else "fix"
+            else:
+                return None, res.error or "审稿拿到空/无效 tool_input", True
 
-        # ---- 把改稿合并回来。**保住 facts/atoms/clues** ----
-        fixed = PuzzleSpec(
-            title=spec.title, puzzle=new_p,
-            answer=str(ti.get("answer", "") or "").strip() or spec.answer,
+        decision = str(ti.get("decision", "")).strip().lower()
+        note = str(ti.get("note", "") or "")
+        issues = [str(x).strip() for x in (ti.get("issues") or []) if str(x).strip()]
+
+        # ---- rewrite: 不修补, 交回生成器 ----
+        if decision == "rewrite":
+            reason = str(ti.get("rewrite_reason", "") or "").strip() or note
+            return None, reason or "审稿要求推倒重出", True
+
+        if decision not in ("pass", "fix"):
+            return None, f"审稿返回未知 decision: {decision!r}", True
+
+        # ---- pass: 但代码点名要改的必须真的改了 ----
+        if decision == "pass":
+            if hard:
+                new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
+                if not new_p or new_p == spec.puzzle:
+                    return None, f"审稿称 pass 但未处理已知问题: {hard}", True
+                return self._apply_review(spec, ti, bp, new_p), note, False
+            return spec, note, False
+
+        # ---- fix: 必须有改后的谜面 ----
+        new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
+        if not new_p or not _looks_chinese(new_p):
+            return None, note or "审稿未给出改稿", True
+        if hard and new_p == spec.puzzle:
+            return None, f"审稿未处理已知问题: {hard}", True
+        return self._apply_review(spec, ti, bp, new_p), note or "审稿已修改", False
+
+    @staticmethod
+    def _apply_review(spec: PuzzleSpec, ti: dict,
+                      bp: PuzzleBlueprint, new_puzzle: str) -> PuzzleSpec:
+        """把审稿返回合并进 spec。**facts/atoms/clues/signature 一起同步**。
+
+        这是 Blocker 5/6 的修复点: 以前只接 puzzle/answer/atoms/clues,
+        facts 与 signature 一律沿用原稿 —— 于是审稿人改了核心机制之后,
+        Q&A 还在用旧事实表, 配额还在记旧指纹。
+        """
+        new_answer = str(ti.get("answer", "") or "").strip() or spec.answer
+
+        # ---- facts: 给了就用, 没给且**谜底没变**才沿用 ----
+        facts = [PuzzleFact.from_dict(f) for f in (ti.get("facts") or [])]
+        if not facts:
+            facts = list(spec.facts)
+
+        # ---- atoms: 同上 ----
+        atoms = [SolveAtom.from_dict(a, i)
+                 for i, a in enumerate(ti.get("solve_atoms") or [])]
+        if not atoms:
+            atoms = list(spec.solve_atoms)
+
+        # ---- clues: 同上 ----
+        clues = [FairClue.from_dict(c) for c in _norm_clues(ti.get("fair_clues"))]
+        if not clues:
+            clues = list(spec.fair_clues)
+
+        # ---- signature: 审稿人的 observed_signature 优先 ----
+        # 它读过改后的题, 比原稿的指纹更可信 —— 而配额就靠这个。
+        obs = ti.get("observed_signature")
+        if isinstance(obs, dict) and (obs.get("mechanism_family")
+                                      or obs.get("solution_shape")):
+            sig = PuzzleSignature.from_dict(obs)
+        else:
+            sig = spec.signature
+
+        return PuzzleSpec(
+            id=spec.id, title=spec.title, puzzle=new_puzzle, answer=new_answer,
+            facts=facts, solve_atoms=atoms, fair_clues=clues,
             hints=[str(h).strip() for h in (ti.get("hints") or [])
                    if str(h).strip()][:3] or list(spec.hints),
-            facts=list(spec.facts),
-            solve_atoms=[SolveAtom.from_dict(a, i)
-                         for i, a in enumerate(ti.get("solve_atoms") or [])]
-            or list(spec.solve_atoms),
-            fair_clues=[FairClue.from_dict(c)
-                        for c in (ti.get("fair_clues") or [])]
-            or list(spec.fair_clues),
-            blueprint=bp, signature=spec.signature,
+            blueprint=bp, signature=sig,
             prompt_version=spec.prompt_version,
             quality_policy_version=spec.quality_policy_version,
             usage=spec.usage, model=spec.model)
-        # 审稿人常把 fair_clues 写成纯字符串数组 —— _norm_clues 已兼容。
-        if not fixed.solve_atoms:
-            fixed.solve_atoms = list(spec.solve_atoms)
-        if not fixed.fair_clues:
-            fixed.fair_clues = list(spec.fair_clues)
-        return fixed, note or "审稿已修改", False
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -1630,8 +1821,8 @@ class PuzzleWriter:
         )
         res = self.client.messages(ANSWER_SYSTEM, user, max_tokens=1500,
                                    tool=_TOOL_ANSWER,
-                                   temperature=getattr(
-                                       self._cfg(), "answer_temperature", None))
+                                   temperature=self._temperature(
+                                       "answer_temperature"))
         results: list[QAResult] = []
         if res.tool_input:
             for a in (_unwrap_tool_input(res.tool_input).get("answers") or []):
@@ -1648,11 +1839,19 @@ class PuzzleWriter:
                 if answer and _leaks_answer(cm, answer):
                     log.info("点评泄露谜底, 已丢弃: %r", cm[:30])
                     cm = ""
+                # ---- candidate 的确定性兜底(方案 review P1) ----
+                # 只信模型自报, 一旦它把**完整答案**误判成 false, Final Judge
+                # 永远看不到它 —— 观众明明说全了, 系统只回"是", 非常伤体验。
+                # 这里宁可多调一次裁判(多花的是一次 LLM 调用), 也不能漏判。
+                cand = bool(a.get("solution_candidate")) or _looks_like_solution(text)
+                if cand and not a.get("solution_candidate"):
+                    log.info("模型未标为候选, 但句式像完整解 -> 仍送裁判: %r",
+                             text[:40])
                 results.append(QAResult(
                     qid=qid, verdict=v, comment=cm,
-                    touched_fact_ids=[str(x) for x in
-                                      (a.get("touched_fact_ids") or [])],
-                    solution_candidate=bool(a.get("solution_candidate"))))
+                    touched_fact_ids=self._clean_fact_ids(
+                        a.get("touched_fact_ids"), spec),
+                    solution_candidate=cand))
         elif res.text:
             # 回退: 文本解析(工具调用不可用时)。
             # 这条路拿不到 candidate -> **保守地认为可能是候选**?
@@ -1698,6 +1897,23 @@ class PuzzleWriter:
                 r0.verdict = P.UNAVAILABLE
                 r0.status = "unavailable"
         return results, res.error
+
+    @staticmethod
+    def _clean_fact_ids(raw, spec: "PuzzleSpec") -> list:
+        """只保留**真实存在**的 fact id。
+
+        模型经常随手编一个 `f999`。Q6 的提示系统会依赖这个集合来选
+        "还没探索过的方向", 混进假 id 会让它挑不到东西(或挑错)。
+        """
+        known = {f.id for f in (spec.facts or [])}
+        out = []
+        for x in (raw or []):
+            fid = str(x).strip()
+            if fid and fid in known and fid not in out:
+                out.append(fid)
+        if raw and not out and known:
+            log.debug("touched_fact_ids 全部非法, 已清空: %r", raw)
+        return out
 
     def _spec_from_args(self, puzzle: str, answer: str,
                         solve_atoms: Optional[list],
@@ -1760,7 +1976,9 @@ class PuzzleWriter:
                 f"观众的提问：{text}\n\n"
                 f"这条提问覆盖了哪些？请逐项判断。")
         res = self.client.messages(JUDGE_SYSTEM, user, max_tokens=1200,
-                                   tool=_TOOL_JUDGE)
+                                   tool=_TOOL_JUDGE,
+                                   temperature=self._temperature(
+                                       "judge_temperature"))
         ti = _unwrap_tool_input(res.tool_input) if res.tool_input else None
         if isinstance(ti, dict) and "cause_hit" in ti:
             is_guess = bool(ti.get("is_guess", True))

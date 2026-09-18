@@ -570,6 +570,27 @@ class RoundEngine:
             return []
         return self._riddle_failed_locked(now, "出题超时")
 
+    def _riddle_action_locked(self, reason: str,
+                              attempt: int = 0) -> EngineAction:
+        """构造 RIDDLE 动作 —— **首轮与重试必须走同一个函数**。
+
+        早先重试时只带 `reason`+`attempt`, 把 `avoid` 和
+        `recent_signatures` 丢了。后果很隐蔽:
+          - director 收到 `recent_signatures=[]` -> Blueprint Scheduler
+            以为"前面一道题都没播过", 配额失效;
+          - `avoid=None` -> 文本去重也失效。
+        也就是说**只要发生一次外层 retry, 就能绕过整个 Q4**。
+        """
+        p = {"reason": reason,
+             "avoid": list(self._used_titles[-8:]),
+             # **转成 dict** —— 这些会经 director 传给 quality 层, 而
+             # payload 是"可序列化的动作描述", 不该塞自定义对象进去
+             # (测试里 `.get()` 会直接炸)。
+             "recent_signatures": [s.to_dict() for s in self._recent_signatures]}
+        if attempt:
+            p["attempt"] = attempt
+        return EngineAction(ActionKind.RIDDLE, p)
+
     def _riddle_failed_locked(self, now: float, why: str) -> list[EngineAction]:
         self._setting_attempts += 1
         self.last_error = why
@@ -583,8 +604,8 @@ class RoundEngine:
                                       title="海龟汤", now=now)
         log.warning("出题失败(%s), 重试 %d/%d", why, self._setting_attempts,
                     self.cfg.riddle_max_attempts)
-        return [EngineAction(ActionKind.RIDDLE, {
-            "reason": "riddle_retry", "attempt": self._setting_attempts})]
+        return [self._riddle_action_locked("riddle_retry",
+                                           self._setting_attempts)]
 
     def _tick_qa_locked(self, now: float) -> list[EngineAction]:
         acts: list[EngineAction] = []
@@ -726,9 +747,7 @@ class RoundEngine:
         # 把最近的指纹交给 director —— blueprint 选择与跨题配额都在**代码层**
         # 决定(方案 §7/§10): 先选好硬约束再让模型照着设计, 而不是写一句
         # "换个完全不同的题材"然后指望它理解什么叫"不同"。
-        acts.append(EngineAction(ActionKind.RIDDLE, {
-            "reason": reason, "avoid": list(self._used_titles[-8:]),
-            "recent_signatures": list(self._recent_signatures)}))
+        acts.append(self._riddle_action_locked(reason))
         return acts
 
     def _remember_signature_locked(self, signature) -> None:

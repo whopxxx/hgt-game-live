@@ -34,6 +34,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -155,7 +156,14 @@ class Director:
         self._archive_failed = False
         # blueprint 调度用的随机源。**不要用全局 random** —— 出题在 worker
         # 线程里跑, 用模块级 random 会和其他代码互相干扰, 复盘也无法重现。
-        self._rng = random.Random()
+        # quality_seed 给了就固定(可复现), 否则用系统随机种子。
+        seed = getattr(cfg, "quality_seed", None)
+        self._rng = random.Random(seed)
+        if seed is not None:
+            log.info("blueprint 调度使用固定 seed=%s(可复现)", seed)
+        # 出题 worker 因锁被占而推迟时的标志 —— 下一拍 tick 补发。
+        # 出题是直播的命脉, 不能因为"当时正忙"就静默丢掉。
+        self._deferred_riddle = False
         # 逐条秒回: 独立的 ANSWER 并发池(与 qa_max_inflight 对齐)
         self._answer_pool: ThreadPoolExecutor | None = None
         if not cfg.no_llm:
@@ -167,7 +175,10 @@ class Director:
 
         if not cfg.no_llm:
             self.client = AnthropicMessagesClient(cfg.llm)
-            self.writer = PuzzleWriter(client=self.client)
+            # **必须传 runtime_cfg**: temperature 与 quota 定义在 Config 上,
+            # 而 client.cfg 是 LLMConfig。漏掉它 -> 这些参数全部静默失效
+            # (取到 None, 网关用默认值), 而测试因为 Fake 上有这些字段仍全绿。
+            self.writer = PuzzleWriter(client=self.client, runtime_cfg=cfg)
 
     # ------------------------------------------------------------------
     def _build_source(self):
@@ -320,11 +331,30 @@ class Director:
         self.push()
 
     # ---- RIDDLE / HINT / REVEAL: 单 worker(低频) ----
-    def _riddle(self, payload: dict) -> threading.Thread:
+    def _riddle(self, payload: dict) -> None:
+        """出题 worker。
+
+        **两条硬纪律**(方案 review Blocker 3):
+
+        ① worker 只"提交结果", 绝不"启动下一次出题"。
+           `submit_riddle(None)` 会立刻返回一个新的 RIDDLE 动作, 而
+           `_dispatch` 会同步把它跑起来 —— 那时本 worker **还没走到
+           finally 释放 `_narrating`**, 于是新 worker 的
+           `acquire(blocking=False)` 失败, 直接把 retry 丢掉:
+           表现为"出题失败后卡住不动"。
+           retry 一律交给 tick 的下一拍。
+
+        ② 失败路径不要继续访问 `r.puzzle` —— `r` 可能为 None,
+           那会抛 AttributeError 再触发一次 submit_riddle, 越滚越乱。
+        """
         def work():
             if not self._narrating.acquire(blocking=False):
-                log.debug("已有在途 LLM 任务, 跳过出题")
+                # 已有在途任务。**不能直接丢弃** —— 出题是直播的命脉,
+                # 丢了就开天窗。交给 tick 下一拍重发。
+                log.info("已有在途 LLM 任务, 本题出题推迟到下一拍")
+                self._deferred_riddle = True
                 return
+            failure: Optional[str] = None
             try:
                 if self.cfg.no_llm or not self.writer:
                     res_p, res_a = self._fake_riddle()
@@ -332,41 +362,41 @@ class Director:
                         res_p, res_a, list(P.FALLBACK_HINTS),
                         title="海龟汤", model="no-llm"))
                 else:
-                    # blueprint 由**代码层**选(方案 §7/§12): 先定好
-                    # mechanism_family/solution_shape/domain 等硬约束
-                    # 再让模型照着设计, 而不是让它自己理解"什么叫不同"。
                     recent = payload.get("recent_signatures") or []
                     bp = self._pick_blueprint(recent)
-                    # 走 spec 路径: 拿到完整结构化定义(含 facts), 再转成
-                    # engine 认的 RiddleResult 形态 —— 这样 archive 能按
-                    # 方案 §34 落盘, 而 runtime 不必改接口。
                     spec = self.writer.gen_spec(avoid=payload.get("avoid"),
                                                 blueprint=bp, recent=recent)
-                    r = _spec_to_riddle(spec) if spec.puzzle else None
-                    if r is None:
-                        log.warning("出题失败: %s", spec.error)
-                        self._dispatch(self.engine.submit_riddle(
-                            None, error=spec.error))
-                    else:
+                    # 只有**通过质量门**的 spec 才允许上直播。
+                    # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
+                    if spec.puzzle and not spec.error:
+                        r = _spec_to_riddle(spec)
                         self._dispatch(self.engine.submit_riddle(
                             r.puzzle, r.answer, r.hints, r.title,
                             error=r.error, usage=r.usage, model=r.model,
                             solve_atoms=r.solve_atoms, fair_clues=r.fair_clues,
                             signature=spec.signature.to_dict(),
                             spec=spec))
-                    if r.puzzle and not r.answer:
-                        log.info("本题未解析出谜底, 揭晓时将重新生成")
-                self.push()
+                        if r.puzzle and not r.answer:
+                            log.info("本题未解析出谜底, 揭晓时将重新生成")
+                    else:
+                        # 记下来, **等释放锁之后**再提交 —— 见上面①
+                        failure = spec.error or "没有生成合格谜题"
+                        log.warning("出题失败, 交回引擎走兜底: %s", failure)
             except Exception as e:
                 log.exception("出题异常: %s", e)
-                self._dispatch(self.engine.submit_riddle(None, error=str(e)))
-                self.push()
+                failure = str(e)
             finally:
                 self._narrating.release()
 
-        t = threading.Thread(target=work, daemon=True, name="riddle")
-        t.start()
-        return t
+            # ---- 锁已释放, 现在提交失败结果(它会触发下一拍 retry) ----
+            if failure is not None:
+                try:
+                    self._dispatch(self.engine.submit_riddle(None, error=failure))
+                except Exception as e:                # noqa: BLE001
+                    log.exception("提交出题失败结果时出错: %s", e)
+            self.push()
+
+        threading.Thread(target=work, daemon=True, name="riddle").start()
 
     def _pick_blueprint(self, recent: list):
         """选下一条 blueprint(方案 §11 的 weighted-LRU)。
@@ -374,7 +404,9 @@ class Director:
         用固定 seed 的 Random 实例 —— 每次出题都换 seed 会让"同输入不同
         输出", 复盘时无法重现。这里用**进程级** rng, 只保证可注入、可测。
         """
-        if not getattr(self.cfg, "pool_enabled", True):
+        # 注意: 这里读的是 quality_scheduler_enabled, **不是** pool_enabled。
+        # 两者职责不同: 前者管"题型分布受不受控", 后者管"要不要预生成题池"。
+        if not getattr(self.cfg, "quality_scheduler_enabled", True):
             return None
         try:
             from story.quality import Quotas, choose_blueprint
@@ -585,6 +617,14 @@ class Director:
             try:
                 for a in self.engine.tick():
                     self._run_action(a)
+                # 上一拍有出题被推迟(锁被占) -> 现在补发。
+                # 仍然走 engine 的 RIDDLE 动作, 所以 avoid/recent 不会丢。
+                if self._deferred_riddle:
+                    self._deferred_riddle = False
+                    if self.engine.phase == Phase.SETTING:
+                        log.info("补发被推迟的出题请求")
+                        self._run_action(
+                            self.engine._riddle_action_locked("riddle_deferred"))
                 self.push()
                 pushes_since += 1
                 if self.engine.should_stop():

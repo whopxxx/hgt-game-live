@@ -25,11 +25,15 @@ def check(name, cond, extra=""):
 class FakeClient:
     """按顺序吐预设的 LLMResult, 并记录收到的 tool 参数。"""
 
-    def __init__(self, results):
+    def __init__(self, results, cfg=None):
         self._results = list(results)
         self.calls = []
-        # gen_spec 会读 client.cfg 上的 temperature / quota 字段。
-        # 这里给一个最小替身, 免得每个用例都得构造真的 LLMConfig。
+        self.runtime_cfg = cfg or runtime_cfg()
+        # 默认 blueprint 必须与 riddle() 自报的 signature 一致 ——
+        # 严格比对生效后, 不一致会被正确拒绝, 那不是这些用例要测的东西。
+        self.default_blueprint = bp_for()
+        # client.cfg 是**传输层**配置(base_url/key/model)。业务层的
+        # temperature/quota 在 runtime_cfg 上, 由 PuzzleWriter 单独持有。
         self.cfg = _FakeLLMCfg()
 
     def messages(self, system, user, max_tokens=None, tool=None,
@@ -42,11 +46,24 @@ class FakeClient:
 
 
 class _FakeLLMCfg:
-    """LLMConfig 的最小替身(只带 gen_spec 会读的字段)。"""
-    answer_temperature = 0.0
-    judge_temperature = 0.0
-    review_temperature = 0.2
-    generate_temperature = 0.8
+    """LLMConfig 的最小替身。
+
+    **故意不带 temperature/quota** —— 它们属于 runtime Config。
+    早先这个替身"恰好什么都有", 于是掩盖了生产环境里参数静默失效的 bug。
+    现在 Fake 也照生产的样子来: 传输层就只管传输层的东西。
+    """
+    model = "fake-model"
+
+
+def runtime_cfg(**kw):
+    """真的 `Config` 实例(带 temperature/quota)。
+
+    用它而不是再造一个替身 —— 替身与真类一旦不同步就会再次掩盖问题。
+    """
+    from story.config import Config
+    kw.setdefault("sim_path", "x")
+    kw.setdefault("no_llm", False)
+    return Config(**kw)
 
 
 # ----------------------------------------------------------------------
@@ -108,26 +125,70 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
             "mechanism_family": "hidden_function",
             "solution_shape": "hidden_function_explains_behavior",
             "domain": "maritime", "relation": "stranger",
-            "emotion_mode": "neutral", "death": False,
-            "past_trauma": False, "long_term_profession": False,
-            "repeated_ritual": False,
+            "emotion_mode": "neutral", "time_shape": "instant",
+            "death": False, "past_trauma": False,
+            "long_term_profession": False, "repeated_ritual": False,
         },
     }
     d.update(kw)
     return d
 
 
+def bp_for(fam="hidden_function",
+           shape="hidden_function_explains_behavior",
+           domain="maritime", relation="stranger",
+           emotion="neutral", time_shape="instant", **flags):
+    """与 `riddle()` 自报 signature 一致的 blueprint。
+
+    严格比对生效后, 测试若用默认 blueprint(information_gap)去配
+    自报 hidden_function 的稿子, 会被正确地拒掉 —— 那不是被测行为。
+    """
+    from story.puzzle import PuzzleBlueprint
+    d = {"mechanism_family": fam, "solution_shape": shape, "domain": domain,
+         "relation": relation, "emotion_mode": emotion, "time_shape": time_shape,
+         "death": False, "past_trauma": False, "long_term_profession": False,
+         "repeated_ritual": False}
+    d.update(flags)
+    return PuzzleBlueprint(**d)
+
+
+def sig_ok():
+    """与 riddle() 自报一致的 observed_signature。"""
+    return {"mechanism_family": "hidden_function",
+            "solution_shape": "hidden_function_explains_behavior",
+            "domain": "maritime", "relation": "stranger",
+            "emotion_mode": "neutral", "time_shape": "instant",
+            "death": False, "past_trauma": False,
+            "long_term_profession": False, "repeated_ritual": False}
+
+
 def review_ok(**kw):
-    """审稿: 通过。"""
-    d = {"ok": True}
+    """审稿: pass。"""
+    d = {"decision": "pass", "observed_signature": sig_ok()}
     d.update(kw)
     return d
 
 
 def review_fix(puzzle, **kw):
-    """审稿: 给出改后的谜面 + 原样带回 atoms/clues。"""
+    """审稿: fix —— 给出改后的谜面 + 整套同步的 facts/atoms/clues。
+
+    默认带回与 `riddle()` 等价的 facts/atoms/clues(quote 按新谜面重算),
+    这样"改稿"在结构上是自洽的。
+    """
     d = riddle(puzzle=puzzle)
-    d.update({"ok": False, "note": "已修改"})
+    d.update({"decision": "fix", "note": "已修改",
+              "observed_signature": sig_ok()})
+    d.update(kw)
+    # 审稿改谜面时 quote 必须跟着改后的谜面走
+    if "fair_clues" not in kw:
+        d["fair_clues"] = clues_for(puzzle)
+    return d
+
+
+def review_rewrite(reason="没有公平推理路径", **kw):
+    """审稿: rewrite —— 不给 patch, 只给理由。"""
+    d = {"decision": "rewrite", "rewrite_reason": reason,
+         "observed_signature": sig_ok()}
     d.update(kw)
     return d
 
@@ -138,8 +199,8 @@ def test_riddle_tool():
         LLMResult(tool_input=riddle(), model="m"),
         LLMResult(tool_input=review_ok()),           # 自检通过
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("谜面解析", r.puzzle == _GOOD_PUZ, r)
     check("谜底解析", r.answer and "礁石" in r.answer, r.answer)
     check("提示 3 条", len(r.hints) == 3, r.hints)
@@ -160,8 +221,8 @@ def test_gen_spec_returns_puzzle_spec():
     from story.puzzle import PuzzleSpec
     fc = FakeClient([LLMResult(tool_input=riddle(), model="m"),
                      LLMResult(tool_input=review_ok())])
-    w = PuzzleWriter(client=fc)
-    spec = w.gen_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
     check("返回的是 PuzzleSpec", isinstance(spec, PuzzleSpec), type(spec))
     check("facts 4 条", len(spec.facts) == 4, spec.facts)
     check("core facts 2 条", len(spec.core_hidden_facts()) == 2, spec.facts)
@@ -191,8 +252,8 @@ def test_hard_validator_rejects_missing_facts():
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="二稿灯塔题目。为什么?")),
                      LLMResult(tool_input=review_ok())])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第一稿被硬校验拦下", r.puzzle and "二稿" in r.puzzle, r)
     check("没给第一稿花 reviewer 调用",
           fc.calls[1]["tool"]["name"] == "emit_riddle",
@@ -207,8 +268,8 @@ def test_hard_validator_rejects_fake_fair_clue():
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="换个题目的灯塔。为什么?")),
                      LLMResult(tool_input=review_ok())])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("被拒后重出成功", r.puzzle and "换个题目" in r.puzzle, r)
 
 
@@ -220,7 +281,7 @@ def test_blueprint_violation_rejected():
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="另一道灯塔题。为什么?")),
                      LLMResult(tool_input=review_ok())])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     bp = PuzzleBlueprint(mechanism_family="hidden_function",
                          solution_shape="hidden_function_explains_behavior",
                          domain="maritime", death=False)
@@ -233,7 +294,7 @@ def test_blueprint_injected_into_prompt():
     from story.puzzle import PuzzleBlueprint
     fc = FakeClient([LLMResult(tool_input=riddle()),
                      LLMResult(tool_input=review_ok())])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     bp = PuzzleBlueprint(mechanism_family="object_misuse",
                          solution_shape="misunderstood_object",
                          domain="commerce", relation="colleague")
@@ -258,8 +319,8 @@ def test_reviewer_fixes_in_place():
         LLMResult(tool_input=review_fix(P1, note="补了具体地点")),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("采用了审稿人的改稿(而不是重出一稿)",
           r.puzzle and "海角" in r.puzzle, r)
     check("改稿的谜底也一并采用", r.answer and "礁石" in r.answer, r.answer)
@@ -280,8 +341,8 @@ def test_hard_rule_asks_reviewer_to_fix():
         LLMResult(tool_input=riddle(puzzle=P0)),
         LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("改成第三人称后被采用",
           r.puzzle and r.puzzle.startswith("他每晚"), r)
     # 审稿请求里应点名"第一人称"这个已知问题
@@ -298,8 +359,8 @@ def test_reviewer_no_fix_falls_back_to_regen():
         LLMResult(tool_input=riddle(puzzle=P2)),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("退回重出后采用新稿", r.puzzle and "鸡蛋" in r.puzzle, r)
     check("共 4 次调用(出题/审稿/重出/审稿)", len(fc.calls) == 4, len(fc.calls))
 
@@ -317,8 +378,8 @@ def test_riddle_check_retries_empty_tool_use():
         LLMResult(tool_input=riddle(puzzle=P2)),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("空 tool_input 不算通过, 重出后成功",
           r.puzzle is not None and "二稿" in r.puzzle, r)
     check("共 4 次调用(生成/质检/生成/质检)", len(fc.calls) == 4, len(fc.calls))
@@ -345,8 +406,8 @@ def test_first_person_story_rejected():
         LLMResult(tool_input=riddle(puzzle=P0)),
         LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第一人称那稿被审稿人改成第三人称",
           r.puzzle and r.puzzle.startswith("一个男人"), r)
 
@@ -370,8 +431,8 @@ def test_no_repeat_puzzles():
         LLMResult(tool_input=riddle(puzzle=c)),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle(avoid=[a])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(avoid=[a], blueprint=fc.default_blueprint)
     check("太像的那稿被弃用, 采用新题", r.puzzle == c, r.puzzle)
     check("共 4 次调用(出题/审稿/重出/审稿)", len(fc.calls) == 4, len(fc.calls))
 
@@ -386,8 +447,8 @@ def test_english_riddle_rejected_on_text_path():
         LLMResult(tool_input=riddle()),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("英文稿被弃用, 采用中文稿",
           r.puzzle is not None and "灯塔" in r.puzzle, r)
 
@@ -411,7 +472,7 @@ def test_riddle_fallback():
             "【谜面】\n雨夜有人敲门, 开门却没人。为什么?\n【谜底】\n是他自己的回声。\n"
             "【提示】\n提示一：注意天气。\n")),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     spec = w.gen_spec(check=False)          # 关掉校验, 只看解析
     check("回退解析出谜面", "敲门" in (spec.puzzle or ""), spec)
     check("回退解析出谜底", "回声" in (spec.answer or ""), spec)
@@ -422,8 +483,9 @@ def test_answer_tool():
     fc = FakeClient([LLMResult(tool_input={
         "answers": [{"id": 7, "verdict": "是", "comment": "就差一点",
                      "touched_fact_ids": ["f1"], "solution_candidate": False}]})])
-    w = PuzzleWriter(client=fc)
-    res, err = w.answer("谜面", "谜底", [], 7, "甲", "是同伴的肉吗")
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    res, err = w.answer("谜面", "谜底", [], 7, "甲", "是同伴的肉吗",
+                        facts=[{"id": "f1", "text": "打嗝", "kind": "core"}])
     check("拿到一条裁决", len(res) == 1, res)
     check("qid 用引擎给的", res[0].qid == 7, res)
     check("verdict 正确", res[0].verdict == "是", res)
@@ -437,14 +499,14 @@ def test_answer_rejects_bad_enum():
     print("[裁决: 非法枚举被丢弃]")
     fc = FakeClient([LLMResult(tool_input={
         "answers": [{"id": 1, "verdict": "也许吧", "comment": "x"}]})])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 1, "甲", "问题")
     check("非法裁决被拒(返回空)", res == [], res)
     check("带错误信息", err is not None, err)
     # Q5: 「揭晓」已从枚举里删掉; 模型若仍吐出来, 降级为"是"而**不是**通关。
     fc2 = FakeClient([LLMResult(tool_input={
         "answers": [{"id": 2, "verdict": "揭晓", "comment": "x"}]})])
-    w2 = PuzzleWriter(client=fc2)
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "甲", "同伴的肉对吧")
     check("废弃的揭晓被降级为'是'", res2 and res2[0].verdict == "是", res2)
     check("降级后没有调裁判",
@@ -461,7 +523,7 @@ def test_answer_enum_forced_by_schema():
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 3, "甲",
                       "退潮礁石露出所以灯是标礁石对吗")
     check("candidate=true + 裁判确认 -> 揭晓",
@@ -471,7 +533,7 @@ def test_answer_enum_forced_by_schema():
     # 反例: candidate=false 不调裁判
     fc2 = FakeClient([LLMResult(tool_input={"answers": [
         {"id": 4, "verdict": "是", "solution_candidate": False}]})])
-    w2 = PuzzleWriter(client=fc2)
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     w2.answer("谜面", "谜底", [], 4, "甲", "他是医生吗")
     check("candidate=false 不调裁判",
           [c["tool"]["name"] for c in fc2.calls] == ["emit_verdict"],
@@ -494,7 +556,7 @@ def test_open_question_never_solves():
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "他为什么跑")
     check("开放疑问保持原裁决", res and res[0].verdict == "是", res)
     check("没有调裁判(只用了 1 次调用)", len(fc.calls) == 1,
@@ -511,7 +573,7 @@ def test_verdict_solve_must_pass_judge():
         LLMResult(tool_input={"is_guess": True, "cause_hit": False,
                               "mechanism_hit": False}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "同伴的肉对吧")
     check("裁判否决 -> 保持'是'", res and res[0].verdict == "是", res)
     check("确实问了裁判",
@@ -530,7 +592,7 @@ def test_open_question_with_hypothesis_can_solve():
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer(
         "谜面", "谜底", [], 1, "甲",
         "为什么他每天多待十五分钟, 是因为以前灯晚亮十五分钟出过事故吗")
@@ -549,7 +611,7 @@ def test_llm_failure_returns_unavailable_not_irrelevant():
     check("UNAVAILABLE 常量存在", P.UNAVAILABLE == "未判定", P.UNAVAILABLE)
     # 工具返回不可用 -> 结果里没有裁决 -> answer() 报错(上层转"未判定")
     fc = FakeClient([LLMResult(error="网关抖动")])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗")
     check("失败时没有臆造裁决", res == [], res)
     check("带出错误信息", err is not None, err)
@@ -559,7 +621,7 @@ def test_judge():
     print("[裁判]")
     fc = FakeClient([LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
                      LLMResult(tool_input={"is_guess": True, "cause_hit": False, "mechanism_hit": False})])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     yes = w.judge("谜面", "谜底", "同伴的肉对吧").solved
     no = w.judge("谜面", "谜底", "他饿了吗").solved
     check("判中", yes is True, yes)
@@ -580,7 +642,7 @@ def test_hint_not_repeated():
         LLMResult(tool_input={"hint": "汤的味道才是关键"}),   # 与 given 重复
         LLMResult(tool_input={"hint": "想想他以前经历过什么"}),  # 新的
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     h, _ = w.hint("谜面", "谜底", 2, given=["注意汤的味道"])
     check("重复的被打回, 采用新的", h == "想想他以前经历过什么", h)
     check("确实重出过", len(fc.calls) == 2, len(fc.calls))
@@ -590,7 +652,7 @@ def test_hint_and_reveal():
     print("[提示 / 揭晓]")
     fc = FakeClient([LLMResult(tool_input={"hint": "注意汤的味道。不剧透"}),
                      LLMResult(tool_input={"reveal": "谜底是同伴的肉汤骗局。"})])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     h, _ = w.hint("谜面", "谜底", 1, [])
     rv, _ = w.reveal("谜面", "谜底", "solved", "甲")
     check("提示解析", h == "注意汤的味道。不剧透", h)
@@ -608,7 +670,7 @@ def test_tool_actually_requested():
         LLMResult(tool_input={"hint": "h"}),
         LLMResult(tool_input={"reveal": "r"}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     w.answer("p", "a", [], 1, "甲", "q")
     w.hint("p", "a", 1, [])
     w.reveal("p", "a", "solved")
@@ -626,7 +688,7 @@ def test_answer_consults_judge():
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 5, "甲", "同伴的肉对吧")
     check("裁判命中 -> 升级为揭晓", res and res[0].verdict == "揭晓", res)
     names = [c["tool"]["name"] for c in fc.calls]
@@ -638,7 +700,7 @@ def test_answer_judge_not_consulted_without_answer():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 1, "verdict": "是"}]}),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "", [], 1, "甲", "问题")   # answer 为空
     check("仍能裁决", res and res[0].verdict == "是", res)
     check("没多调裁判", len(fc.calls) == 1, [c["tool"]["name"] for c in fc.calls])
@@ -660,8 +722,8 @@ def test_reject_reasons_accumulate():
         LLMResult(tool_input=riddle(puzzle="他每天擦那扇窗。为什么?")),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("最终采用第 3 稿", r.puzzle is not None and "擦那扇窗" in r.puzzle, r)
     # 第 3 稿的生成请求(第 5 次调用)里, **两条**原因都该在。
     # 注意: 前两稿必须**真的不合格**(不带 facts 就过不了硬校验),
@@ -689,8 +751,8 @@ def test_rejected_puzzle_goes_into_avoid():
         LLMResult(tool_input=review_ok()),
     ])
     # 调用次数 = 出题(坏) + 重出 + 审稿 = 3
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第二稿被采用", r.puzzle and "楼梯" in r.puzzle, r)
     gen2 = fc.calls[1]["user"]
     check("第二稿的 prompt 里带了被毙的沙漠题", "沙漠" in gen2, gen2[-400:])
@@ -707,8 +769,8 @@ def test_bad_draft_does_not_consume_attempt():
         LLMResult(tool_input=review_ok()),
     ])
     # 两次英文独白走文本分支 -> 解析不出谜面 -> 不消耗次数
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("两次废稿后仍能出题成功",
           r.puzzle is not None and "擦那扇窗" in r.puzzle, r)
     check("废稿没有消耗重试次数(共 4 次调用)", len(fc.calls) == 4,
@@ -735,8 +797,8 @@ def test_wrapped_tool_input_unwrapped():
                                   puzzle="他每天擦那扇窗。为什么?")}),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("套壳的一稿被正确解析",
           r.puzzle is not None and "擦那扇窗" in r.puzzle, r)
 
@@ -763,8 +825,8 @@ def test_reviewer_keeps_solve_atoms():
         LLMResult(tool_input=review_fix(P1)),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("改稿被采用", r.puzzle and "海角" in r.puzzle, r)
     check("solve_atoms 经过审稿后仍在",
           [a["id"] for a in r.solve_atoms] == ["a1", "a2"], r.solve_atoms)
@@ -793,8 +855,8 @@ def test_reviewer_can_replace_atoms_when_answer_changes():
                          "supports_atoms": ["a1"]}])),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("用了审稿人新给的 atoms",
           [a["text"] for a in r.solve_atoms] == ["新因", "新机制"], r.solve_atoms)
     check("用了审稿人新给的 clues",
@@ -811,8 +873,8 @@ def test_main_regression_no_atoms_lost():
         LLMResult(tool_input=review_fix(P1)),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("改稿后仍有谜题", r.puzzle is not None, r)
     check("改稿后 atoms 非空", len(r.solve_atoms) == 2, r.solve_atoms)
     check("改稿后 clues 非空", len(r.fair_clues) == 2, r.fair_clues)
@@ -832,7 +894,7 @@ def test_atom_role_gate():
     fc = FakeClient([LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True,
         "matched_atoms": [0]})])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     jr = w.judge("谜面", "谜底", "退潮时礁石露出来", ATOMS)
     check("只命中 cause 不算通关(缺 mechanism)", jr.solved is False,
           f"solved={jr.solved} hit={jr.matched_atoms}")
@@ -840,14 +902,14 @@ def test_atom_role_gate():
     fc2 = FakeClient([LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True,
         "matched_atoms": [0, 1]})])
-    w2 = PuzzleWriter(client=fc2)
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     jr2 = w2.judge("谜面", "谜底", "退潮礁石露出, 亮灯标位置, 涨潮误导", ATOMS)
     check("两条都命中 -> 通关", jr2.solved is True, jr2)
     # ③ 没有 role 的老数据 -> 不做 atom 校验, 不误杀
     fc3 = FakeClient([LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True,
         "matched_atoms": []})])
-    w3 = PuzzleWriter(client=fc3)
+    w3 = PuzzleWriter(client=fc3, runtime_cfg=fc3.runtime_cfg)
     jr3 = w3.judge("谜面", "谜底", "说清了", ["纯字符串1", "纯字符串2"])
     check("老格式(无 role)不误杀", jr3.solved is True, jr3)
 
@@ -862,7 +924,7 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
             {"id": 1, "verdict": "是", "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),          # 裁判失败: 无 tool_input 无 text
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "同伴的肉对吧")
     check("保留第一层的'是'", res and res[0].verdict == "是", res)
     check("没有伪装成'无关'", res and res[0].verdict != "无关", res)
@@ -872,7 +934,7 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
             {"id": 2, "verdict": "", "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),
     ])
-    w2 = PuzzleWriter(client=fc2)
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "乙", "他是盲人吗")
     check("第一层也无裁决时才降级", res2 == [], res2)
 
@@ -921,8 +983,8 @@ def test_reviewer_structured_atoms_survive():
         # 审稿改了谜面, 原样带回**结构化** atoms(含 id/fact_ids)
         LLMResult(tool_input=review_fix(P1, solve_atoms=ATOMS)),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     # _spec_to_riddle 会补一个 required=True —— 只比关键字段
     key = [{k: a.get(k) for k in ("id", "role", "text", "fact_ids")}
            for a in r.solve_atoms]
@@ -935,29 +997,60 @@ def test_reviewer_structured_atoms_survive():
           fc.calls[1]["user"][-700:])
 
 
-def test_fallback_last_draft_keeps_atoms():
-    """Q0.3: 所有稿都未通过时的**兜底稿**不能丢 facts/atoms/clues。
+def test_rejected_spec_never_returned():
+    """P0-1: 所有稿都被拒时, **不能**返回带 puzzle 的兜底稿。
 
-    这是"拿最后一稿兜底"的路径 —— 少了它们, 新裁判链会悄悄退化成
-    "凭一段文学谜底猜感觉", 而日志上完全正常。
+    这是最危险的一条路径: 早先 `return last`, 而 last 带着 puzzle/answer
+    和一个 error 字符串; director 只看 `spec.puzzle` 非空就上直播 ——
+    于是"连续几稿都因跨题重复被拒"的最后一稿会照常播出,
+    跨题去重等于形同虚设。
+
+    质量系统明确拒绝的题, 绝不能反过来变成兜底。
     """
-    good = riddle()
-    bad = dict(good, facts=[])        # 结构不合格 -> 走兜底
+    bad = dict(riddle(), facts=[])          # 结构不合格 -> 每稿都被拒
     fc = FakeClient([
         LLMResult(tool_input=dict(bad)),
         LLMResult(tool_input=dict(bad, puzzle="二稿。为什么?")),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle(max_attempts=2)
-    check("兜底稿仍有谜面", bool(r.puzzle), r)
-    check("兜底稿 err 标记不合格", "不合格" in (r.error or ""), r.error)
-    check("兜底稿**保住了** solve_atoms",
-          [a.get("text") for a in r.solve_atoms] == ["退潮使礁石需要标出",
-                                                     "灯是标礁石不是引路"],
-          r.solve_atoms)
-    check("兜底稿**保住了** fair_clues",
-          len(r.fair_clues) == 2 and all(c.get("quote") for c in r.fair_clues),
-          r.fair_clues)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=2)
+    check("失败时不返回 puzzle", not spec.puzzle, spec.puzzle)
+    check("失败时 error 非空", bool(spec.error), spec.error)
+    check("失败时也不返回 answer", not spec.answer, spec.answer)
+
+
+def test_rejected_by_cross_puzzle_gate_not_returned():
+    """P0-1: 被**跨题门**拒掉的稿子同样不能兜底播出。
+
+    这条最容易被忽略 —— 题目本身完全合格, 只是"和最近题结构重复"。
+    早先这种稿会作为 last 被返回, 于是配额形同虚设。
+    """
+    from story.puzzle import PuzzleSignature
+    dup = PuzzleSignature(mechanism_family="hidden_function",
+                          solution_shape="hidden_function_explains_behavior",
+                          domain="maritime", relation="stranger",
+                          emotion_mode="neutral", time_shape="instant")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=riddle(puzzle="二稿灯塔。为什么?")),
+        LLMResult(tool_input=review_ok()),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    # 最近两道都是同一 (mechanism, shape) -> 配额已满
+    spec = w.gen_spec(blueprint=fc.default_blueprint, recent=[dup, dup],
+                      max_attempts=2)
+    check("跨题重复的稿不返回", not spec.puzzle, spec.puzzle)
+    check("带出跨题原因", "重复" in (spec.error or ""), spec.error)
+
+
+def test_director_only_airs_clean_spec():
+    """P0-1: director 必须用 error 判断, 不能只看 puzzle 是否为空。"""
+    import inspect
+    import director as D
+    src = inspect.getsource(D.Director._riddle)
+    check("director 检查了 spec.error", "spec.error" in src, src)
+    check("不再只判断 puzzle", "if spec.puzzle else None" not in src, src)
 
 
 def test_fixable_format_goes_to_reviewer_not_rejected():
@@ -982,8 +1075,8 @@ def test_fixable_format_goes_to_reviewer_not_rejected():
         LLMResult(tool_input=riddle(puzzle=P0)),
         LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
     ])
-    w = PuzzleWriter(client=fc)
-    r2 = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r2 = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第一人称稿被审稿人改好并采用",
           r2.puzzle and r2.puzzle.startswith("他每晚"), r2)
     check("只用了 2 次调用(出题 + 审稿)", len(fc.calls) == 2, len(fc.calls))
@@ -1001,10 +1094,75 @@ def test_unfixed_format_still_rejected():
         LLMResult(tool_input=riddle(puzzle="他每天数楼梯台阶。为什么?")),
         LLMResult(tool_input=review_ok()),
     ])
-    w = PuzzleWriter(client=fc)
-    r = w.gen_riddle()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("没改人称的稿被拒, 最终采用第三人称的",
           r.puzzle and not r.puzzle.startswith("我"), r)
+
+
+def test_writer_reads_temperature_from_runtime_cfg():
+    """P0-8: temperature 必须从 **runtime Config** 读, 不是 client.cfg。
+
+    这类 bug 的特征是"测试全绿但生产失效": `client.cfg` 是 LLMConfig,
+    没有 temperature 字段, `getattr(..., None)` 恒为 None, 参数静默不生效。
+    早先测试里的 Fake 替身恰好什么字段都有, 于是完全掩盖了它。
+    """
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=runtime_cfg(generate_temperature=0.9,
+                                                       review_temperature=0.1))
+    w.gen_riddle(blueprint=fc.default_blueprint)
+    check("出题用 runtime_cfg 的 generate_temperature",
+          fc.calls[0]["temperature"] == 0.9, fc.calls[0]["temperature"])
+    check("审稿用 runtime_cfg 的 review_temperature",
+          fc.calls[1]["temperature"] == 0.1, fc.calls[1]["temperature"])
+    # **没配 runtime_cfg** 时必须返回 None 并告警, 绝不静默用 0
+    fc2 = FakeClient([LLMResult(tool_input=riddle()),
+                      LLMResult(tool_input=review_ok())])
+    w2 = PuzzleWriter(client=fc2)          # 不给 runtime_cfg
+    w2.gen_riddle(blueprint=fc2.default_blueprint)
+    check("缺 runtime_cfg 时不发 temperature",
+          fc2.calls[0]["temperature"] is None, fc2.calls[0]["temperature"])
+
+
+def test_client_cfg_is_not_used_for_temperature():
+    """P0-8 反例: 即便 client.cfg 上碰巧有同名字段, 也不能用它。"""
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    # 给传输层配置硬塞一个 generate_temperature —— 它**不该**被读到
+    fc.cfg.generate_temperature = 0.123
+    w = PuzzleWriter(client=fc, runtime_cfg=runtime_cfg(generate_temperature=0.7))
+    w.gen_riddle(blueprint=fc.default_blueprint)
+    check("忽略 client.cfg 上的同名字段",
+          fc.calls[0]["temperature"] == 0.7, fc.calls[0]["temperature"])
+
+
+def test_quotas_read_from_runtime_cfg():
+    """P0-9: cross_puzzle_gate 的 quota 也必须来自 runtime Config。
+
+    否则 director 选 blueprint 用真 quota、generator 的 gate 用默认 quota,
+    同一题上跑着两套 policy。
+    """
+    from story.quality import Quotas
+    cfg = runtime_cfg(quota_same_mechanism=1, quality_recent_window=4)
+    q = Quotas.from_config(cfg)
+    check("window 读对", q.window == 4, q.window)
+    check("same_mechanism 读对", q.same_mechanism == 1, q.same_mechanism)
+    # 经 PuzzleWriter 读到的必须是同一个
+    w = PuzzleWriter(client=FakeClient([]), runtime_cfg=cfg)
+    q2 = Quotas.from_config(w._cfg())
+    check("PuzzleWriter._cfg() 给出同一个 Config",
+          q2.window == 4 and q2.same_mechanism == 1, q2)
+
+
+def test_judge_passes_temperature():
+    """P0-8: judge 也必须真的把 judge_temperature 传下去。"""
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True})])
+    w = PuzzleWriter(client=fc, runtime_cfg=runtime_cfg(judge_temperature=0.0))
+    w.judge("谜面", "谜底", "说中了")
+    check("judge 传了 temperature", fc.calls[0]["temperature"] == 0.0,
+          fc.calls[0]["temperature"])
 
 
 def test_no_dead_judge_definition():
@@ -1033,7 +1191,7 @@ def test_judge_tech_failure_preserves_layer1_verdict():
              "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),
     ])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "是同伴的肉吗")
     check("保留第一层的'不是'", res and res[0].verdict == "不是", res)
     check("comment 也保留", res and res[0].comment == "方向不对", res)
@@ -1050,7 +1208,7 @@ def test_judge_gate_cuts_calls():
     canned.append(LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True}))
     fc = FakeClient(canned)
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     for i in range(10):
         w.answer("谜面", "谜底", [], i + 1, "甲", f"他是医生吗{i}")
     w.answer("谜面", "谜底", [], 11, "甲", "礁石露出所以灯标礁石")
@@ -1068,7 +1226,7 @@ def test_answer_uses_facts_block():
              {"id": "f2", "text": "灯是标礁石位置", "kind": "core"}]
     fc = FakeClient([LLMResult(tool_input={"answers": [
         {"id": 1, "verdict": "是", "solution_candidate": False}]})])
-    w = PuzzleWriter(client=fc)
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
     u = fc.calls[0]["user"]
     check("prompt 有事实表段", "【事实表(判定依据)】" in u, u[:300])
@@ -1114,6 +1272,208 @@ def test_text_fallback_solution_heuristic():
 
 
 
+def test_review_decision_pass():
+    """P0-4: decision=pass -> 原样采用, 不改任何字段。"""
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("pass 后谜面不变", spec.puzzle == _GOOD_PUZ, spec.puzzle)
+    check("pass 后 facts 不变", len(spec.facts) == 4, spec.facts)
+    check("pass 后 signature 不变",
+          spec.signature.mechanism_family == "hidden_function", spec.signature)
+
+
+def test_review_decision_rewrite_regenerates():
+    """P0-4: decision=rewrite -> **不修补**, 交回生成器换骨架。
+
+    这是"结构性烂题"的唯一出口。早先只有 ok=true/false, 于是
+    "核心就是不成立的题"会被 reviewer 围着旧骨架反复修。
+    """
+    P2 = "他每天数冰箱里的鸡蛋。为什么?"
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_rewrite("谜底依赖题面外的私人往事")),
+        # 应该**重新出题**(而不是修补上一稿)
+        LLMResult(tool_input=riddle(puzzle=P2)),
+        LLMResult(tool_input=review_ok()),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("采用了重出的新题", spec.puzzle == P2, spec.puzzle)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("rewrite 后走的是**重新出题**而不是修补",
+          names == ["emit_riddle", "emit_review", "emit_riddle", "emit_review"],
+          names)
+    # 重出请求里应带上 rewrite 的理由
+    gen2 = fc.calls[2]["user"]
+    check("重出请求带上 rewrite 理由", "私人往事" in gen2, gen2[-400:])
+
+
+def test_review_decision_fix_syncs_facts():
+    """P0-5: 审稿改了 answer -> facts **必须**跟着变。
+
+    不然正式 Q&A 会依据**过期事实表**回答观众 —— 比以前"只看文学谜底"
+    更危险, 因为现在系统会非常自信。
+    """
+    P1 = "海角守塔人只在退潮的那几个小时亮灯。为什么?"
+    NEW_FACTS = [
+        {"id": "f1", "text": "退潮时礁石露出", "kind": "core"},
+        {"id": "f2", "text": "灯是标礁石位置", "kind": "core"},
+        {"id": "f3", "text": "涨潮后亮灯误导船只", "kind": "support"},
+        {"id": "f4", "text": "不是为了纪念", "kind": "exclusion"},
+    ]
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_fix(
+            P1, answer="换了新解释。", facts=NEW_FACTS,
+            solve_atoms=[{"id": "a1", "role": "cause", "text": "新因",
+                          "fact_ids": ["f1"]},
+                         {"id": "a2", "role": "mechanism", "text": "新机制",
+                          "fact_ids": ["f2"]}],
+            fair_clues=[{"quote": "只在退潮的那几个小时亮灯",
+                         "supports_atoms": ["a1"]}])),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("facts 用了审稿人新给的",
+          [f.text for f in spec.facts] == [f["text"] for f in NEW_FACTS],
+          spec.facts)
+    check("answer 也换了", "新解释" in (spec.answer or ""), spec.answer)
+    check("atoms 指向**新** fact id",
+          spec.solve_atoms[0].fact_ids == ["f1"], spec.solve_atoms[0].fact_ids)
+
+
+def test_review_decision_fix_syncs_signature():
+    """P0-6: 审稿改了核心 -> signature 必须用**重新判断**的。
+
+    否则跨题配额登记的假指纹会把分布算错: 调度器以为刚播的是
+    hidden_function, 实际观众看的是创伤题材。
+    """
+    P1 = "他三十年如一日擦那扇窗。为什么?"
+    OBS = dict(sig_ok())
+    OBS.update({"mechanism_family": "time_reinterpretation",
+                "solution_shape": "past_trauma_explains_current_ritual",
+                "emotion_mode": "grief", "time_shape": "years_long",
+                "past_trauma": True, "repeated_ritual": True})
+    # 生成器这一稿**自报**的就是 trauma 形状(否则会被 blueprint 严格比对
+    # 在 reviewer 之前就拒掉 —— 那是另一条测试的事)。审稿人改完核心之后,
+    # 用 observed_signature 把指纹**修正**成真实形状。
+    gen = dict(riddle(puzzle=P1))
+    gen["signature"] = dict(OBS)
+    fc = FakeClient([
+        LLMResult(tool_input=gen),
+        LLMResult(tool_input=review_fix(P1, observed_signature=OBS,
+                                        answer="他妻子在那扇窗后。")),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    bp = bp_for(fam="time_reinterpretation",
+                shape="past_trauma_explains_current_ritual",
+                emotion="grief", time_shape="years_long",
+                past_trauma=True, repeated_ritual=True)
+    spec = w.gen_spec(blueprint=bp)
+    check("signature 用了审稿人的 observed_signature",
+          spec.signature.mechanism_family == "time_reinterpretation",
+          spec.signature)
+    check("trauma 标记也更新了", spec.signature.past_trauma is True,
+          spec.signature)
+    check("time_shape 也跟着变了",
+          spec.signature.time_shape == "years_long", spec.signature)
+
+
+def test_review_rewrite_has_no_patch_requirement():
+    """rewrite 时**不该**要求审稿人给 patch —— 它只需要给理由。"""
+    from story.llm import _TOOL_CHECK
+    req = _TOOL_CHECK["input_schema"]["required"]
+    check("只要求 decision + observed_signature",
+          set(req) == {"decision", "observed_signature"}, req)
+    props = _TOOL_CHECK["input_schema"]["properties"]
+    check("有 rewrite_reason 字段", "rewrite_reason" in props, sorted(props))
+    check("有 facts 字段", "facts" in props, sorted(props))
+    check("有 observed_signature 字段", "observed_signature" in props,
+          sorted(props))
+    d = props["decision"]
+    check("decision 是三选一", d["enum"] == ["pass", "fix", "rewrite"], d)
+
+
+def test_check_system_teaches_rewrite():
+    """CHECK_SYSTEM 必须真的教 rewrite, 而不是只改 schema。"""
+    from story.llm import CHECK_SYSTEM
+    for k in ("pass", "fix", "rewrite", "rewrite_reason",
+              "observed_signature", "私人往事"):
+        check(f"CHECK_SYSTEM 含 {k}", k in CHECK_SYSTEM, k)
+    check("不再说'任务是改不是退'", "你的任务是改" not in CHECK_SYSTEM,
+          CHECK_SYSTEM[:200])
+    check("明确不要照抄 signature", "不要照抄" in CHECK_SYSTEM,
+          CHECK_SYSTEM[-600:])
+
+
+
+def test_candidate_safety_net():
+    """P1: 模型漏标 candidate 时, 句式兜底要把它救回来。
+
+    只信模型自报的话, 一旦它把**完整答案**判成 false, Final Judge
+    永远看不到 —— 观众明明说全了, 系统只回"是"。宁可多调一次裁判。
+    """
+    fc = FakeClient([
+        # 模型说"不是候选", 但这句明显是完整因果
+        LLMResult(tool_input={"answers": [
+            {"id": 1, "verdict": "是", "solution_candidate": False}]}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                              "mechanism_hit": True}),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    res, _ = w.answer("谜面", "谜底", [], 1, "甲",
+                      "退潮时礁石露出来所以灯是在标礁石位置")
+    check("兜底后仍调了裁判",
+          [c["tool"]["name"] for c in fc.calls]
+          == ["emit_verdict", "emit_judgement"],
+          [c["tool"]["name"] for c in fc.calls])
+    check("救回了通关", res and res[0].verdict == "揭晓", res)
+    # 普通事实提问不该被兜底误伤
+    fc2 = FakeClient([LLMResult(tool_input={"answers": [
+        {"id": 2, "verdict": "是", "solution_candidate": False}]})])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    w2.answer("谜面", "谜底", [], 2, "甲", "他是医生吗")
+    check("短事实提问不触发兜底", len(fc2.calls) == 1,
+          [c["tool"]["name"] for c in fc2.calls])
+
+
+def test_touched_fact_ids_filtered():
+    """P1: touched_fact_ids 必须过滤到**真实存在**的 fact id。
+
+    Q6 的提示系统会靠这个集合选"还没探索过的方向", 混进假 id
+    (模型爱编 f999) 会让它挑错。
+    """
+    facts = [{"id": "f1", "text": "退潮礁石露出", "kind": "core"},
+             {"id": "f2", "text": "灯标礁石", "kind": "core"}]
+    fc = FakeClient([LLMResult(tool_input={"answers": [
+        {"id": 1, "verdict": "是", "solution_candidate": False,
+         "touched_fact_ids": ["f1", "f999", "f2", "f1"]}]})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    res, _ = w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
+    check("只留合法 id 且去重",
+          res[0].touched_fact_ids == ["f1", "f2"], res[0].touched_fact_ids)
+    # 全非法 -> 清空
+    fc2 = FakeClient([LLMResult(tool_input={"answers": [
+        {"id": 2, "verdict": "是", "solution_candidate": False,
+         "touched_fact_ids": ["f999", "f888"]}]})])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    res2, _ = w2.answer("谜面", "谜底", [], 2, "甲", "礁石吗", facts=facts)
+    check("全非法时清空", res2[0].touched_fact_ids == [],
+          res2[0].touched_fact_ids)
+
+
+def test_candidate_definition_documented():
+    """P1: candidate 的判据与例子要写进 schema, 别让模型猜。"""
+    from story.llm import _TOOL_ANSWER
+    sc = _TOOL_ANSWER["input_schema"]["properties"]["answers"]["items"][
+        "properties"]["solution_candidate"]
+    for k in ("和灯塔有关吗", "退潮后礁石露出来", "他是医生吗"):
+        check(f"schema 有例子 {k}", k in sc["description"], sc["description"][:200])
+
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -1141,9 +1501,25 @@ def main():
               # ---- Q0: 链路缺陷回归 ----
               test_check_tool_schema_matches_generator,
               test_reviewer_structured_atoms_survive,
-              test_fallback_last_draft_keeps_atoms,
               test_fixable_format_goes_to_reviewer_not_rejected,
               test_unfixed_format_still_rejected,
+              test_writer_reads_temperature_from_runtime_cfg,
+              test_client_cfg_is_not_used_for_temperature,
+              test_quotas_read_from_runtime_cfg,
+              test_judge_passes_temperature,
+              # ---- P0-4/5/6 ----
+              test_rejected_spec_never_returned,
+              test_rejected_by_cross_puzzle_gate_not_returned,
+              test_director_only_airs_clean_spec,
+              test_candidate_safety_net,
+              test_touched_fact_ids_filtered,
+              test_candidate_definition_documented,
+              test_review_decision_pass,
+              test_review_decision_rewrite_regenerates,
+              test_review_decision_fix_syncs_facts,
+              test_review_decision_fix_syncs_signature,
+              test_review_rewrite_has_no_patch_requirement,
+              test_check_system_teaches_rewrite,
               test_no_dead_judge_definition,
               # ---- Q5 ----
               test_judge_tech_failure_preserves_layer1_verdict,

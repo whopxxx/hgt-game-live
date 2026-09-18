@@ -658,8 +658,9 @@ def test_signature_recorded_and_passed_on():
     check("产生了 RIDDLE 动作", len(rid) == 1, acts)
     rs = rid[0].payload.get("recent_signatures")
     check("RIDDLE 带上 recent_signatures", rs and len(rs) == 1, rs)
-    check("signature 是结构化对象", rs and rs[0].get("mechanism_family")
-          == "hidden_function", rs)
+    check("signature 是**可序列化的 dict**",
+          rs and isinstance(rs[0], dict)
+          and rs[0].get("mechanism_family") == "hidden_function", rs)
 
 
 def test_signature_window_bounded():
@@ -686,16 +687,16 @@ def test_touched_facts_accumulate_and_reset():
     eng, clk = boot(mkcfg())
     check("开局 touched 为空", eng._touched_fact_ids == set(),
           eng._touched_fact_ids)
-    say(eng, clk, "u1", "甲", "#礁石吗")
-    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
+    ans = [a for a in say(eng, clk, "u1", "甲", "#礁石吗")
+           if a.kind == ActionKind.ANSWER]
     qid = ans[0].payload["qid"]
     eng.submit_qa([QAResult(qid=qid, verdict="是", touched_fact_ids=["f1"],
                             solution_candidate=False)])
     check("f1 记进 touched", eng._touched_fact_ids == {"f1"},
           eng._touched_fact_ids)
-    say(eng, clk, "u2", "乙", "#涨潮呢")
-    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
-    eng.submit_qa([QAResult(qid=ans[0].payload["qid"], verdict="是",
+    ans2 = [a for a in say(eng, clk, "u2", "乙", "#涨潮呢")
+            if a.kind == ActionKind.ANSWER]
+    eng.submit_qa([QAResult(qid=ans2[0].payload["qid"], verdict="是",
                             touched_fact_ids=["f2", "f3"])])
     check("touched 累加", eng._touched_fact_ids == {"f1", "f2", "f3"},
           eng._touched_fact_ids)
@@ -713,8 +714,8 @@ def test_touched_facts_accumulate_and_reset():
 def test_candidate_count_and_reset_on_new_puzzle():
     """Q5: candidate 计数, 以及开新题时清空。"""
     eng, clk = boot(mkcfg())
-    say(eng, clk, "u1", "甲", "#完整解释")
-    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
+    ans = [a for a in say(eng, clk, "u1", "甲", "#完整解释")
+           if a.kind == ActionKind.ANSWER]
     eng.submit_qa([QAResult(qid=ans[0].payload["qid"], verdict="是",
                             solution_candidate=True, touched_fact_ids=["f1"])])
     check("candidate 计数 +1", eng._candidate_count == 1, eng._candidate_count)
@@ -747,6 +748,70 @@ def test_answer_action_carries_facts():
          "visibility": "hidden", "hintable": True}], ans[0].payload.get("facts"))
 
 
+def test_retry_riddle_keeps_avoid_and_recent():
+    """P0-2: retry 的 RIDDLE 动作必须**带上** avoid 与 recent_signatures。
+
+    早先重试只带 reason+attempt, 于是:
+      - director 收到 recent_signatures=[] -> Blueprint Scheduler 以为
+        "前面一道题都没播过", 配额失效;
+      - avoid=None -> 文本去重也失效。
+    也就是说**只要发生一次外层 retry, 就能绕过整个 Q4**。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=3), clock=clk)
+    eng.start()
+    # 先播一题, 让它有 used_titles 与 signature
+    eng.submit_riddle("第一题。为什么?", "底", ["a", "b", "c"],
+                      signature={"mechanism_family": "hidden_function",
+                                 "solution_shape": "hidden_function_explains_behavior",
+                                 "domain": "maritime"})
+    check("指纹已记录", len(eng._recent_signatures) == 1, eng._recent_signatures)
+    # 进下一题 -> 出题失败 -> retry
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底")
+    clk.advance(31.0)
+    eng.tick(clk.t)
+    check("进入 SETTING", eng.phase == Phase.SETTING, eng.phase)
+    acts = eng.submit_riddle(None, error="网关抖动")
+    rid = [a for a in acts if a.kind == ActionKind.RIDDLE]
+    check("产生了 retry 的 RIDDLE", len(rid) == 1, acts)
+    pl = rid[0].payload
+    check("retry 带 avoid", "avoid" in pl, pl)
+    check("retry 带 recent_signatures", "recent_signatures" in pl, pl)
+    check("recent_signatures 非空(核心断言)",
+          len(pl.get("recent_signatures") or []) == 1, pl)
+    check("reason 标为 retry", pl.get("reason") == "riddle_retry", pl)
+
+
+def test_first_and_retry_riddle_actions_match():
+    """P0-2: 首轮与 retry 的 payload 键必须一致 —— 防止将来又漏一个。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=3), clock=clk)
+    first = [a for a in eng.start() if a.kind == ActionKind.RIDDLE][0]
+    retry = eng._riddle_action_locked("riddle_retry", 1)
+    a, b = set(first.payload), set(retry.payload)
+    check("键集合一致(除 attempt)", a - {"attempt"} == b - {"attempt"},
+          (sorted(a), sorted(b)))
+    check("两者都带 avoid", "avoid" in a and "avoid" in b, (a, b))
+    check("两者都带 recent_signatures",
+          "recent_signatures" in a and "recent_signatures" in b, (a, b))
+
+
+def test_retry_payload_is_a_copy():
+    """P0-2: payload 里的列表必须是**拷贝** —— 否则后面改引擎状态会串改历史。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle("第一题。为什么?", "底", ["a", "b", "c"],
+                      signature={"mechanism_family": "hidden_function",
+                                 "solution_shape": "s", "domain": "maritime"})
+    act = eng._riddle_action_locked("riddle")
+    eng._recent_signatures.clear()
+    check("recent_signatures 是拷贝",
+          len(act.payload["recent_signatures"]) == 1,
+          act.payload["recent_signatures"])
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -761,7 +826,17 @@ def main():
              test_hint_order_and_dedup, test_commands_survive_burst_buffer,
              test_replay_detection, test_determinism,
              test_llm_failure_never_drops, test_coverage_reaches_archive,
-             test_reveal_payload_carries_atoms]
+             test_reveal_payload_carries_atoms,
+             # ---- Q4 / Q5 ----
+             test_signature_recorded_and_passed_on,
+             test_signature_window_bounded,
+             test_touched_facts_accumulate_and_reset,
+             test_candidate_count_and_reset_on_new_puzzle,
+             test_answer_action_carries_facts,
+             # ---- P0-2 / P0-3 ----
+             test_retry_riddle_keeps_avoid_and_recent,
+             test_first_and_retry_riddle_actions_match,
+             test_retry_payload_is_a_copy]
     for t in tests:
         t()
     print()

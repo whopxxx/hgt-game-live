@@ -175,11 +175,17 @@ def validate_spec(spec: PuzzleSpec,
     if clues and req:
         supported = {aid for c in clues for aid in (c.supports_atoms or [])}
         req_ids = {a.id for a in req}
-        if supported and not (supported & req_ids):
-            # supports_atoms 全空时不算硬失败(老数据没这个字段), 只警告
-            r.warn("没有 fair_clue 支持任何 required atom")
-        elif not supported:
-            r.warn("fair_clues 没有标注 supports_atoms")
+        v2 = _is_v2_spec(spec)
+        if not supported:
+            # v2 的 generator/reviewer schema 都**要求** supports_atoms,
+            # 所以"一条都没标"在新题上是硬失败 —— 否则 reviewer 一丢,
+            # 公平性数据就退化了(方案 review P1)。
+            # 老数据没这个字段, 只警告。
+            (r.fail if v2 else r.warn)(
+                "fair_clues 没有标注 supports_atoms(应指向 required atom)")
+        elif not (supported & req_ids):
+            (r.fail if v2 else r.warn)(
+                "没有 fair_clue 支持任何 required atom(题目缺公平推理路径)")
 
     # ---- hints ----
     hints = spec.hints or []
@@ -202,6 +208,14 @@ def validate_blueprint(spec: PuzzleSpec,
 
     方案 §12 的硬要求: blueprint 是代码决定的硬约束, 生成器不能改。
     模型很容易无视 `death=false` 照样写死人, 所以必须回来验。
+
+    **这里全部是 error, 不是 warning**(方案 review Blocker 7)。
+    早先 mechanism/solution/relation 只 warn —— 于是代码说"这题必须
+    hidden_function / commerce / neutral / stranger", 模型交回
+    emotional_motive / family / grief 也照样过。那样 blueprint 就只是
+    "建议", 跨题配额也就失去意义(登记的是模型自报的指纹)。
+
+    仅对 **v2 spec** 生效: 老数据没有 signature, 不能一刀切拒掉。
     """
     r = ValidationResult()
     bp = blueprint or spec.blueprint
@@ -210,9 +224,8 @@ def validate_blueprint(spec: PuzzleSpec,
         return r
 
     sig = spec.signature
-    text = f"{spec.puzzle or ''} {spec.answer or ''}"
 
-    # ---- 枚举字段必须在词表内 ----
+    # ---- blueprint 自身的枚举合法性 ----
     for name, val, allowed in (
             ("mechanism_family", bp.mechanism_family, MECHANISM_FAMILIES),
             ("solution_shape", bp.solution_shape, SOLUTION_SHAPES),
@@ -223,39 +236,49 @@ def validate_blueprint(spec: PuzzleSpec,
         if val not in allowed:
             r.fail(f"blueprint.{name} 非法: {val!r}")
 
-    # ---- 静态标记: 模型必须执行 ----
-    # 这里只用**模型自报的 signature**(它读得懂语义), 代码只做一致性比对。
-    # 纯关键词检测死亡/创伤不可靠 —— "他去世了"和"她走了"没法穷举。
-    if bp.death is False and sig.death is True:
-        r.fail("blueprint 要求 death=false, 但题目里死了人")
-    if bp.past_trauma is False and sig.past_trauma is True:
-        r.fail("blueprint 要求 past_trauma=false, 但题目依赖既往创伤")
-    if bp.relation != "stranger" and sig.relation and sig.relation != bp.relation:
-        r.warn(f"blueprint.relation={bp.relation}, 自报 {sig.relation}")
+    # ---- 老数据(没有 signature) -> 不做逐项比对 ----
+    # 只有 puzzle/answer 的老 archive 不该被这套规则判死。
+    if not _is_v2_spec(spec):
+        if not sig.mechanism_family:
+            r.warn("signature 缺 mechanism_family(老 spec, 跳过逐项比对)")
+        return r
 
-    # ---- mechanism/solution 形状自报一致 ----
-    if sig.mechanism_family and sig.mechanism_family != bp.mechanism_family:
-        r.warn(f"自报 mechanism_family={sig.mechanism_family}, "
-               f"blueprint 要求 {bp.mechanism_family}")
-    if sig.solution_shape and sig.solution_shape != bp.solution_shape:
-        r.warn(f"自报 solution_shape={sig.solution_shape}, "
-               f"blueprint 要求 {bp.solution_shape}")
+    # ---- 逐项严格比对(方案 review Blocker 7) ----
+    for name in ("mechanism_family", "solution_shape", "domain",
+                 "relation", "emotion_mode", "time_shape"):
+        want = getattr(bp, name, "")
+        got = getattr(sig, name, "")
+        if got != want:
+            r.fail(f"blueprint 要求 {name}={want!r}, 但题实际是 {got!r}")
 
-    # ---- 廉价的关键词兜底: 只有高置信度的才当硬失败 ----
-    # "死去/去世/自杀/车祸" 这类词出现在**谜底**里, 基本可以断定是死亡题材。
-    if bp.death is False and not sig.death:
+    # ---- 4 个静态标记**双向**比对 ----
+    # 早先只查了 False->True 一个方向, 于是 blueprint.past_trauma=True
+    # 而实际 False 时不会报 —— 那种题会被登记成"有创伤", 把配额算错。
+    for name in ("death", "past_trauma", "long_term_profession",
+                 "repeated_ritual"):
+        want = bool(getattr(bp, name, False))
+        got = bool(getattr(sig, name, False))
+        if got != want:
+            r.fail(f"blueprint 要求 {name}={want}, 但题实际是 {got}")
+
+    # ---- 廉价的关键词兜底(比自报更可信的高置信度信号) ----
+    # 即便模型自报 death=False, 谜底里明确写了自杀/身亡就该拦下。
+    if not bp.death:
         for kw in ("自杀", "死去", "去世", "身亡", "丧生", "殉"):
             if kw in (spec.answer or ""):
                 r.fail(f"blueprint 要求 death=false, 但谜底出现 {kw!r}")
                 break
-    # 职业怪癖坍缩的典型句式(方案 §15)
-    if bp.long_term_profession is False and bp.repeated_ritual is False:
-        if ("年了" in text and ("规矩" in text or "从不" in text)):
-            r.warn("疑似'做了 N 年 + 有个怪规矩'的坍缩句式")
-
-    if not spec.signature.mechanism_family:
-        r.warn("signature 缺 mechanism_family(生成器没回传?)")
     return r
+
+
+def _is_v2_spec(spec: PuzzleSpec) -> bool:
+    """是不是"新版" spec(有 signature 的)。
+
+    老 archive 只有 puzzle/answer, 不该被 v2 的严格规则判死。
+    """
+    sig = spec.signature
+    return bool(sig and (sig.mechanism_family or sig.solution_shape
+                         or sig.domain))
 
 
 # ======================================================================
@@ -479,7 +502,8 @@ def signature_of(bp: PuzzleBlueprint) -> PuzzleSignature:
         mechanism_family=bp.mechanism_family,
         solution_shape=bp.solution_shape,
         domain=bp.domain, emotion_mode=bp.emotion_mode,
-        relation=bp.relation, death=bp.death, past_trauma=bp.past_trauma,
+        relation=bp.relation, time_shape=bp.time_shape,
+        death=bp.death, past_trauma=bp.past_trauma,
         long_term_profession=bp.long_term_profession,
         repeated_ritual=bp.repeated_ritual)
 

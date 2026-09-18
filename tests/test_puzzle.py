@@ -74,7 +74,7 @@ def good_spec(**kw) -> PuzzleSpec:
                        mechanism_family="hidden_function",
                        solution_shape="hidden_function_explains_behavior",
                        domain="maritime", emotion_mode="neutral",
-                       relation="stranger"),
+                       relation="stranger", time_shape="habitual"),
                    prompt_version="riddle-v3",
                    quality_policy_version="quality-v2")
     for k, v in kw.items():
@@ -328,11 +328,109 @@ def test_validate_blueprint_flags():
     r2 = validate_blueprint(s2, bp)
     check("谜底出现'自杀'但 death=false -> 拒", not r2.ok, r2.errors)
     # 正常
-    r3 = validate_blueprint(good_spec(),
-                            PuzzleBlueprint(mechanism_family="hidden_function",
-                                            solution_shape="hidden_function_explains_behavior",
-                                            domain="maritime"))
+    bp3 = PuzzleBlueprint(mechanism_family="hidden_function",
+                          solution_shape="hidden_function_explains_behavior",
+                          domain="maritime", relation="stranger",
+                          emotion_mode="neutral", time_shape="habitual")
+    r3 = validate_blueprint(good_spec(), bp3)
     check("一致时通过", r3.ok, r3.errors)
+
+
+def test_blueprint_mismatch_is_rejected_not_warned():
+    """P0-7: blueprint 的每一维都必须**严格**比对, 不一致是 error 不是 warn。
+
+    早先 mechanism/solution/relation 只 warn, 于是代码说"必须
+    hidden_function/commerce/neutral/stranger", 模型交回
+    emotional_motive/family/grief 照样过 —— blueprint 只是"建议",
+    跨题配额登记的也是假指纹。
+    """
+    bp = PuzzleBlueprint(mechanism_family="hidden_function",
+                         solution_shape="hidden_function_explains_behavior",
+                         domain="commerce", relation="stranger",
+                         emotion_mode="neutral", time_shape="instant")
+    # 每一维各错一个, 都必须被拒
+    cases = {
+        "mechanism_family": PuzzleSignature(mechanism_family="emotional_motive",
+                                            solution_shape="hidden_function_explains_behavior",
+                                            domain="commerce", relation="stranger",
+                                            emotion_mode="neutral", time_shape="instant"),
+        "solution_shape": PuzzleSignature(mechanism_family="hidden_function",
+                                          solution_shape="goal_reversal",
+                                          domain="commerce", relation="stranger",
+                                          emotion_mode="neutral", time_shape="instant"),
+        "domain": PuzzleSignature(mechanism_family="hidden_function",
+                                  solution_shape="hidden_function_explains_behavior",
+                                  domain="family", relation="stranger",
+                                  emotion_mode="neutral", time_shape="instant"),
+        "relation": PuzzleSignature(mechanism_family="hidden_function",
+                                    solution_shape="hidden_function_explains_behavior",
+                                    domain="commerce", relation="family",
+                                    emotion_mode="neutral", time_shape="instant"),
+        "emotion_mode": PuzzleSignature(mechanism_family="hidden_function",
+                                        solution_shape="hidden_function_explains_behavior",
+                                        domain="commerce", relation="stranger",
+                                        emotion_mode="grief", time_shape="instant"),
+        "time_shape": PuzzleSignature(mechanism_family="hidden_function",
+                                      solution_shape="hidden_function_explains_behavior",
+                                      domain="commerce", relation="stranger",
+                                      emotion_mode="neutral", time_shape="years_long"),
+    }
+    for name, sig in cases.items():
+        sp = good_spec()
+        sp.blueprint, sp.signature = bp, sig
+        r = validate_blueprint(sp, bp)
+        check(f"{name} 不一致 -> error", not r.ok, r.errors)
+        check(f"  错误信息点到 {name}",
+              any(name in e for e in r.errors), r.errors)
+
+
+def test_blueprint_flags_both_directions():
+    """P0-7: 4 个静态标记必须**双向**比对。
+
+    早先只查 False->True 一个方向: blueprint.past_trauma=True 而题实际
+    False 时不报, 于是这道题被登记成"有创伤", 配额算错。
+    """
+    for name in ("death", "past_trauma", "long_term_profession",
+                 "repeated_ritual"):
+        # blueprint 要 True, 题实际 False -> 也该拒
+        bp = PuzzleBlueprint(mechanism_family="hidden_function",
+                             solution_shape="hidden_function_explains_behavior",
+                             domain="maritime", relation="stranger",
+                             emotion_mode="neutral", time_shape="habitual",
+                             **{name: True})
+        sp = good_spec()
+        sp.blueprint = bp
+        sp.signature = PuzzleSignature(
+            mechanism_family="hidden_function",
+            solution_shape="hidden_function_explains_behavior",
+            domain="maritime", relation="stranger", emotion_mode="neutral",
+            time_shape="habitual", **{name: False})
+        r = validate_blueprint(sp, bp)
+        check(f"{name}: blueprint=True 题=False -> 拒", not r.ok, r.errors)
+        # 反向: blueprint 要 False, 题报 True -> 也要拒
+        bp2 = PuzzleBlueprint(mechanism_family="hidden_function",
+                              solution_shape="hidden_function_explains_behavior",
+                              domain="maritime", relation="stranger",
+                              emotion_mode="neutral", time_shape="habitual")
+        sp2 = good_spec()
+        sp2.blueprint = bp2
+        sp2.signature = PuzzleSignature(
+            mechanism_family="hidden_function",
+            solution_shape="hidden_function_explains_behavior",
+            domain="maritime", relation="stranger", emotion_mode="neutral",
+            time_shape="habitual", **{name: True})
+        r2 = validate_blueprint(sp2, bp2)
+        check(f"{name}: blueprint=False 题=True -> 拒", not r2.ok, r2.errors)
+
+
+def test_legacy_spec_skips_blueprint_comparison():
+    """P0-7: 老 spec(没有 signature)不该被逐项比对判死。"""
+    legacy = PuzzleSpec(puzzle="老谜面。为什么?", answer="老谜底。")
+    bp = PuzzleBlueprint(mechanism_family="hidden_function",
+                         solution_shape="hidden_function_explains_behavior",
+                         domain="commerce")
+    r = validate_blueprint(legacy, bp)
+    check("老 spec 不做逐项比对", r.ok, r.errors)
 
 
 def test_quota_blocks_after_two_deaths():
@@ -590,6 +688,9 @@ def main():
         test_puzzle_format_checks,
         test_legacy_atoms_migrate,
         test_validate_blueprint_flags,
+        test_blueprint_mismatch_is_rejected_not_warned,
+        test_blueprint_flags_both_directions,
+        test_legacy_spec_skips_blueprint_comparison,
         test_quota_blocks_after_two_deaths,
         test_quota_blocks_trauma_ritual,
         test_quota_blocks_same_mechanism,
