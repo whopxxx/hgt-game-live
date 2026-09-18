@@ -235,6 +235,13 @@ class Config:
     quota_death: int = 2                  # 死人题上限
     quota_past_trauma: int = 2            # 依赖既往创伤的上限
     quota_trauma_ritual: int = 1          # "创伤 + 长年怪规矩"上限(实测坍缩最重)
+    # ---- Step 02: reveal / tone / 规则依赖的 rolling quota ----
+    # 数的是 **observed**(Reviewer 读完如实回传的 Signature), 不是调度器
+    # 的目标值 —— 目标只是输入, 配额反映的是观众真实看到的分布。
+    quota_same_reveal_mode: int = 2       # 同一揭晓结构最多几道
+    quota_straight_explanation: int = 2   # "没有翻转的正面解释"上限
+    quota_neutral_emotion: int = 3        # "中性气氛"上限(去掉固定偏置后的护栏)
+    quota_procedural_rule: int = 2        # 主要靠制度性设定成立的题上限
 
     # ---- AI 试玩(方案 §40/§42): 直播热路径里**默认关闭** ----
     # 只在后台 prefetch candidate 上跑, `_riddle` 永远不试玩。

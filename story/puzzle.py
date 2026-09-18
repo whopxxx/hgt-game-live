@@ -319,19 +319,15 @@ class PuzzleBlueprint:
         RIDDLE 的 user 消息、由 `_review()` 拼进审稿消息。所以往这里加一行
         就是**改生产行为**, 不是改数据结构。
 
-        ## 为什么这里**仍然**没有 reveal_mode 这一行
+        ## 为什么 reveal_mode 现在**可以**印出来了
 
-        Step 01 刻意不暴露它; Step 04 让模型**理解**了这个字段的语义
-        (RIDDLE_SYSTEM / CHECK_SYSTEM 的正交说明 + 两边 tool schema),
-        但**没有**在这里暴露一个"目标值"。
+        Step 01 不暴露它, Step 04 让模型理解了它的语义但**仍然**没暴露
+        目标值 —— 因为那时 `self.reveal_mode` 恒为默认, 印出去是个伪目标。
 
-        理由是顺序: 这一行印出去的是**调度器想要的** reveal_mode。在
-        Step 02 的 reveal 调度器落地之前, `self.reveal_mode` 恒为默认值,
-        印出去只会给模型一个"永远等于 straight_explanation 的伪目标",
-        反而污染 observed_signature(模型会以为题目就该是普通解释)。
-
-        等 Step 02 有了真正的 reveal 选择器, 再加这一行 —— 那时它才是
-        一个有信息量的约束, 也才配得上 `reveal_mode adherence` 检查。
+        Step 02 落地了真正的 reveal 选择器(`quality.choose_reveal_mode`),
+        于是这一行现在携带真实信息: 它是调度器按 rolling quota 挑出的
+        **目标结构**。模型应当朝它写, 但**如实报告实际写成了什么** ——
+        `reveal_mode adherence` 检查的正是这两个值的差。
         """
         flags = [k for k in ("death", "past_trauma", "long_term_profession",
                              "repeated_ritual") if getattr(self, k)]
@@ -342,6 +338,7 @@ class PuzzleBlueprint:
             f"- relation(人物关系): {self.relation}\n"
             f"- emotion_mode(情绪基调): {self.emotion_mode}\n"
             f"- time_shape(时间形态, 参考): {self.time_shape}\n"
+            f"- reveal_mode(揭晓结构, **目标**): {self.reveal_mode}\n"
             f"- 必须为真的标记: {', '.join(flags) if flags else '(无)'}\n"
             f"- 必须为假的标记: "
             f"{', '.join(k for k in ('death', 'past_trauma', 'long_term_profession', 'repeated_ritual') if not getattr(self, k))}"

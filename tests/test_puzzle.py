@@ -23,7 +23,7 @@ from story.puzzle import (  # noqa: E402
 from story.quality import (  # noqa: E402
     QUALITY_POLICY_VERSION, Quotas, check_signature, choose_blueprint,
     cross_puzzle_gate, FAMILY_SHAPES, check_tables, is_structurally_duplicate,
-    signature_of, validate_blueprint, validate_spec,
+    signature_counts, signature_of, validate_blueprint, validate_spec,
 )
 
 FAIL = [0]
@@ -422,21 +422,26 @@ def test_signature_reveal_mode_rejects_bad_value():
           ).signature.procedural_rule_dependency is True)
 
 
-def test_describe_does_not_leak_reveal_mode():
-    """Step 01 review-fix: `describe()` 直接进生产 Prompt, 不能提前暴露新字段。
+def test_describe_exposes_reveal_target():
+    """Step 02: `describe()` 现在**应该**带上 reveal_mode 目标。
 
-    `_gen_spec_once()` 把它拼进 RIDDLE 的 user 消息(生成器),
-    `_review()` 把它拼进审稿消息。所以往这里加一行 = **改生产行为**。
+    历史: Step 01 刻意不暴露它(那时它恒为默认, 印出去是伪目标);
+    Step 02 有了 `choose_reveal_mode` 调度器, 这一行才携带真实信息。
 
-    Step 01 只做 schema/serialization; 让生成器/审稿人正式理解
-    `reveal_mode`(并同步 prompt version / tool schema / regression)
-    是 Step 04 的事。
+    `describe()` 直接进生产 Prompt(`_gen_spec_once` 的 RIDDLE user 消息、
+    `_review` 的审稿消息), 所以这条同时是"生产行为变更"的回归护栏。
+
+    但 `procedural_rule_dependency` **仍然不该出现** —— 它是**观察值**,
+    不是指令。让生成器看见一个"你必须依赖/不依赖规则"的硬约束, 会让它
+    按目标编造 observed 值, 那个字段立刻失去统计意义。
     """
     txt = PuzzleBlueprint(reveal_mode="identity_flip").describe()
-    check("describe() 不出现 reveal_mode", "reveal_mode" not in txt, txt)
-    check("describe() 不出现 procedural_rule_dependency",
+    check("describe() 出现 reveal_mode 目标", "reveal_mode" in txt, txt)
+    check("describe() 印出的是那个目标值",
+          "identity_flip" in txt, txt)
+    check("describe() **不**出现 procedural_rule_dependency",
           "procedural_rule_dependency" not in txt, txt)
-    # 但原有的硬约束字段必须还在(别为了删一行把整段弄坏)
+    # 原有的硬约束字段必须还在(别为了加一行把整段弄坏)
     for must in ("mechanism_family", "solution_shape", "domain",
                  "relation", "emotion_mode", "time_shape"):
         check(f"describe() 仍含 {must}", must in txt, txt)
@@ -892,6 +897,236 @@ def test_quotas_from_config():
     check("缺字段时用默认", q2.window == 10 and q2.death == 2, q2)
 
 
+# ======================================================================
+# Step 02 — reveal / tone scheduler + rolling quota
+# ======================================================================
+def _sig(**kw):
+    """造一个最近窗口里的 observed signature。"""
+    d = {"mechanism_family": "hidden_function",
+         "solution_shape": "hidden_function_explains_behavior",
+         "domain": "maritime", "relation": "stranger",
+         "emotion_mode": "neutral", "time_shape": "instant"}
+    d.update(kw)
+    return PuzzleSignature(**d)
+
+
+def test_s02_neutral_bias_removed():
+    """Step 02 核心: `_candidates` 不再把每一道题的情绪钉死成 neutral。
+
+    修之前 `_shape_flags(shape, "neutral")` 写死了情绪 —— 配额再准也没用,
+    因为**别的取值从来没被选过**。这条直接验候选集合里存在非 neutral。
+    """
+    print("\n[S02-1] 去掉『永远 neutral』的固定偏置")
+    from story.quality import _candidates
+    import random as _r
+    cands = _candidates(Quotas(), [])
+    emos = {bp.emotion_mode for bp, _ in cands}
+    check("候选里不止 neutral", len(emos) > 1, emos)
+    check("候选里确实有非 neutral",
+          any(e != "neutral" for e in emos), emos)
+    # ---- 真正的**分布**测试(光看候选集合不够) ----
+    #
+    # ⚠️ 关键陷阱: 有些情绪是**形状钉死**的(`past_trauma_...` 必然是
+    # grief, 见 SHAPE_FLAGS)。就算"自由情绪选择"被整体固定回 neutral,
+    # 那些被钉死的仍会出现 —— 于是"出现了 >1 种情绪"依然成立, 测试
+    # **假绿**。所以这里必须只看**自由选择**那部分的分布。
+    from story.quality import SHAPE_FLAGS
+    pinned_emos = {v["emotion_mode"] for v in SHAPE_FLAGS.values()
+                   if "emotion_mode" in v}
+    free = []
+    for s in range(120):
+        bp = choose_blueprint([], _r.Random(s))
+        if bp.solution_shape in SHAPE_FLAGS and                 "emotion_mode" in SHAPE_FLAGS[bp.solution_shape]:
+            continue            # 形状钉死, 不算自由选择的功劳
+        free.append(bp.emotion_mode)
+    uniq = set(free)
+    check("自由选择的情绪不止一种(固定偏置会在这里挂)",
+          len(uniq) > 1, uniq)
+    check("自由选择里 neutral 不占满",
+          free.count("neutral") < len(free), free.count("neutral"))
+    check("自由选择样本量足够", len(free) > 10, len(free))
+    check("被钉死的情绪确实是 grief", "grief" in pinned_emos, pinned_emos)
+    # 形状钉死的情绪仍然优先(结构性, 不该被自由选择覆盖)
+    pinned = [bp for bp, _ in cands
+              if bp.solution_shape == "past_trauma_explains_current_ritual"]
+    check("被形状钉死的仍是 grief",
+          all(bp.emotion_mode == "grief" for bp in pinned),
+          {bp.emotion_mode for bp in pinned})
+
+
+def test_s02_neutral_quota_limits_distribution():
+    """neutral 上限 3/10 —— 大量采样后不能垄断。"""
+    print("\n[S02-2] neutral 情绪受 rolling quota 限制")
+    q = Quotas()
+    e = PuzzleSignature(emotion_mode="neutral")
+    recent = [e] * 3
+    bad = check_signature(PuzzleSignature(emotion_mode="neutral"), recent, q)
+    check("已有 3 道 neutral -> 第 4 道被拒", bad != [], bad)
+    check("理由提到中性", any("中性" in x for x in bad), bad)
+    # 非 neutral 不受这条限制
+    ok = check_signature(PuzzleSignature(emotion_mode="warm"), recent, q)
+    check("warm 不受 neutral 配额影响", ok == [], ok)
+
+
+def test_s02_straight_explanation_quota():
+    """straight_explanation <= 2/10(它是"不翻转"的默认态, 单独设限)。"""
+    print("\n[S02-3] straight_explanation 上限 2/10")
+    q = Quotas()
+    recent = [_sig(reveal_mode="straight_explanation")] * 2
+    bad = check_signature(_sig(reveal_mode="straight_explanation"), recent, q)
+    check("已有 2 道 -> 第 3 道被拒", bad != [], bad)
+    check("理由提到正面解释",
+          any("正面解释" in x for x in bad), bad)
+    # 换个有翻转的结构就不受这条限制。
+    # ⚠️ 对照组必须**同时**换掉 mechanism/shape: `_sig()` 的默认是
+    # hidden_function, 10 道同 mechanism 会撞上 another 上限, 那样就算
+    # straight 配额没问题也会红 —— 是测试自己造出来的假阳性。
+    ok = check_signature(
+        _sig(reveal_mode="identity_flip", mechanism_family="object_misuse",
+             solution_shape="misunderstood_object"), [], q)
+    check("有翻转的结构不受 straight 配额影响", ok == [], ok)
+
+
+def test_s02_same_reveal_mode_quota():
+    """同一 reveal_mode <= 2/10。"""
+    print("\n[S02-4] 同一 reveal_mode 上限 2/10")
+    q = Quotas()
+    recent = [_sig(reveal_mode="identity_flip")] * 2
+    bad = check_signature(_sig(reveal_mode="identity_flip"), recent, q)
+    check("identity_flip 出现 2 次 -> 第 3 次被拒", bad != [], bad)
+    check("理由提到该结构", any("identity_flip" in x for x in bad), bad)
+    ok = check_signature(
+        _sig(reveal_mode="goal_flip", mechanism_family="object_misuse",
+             solution_shape="misunderstood_object"), [], q)
+    check("另一个结构不受影响", ok == [], ok)
+
+
+def test_s02_procedural_rule_dependency_quota():
+    """Step 02: procedural_rule_dependency <= 2/10(observed 口径)。"""
+    print("\n[S02-5] 规则依赖上限 2/10")
+    q = Quotas()
+    recent = [_sig(procedural_rule_dependency=True)] * 2
+    bad = check_signature(_sig(procedural_rule_dependency=True), recent, q)
+    check("已有 2 道 -> 第 3 道被拒", bad != [], bad)
+    check("理由提到制度性设定",
+          any("制度性设定" in x for x in bad), bad)
+    ok = check_signature(
+        _sig(procedural_rule_dependency=False, mechanism_family="object_misuse",
+             solution_shape="misunderstood_object"), [], q)
+    check("不依赖规则的题不受限制", ok == [], ok)
+
+
+def test_s02_unknown_reveal_is_not_counted_as_straight():
+    """`reveal_mode == ""` 是"没观察过", **不**计入 straight 桶。
+
+    否则老题(没有这个字段)会被一律读成"普通解释", 历史统计立刻失真,
+    而且 straight 配额会被历史数据无端占满。
+    """
+    print("\n[S02-6] 未知 reveal 不算 straight")
+    recent = [_sig(reveal_mode="")] * 5
+    c = signature_counts(recent)
+    check("straight 桶为 0", c.get("reveal:straight_explanation", 0) == 0, c)
+    check("记进 __unknown_reveal__", c.get("__unknown_reveal__") == 5, c)
+    q = Quotas()
+    # 用空窗口验"未知值不占用 straight 桶" —— 拿上面那 5 条当 recent 会
+    # 顺带撞上 mechanism 配额, 那样红的是别的原因, 测不到本意。
+    ok = check_signature(_sig(reveal_mode="straight_explanation"), [], q)
+    check("因此 straight 仍可用", ok == [], ok)
+
+
+def test_s02_reveal_preference_puts_straight_last():
+    """`straight_explanation` 必须在偏好序**最后** —— 允许但不当默认。"""
+    print("\n[S02-7] straight 永远排在偏好序最后")
+    from story.quality import REVEAL_PREFERENCE
+    check("顺序里含全部 8 种",
+          set(REVEAL_PREFERENCE) == set(REVEAL_MODES),
+          (set(REVEAL_PREFERENCE), set(REVEAL_MODES)))
+    check("straight 在最后",
+          REVEAL_PREFERENCE[-1] == "straight_explanation",
+          REVEAL_PREFERENCE[-1])
+
+
+def test_s02_choose_reveal_mode_avoids_exhausted():
+    """`choose_reveal_mode` 不选已超配额的; 且有翻转型优先。"""
+    print("\n[S02-8] reveal 选择器避开超配额的")
+    import random
+    from story.quality import choose_reveal_mode
+    q = Quotas()
+    # 把 7 种翻转型全部填满到超配额, 只留 straight。
+    # ⚠️ 必须让**每一种都落在 window 内**: `signature_counts` 只看最近
+    # window 条, 7 种 × 2 条 = 14 > window(10), 前面的会被挤出窗口 ——
+    # 那样 identity_flip 等会"看起来没出现过", 选择器正确地返回了它,
+    # 而测试却以为它该被挡住。用一个小 window 的 Quotas 精确表达意图。
+    q2 = Quotas(window=14)
+    recent = []
+    for m in REVEAL_MODES:
+        if m == "straight_explanation":
+            continue
+        recent += [_sig(reveal_mode=m)] * q2.same_reveal_mode
+    check("前置: 7 种翻转型都在窗口内",
+          all(signature_counts(recent, q2.window)[f"reveal:{m}"] == 2
+              for m in REVEAL_MODES if m != "straight_explanation"))
+    got = choose_reveal_mode(recent, random.Random(3), q2)
+    check("翻转型全满时只能给 straight", got == "straight_explanation", got)
+    # 反过来: straight 满了 -> 必须给某个翻转型
+    recent2 = [_sig(reveal_mode="straight_explanation")] * q.straight_explanation
+    got2 = choose_reveal_mode(recent2, random.Random(3), q)
+    check("straight 满时给翻转型", got2 != "straight_explanation", got2)
+    # 空窗口: 多次采样应覆盖多个翻转型(不是永远同一个)
+    picks = {choose_reveal_mode([], random.Random(s), q) for s in range(30)}
+    check("多 seed 覆盖多个结构", len(picks) > 1, picks)
+    check("多 seed 里 straight 不占多数",
+          sum(1 for s in range(30)
+              if choose_reveal_mode([], random.Random(s), q)
+              == "straight_explanation") < 15)
+
+
+def test_s02_blueprint_carries_reveal_target():
+    """调度出来的 blueprint 必须带上 reveal 目标值。"""
+    print("\n[S02-9] blueprint 带上 reveal 目标")
+    import random
+    bp = choose_blueprint([], random.Random(5))
+    check("reveal_mode 非空", bool(bp.reveal_mode), bp.reveal_mode)
+    check("reveal_mode 在枚举内", bp.reveal_mode in REVEAL_MODES, bp.reveal_mode)
+    check("describe() 印出了该目标",
+          bp.reveal_mode in bp.describe(), bp.describe())
+    # ---- **分布**测试: 目标不能被固定成 straight_explanation ----
+    # 只验"非空 + 枚举内"是抓不住"固定成 straight"的 —— straight 本身
+    # 合法。要跑一串调度看分布。
+    targets = [choose_blueprint([], random.Random(s)).reveal_mode
+               for s in range(120)]
+    uniq = set(targets)
+    check("调度 120 次出现 >1 种 reveal 目标", len(uniq) > 1, uniq)
+    check("straight 不占满",
+          targets.count("straight_explanation") < len(targets),
+          targets.count("straight_explanation"))
+    check("有翻转的目标出现过",
+          any(t != "straight_explanation" for t in targets), uniq)
+
+
+def test_s02_quota_responsibility_stays_in_code():
+    """Step 02 硬边界: 配额判断在**代码层**, 不在 Reviewer。
+
+    Reviewer 看不到完整的最近题窗口, 所以"最近是否超配额"这句话不能由它
+    来说。这条从**调用关系**上验: `cross_puzzle_gate` 是唯一决定
+    "该题能否进链路"的地方, 且它不调用任何 LLM。
+    """
+    print("\n[S02-10] 配额职责留在代码层")
+    import inspect
+    from story.quality import check_signature as _cs
+    from story.quality import cross_puzzle_gate as _cg
+    for fn, name in ((_cs, "check_signature"), (_cg, "cross_puzzle_gate")):
+        src = inspect.getsource(fn)
+        check(f"{name} 不调用 LLM/writer",
+              "PuzzleWriter" not in src and "client" not in src
+              and "messages(" not in src, name)
+    # 超配额 -> gate 拒绝, 而不是"让 reviewer 去改"
+    recent = [_sig(mechanism_family="hidden_function")] * 2
+    s = good_spec()
+    bad = cross_puzzle_gate(s, recent, Quotas(), s.blueprint)
+    check("超配额时 gate 返回拒绝原因", bad != [], bad)
+
+
 def test_hint_focus_picks_untouched_required_atom():
     """Q6(方案 §33): 提示方向 = required atom -> 其 facts -> 未 touched -> hintable。"""
     from story.quality import hint_focus
@@ -1022,7 +1257,7 @@ def main():
         test_legacy_signature_reveal_mode_is_unknown_not_straight,
         test_signature_reveal_mode_default_is_unknown,
         test_signature_reveal_mode_rejects_bad_value,
-        test_describe_does_not_leak_reveal_mode,
+        test_describe_exposes_reveal_target,
         test_legacy_atoms_migrate,
         test_validate_blueprint_flags,
         test_blueprint_mismatch_is_rejected_not_warned,
@@ -1044,6 +1279,17 @@ def main():
         test_trauma_ritual_quota_applies_via_shape,
         test_signature_helpers,
         test_quotas_from_config,
+        # ---- Step 02: reveal/tone scheduler + rolling quota ----
+        test_s02_neutral_bias_removed,
+        test_s02_neutral_quota_limits_distribution,
+        test_s02_straight_explanation_quota,
+        test_s02_same_reveal_mode_quota,
+        test_s02_procedural_rule_dependency_quota,
+        test_s02_unknown_reveal_is_not_counted_as_straight,
+        test_s02_reveal_preference_puts_straight_last,
+        test_s02_choose_reveal_mode_avoids_exhausted,
+        test_s02_blueprint_carries_reveal_target,
+        test_s02_quota_responsibility_stays_in_code,
     ]
     for t in tests:
         t()

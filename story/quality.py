@@ -25,7 +25,8 @@ from typing import Any, Optional
 
 from .puzzle import (
     ATOM_ROLES, DOMAINS, EMOTION_MODES, FACT_KINDS, FACT_VISIBILITY,
-    GRIEF_MODES, MECHANISM_FAMILIES, RELATIONS, SOLUTION_SHAPES, TIME_SHAPES,
+    GRIEF_MODES, MECHANISM_FAMILIES, RELATIONS, REVEAL_MODES, SOLUTION_SHAPES,
+    TIME_SHAPES,
     PuzzleBlueprint, PuzzleSignature, PuzzleSpec, has_closing_question,
     has_meta_text, is_first_person, quote_in_puzzle,
 )
@@ -251,7 +252,10 @@ def validate_blueprint(spec: PuzzleSpec,
             ("domain", bp.domain, DOMAINS),
             ("emotion_mode", bp.emotion_mode, EMOTION_MODES),
             ("relation", bp.relation, RELATIONS),
-            ("time_shape", bp.time_shape, TIME_SHAPES)):
+            ("time_shape", bp.time_shape, TIME_SHAPES),
+            # reveal_mode 是 Step 02 的调度**目标**, 只验它在枚举内。
+            # 它**不参与下面的逐项比对** —— 见那里的说明。
+            ("reveal_mode", bp.reveal_mode, REVEAL_MODES)):
         if val not in allowed:
             r.fail(f"blueprint.{name} 非法: {val!r}")
 
@@ -276,6 +280,13 @@ def validate_blueprint(spec: PuzzleSpec,
     # metadata**: 生成器如实回传, 代码只统计(见 signature_counts), 不拒稿。
     # 等将来真要做 time_shape 维度的配额, 得先有 family × time_shape 的
     # 兼容表, 而不是拿一个默认值去卡所有题。
+    #
+    # `reveal_mode` 同理**不在这里**(Step 02)。它是一个**目标**: 调度器
+    # 挑一个稀缺的结构让模型朝它写, 而 `signature.reveal_mode` 是
+    # Reviewer 读完**如实**回传的实际结构。两者不一致时正确处置是
+    # **记录下来**(见 Step 04 的 reveal_mode adherence), 不是拒稿 ——
+    # 否则模型只要照抄目标值就能通过, 那个观察值立刻失去意义, 配额也就
+    # 统计不到真实分布了。
     for name in ("mechanism_family", "solution_shape", "domain",
                  "relation", "emotion_mode"):
         want = getattr(bp, name, "")
@@ -330,6 +341,18 @@ class Quotas:
     profession_ritual: int = 1
     same_domain: int = 3
     same_relation: int = 3
+    # ---- Step 02 ----
+    #: 同一 `reveal_mode`(observed)最多几道。
+    same_reveal_mode: int = 2
+    #: `straight_explanation`(没有翻转的正面解释)上限。
+    #: 单独一条, 因为它是"不翻转"这个**默认态**的护栏: 即使每个具体
+    #: reveal_mode 都没超 `same_reveal_mode`, 也可能连着好几道都不翻转。
+    straight_explanation: int = 2
+    #: `neutral` 情绪上限。Step 02 去掉了"永远选 neutral"的固定偏置,
+    #: 这条是防止它从另一个方向坍缩(比如全变 warm)。
+    neutral_emotion: int = 3
+    #: 主要靠制度性设定成立的题上限(`procedural_rule_dependency`, observed)。
+    procedural_rule: int = 2
 
     @classmethod
     def from_config(cls, cfg: Any) -> "Quotas":
@@ -344,6 +367,10 @@ class Quotas:
             death=g("quota_death", 2),
             past_trauma=g("quota_past_trauma", 2),
             trauma_ritual=g("quota_trauma_ritual", 1),
+            same_reveal_mode=g("quota_same_reveal_mode", 2),
+            straight_explanation=g("quota_straight_explanation", 2),
+            neutral_emotion=g("quota_neutral_emotion", 3),
+            procedural_rule=g("quota_procedural_rule", 2),
         )
 
 
@@ -362,7 +389,20 @@ def _recent(recent: Optional[list], window: int) -> list:
 
 def signature_counts(recent: Optional[list],
                      window: int = RECENT_WINDOW) -> dict:
-    """统计最近 window 题的各维度计数。"""
+    """统计最近 window 题的各维度计数。
+
+    ⚠️ 这两个新维度(`reveal_mode` / `procedural_rule_dependency`)统计的
+    是 **observed** 值 —— 即 Reviewer 读完如实回传、落进 `spec.signature`
+    的那个值。**不是**调度器的目标值。理由: 配额要反映观众真实看到的
+    分布; 拿目标值统计的话, 模型不服从时配额会静默跑偏, 且调度意图
+    无法审计。
+
+    老题 / 缺失值: `reveal_mode == ""` 表示"没观察过"。它**不进**任何
+    具体模式的桶(不会被当成 straight_explanation), 只在
+    `__unknown_reveal__` 里留个计数, 便于排查"这批题有多少没观察值"。
+    `procedural_rule_dependency` 是 bool, 缺失即 False(它不是"未知",
+    而是"默认不依赖" —— 与 Signature 里其余 bool 字段一致)。
+    """
     rs = _recent(recent, window)
     c = Counter()
     for s in rs:
@@ -372,6 +412,15 @@ def signature_counts(recent: Optional[list],
         c[f"relation:{s.relation}"] += 1
         if s.time_shape:
             c[f"time:{s.time_shape}"] += 1    # 只统计, 不参与配额
+        if s.emotion_mode:
+            c[f"emotion:{s.emotion_mode}"] += 1
+        # ---- Step 02: reveal 结构(observed) ----
+        if s.reveal_mode:
+            c[f"reveal:{s.reveal_mode}"] += 1
+        else:
+            c["__unknown_reveal__"] += 1
+        if s.procedural_rule_dependency:
+            c["procedural_rule"] += 1
         if s.death:
             c["death"] += 1
         if s.past_trauma:
@@ -427,6 +476,29 @@ def check_signature(sig: PuzzleSignature, recent: Optional[list],
     if sig.relation and c.get(f"relation:{sig.relation}", 0) >= q.same_relation:
         bad.append(f"最近 {q.window} 题里关系 {sig.relation} 已出现 "
                    f"{c[f'relation:{sig.relation}']} 次(上限 {q.same_relation})")
+    # ---- Step 02: reveal 结构 / 情绪 / 规则依赖 ----
+    # 没有 observed reveal_mode(`""`)时**不判** —— 那是"没观察过", 不是
+    # "普通解释"。拿未知当 straight 会把老题和历史统计一起弄脏。
+    if sig.reveal_mode:
+        if (sig.reveal_mode == "straight_explanation"
+                and c.get("reveal:straight_explanation", 0)
+                >= q.straight_explanation):
+            bad.append(f"最近 {q.window} 题里有 "
+                       f"{c['reveal:straight_explanation']} 道'没有翻转的正面解释'"
+                       f"(上限 {q.straight_explanation})")
+        if (sig.reveal_mode != "straight_explanation"
+                and c.get(f"reveal:{sig.reveal_mode}", 0) >= q.same_reveal_mode):
+            bad.append(f"最近 {q.window} 题里揭晓结构 {sig.reveal_mode} 已出现 "
+                       f"{c[f'reveal:{sig.reveal_mode}']} 次"
+                       f"(上限 {q.same_reveal_mode})")
+    if (sig.emotion_mode == "neutral"
+            and c.get("emotion:neutral", 0) >= q.neutral_emotion):
+        bad.append(f"最近 {q.window} 题里有 {c['emotion:neutral']} 道中性情绪题"
+                   f"(上限 {q.neutral_emotion})")
+    if (sig.procedural_rule_dependency
+            and c.get("procedural_rule", 0) >= q.procedural_rule):
+        bad.append(f"最近 {q.window} 题里有 {c['procedural_rule']} 道主要靠"
+                   f"制度性设定成立(上限 {q.procedural_rule})")
     return bad
 
 
@@ -507,31 +579,113 @@ def _candidates(quotas: Quotas, recent: Optional[list]) -> list:
     死亡/创伤/长年规矩这些标记按 SHAPE_FLAGS 从解法形状推导
     (past_trauma_explains_current_ritual 必然带 trauma+ritual),
     所以 trauma_ritual 的严格配额在这里自然生效。
+
+    ## Step 02: 去掉"永远 neutral"的固定偏置
+
+    早先这里写死 `_shape_flags(shape, "neutral")` —— 每一道题的 blueprint
+    都被告知"你的情绪基调是 neutral", 于是模型把整场都写成中性。那不是
+    配额不够, 是**从来没有任何别的取值被选过**。
+
+    现在: 情绪按 `EMOTION_MODES` **逐层展开**成候选, 由 `check_signature`
+    的 `neutral_emotion` 配额把中性压到不再垄断。`SHAPE_FLAGS` 里被形状
+    钉死的情绪(例如 `past_trauma_explains_current_ritual` 必然是 grief)
+    仍然优先 —— 那是**结构性**的, 不该被情绪选择覆盖。
     """
     c = signature_counts(recent, quotas.window)
     out = []
     for fam, shapes in FAMILY_SHAPES.items():
         for shape in shapes:
-            flags = _shape_flags(shape, "neutral")
-            for dom in DOMAINS:
-                if c.get(f"domain:{dom}", 0) >= quotas.same_domain:
-                    continue
-                for rel in RELATIONS:
-                    if c.get(f"relation:{rel}", 0) >= quotas.same_relation:
+            # 形状钉死的情绪优先; 没有钉死才允许自由选。
+            pinned = SHAPE_FLAGS.get(shape, {}).get("emotion_mode")
+            emotions = (pinned,) if pinned else EMOTION_MODES
+            for emo in emotions:
+                flags = _shape_flags(shape, emo)
+                for dom in DOMAINS:
+                    if c.get(f"domain:{dom}", 0) >= quotas.same_domain:
                         continue
-                    bp = PuzzleBlueprint(
-                        mechanism_family=fam, solution_shape=shape,
-                        domain=dom, relation=rel,
-                        emotion_mode=flags["emotion_mode"],
-                        time_shape=flags["time_shape"],
-                        death=flags.get("death", False),
-                        past_trauma=flags.get("past_trauma", False),
-                        long_term_profession=flags.get("long_term_profession", False),
-                        repeated_ritual=flags.get("repeated_ritual", False))
-                    sig = signature_of(bp)
-                    if not check_signature(sig, recent, quotas):
-                        out.append((bp, sig))
+                    for rel in RELATIONS:
+                        if c.get(f"relation:{rel}", 0) >= quotas.same_relation:
+                            continue
+                        bp = PuzzleBlueprint(
+                            mechanism_family=fam, solution_shape=shape,
+                            domain=dom, relation=rel,
+                            emotion_mode=flags["emotion_mode"],
+                            time_shape=flags["time_shape"],
+                            death=flags.get("death", False),
+                            past_trauma=flags.get("past_trauma", False),
+                            long_term_profession=flags.get("long_term_profession", False),
+                            repeated_ritual=flags.get("repeated_ritual", False))
+                        sig = signature_of(bp)
+                        if not check_signature(sig, recent, quotas):
+                            out.append((bp, sig))
     return out
+
+
+#: 揭晓结构的选择顺序(Step 02)。**不是**随机均匀 —— 精确按此顺序做
+#: "越靠前越优先, 但受 rolling quota 约束":
+#:
+#:   1. 有翻转的结构(7 种) —— 优先, 因为它们是"意外感"的来源;
+#:   2. `straight_explanation` —— 允许, 但**永远排在最后**。
+#:
+#: 这样既不禁止正面解释(有些题就是不需要翻转), 又保证它不会成为默认。
+#: 具体选哪一个由 `choose_reveal_mode` 在配额允许的集合里随机取。
+REVEAL_PREFERENCE = (
+    "identity_flip",
+    "meaning_flip",
+    "causal_flip",
+    "goal_flip",
+    "recontextualization",
+    "hidden_stakes",
+    "perspective_flip",
+    "straight_explanation",     # 永远最后
+)
+
+
+def choose_reveal_mode(recent: Optional[list],
+                       rng: Optional[random.Random] = None,
+                       quotas: Optional[Quotas] = None) -> str:
+    """为下一道题挑一个**未超配额**的 reveal_mode(observed 口径)。
+
+    ## 为什么这是"目标"而不是"配额数据源"
+
+    配额统计的是 **observed**(Reviewer 读完回传的值, 见
+    `signature_counts`)。这里返回的是**调度目标** —— 它是给生成器的
+    一个方向, 不是"已经播出的分布"。两者刻意分开:
+
+      - 目标 -> 引导生成器往稀缺的结构走;
+      - observed -> 真正记进最近窗口、参与配额的量。
+
+    如果模型不服从(要 identity_flip 结果写成 recontextualization),
+    observed 会如实记成后者, 配额也跟着按后者走 —— 不会因为"我们本来
+    想要 identity_flip"而假装那个缺口被填上了。这正是"配额反映观众
+    真实看到的分布"的含义。
+
+    挑不到(全被配额堵死)时返回 `straight_explanation` —— 永远有返回值,
+    出题链不能因为配额算法卡死。
+    """
+    rng = rng or random.Random()
+    q = quotas or Quotas()
+    c = signature_counts(recent, q.window)
+    ok_modes = []
+    for mode in REVEAL_PREFERENCE:
+        if mode == "straight_explanation":
+            if c.get("reveal:straight_explanation", 0) >= q.straight_explanation:
+                continue
+        elif c.get(f"reveal:{mode}", 0) >= q.same_reveal_mode:
+            continue
+        ok_modes.append(mode)
+    if not ok_modes:
+        return "straight_explanation"
+    # 在"未超配额"的集合里随机 —— 但权重偏向更靠前的(更有翻转感)。
+    weights = [1.0 / (i + 1) for i in range(len(ok_modes))]
+    total = sum(weights)
+    pick = rng.random() * total
+    acc = 0.0
+    for mode, w in zip(ok_modes, weights):
+        acc += w
+        if pick <= acc:
+            return mode
+    return ok_modes[-1]
 
 
 def signature_of(bp: PuzzleBlueprint) -> PuzzleSignature:
@@ -557,12 +711,19 @@ def choose_blueprint(recent: Optional[list],
 
     候选为空时(配额把所有组合都堵死了)退化为"最久没出现的 family",
     保证**永远有返回值** —— 出题链不能因为配额算法而卡死。
+
+    Step 02: 返回的 blueprint 上同时带上**目标 `reveal_mode`**
+    (由 `choose_reveal_mode` 按 rolling quota 选)。它是给生成器的方向,
+    不是配额数据源 —— 配额数的是 Reviewer 回传的 observed 值。
     """
     rng = rng or random.Random()
     q = quotas or Quotas()
+    target_reveal = choose_reveal_mode(recent, rng=rng, quotas=q)
     cands = _candidates(q, recent)
     if not cands:
-        return _least_recently_seen(q, recent)
+        bp = _least_recently_seen(q, recent)
+        bp.reveal_mode = target_reveal
+        return bp
 
     # ---- 权重: family 越久没出现, 权重越高 ----
     rs = _recent(recent, q.window)
@@ -579,14 +740,19 @@ def choose_blueprint(recent: Optional[list],
 
     total = sum(weights)
     if total <= 0:
-        return cands[rng.randrange(len(cands))][0]
+        bp = cands[rng.randrange(len(cands))][0]
+        bp.reveal_mode = target_reveal
+        return bp
     pick = rng.random() * total
     acc = 0.0
     for (bp, _sig), w in zip(cands, weights):
         acc += w
         if pick <= acc:
+            bp.reveal_mode = target_reveal
             return bp
-    return cands[-1][0]
+    bp = cands[-1][0]
+    bp.reveal_mode = target_reveal
+    return bp
 
 
 def _least_recently_seen(quotas: Quotas,
