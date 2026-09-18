@@ -102,104 +102,165 @@ window.addEventListener("load", async () => {
     check(dmNodes() === n2 + 1, "只应新增第 3 条, 实际新增 "
           + (dmNodes() - n2));
 
-    // ⓪b 回归: "越播越快"(P1)
+    // ⓪b 弹幕轨道占用(P1 + P2)
     //
-    // 曾经的 bug: `pushDanmaku` 在 list 非空时**无条件**刷新 `lastDmAt`,
-    // 而服务端在房间有人说过话之后每个 snapshot 都带最近 40 条 —— 于是
-    // 1.2 秒的 batch 清零**永远不触发**, `batchSlots` 单调上涨; 而动画
-    // 时长固定 9~12 秒、位移却含 `echo` -> 同一轨道越往后越快。
+    // 历史 bug 链条:
+    //   P1  `batchSlots` 只增不减(靠 1.2s 批次时钟归零, 而那时钟被 4Hz 的
+    //       重复窗口一直刷新 -> 永不归零) + 固定时长 => 同一轨道越播越快。
+    //   P2  即使修好 P1 的时钟, `batchSlots` 仍是"累计到过这里的弹幕总宽度",
+    //       没有物理含义 —— 只要一直有人说话就无限上涨, 表现为出生偏移
+    //       越来越大(越来越晚出现)。
     //
-    // 复现有三个必要条件。我前三版探针逐个漏掉, 记下来免得再犯:
-    //   ① 重复推送之间的间隔必须 **< 1.2s**(真实服务端 4Hz ≈ 250ms)。
-    //      间隔一旦超过 1.2s, 即使无条件刷新 lastDmAt, 下次来新消息时
-    //      `now - lastDmAt > 1200` 仍成立 -> fill(0) 照样执行 -> 不复现。
-    //   ② 必须落在**同一条轨道**上: `batchSlots` 是**按轨道**计数的, 而
-    //      `(dmSeq++) % LANES` 会轮换; 每次换新轨道时该轨道 echo 都是 0,
-    //      所以"每次只放一条"根本测不出累积。
-    //   ③ 无头 Chrome 的虚拟时间不能用来量速度 —— performance.now() 走
-    //      虚拟时间而 setTimeout 立刻触发, 量出来只有个位数 px/s。
-    //      必须打**受控时钟**。
+    // 现在的模型: 每条轨道只保留**尚未释放的尾部占用** `tailPx`, 在下一条
+    // 弹幕到来时按 `DM_SPEED × Δt` **lazy 释放**。所以间歇流量下轨道会自然
+    // 空出来; 持续超过 5 条轨道吞吐能力时仍会排队(物理限制, 不是 bug)。
+    //
+    // 测试纪律:
+    //   - 跑**真实** pushDanmaku / renderDanmaku, 只控制时钟与输入;
+    //   - 绝不在测试里重写占用公式;
+    //   - 每个不变量先 `window.__dmReset()` 归零 —— 否则上一个断言留下的
+    //     占用会污染下一个, 而 `dmSeq` 跨断言增长使轨道无法对齐。
+    //
+    // 曾经踩过的坑(前几版探针因此**反向验证抓不到 bug**):
+    //   ① 重复推送的间隔必须 < 1.2s(真实 4Hz ≈ 250ms);
+    //   ② 必须落在**同一轨道** —— 状态按轨道存, 而 `(dmSeq++) % LANES` 轮换;
+    //   ③ 无头 Chrome 的 `--virtual-time-budget` 下量不出真实速度, 必须打
+    //      **受控时钟**。
     {
       const dmEl = document.getElementById("danmaku");
+      const LANES_JS = 5;        // 与 app.js 的 LANES 一致
+      const SPEED_JS = 130;      // 与 app.js 的 DM_SPEED 一致(仅用于算等待量)
+      const WIDTH_EST = 224;     // 文本宽度估计(仅用于算等待量)
+      const GAP_EST = 60;        // 与 app.js 的 DM_GAP_PX 一致
       const nowOrig = performance.now;
       let fakeT = 100000;
       performance.now = () => fakeT;
+
+      const reset = () => {
+        dmEl.innerHTML = "";
+        window.__dmReset();
+      };
+      let seq = 0;
+      // 放一条弹幕; at 给出该条的到达时刻
+      const pushOne = (at, label) => {
+        fakeT = at;
+        send({danmaku: [{seq: ++seq, user_name: "甲",
+                         content: label || "同样的内容", is_command: false}]});
+        const nodes = dmEl.querySelectorAll(".dm");
+        const n = nodes[nodes.length - 1];
+        return n ? {left: parseFloat(n.style.left),
+                    lane: Math.round((parseFloat(n.style.top) - 4) / 44),
+                    dist: parseFloat(n.dataset.dmDist),
+                    dur: parseFloat(n.dataset.dmDur)}
+                 : null;
+      };
+      // 重复推**同一个**窗口(无新 seq) —— 真实 4Hz 形态
+      const pushStale = (at) => {
+        fakeT = at;
+        send({danmaku: [{seq: seq, user_name: "甲", content: "同样的内容",
+                         is_command: false}]});
+      };
+
       try {
-        let seq = 7000;
-        // 放一条新弹幕, 返回起始位移/轨道/生产代码算出的时长
-        const pushOne = (label) => {
-          send({danmaku: [{seq: ++seq, user_name: "甲", content: label,
-                           is_command: false}]});
-          const nodes = dmEl.querySelectorAll(".dm");
-          const n = nodes[nodes.length - 1];
-          return n ? {left: parseFloat(n.style.left),
-                      lane: Math.round((parseFloat(n.style.top) - 4) / 44),
-                      dist: parseFloat(n.dataset.dmDist),
-                      dur: parseFloat(n.dataset.dmDur)}
-                   : null;
-        };
-
-        // ---- 断言 1: 4Hz 重复窗口不得让同轨道 echo 累积 ----
-        // 放满 5 条(命中全部 5 条轨道), 记轨道 0 的起始位移
-        const round1 = [];
-        for (let i = 0; i < 5; i++) round1.push(pushOne("同样的内容"));
-        const lane0a = round1.find((x) => x && x.lane === 0);
-
-        // 中间穿插 3 秒的"4Hz 重复推同一窗口"(seq 不变, 每 250ms 一次) ——
-        // 这期间**没有新消息**, 正确实现不该碰 batch 时钟。
-        for (let t = 250; t <= 3000; t += 250) {
-          fakeT = 100000 + t;
-          send({danmaku: [{seq: seq, user_name: "甲", content: "同样的内容",
-                           is_command: false}]});
+        // ============ 不变量 A: 无新 seq 的 snapshot 对状态零影响 ======
+        reset();
+        const a1 = pushOne(100000);
+        for (let t = 250; t <= 3000; t += 250) pushStale(100000 + t);
+        // 绕一圈回到同一轨道
+        let a2 = null;
+        for (let i = 0; i < LANES_JS; i++) {
+          const x = pushOne(103250 + i);
+          if (x && x.lane === a1.lane) a2 = x;
         }
-        // 时间推后到距上次**真实**批次 > 1.2s, 再放 5 条
-        fakeT = 100000 + 3250;
-        const round2 = [];
-        for (let i = 0; i < 5; i++) round2.push(pushOne("同样的内容"));
-        const lane0b = round2.find((x) => x && x.lane === 0);
+        check(a2 && a2.left === 1080,
+              "**A: 无新 seq 的 snapshot 不得改变轨道占用** (同轨道 left="
+              + (a2 ? a2.left : "null") + ", 期望 1080)");
 
-        if (!lane0a || !lane0b) {
-          check(false, "没拿到轨道 0 的节点");
-        } else {
-          check(lane0a.left === 1080 && lane0b.left === 1080,
-                "**4Hz 重复窗口不应让同轨道 echo 累积** (第1轮 left="
-                + lane0a.left + ", 第2轮 left=" + lane0b.left + ")");
+        // ============ 不变量 B: 时间真的会释放占用 =====================
+        // B1: 时间几乎没走 -> 后一条被推开
+        reset();
+        const b1 = pushOne(200000);
+        let b2 = null;
+        for (let i = 1; i <= LANES_JS; i++) {
+          const x = pushOne(200000 + i);
+          if (x && x.lane === b1.lane) b2 = x;
         }
+        check(b2 && b2.left > 1080,
+              "B1: 紧跟的同轨道弹幕应被推开 (left="
+              + (b2 ? b2.left : "null") + ")");
 
-        // ---- 断言 2: 速度恒定, 与 echo 无关 ----
-        //
-        // 覆盖**另一个**独立修法: 时长从"固定 9~12 秒"改成"位移 / 恒定速度"。
-        // 必须在 **echo > 0** 时比较才有判别力 —— echo 归零时两种实现算出
-        // 的时长本来就相同(这正是前一版探针反向验证抓不到的原因)。
-        // 真实触发: 一批里连来几条, 同轨道第 2 条的位移含 STAGGER_PX。
-        // 连放 10 条(= 2 轮 5 轨道), 这样**同一条轨道**上必然有 2 条,
-        // 后一条的起始位移比前一条大 STAGGER_PX。
+        // B2: 等足够久 -> 占用完全释放, 回到 1080
+        reset();
+        const c1 = pushOne(300000);
+        let c2 = null;
+        for (let i = 1; i <= LANES_JS; i++) {
+          const x = pushOne(300000 + i);
+          if (x && x.lane === c1.lane) c2 = x;
+        }
+        // 需要释放的是 c2 **放完之后**该轨道的全部尾部占用:
+        //   c2 的起点偏移 + c2 自身宽度 + 间距
+        // 早先只按 `c2.left - 1080`(起点偏移)算, 漏了 c2 自己的宽度+间距,
+        // 等待时间算短了 -> 断言误报。轨道占用的定义看 app.js 的 laneState。
+        const occupied = c2 ? (c2.left - 1080) + WIDTH_EST + GAP_EST : 0;
+        const waitMs = occupied / SPEED_JS * 1000 + 500;   // 留余量
+        let c3 = null;
+        for (let i = 0; i < LANES_JS; i++) {
+          const x = pushOne(300000 + waitMs + i);
+          if (x && x.lane === c1.lane) c3 = x;
+        }
+        check(c3 && c3.left === 1080,
+              "**B2: 等足够久后占用应完全释放**(重新从 1080 出生) (left="
+              + (c3 ? c3.left : "null") + ", 等待 " + waitMs.toFixed(0)
+              + "ms, 需释放 " + occupied.toFixed(0) + "px)");
+
+        // ============ 不变量 C: 速度恒定, 与出生偏移无关 ===============
+        reset();
         const burst = [];
-        for (let i = 0; i < 10; i++) burst.push(pushOne("同样的内容"));
+        for (let i = 0; i < 10; i++) burst.push(pushOne(400000 + i));
         const byLane = {};
         burst.forEach((b) => {
           if (b) (byLane[b.lane] = byLane[b.lane] || []).push(b);
         });
         const pairLane = Object.keys(byLane).find((k) => byLane[k].length >= 2);
         if (pairLane === undefined) {
-          check(false, "本批没有同轨道相邻两条, 无法验证速度恒定");
+          check(false, "C: 没拿到同轨道相邻两条");
         } else {
           const x = byLane[pairLane][0], y = byLane[pairLane][1];
           const sx = x.dist / x.dur, sy = y.dist / y.dur;
           check(Math.abs(sy / sx - 1) < 0.02,
-                "**速度应与位移无关** (第1条 " + sx.toFixed(1)
+                "**C: 速度应与出生偏移无关** (第1条 " + sx.toFixed(1)
                 + " px/s @位移" + x.dist.toFixed(0) + ", 第2条 "
                 + sy.toFixed(1) + " px/s @位移" + y.dist.toFixed(0) + ")");
-          // 确认这两条确实处于"echo 不同"的状态, 否则上面那条断言是空的
-          check(y.dist > x.dist + 100,
-                "同轨道相邻两条的位移应相差约 STAGGER_PX ("
+          check(y.dist > x.dist + 1,
+                "C: 同轨道相邻两条位移应不同(否则上一条是空的) ("
                 + x.dist.toFixed(0) + " -> " + y.dist.toFixed(0) + ")");
         }
+
+        // ============ 不变量 D: 长期低负载不产生递增的出生延迟 =========
+        //
+        // 核心 P2 回归。**必须低于轨道容量**: 每条弹幕占用 width+gap,
+        // 走完需 (width+gap)/SPEED; 5 条轨道轮转间隔 = 5 × 发送间隔。
+        // 只有 轮转间隔 > 释放时间 时, 才不该累积。
+        //   发送间隔 500ms -> 轮转 2.5s > 释放 ~2.2s  ✓ 低于容量
+        //   (早先写 400ms -> 轮转 2.0s < 2.2s, 那是**超载**, 增长合理,
+        //    断言会误报 —— 这个坑记下来。)
+        reset();
+        let t = 500000;
+        const offsets = [];
+        for (let round = 0; round < 80; round++) {
+          const x = pushOne(t);
+          if (x) offsets.push(x.left - 1080);
+          t += 500;
+        }
+        const early = Math.max.apply(null, offsets.slice(0, 10));
+        const late = Math.max.apply(null, offsets.slice(-10));
+        check(late <= early + 1,
+              "**D: 长期低负载不应让出生偏移越来越大** (前10条最大 "
+              + early + "px -> 后10条最大 " + late + "px)");
       } finally {
         performance.now = nowOrig;
       }
     }
-
     // ① 谜面 + 问答流追加
     send({qa_log: mkQa(3), qa_total: 3});
     check(document.querySelectorAll(".qa-row").length === 3, "应渲染 3 行问答");

@@ -313,9 +313,8 @@
   // ================= 弹幕 =================
   const LANES = 5, LANE_H = 44;
   let dmSeq = 0;                     // 轨道轮换序号
-  // 同一轨道上"还没走远"的弹幕数 -> 每条再往右错开 STAGGER_PX,
-  // 否则同一批涌进来的弹幕会叠在一起(重连重放时最明显)。
-  const STAGGER_PX = 260;
+  // 同一轨道上前后两条之间的最小间距(px), 避免"追尾"看起来像叠在一起。
+  const DM_GAP_PX = 60;
   // 弹幕的**恒定**移动速度(px/s)。原来用固定时长(9~12s) + 变化的位移,
   // 位移一涨速度就跟着涨 —— 见 renderDanmaku 里的说明。
   //
@@ -327,8 +326,25 @@
   // 正好落回原来的 9~12 秒区间。
   // (早先取 110 时**漏算了 offsetWidth**, 实际会变成 11.6~13.5 秒, 偏慢。)
   const DM_SPEED = 130;
-  const batchSlots = new Array(LANES).fill(0);
-  let lastDmAt = 0;
+
+  //: 每条轨道"尚未释放的尾部占用"(px)。
+  //
+  // 取代了早先的 `batchSlots`(一个只增不减的累计像素计数器) + `lastDmAt`
+  // + 1200ms 批次时钟。那套东西的问题:
+  //   ① 只有"距上一条 > 1.2 秒"才会清零, 而服务端窗口一直在推, 时钟
+  //      永远被刷新 -> 状态**从不释放**, 单调上涨;
+  //   ② 它记的是"到过这里的弹幕总宽度", 不是"现在还剩多少没走" ——
+  //      没有任何物理含义。
+  //
+  // 新模型: 轨道上只保留**当前还未让开屏幕右侧的那一段**。前面的弹幕
+  // 以 DM_SPEED 向左移动, 所以占用按时间**自然衰减**。
+  //
+  // 关键: 释放是 **lazy** 的 —— 不靠任何定时器, 而是在下一条弹幕进来时
+  // 按 `DM_SPEED × Δt` 一次性扣掉。所以低流量时轨道会自然空出来。
+  const laneState = Array.from({length: LANES}, () => ({
+    tailPx: 0,      // 尚未释放的尾部占用
+    updatedAt: 0,   // 上次更新该轨道状态的时刻
+  }));
 
   // 服务端每次推的是**最近 N 条的窗口**(4Hz)。必须只渲染"没见过的"
   // —— 用服务端给的**单调递增 seq** 判断。
@@ -336,6 +352,22 @@
   // 早先按"人+内容、相邻 2 条内算重复"判重: 每次推送整个窗口时序号全在涨,
   // 于是 40 条旧弹幕**全部重新飞一遍** —— 就是"发一条消息后弹幕乱飞"的根因。
   let lastDmSeq = 0;
+
+  // 测试专用: 把轨道占用与 seq 水位复位。
+  //
+  // 离线用例需要"从干净状态开始"才能断言绝对位移(例如"等久了应回到
+  // 1080"), 否则每个断言都被上一个断言留下的占用污染 —— 而
+  // `dmSeq` 是跨断言持续增长的, 测试无法靠"数到第几条"来对齐轨道。
+  //
+  // **只被 tests/test_web.py 调用**, 生产路径没有任何地方使用它。
+  window.__dmReset = function () {
+    dmSeq = 0;
+    lastDmSeq = 0;
+    for (let i = 0; i < LANES; i++) {
+      laneState[i].tailPx = 0;
+      laneState[i].updatedAt = 0;
+    }
+  };
 
   function pushDanmaku(list) {
     if (!list || !list.length) return;
@@ -352,18 +384,13 @@
     }
     lastDmSeq = top;
 
-    // 关键: **没有新弹幕就不要碰批次的时钟**。
+    // **没有新弹幕就什么都不做** —— 不碰任何轨道状态。
     //
-    // 曾经的写法是无条件 `lastDmAt = now`, 而服务端在房间有人说过话之后,
-    // 每个 snapshot 都会带上最近 40 条 —— 即使这 1.2 秒里**根本没人说话**,
-    // 这个函数仍以约 4Hz 被调用, `lastDmAt` 一直被刷新, 下面那句
-    // `batchSlots.fill(0)` **永远不执行**。
-    // 于是 batchSlots 单调上涨 -> 位移越来越长而时长固定 -> **越播越快**。
+    // 这是 P1/P2 共同的核心不变量: 服务端在房间有人说过话之后, 每个
+    // snapshot 都带最近 40 条(约 4Hz), 所以"重复窗口"必须对状态**零影响**。
+    // 早先无条件刷新 `lastDmAt` 正是"越播越快"的根因: 时钟被反复推后,
+    // 批次永不归零 -> 累计量单调上涨。
     if (!fresh.length) return;
-
-    const now = performance.now();
-    if (now - lastDmAt > 1200) batchSlots.fill(0);
-    lastDmAt = now;
 
     for (let i = 0; i < fresh.length; i++) renderDanmaku(fresh[i]);
   }
@@ -373,35 +400,45 @@
     node.className = "dm" + (d.is_command ? " cmd" : "");
     node.textContent = d.user_name + "：" + d.content;
     const lane = (dmSeq++) % LANES;
+    const st = laneState[lane];
     node.style.top = lane * LANE_H + 4 + "px";
-    // 同一批进来的弹幕(重连重放时会一次涌进十几条)不能从同一个 x 出发,
-    // 否则会**完全叠在一起**, 看起来像"没显示"。
-    // 给同一轨道上还没走远的弹幕再错开一段。
-    const echo = batchSlots[lane] || 0;
-    node.style.left = (STAGE_W + echo) + "px";
-    batchSlots[lane] = echo + STAGGER_PX;
+
+    // ---- 轨道占用: 先按经过的时间释放, 再决定这一条的出生偏移 ----
+    //
+    // lazy 释放: 不跑定时器, 用"距上次更新过了多久"一次性扣减。
+    // 前面的弹幕以 DM_SPEED 左移, 走过的距离就是让开的空间。
+    const now = performance.now();
+    if (st.updatedAt) {
+      const moved = DM_SPEED * (now - st.updatedAt) / 1000;
+      st.tailPx = Math.max(0, st.tailPx - moved);
+    }
+    const offset = st.tailPx;
+    node.style.left = (STAGE_W + offset) + "px";
     el.danmaku.appendChild(node);
+
     // ---- 固定**速度**, 不是固定时长 ----
     //
-    // 曾经是 `dur = 9 + random*3`(固定时长), 而位移里含 `echo` ——
-    // 于是 echo 一涨, 同样的 9~12 秒要跑更远的路, 弹幕越飞越快。
-    //
-    // 改成按距离算时长, 速度才与 echo 无关。
-    // DM_SPEED 取的是原来**首条弹幕**的速度: 舞台宽约 1080、时长 9~12 秒
-    // -> 约 90~120 px/s, 取中值 110。**刻意不趁机调快** —— 这次只修 bug,
-    // 不混入观感调整。
-    const w = node.offsetWidth + echo;
-    const distance = STAGE_W + w;
+    // 曾经是 `dur = 9 + random*3`(固定时长), 而位移里含出生偏移 ——
+    // 于是偏移一涨, 同样的 9~12 秒要跑更远的路, 弹幕越飞越快。
+    // 改成按距离算时长, 速度才与偏移无关。
+    const width = node.offsetWidth;
+    const distance = STAGE_W + offset + width;
     const dur = distance / DM_SPEED;
     // 测试探针: 把这一条的位移/时长暴露出来, 供离线用例断言
-    // "速度与 echo 无关"。**只读导出**, 不影响渲染逻辑。
+    // "速度与出生偏移无关"。**只读导出**, 不影响渲染逻辑。
     node.dataset.dmDist = distance;
     node.dataset.dmDur = dur;
+
+    // 这一条成为轨道的新尾部: 它自己的宽度 + 与后一条的最小间距。
+    st.tailPx = offset + width + DM_GAP_PX;
+    st.updatedAt = now;
+
     const t0 = performance.now();
     (function step(t) {
       const p = (t - t0) / (dur * 1000);
       if (p >= 1) { node.remove(); return; }
-      node.style.transform = "translateX(" + (-(STAGE_W + w) * p) + "px)";
+      // 终点与 distance 一致: 整条走出屏幕左侧
+      node.style.transform = "translateX(" + (-distance * p) + "px)";
       requestAnimationFrame(step);
     })(performance.now());
   }
