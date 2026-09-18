@@ -356,6 +356,63 @@ class PuzzlePool:
         with self._lock:
             return len(self._used)
 
+    @property
+    def ledger_trustworthy(self) -> bool:
+        """used 账本是否可信。
+
+        补池(Q9)必须读它: 账本不可信时 `pop_next` 一道都不交付, 此时
+        再往池子里灌题就是纯烧网关配额 —— 灌多少都不会被播出来。
+
+        **只读**: `_used_trustworthy` 的写者只有一个, 就是 `load()`。
+        补池绝不碰它(否则"账本坏了"这个判断会被补池活动悄悄改掉)。
+        """
+        with self._lock:
+            return self._used_trustworthy
+
+    # ------------------------------------------------------------------
+    def stock_count(self, limit: Optional[int] = None) -> int:
+        """**补池用**的库存数: 未 used 且**能过 `_validate_pool_spec()`**
+        的持久题。数够 `limit` 就早退。
+
+        为什么补池不能直接用 `pending_count()`: 后者只减 `_used`,
+        **不跑校验** —— 一道 signature 被磁盘改坏的题照样被算进"库存"。
+        补池据此判断"够不够"就会一直少补; 极端情况下库存看着有 3 道、
+        实际 0 道能播, 补池却认为池子满了, 一道都不补。
+
+        两个数的**语义不同**, 不是同一个量的两种写法:
+            `pending_count` = 盘上有多少条候选
+            `stock_count`   = 其中多少条真能进 `pop_next` 的候选集
+
+        **刻意不扣** dynamic gate: `recent_signatures` / `avoid` /
+        `cross_puzzle_gate` / `too_similar` 全是"**此刻能不能播**",
+        不是"库存有没有"。被当前窗口挡住的题**仍然是库存** —— 等最近
+        N 题滚过去它就能用。把它们扣掉会让补池在窗口拥挤时狂补,
+        而盘上其实已经堆满了。
+
+        `limit`: 数够就早退。补池的 latch 只需要区分三种情况
+        ("< 低水位" / ">= 高水位" / 都不是), 数到 target 就够判断了;
+        而校验是 O(池大小) 且这个函数由 4Hz 的 tick 调用, 池子大了
+        会和 live 路径的 `pop_next` 抢同一把锁。传 limit 把这个
+        开销封顶。
+
+        不抛异常(与本模块其他公开方法一致)。
+        """
+        with self._lock:
+            n = 0
+            for s in self._items:
+                if limit is not None and n >= limit:
+                    break
+                if spec_key(s) in self._used:
+                    continue
+                try:
+                    ok, _ = self._validate_pool_spec(s)
+                except Exception:                   # noqa: BLE001
+                    log.exception("库存校验异常, 该题不计入库存")
+                    continue
+                if ok:
+                    n += 1
+            return n
+
     # ------------------------------------------------------------------
     @staticmethod
     def _validate_pool_spec(spec: PuzzleSpec) -> tuple:
@@ -611,8 +668,13 @@ class PuzzlePool:
                 "size": len(self._items),
                 "available": sum(1 for s in self._items
                                  if spec_key(s) not in self._used),
+                # 补池用的真实库存(未 used 且过得了准入门)。与 available
+                # 的差就是"盘上有、但其实播不出来"的题数 —— banner 里
+                # 两个都打, 免得"库存 5 却一道都取不出来"没法解释。
+                "stock": self.stock_count(),
                 "used": len(self._used),
                 "aired": len(self._aired),
+                "trustworthy": self._used_trustworthy,
                 "path": self.pool_path,
                 "used_path": self.used_path,
             }

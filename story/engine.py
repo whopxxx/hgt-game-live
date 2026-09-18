@@ -658,6 +658,22 @@ class RoundEngine:
             return []
         return self._riddle_failed_locked(now, "出题超时")
 
+    def _generation_inputs_locked(self) -> dict[str, Any]:
+        """生成一道题需要的两个"看历史"的字段 —— **唯一定义处**。
+
+        抽出来是因为它有两个消费者(现场出题 / 后台补池), 而"两条代码
+        路径在这两个字段上漂移"已经害过我们一次: 早先重试路径漏带
+        `avoid`+`recent_signatures`, 于是**只要发生一次外层 retry 就能
+        绕过整个 Q4**。字段定义写两遍, 迟早再漂一次。
+        """
+        return {
+            "avoid": list(self._used_titles[-8:]),
+            # **转成 dict** —— 这些会经 director 传给 quality 层, 而
+            # payload 是"可序列化的动作描述", 不该塞自定义对象进去
+            # (测试里 `.get()` 会直接炸)。
+            "recent_signatures": [s.to_dict() for s in self._recent_signatures],
+        }
+
     def _riddle_action_locked(self, reason: str,
                               attempt: int = 0) -> EngineAction:
         """构造 RIDDLE 动作 —— **首轮与重试必须走同一个函数**。
@@ -669,12 +685,8 @@ class RoundEngine:
           - `avoid=None` -> 文本去重也失效。
         也就是说**只要发生一次外层 retry, 就能绕过整个 Q4**。
         """
-        p = {"reason": reason,
-             "avoid": list(self._used_titles[-8:]),
-             # **转成 dict** —— 这些会经 director 传给 quality 层, 而
-             # payload 是"可序列化的动作描述", 不该塞自定义对象进去
-             # (测试里 `.get()` 会直接炸)。
-             "recent_signatures": [s.to_dict() for s in self._recent_signatures]}
+        p = {"reason": reason}
+        p.update(self._generation_inputs_locked())
         if attempt:
             p["attempt"] = attempt
         return EngineAction(ActionKind.RIDDLE, p)
@@ -689,6 +701,50 @@ class RoundEngine:
         """
         with self._lock:
             return self._riddle_action_locked(reason)
+
+    def snapshot_generation_inputs(self) -> dict[str, Any]:
+        """给**外部生成线程**用的一致快照: `{"avoid", "recent_signatures"}`。
+
+        后台补池(Q9)要在"决定生成那一刻"取一份 self-consistent 的
+        avoid/recent —— 与 `_riddle_action_locked` 走的是同一个
+        `_generation_inputs_locked()`, 同一把锁。
+
+        刻意**不**复用 `request_riddle_action()`: 那个返回的是一个
+        RIDDLE **动作**(给 director 派发用), 补池只需要两个字段,
+        不该被动作的形状绑架 —— 将来 payload 加字段时, 补池不该
+        被动地跟着变。
+        """
+        with self._lock:
+            return self._generation_inputs_locked()
+
+    def pressure(self) -> dict[str, Any]:
+        """补池用的**只读**压力探针。
+
+        **不放进 `Snapshot`** —— 这是内部生成状态, 前端不需要也不该
+        看到(与 `_recent_signatures` 同样的理由)。
+
+        为什么不复用 `_probe()`: 后者明确标注"测试/装配用", 而且它把
+        phase 转成 str、字段集是给断言用的, 不是稳定 API。补池是生产
+        消费者, 给它一个语义写死的入口。
+
+        为什么必须暴露 hint/reveal 在途: `_hint_pending` / `_reveal_deadline`
+        **既不在 Snapshot 里, 也不反映在 `pending_count` 上** —— hint
+        在途时 `pending_count` 仍然是 0(`pending_count` 只数观众的
+        提问)。少了这两个字段, 补池就会在一次提示生成的同时再打一次
+        出题 LLM, 而那正是"补池不能和直播抢网关"要避免的。
+        """
+        with self._lock:
+            return {
+                "phase": self.phase,
+                "pending": len(self._pending),
+                "inflight": len(self._inflight),
+                "hint_inflight": bool(self._hint_pending),
+                "reveal_inflight": self._reveal_deadline is not None,
+                # 用 `_stopped` 而不是 phase == STOPPED: 后者在 `stop()`
+                # 里与前者同锁同写, 但 `_stopped` 才是那个真正的标志位
+                # (should_stop 也是读它)。补池只关心"还该不该干活"。
+                "stopped": bool(self._stopped),
+            }
 
     def _riddle_failed_locked(self, now: float, why: str) -> list[EngineAction]:
         self._setting_attempts += 1

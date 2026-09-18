@@ -173,15 +173,24 @@ class Config:
 
     # ---- 题池(方案 §40) ----
     # 已通过质量链的题存下来、优先投入直播; 池子空了再现场生成。
-    #
-    # ⚠️ `pool_target_size` / `pool_min_size` 在 Q8 阶段是**惰性的** ——
-    # 没有任何代码读它们。它们的唯一消费者是 Q9 的自动补池(prefetch),
-    # 而那是有意留到下一步的。**不要**顺手把它们接进 pop_next, 那会让
-    # 池子自我补池, 把"什么时候写盘、写失败怎么办"整套并发问题提前
-    # 引进来。
     pool_enabled: bool = True
+    # 低水位 / 高水位(hysteresis)。Q9 的补池 latch:
+    #   库存 < pool_min_size   -> 启动一次"补池周期"
+    #   补池周期一直补到 库存 >= pool_target_size 才结束
+    # 必须是**真正的滞回**, 不是每个 tick 判一次 `stock < min` ——
+    # 否则 1 补成 2 就停了, pool_target_size 永远没有意义。
     pool_target_size: int = 5
     pool_min_size: int = 2
+    # 补池总开关。**与 pool_enabled 解耦**: 关掉它 = 不后台生成, 但
+    # 手工/脚本灌进池子的存量题**照常用**。网关故障时就是靠这一条
+    # 停掉后台生成、同时继续播已有的题(pool_enabled=False 做不到 ——
+    # 它把池子整个关掉)。
+    pool_prefetch_enabled: bool = True
+    # 补池失败(gen_spec 失败 / pool.add 失败 / 意外异常)后的退避秒数。
+    # 为什么必须有: tick 是 4Hz。没有退避时, 网关或磁盘持续故障的
+    # 每一次 tick 都会重新提交一个生成任务 —— 那是每秒 4 次的失败
+    # 风暴, 比不补池糟得多(它还会和直播出题抢同一个网关配额)。
+    pool_prefetch_backoff_s: float = 30.0
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -279,6 +288,22 @@ class Config:
                 f"模型 '{self.llm.model}' 不在已知列表 {sorted(SUPPORTED_MODELS)} 中。"
                 f"网关对未知模型会静默用默认模型回答(HTTP 200), 配置可能是错的。"
             )
+        # 高水位低于低水位 -> 滞回是反的: 补池周期会在启动的那一拍
+        # 立刻被判"已到高水位"而清掉, min/target 双双失效, 表现是
+        # 池子永远补不起来。这不是"某种可用的配置", 是必然的误配置。
+        if self.pool_target_size < self.pool_min_size:
+            warns.append(
+                f"pool_target_size({self.pool_target_size}) < "
+                f"pool_min_size({self.pool_min_size}): 补池滞回反了, "
+                f"池子永远补不起来。要让 target >= min。"
+            )
+        if self.pool_min_size < 0:
+            warns.append(f"pool_min_size({self.pool_min_size}) 为负, 已按 0 处理。")
+        if self.pool_prefetch_backoff_s <= 0:
+            warns.append(
+                f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "
+                f"补池失败后不会退避, 4Hz 的 tick 会打成失败风暴。"
+            )
         return warns
 
 
@@ -332,6 +357,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="真房间无弹幕多久判定为停摆并重连, 默认 120")
     ap.add_argument("--max-puzzles", type=int, default=0,
                     help="跑多少题后停止(0=无限), 默认 0")
+    ap.add_argument("--no-prefetch", dest="pool_prefetch_enabled",
+                    action="store_false",
+                    help="不后台补池(只用已有/手工灌的题; 默认开启)。"
+                         "网关故障时用它停掉后台生成, 池子里的存量题照常播")
 
     ap.add_argument("--max-question-len", type=int, default=60,
                     help="单条提问最大长度, 默认 60")
@@ -380,6 +409,9 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         tick_hz=a.tick_hz,
         stall_seconds=a.stall_seconds,
         max_puzzles=a.max_puzzles,
+        # 只加 flag 不在这里接上 = 又一个 dead config(参数形同虚设,
+        # 而 --help 里明明写着)。加 flag 和接线必须同一处完成。
+        pool_prefetch_enabled=a.pool_prefetch_enabled,
         max_question_len=a.max_question_len,
         host=a.host,
         port=a.port,
