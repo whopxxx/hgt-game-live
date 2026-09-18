@@ -115,6 +115,9 @@ class DouyinLiveWebFetcher:
         self.abogus_file = abogus_file
         self.__ttwid = None
         self.__room_id = None
+        #: WS bootstrap 状态(动态获取)。None = 还没取过。
+        #: 见 `_fetch_bootstrap_state`。
+        self.__bootstrap = None
         self.session = requests.Session()
         self.live_id = live_id
         self.host = "https://www.douyin.com/"
@@ -235,10 +238,100 @@ class DouyinLiveWebFetcher:
             nickname = user.get('nickname')
             print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
     
+    def _fetch_bootstrap_state(self):
+        """连接 WS **之前**取一次本次直播的 cursor / internal_ext。
+
+        ## 为什么必须动态取
+
+        原来 `_connectWebSocket()` 里的这组值全是写死的 2024-07 状态:
+
+            cursor=d-1_u-1_fh-...t-1721106114633_r-1
+            |first_req_ms:1721106114541|fetch_time:1721106114633|...
+            wrds_v:7392094459690748497
+
+        (1721106114633 ms ≈ 2024-07-16)。`Response` 自己携带
+        `cursor`(:2) / `internalExt`(:5) / `liveCursor`(:11), 说明这是一套
+        **会话状态**, 本该由服务端在每次响应里推进 —— 写死几个月前的值
+        意味着告诉服务端"我要从那时开始收"。
+
+        ## 实现
+
+        `get_room_status()` 打的 `/webcast/room/web/enter/` 响应里带
+        `data.room` 的状态字段。这里复用它(同一次请求就行, 不再多打一次),
+        取出 cursor/internal_ext; 取不到就**回退**到旧常量, 保证不会因为
+        这个改动连不上。
+
+        返回 dict: {"cursor": str, "internal_ext": str} 或 None。
+        """
+        try:
+            msToken = generateMsToken()
+            nonce = self.get_ac_nonce()
+            signature = self.get_ac_signature(nonce)
+            url = ('https://live.douyin.com/webcast/room/web/enter/?aid=6383'
+                   '&app_name=douyin_web&live_id=1&device_platform=web'
+                   '&language=zh-CN&enter_from=page_refresh'
+                   '&cookie_enabled=true&screen_width=5120&screen_height=1440'
+                   '&browser_language=zh-CN&browser_platform=Win32'
+                   '&browser_name=Edge&browser_version=140.0.0.0'
+                   f'&web_rid={self.live_id}'
+                   f'&room_id_str={self.room_id}'
+                   '&enter_source=&is_need_double_stream=false'
+                   '&insert_task_id=&live_reason=&msToken=' + msToken)
+            query = parse_url(url).query
+            params = {i[0]: i[1] for i in [j.split('=') for j in query.split('&')]}
+            a_bogus = self.get_a_bogus(params)
+            url += f"&a_bogus={a_bogus}"
+            headers = self.headers.copy()
+            headers.update({
+                'Referer': f'https://live.douyin.com/{self.live_id}',
+                'Cookie': f'ttwid={self.ttwid};__ac_nonce={nonce}; '
+                          f'__ac_signature={signature}',
+            })
+            resp = self.session.get(url, headers=headers)
+            data = (resp.json() or {}).get('data') or {}
+            room = data.get('room') or {}
+            # 字段可能在不同层级, 都试一遍(服务端结构变过好几次)
+            cursor = (room.get('cursor')
+                      or (data.get('cursor'))
+                      or '')
+            internal_ext = (room.get('internal_ext')
+                            or data.get('internal_ext')
+                            or '')
+            if cursor or internal_ext:
+                print(f"【bootstrap】cursor/internal_ext 取自本次响应 "
+                      f"(cursor={'有' if cursor else '无'}, "
+                      f"internal_ext={'有' if internal_ext else '无'})")
+                return {"cursor": str(cursor), "internal_ext": str(internal_ext)}
+            print("【bootstrap】响应里没有 cursor/internal_ext, 回退旧常量")
+            return None
+        except Exception as err:
+            print(f"【bootstrap】取 bootstrap 状态失败, 回退旧常量: {err}")
+            return None
+
     def _connectWebSocket(self):
         """
         连接抖音直播间websocket服务器，请求直播间数据
         """
+        # ---- WS bootstrap 状态: 优先**动态取**, 取不到才回退旧常量 ----
+        #
+        # 原来这里写死了 2024-07 的 cursor/internal_ext(wrds_v 等), 等于
+        # 告诉服务端"从几个月前开始收"。`Response` 自带
+        # cursor(:2)/internalExt(:5)/liveCursor(:11), 说明这是会话状态,
+        # 本该由服务端在响应里推进。
+        #
+        # 回退值是**保命**用的: 万一详情接口拿不到状态, 也还能连上(至少
+        # 与改动前行为一致), 不会因为这个改动把直播搞挂。
+        boot = self.__bootstrap
+        if boot is None:
+            boot = self._fetch_bootstrap_state() or {}
+            self.__bootstrap = boot
+        cursor = boot.get("cursor") or (
+            "d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1")
+        internal_ext = boot.get("internal_ext") or (
+            f"internal_src:dim|wss_push_room_id:{self.room_id}"
+            f"|wss_push_did:7319483754668557238"
+            f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1"
+            f"|wss_info:0-1721106114633-0-0|wrds_v:7392094459690748497")
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
                "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
                "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
@@ -247,10 +340,8 @@ class DouyinLiveWebFetcher:
                "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
                "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
                "&browser_online=true&tz_name=Asia/Shanghai"
-               "&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
-               f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
-               f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
-               f"wrds_v:7392094459690748497"
+               f"&cursor={cursor}"
+               f"&internal_ext={internal_ext}"
                f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
                f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
                f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0")
