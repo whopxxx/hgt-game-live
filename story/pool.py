@@ -52,8 +52,13 @@ background prefetch / build_pool 自动补池 / playtest。题池里的题靠
 最坏情况只是丢最后一行 —— 而丢一行 `air:true` 时, 更早那行 `air:false`
 仍在盘上, 所以"已播过"这个事实**不会**因为截断而消失。
 
-这也是为什么"单行损坏就地跳过"仍然满足验收点 4: 损坏行等价于
-丢一行, 而不是丢全部。
+⚠️ 注意**不要**从上面这句推出"used 单行损坏就地跳过也可以"。那正是
+早先 fail-open 版本的错误推理: 它假定"损坏行 = 丢一行 = 安全"。对
+`air:true` 那行成立, 但**对任意一行不成立** —— 我们事前并不知道坏的
+是哪一行, 而如果坏的是 `air:false` 行, 那道题就在 `_used` 里消失了,
+下次会被再播一次。所以 used 的语义是**整份账本**:
+单行损坏 -> 读不懂一处 -> 整个 ledger 不可信 -> 题池本次完全禁用
+(回落现场生成)。损坏的粒度是"账本", 不是"行"。
 
 零新依赖。
 """
@@ -379,8 +384,13 @@ class PuzzlePool:
         的配额统计(见 `quality._quota_conflicts`)。磁盘里写
         `domain="乱写的值"` 的题目前仍能进池, 之后它计进
         `domain:乱写的值` 这个桶 —— 而它实际会占掉别的领域的播出位,
-        等于绕过 `same_domain` 配额。`time_shape` 目前只统计不限额, 但
-        它是与 blueprint 严格比对的一维, 一并验掉。
+        等于绕过 `same_domain` 配额。
+
+        `time_shape` 在这里**只要求属于合法枚举**, 不参与配额, 也
+        **不**与 blueprint 严格比对(`validate_blueprint` 刻意不比对它,
+        见 `quality.py` 的说明: blueprint 里 time_shape 只有默认值
+        instant, 严格比对会误杀"长年习惯"这类题)。收进来只是为了
+        挡住明显的坏值, 以及让它能被统计。
         """
         if spec is None or not getattr(spec, "puzzle", ""):
             return False, "空 spec / 空谜面"
