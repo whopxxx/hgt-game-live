@@ -106,7 +106,14 @@ class tmpdir:
         return self._d.name
 
     def __exit__(self, *a):
-        self._d.cleanup()
+        # ignore_cleanup_errors: Director 会起后台线程(提示/揭晓), 它在
+        # Windows 上可能还攥着临时目录里的文件句柄, 删目录时报
+        # PermissionError。那是清理期的噪音, 不是测试失败 —— 断言都已经
+        # 跑完了。**不要**为这个把测试改成 flaky。
+        try:
+            self._d.cleanup()
+        except (PermissionError, OSError):
+            pass
 
 
 def _write_raw(path, lines):
@@ -606,6 +613,217 @@ def test_director_with_pool_disabled_never_touches_pool():
 
 
 # ======================================================================
+# ======================================================================
+# Q8 final fix
+# ======================================================================
+def test_truncated_used_ledger_blocks_everything():
+    """P0: used 账本损坏 -> 本次**一道都不交付**(fail closed)。
+
+    这是"宁可不播, 也不能重启后复活"那条硬保证的直接体现。
+
+    故障链(修之前真实存在):
+      A 播过 -> used 里有 A -> 某行被截断 -> 重启时坏行被跳过
+      -> _used 里没有 A -> 池里的 A 仍在 -> **A 被再播一次**。
+    """
+    print("\n[7a] used 账本截断 -> fail closed")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        got = pool.pop_next(recent_signatures=[])
+        check("首次能交付", got is not None)
+        pool.mark_used(got, aired=True)
+        # 把 used 的第一行截断成非法 JSON
+        lines = open(cfg.pool_used_path, encoding="utf-8").readlines()
+        _write_raw(cfg.pool_used_path, [lines[0][:20]])
+        pool2 = PuzzlePool.open(cfg)
+        check("账本标记为不可信", pool2._used_trustworthy is False,
+              pool2._used_trustworthy)
+        check("**不再交付任何题**",
+              pool2.pop_next(recent_signatures=[]) is None)
+        check("池子本身还在(只是不用)", pool2.size() == 1, pool2.size())
+
+
+def test_corrupt_used_line_blocks_everything():
+    """P0: 账本里有一条坏行(不只看截断) -> 同样 fail closed。"""
+    print("\n[7b] used 账本有坏行 -> fail closed")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec(puzzle="第一道完全不同的题。为什么?",
+                           answer="第一个谜底。",
+                           fair_clues=[FairClue(quote="第一道完全不同的题",
+                                                supports_atoms=["a1"])]))
+        pool.add(good_spec())
+        _write_raw(cfg.pool_used_path, ["这是坏行"])
+        pool2 = PuzzlePool.open(cfg)
+        check("账本不可信", pool2._used_trustworthy is False)
+        check("不交付", pool2.pop_next(recent_signatures=[]) is None)
+
+
+def test_invalid_utf8_used_does_not_crash():
+    """P0: used 含非法 UTF-8 时, **open 不能崩**, 且不交付。
+
+    修之前这里抛 `UnicodeDecodeError` —— 它不是 OSError 的子类, 没被
+    捕获, 会让 `PuzzlePool.open()` 在 Director 启动时直接炸掉(直播起不来)。
+    """
+    print("\n[7c] used 非法 UTF-8 -> 不崩 + 不交付")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        pool.mark_used(good_spec(), aired=True)
+        with open(cfg.pool_used_path, "ab") as f:
+            f.write(b"\xff\xfe not utf8 \x80\n")
+        try:
+            pool2 = PuzzlePool.open(cfg)
+            crashed = False
+        except Exception as e:                  # noqa: BLE001
+            crashed = True
+            print("     崩了:", type(e).__name__, e)
+            pool2 = None
+        check("open 没有崩", not crashed)
+        if pool2 is not None:
+            check("也不交付", pool2.pop_next(recent_signatures=[]) is None)
+
+
+def test_missing_used_file_is_trustworthy():
+    """账本文件不存在 = 空账本, **算可信**(第一次启动的正常状态)。
+
+    别把"没有账本"和"账本坏了"混为一谈 —— 那会让池子第一次就跑不起来。
+    """
+    print("\n[7d] 账本不存在算可信")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        check("标记为可信", pool._used_trustworthy is True,
+              pool._used_trustworthy)
+
+
+def test_pool_file_corruption_still_fail_open():
+    """池子(缓存)坏行仍是 fail **open** —— 别把两边都改成 fail closed。"""
+    print("\n[7e] 池文件坏行仍跳过(缓存不 fail closed)")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        _write_raw(cfg.pool_path, [
+            "坏行",
+            json.dumps({"spec": good_spec().to_archive()}, ensure_ascii=False),
+        ])
+        pool = PuzzlePool.open(cfg)
+        check("账本仍可信(与池子无关)", pool._used_trustworthy is True)
+        check("好题照常交付", pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_rejects_empty_signature():
+    """P1: signature 全空的题不能入池(否则全局配额会漏记)。"""
+    print("\n[7f] 空 signature 拒绝入池")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        s = good_spec()
+        s.signature = PuzzleSignature()          # 全空
+        check("空 signature 被拒", pool.add(s) is False)
+        check("半空也被拒", pool.add(good_spec(
+            signature=PuzzleSignature(mechanism_family="hidden_function")))
+            is False)
+        check("合法枚举外也被拒", pool.add(good_spec(
+            signature=PuzzleSignature(mechanism_family="不是枚举里的",
+                                      solution_shape="hidden_function_explains_behavior")))
+            is False)
+        check("池子仍空", pool.size() == 0, pool.size())
+
+
+def test_accepts_valid_signature():
+    """回归: 正常 signature 照常入池。"""
+    print("\n[7g] 合法 signature 正常入池")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        check("正常题能入池", pool.add(good_spec()) is True)
+        check("size=1", pool.size() == 1, pool.size())
+
+
+def test_blueprint_specified_is_revalidated_on_add():
+    """P1: blueprint_specified=True 时入池要再验 blueprint 有没有被执行。"""
+    print("\n[7h] blueprint_specified 时重验 blueprint")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        s = good_spec()
+        s.blueprint_specified = True
+        # blueprint 与 signature 不一致 -> validate_blueprint 该拒
+        s.blueprint = PuzzleBlueprint(
+            mechanism_family="identity_misread",
+            solution_shape="identity_reversal",
+            domain="maritime", relation="stranger",
+            emotion_mode="neutral", time_shape="instant")
+        check("blueprint 与 signature 不一致 -> 拒绝", pool.add(s) is False)
+        # 一致则通过
+        s2 = good_spec()
+        s2.blueprint_specified = True
+        check("一致 -> 通过", pool.add(s2) is True)
+
+
+def test_only_pool_source_writes_used_ledger():
+    """P1: 只有 pool 来源的题才写 pool_used.jsonl。
+
+    早先只判断 `spec is not None`, 于是 live_generate / fallback 也写进去,
+    造成"当前进程不算已用, 重启后突然算已用"的状态不一致。
+    """
+    print("\n[7i] 只有 pool 来源写 used(端到端)")
+    import json as _json
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        cfg.puzzle_out_path = os.path.join(d, "arch.jsonl")
+
+        class _Gen:
+            class client:
+                class cfg:
+                    model = "fake"
+
+            def gen_spec(self, *a, **k):
+                return good_spec()          # 现场生成一道
+
+            def hint(self, *a, **k):
+                return ("h", None)
+
+            def reveal(self, *a, **k):
+                return ("谜底", None)
+
+        dr = Director(cfg)
+        dr.writer = _Gen()
+        dr.engine.start()
+        import director as _D
+        real = _D.threading.Thread
+
+        class _Inline:
+            def __init__(self, target=None, daemon=None, name=None, **kw):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        _D.threading.Thread = _Inline
+        try:
+            dr._riddle({"reason": "riddle", "avoid": [], "recent_signatures": []})
+        finally:
+            _D.threading.Thread = real
+        check("走的是现场生成",
+              dr.engine._spec_source == "live_generate", dr.engine._spec_source)
+        # 揭晓。`_reveal` 会起后台线程, 所以也换成同步执行 —— 否则它会
+        # 在 tmpdir 清理之后才跑去落盘, 报 FileNotFoundError(测试本身
+        # 已经断言完了, 那是纯噪音)。
+        acts = dr.engine._enter_revealing_locked(0.0, "giveup", "")
+        rev = [a for a in acts if a.kind.name == "REVEAL"][0]
+        _D.threading.Thread = _Inline
+        try:
+            dr._reveal(rev.payload)
+        finally:
+            _D.threading.Thread = real
+        # live_generate **不该**写进 pool_used
+        has_used = os.path.exists(cfg.pool_used_path)
+        n = len(open(cfg.pool_used_path, encoding="utf-8").readlines()) if has_used else 0
+        check("live_generate 不写 pool_used", n == 0, f"{n} 行")
+
+
 def main():
     tests = [
         # 验收点 1
@@ -638,6 +856,16 @@ def main():
         test_director_serves_from_pool_end_to_end,
         test_director_falls_back_when_pool_empty,
         test_director_with_pool_disabled_never_touches_pool,
+        # ---- Q8 final fix ----
+        test_truncated_used_ledger_blocks_everything,
+        test_corrupt_used_line_blocks_everything,
+        test_invalid_utf8_used_does_not_crash,
+        test_missing_used_file_is_trustworthy,
+        test_pool_file_corruption_still_fail_open,
+        test_rejects_empty_signature,
+        test_accepts_valid_signature,
+        test_blueprint_specified_is_revalidated_on_add,
+        test_only_pool_source_writes_used_ledger,
     ]
     for t in tests:
         t()

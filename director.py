@@ -516,10 +516,21 @@ class Director:
                         payload.get("reason", ""), payload.get("winner", ""))
                 if text:
                     self._archive_reveal(payload, text)
-                # 题池来源的题: 补记 air:true。`pop_next` 交付时已经写了
-                # air:false, 所以即使这一行丢了, 题也**不会**复活 ——
-                # 这行只是让"是否真的播完"可查。
-                if self.pool is not None and payload.get("spec") is not None:
+                # 只有**题池来源**的题才补记 air:true —— 忠于这个文件的名字
+                # 与职责。早先这里只判断 `spec is not None`, 于是
+                # pool / live_generate / fallback 三种来源全都写进
+                # pool_used.jsonl, 造成一个隐蔽的状态不一致:
+                #   mark_used(aired=True) 只往 `_aired` 加,
+                #   而重启后 load() 又把这个 key 加进 `_used` ——
+                #   同一道 live_generate 题"当前进程不算已用, 重启后突然算"。
+                # 真要做"全局所有播过题的 ledger", 该单独定义, 不要暗中
+                # 借这个文件承担第二个职责。
+                #
+                # `pop_next` 交付时已经写了 air:false, 所以即使这一行丢了,
+                # 题也**不会**复活 —— 这行只让"是否真的播完"可查。
+                if (self.pool is not None
+                        and payload.get("spec") is not None
+                        and payload.get("spec_source") == "pool"):
                     try:
                         self.pool.mark_used(payload.get("spec"), aired=True)
                     except Exception:               # noqa: BLE001

@@ -187,10 +187,12 @@ class Config:
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
     pool_path: str = os.path.join("data", "pool.jsonl")
     pool_used_path: str = os.path.join("data", "pool_used.jsonl")
-    # pop_next 做文件 I/O 时正持有出题的互斥锁(在 worker 线程里), 而
-    # 引擎那边唯一的兜底是 setting_timeout_seconds(故意很大)。给个
-    # 上界, 免得慢盘把出题拖到超时。
-    pool_op_budget_ms: int = 500
+    # 注: 这里**曾**有一个 `pool_op_budget_ms`, 号称给 pop_next 的 I/O 一个
+    # 上界。它没有任何代码读它 —— 是个 dead config, 注释却会让人以为
+    # "500ms 后一定回落", 那是不存在的保证(单次 open/fsync 真卡住时,
+    # 没有任何东西能打断它)。删掉, 免得留下假承诺。
+    #
+    # 真要给阻塞 I/O 做硬超时, 得放到后台线程里做, 那是 Q9 的设计范围。
 
     # ---- Blueprint 调度(方案 §7) ----
     # **与 pool_enabled 解耦** —— 关掉题池不该顺便关掉"控制题型分布"。

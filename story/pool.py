@@ -29,6 +29,12 @@ background prefetch / build_pool 自动补池 / playtest。题池里的题靠
 3. **used 是追加式日志, 不是重写**。这条和"重启后已播的题不复活"
    (验收点 4)直接相关, 见下面 `mark_used` 的说明。
 
+4. **账本 fail closed, 池子 fail open**。两个文件的容错语义**不同**:
+   `pool.jsonl` 是缓存(坏行跳过, 好题照用); `pool_used.jsonl` 是**账本**
+   —— 只要有一处读不全, 整个账本就不可信, 本次**一道都不交付**,
+   回落现场生成。因为"某道题不在 used 里"和"那行没读出来"从结果上
+   无法区分, 而前者意味着把已经播过的题再播一次。详见 `_read_jsonl`。
+
 ## 先落盘再交付(验收点 4 的核心不变式)
 
     pop_next()  -> 先把 `air:false` 行写盘+fsync, **才**把 spec 交出去
@@ -56,8 +62,9 @@ import random
 import time
 from typing import Any, Optional
 
-from .puzzle import PuzzleSpec
-from .quality import (Quotas, cross_puzzle_gate, too_similar, validate_spec)
+from .puzzle import (MECHANISM_FAMILIES, SOLUTION_SHAPES, PuzzleSpec)
+from .quality import (Quotas, cross_puzzle_gate, too_similar, validate_blueprint,
+                      validate_spec)
 
 log = logging.getLogger("story.pool")
 
@@ -87,19 +94,33 @@ def spec_key(spec: PuzzleSpec) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:KEY_LEN]
 
 
-def _read_jsonl(path: str) -> list:
-    """容错读 JSONL —— 坏行跳过 + 记日志, **绝不抛**。
+def _read_jsonl(path: str, strict: bool = False) -> tuple:
+    """容错读 JSONL, 返回 `(records, trustworthy)`。
 
-    照 `story/ingest.py` 的 `SimSource._load` 的写法(它是本仓库里唯一
-    另一个 JSONL 读取点): 空行与 `//` 注释静默跳过, 其余坏行记 error
-    后 continue。
+    ## 为什么要有 `strict`: 池子是缓存, used 是**账本**
 
-    文件不存在是**正常情况**(第一次跑、或池子被清空), 返回空列表而
-    不是报错。
+    两个文件的容错语义**必须分开**, 混用会把"已播过的题不复活"这条
+    硬保证打穿:
+
+      - `pool.jsonl`(缓存): 坏行跳过, 剩下的题照用。池子少几道题
+        只是少点便利, 不影响正确性。
+      - `pool_used.jsonl`(**账本**): 只要有一处读不全, 整个账本
+        就**不可信** —— 因为"某道题不在 `_used` 里"和"那行没读出来"
+        从结果上无法区分, 而前者的后果是**把已经播过的题再播一次**。
+
+    所以 `strict=True` 时: 坏行/读不了 -> `trustworthy=False`, 调用方
+    据此**本次禁用题池**(fail closed), 回落现场生成。**不尝试"尽量
+    恢复"** —— 我们选的是安全优先。
+
+    文件不存在**不算**不可信: 第一次启动本来就是空账本。
+
+    另外: `open()` 遇到非法 UTF-8 会抛 `UnicodeDecodeError`, 那**不是**
+    `OSError` 的子类, 早先没被捕获, 会让 `PuzzlePool.open()` 在
+    Director 启动时直接崩掉。这里一并接住。
     """
     out: list = []
     if not path:
-        return out
+        return out, True
     try:
         with open(path, "r", encoding="utf-8") as f:
             for ln, line in enumerate(f, 1):
@@ -109,14 +130,18 @@ def _read_jsonl(path: str) -> list:
                 try:
                     out.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    log.error("池文件第 %d 行不是合法 JSON, 已跳过: %s",
-                              ln, e)
+                    log.error("池文件第 %d 行不是合法 JSON: %s", ln, e)
+                    if strict:
+                        return out, False
     except FileNotFoundError:
-        log.info("池文件不存在(视为空池): %s", path)
-    except OSError as e:
-        # 不可读(权限/磁盘)也只当空池 —— 题池是加速器, 不是账本。
-        log.warning("池文件读不了(视为空池): %s: %s", path, e)
-    return out
+        # 空账本/空池都是正常状态。
+        log.info("池文件不存在(视为空): %s", path)
+        return out, True
+    except (OSError, UnicodeDecodeError) as e:
+        log.warning("池文件读不了: %s: %s", path, e)
+        if strict:
+            return out, False
+    return out, True
 
 
 def _append_line(path: str, rec: dict, fsync: bool = False) -> bool:
@@ -163,12 +188,14 @@ class PuzzlePool:
 
         self.pool_path = str(getattr(cfg, "pool_path", "") or "")
         self.used_path = str(getattr(cfg, "pool_used_path", "") or "")
-        self._budget_ms = int(getattr(cfg, "pool_op_budget_ms", 500) or 500)
 
         self._items: list[PuzzleSpec] = []
         self._keys: set[str] = set()      # 池内去重
         self._used: set[str] = set()      # 已交付过的(含已播)
         self._aired: set[str] = set()     # 其中已揭晓的
+        #: used 账本是否可信。读不全时为 False -> 题池本次**完全禁用**。
+        #: 默认 False: 没 load 过之前不该交付任何东西(fail closed)。
+        self._used_trustworthy = False
         #: 排除了池内已有与已用过的题之后的"该避开"的谜面。
         self._avoid_extra: list[str] = []
 
@@ -192,11 +219,18 @@ class PuzzlePool:
 
     # ------------------------------------------------------------------
     def load(self) -> int:
-        """载入池子与 used 日志。返回载入的池内题数。**不抛**。"""
+        """载入池子与 used 账本。返回载入的池内题数。**不抛**。
+
+        两个文件的容错语义不同(见 `_read_jsonl`): 池子坏行跳过,
+        账本坏一处就整体不可信 -> `_used_trustworthy=False` ->
+        `pop_next` 本次一律返回 None(fail closed)。
+        """
         with self._lock:
             self._items = []
             self._keys = set()
-            for rec in _read_jsonl(self.pool_path):
+            # 池子是缓存: 坏行跳过, 好题照用。
+            pool_recs, _ = _read_jsonl(self.pool_path, strict=False)
+            for rec in pool_recs:
                 spec = self._spec_from_record(rec)
                 if spec is None:
                     continue
@@ -206,20 +240,32 @@ class PuzzlePool:
                 self._items.append(spec)
                 self._keys.add(k)
 
+            # 账本是权威: 读不全就整体不可信。
+            used_recs, self._used_trustworthy = _read_jsonl(
+                self.used_path, strict=True)
             self._used = set()
             self._aired = set()
-            for rec in _read_jsonl(self.used_path):
+            for rec in used_recs:
                 if not isinstance(rec, dict):
                     continue
                 k = rec.get("key")
                 if not k:
                     continue
+                # 注意: 记进 _used 的**只**该是题池交付过的题。老日志里
+                # 可能混着别的来源(早先的 bug), 这里无法分辨, 所以
+                # 一律算 —— 宁可少用一道题, 也不能复活一道。
                 self._used.add(k)
                 if rec.get("air"):
                     self._aired.add(k)
 
-            log.info("题池载入: %d 道可用, %d 道已用过(其中 %d 已播)",
-                     len(self._items), len(self._used), len(self._aired))
+            if not self._used_trustworthy:
+                log.error("used 账本不可信(有损坏行/读不了), "
+                          "题池本次**完全禁用**, 回落现场生成: %s",
+                          self.used_path)
+            log.info("题池载入: %d 道可用, %d 道已用过(其中 %d 已播), "
+                     "账本可信=%s",
+                     len(self._items), len(self._used), len(self._aired),
+                     self._used_trustworthy)
             return len(self._items)
 
     @staticmethod
@@ -285,6 +331,43 @@ class PuzzlePool:
             # 是审稿后的成品 —— 还留着 fixable 说明它没走完质量链。
             log.info("拒绝入池: 还有未修的 fixable(%s)", vr.must_fix()[:120])
             return False
+        # ---- signature 必须有效(P1) ----
+        #
+        # `validate_spec` **不**要求 signature 存在, 所以光靠它, 一道
+        # signature 全空的题也能入池。弹出时 `cross_puzzle_gate` 会拿
+        # blueprint 临时顶替, 看起来还能工作 —— 但上屏时 `_submit_spec`
+        # 传的是 `spec.signature.to_dict()`, 也就是那个**空 dict**。
+        # engine 见它是非空 dict 就登记进 recent, 于是:
+        #     这道题实际播了 hidden_function -> recent 里记成空白
+        #     -> 下一题的全局配额看不见它 -> 配额被悄悄放松。
+        #
+        # 所以"完整 spec"在这里要更严格: signature 的核心维度必须存在
+        # 且枚举合法。老 archive 缺 signature 的题仍可被 `from_dict`
+        # 读出来, 但**不能直接成为池库存量** —— 要进池得走显式的
+        # 迁移/重新审批。
+        core = (spec.signature.mechanism_family, spec.signature.solution_shape)
+        if not all(core):
+            log.info("拒绝入池: signature 缺核心维度(%s)", core)
+            return False
+        if spec.signature.mechanism_family not in MECHANISM_FAMILIES:
+            log.info("拒绝入池: mechanism_family 不在枚举内(%s)",
+                     spec.signature.mechanism_family)
+            return False
+        if spec.signature.solution_shape not in SOLUTION_SHAPES:
+            log.info("拒绝入池: solution_shape 不在枚举内(%s)",
+                     spec.signature.solution_shape)
+            return False
+        # blueprint 被显式分配过 -> 顺带验它确实被执行了(与实时路径
+        # 的第三道门一致)。没分配过(自由生成)就跳过。
+        if getattr(spec, "blueprint_specified", False):
+            try:
+                vb = validate_blueprint(spec, spec.blueprint)
+            except Exception:                   # noqa: BLE001
+                log.exception("入池 blueprint 校验异常, 拒绝")
+                return False
+            if not vb.ok:
+                log.info("拒绝入池: blueprint 校验不过(%s)", vb.why()[:120])
+                return False
 
         with self._lock:
             k = spec_key(spec)
@@ -338,6 +421,14 @@ class PuzzlePool:
     def _pop_next_locked(self, recent: Optional[list],
                          avoid: Optional[list]) -> Optional[PuzzleSpec]:
         with self._lock:
+            # ---- fail closed ----
+            # 账本不可信时**一道都不交付**。理由: "某道题不在 _used 里"
+            # 和"那一行没读出来"从结果上无法区分, 而前者意味着把已经
+            # 播过的题再播一次 —— 那正是我们定死的"宁可不播"要避免的。
+            # 池子本身还完好, 但账本坏了就不能信池子里的任何判断。
+            if not self._used_trustworthy:
+                log.error("used 账本不可信, 本次不交付任何题(回落现场生成)")
+                return None
             cands = [s for s in self._items
                      if spec_key(s) not in self._used]
             if not cands:
