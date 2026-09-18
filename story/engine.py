@@ -73,7 +73,7 @@ class RoundEngine:
         self._used_titles: list[str] = []
         self._hint_pool: list[str] = []      # AI 出题时附带的提示(备用)
         # 出题时定下的原子事实 —— 传给裁判, 让"说中了几条"有据可依
-        self._solve_atoms: list[str] = []
+        self._solve_atoms: list = []
         self._hints_shown: list[str] = []    # **实际展示过**的提示文本
         self._hints_given = 0
         self._hint_text = ""
@@ -342,7 +342,8 @@ class RoundEngine:
                       hints: Optional[list] = None, title: Optional[str] = None,
                       error: Optional[str] = None, usage: Optional[dict] = None,
                       model: Optional[str] = None, now: Optional[float] = None,
-                      solve_atoms: Optional[list] = None
+                      solve_atoms: Optional[list] = None,
+                      fair_clues: Optional[list] = None
                       ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
@@ -360,6 +361,7 @@ class RoundEngine:
             self._title = title or ""
             self._hint_pool = list(hints or [])
             self._solve_atoms = list(solve_atoms or [])
+            self._fair_clues = list(fair_clues or [])
             self._hints_shown = []
             self._puzzle_index += 1
             self.round_index = self._puzzle_index
@@ -416,7 +418,11 @@ class RoundEngine:
                 if self.phase != Phase.QA:
                     continue
                 rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
-                            verdict=r.verdict, comment=r.comment, kind="qa", ts=now)
+                            verdict=r.verdict, comment=r.comment, kind="qa", ts=now,
+                            status=r.status,
+                            is_guess=r.is_guess, cause_hit=r.cause_hit,
+                            mechanism_hit=r.mechanism_hit,
+                            matched_atoms=r.matched_atoms)
                 self._append_qa_locked(rec)
                 self._answered_total += 1
                 # 「未判定」是系统故障, 不是对观众猜测的评价 ——
@@ -591,6 +597,7 @@ class RoundEngine:
                 "qid": q.qid, "user_name": q.user_name, "text": q.text,
                 "puzzle": self._puzzle, "answer": self._answer,
                 "solve_atoms": list(self._solve_atoms),
+                "fair_clues": list(self._fair_clues),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
             }))
@@ -672,6 +679,7 @@ class RoundEngine:
         self._puzzle = ""
         self._answer = ""
         self._solve_atoms = []
+        self._fair_clues: list = []
         self._title = ""
         self._pending.clear()
         self._inflight.clear()
@@ -815,6 +823,7 @@ class RoundEngine:
                 solved=self._solved,
                 solved_by=self._solved_by,
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
+                qa_archive=[r.to_archive() for r in self._qa_log],
                 qa_total=self._qa_total,
                 pending_count=len(self._pending) + len(self._inflight),
                 hint_count=self._hints_given,

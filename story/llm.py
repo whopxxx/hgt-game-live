@@ -143,6 +143,71 @@ def _unwrap_tool_input(ti) -> dict:
     return ti
 
 
+def _norm_atoms(raw) -> list:
+    """把 solve_atoms 归一成 [{"role":..., "text":...}, ...]。
+
+    接受两种形态:
+      - 新: {"role": "cause", "text": "..."}
+      - 旧: "纯字符串"  -> 按位置补 role(第 1 条 cause, 第 2 条 mechanism),
+        这样老数据/老 prompt 回退时不会炸。
+    """
+    out = []
+    for i, a in enumerate(raw or []):
+        if isinstance(a, dict):
+            role = str(a.get("role", "") or "").strip().lower()
+            text = str(a.get("text", "") or "").strip()
+        else:
+            role, text = "", str(a or "").strip()
+        if not text:
+            continue
+        if role not in ("cause", "mechanism", "support"):
+            # 没给 role -> 按位置推: 头两条分别是 cause / mechanism
+            role = ("cause" if i == 0 else
+                    "mechanism" if i == 1 else "support")
+        out.append({"role": role, "text": text})
+        if len(out) >= 4:
+            break
+    return out
+
+
+def _atom_texts(atoms) -> list:
+    """取原子的纯文本(给提示词/日志用)。"""
+    return [a["text"] if isinstance(a, dict) else str(a)
+            for a in (atoms or [])]
+
+
+@dataclass
+class JudgeResult:
+    """裁判的完整结果。
+
+    为什么要单独一个 dataclass(而不是 `-> tuple[bool, error]`):
+      - 复盘时最需要的就是"这条为什么没判中 / 判中了哪几条 atom";
+      - 只有 bool 的话, cause/mechanism/matched_atoms 用完就扔,
+        落盘落不到, 下一轮改 prompt 只能靠猜(实测吃过这个亏)。
+    """
+    solved: bool = False
+    is_guess: bool = False
+    cause_hit: bool = False
+    mechanism_hit: bool = False
+    matched_atoms: list = field(default_factory=list)
+    # 技术失败(网关抖动/空 input) —— 与"明确判否"是两回事。
+    # 上层据此决定回"未判定"还是回正常的"不是"。
+    failed: bool = False
+    error: Optional[str] = None
+
+
+def _fill_coverage(qa: "QAResult", jr: "JudgeResult") -> None:
+    """把裁判的覆盖结果填回 QAResult —— 让它能一路落盘。
+
+    这是复盘的关键数据: 赛后只有"未中"两个字是没法改 prompt 的,
+    必须能看到是 cause 没中还是 mechanism 没中、命中了哪几条 atom。
+    """
+    qa.is_guess = jr.is_guess
+    qa.cause_hit = jr.cause_hit
+    qa.mechanism_hit = jr.mechanism_hit
+    qa.matched_atoms = list(jr.matched_atoms or [])
+
+
 def _merge_fix(base: "RiddleResult", fixed: "RiddleResult") -> "RiddleResult":
     """把审稿人的改稿合并回原稿。
 
@@ -655,7 +720,7 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 - "是纪念死在海里的人"         -> false(万能悲情猜法)
 - "退潮时礁石才露出来, 亮灯是标礁石, 涨潮后继续亮反而误导船只" -> true
 
-【拿不准时判 false。】只回答 true 或 false。"""
+【拿不准时, 把对应的那项填 false。】按工具字段**逐项返回**, 不要只回一个词。"""
 
 
 _TOOL_RIDDLE = {
@@ -675,12 +740,30 @@ _TOOL_RIDDLE = {
             },
             "solve_atoms": {
                 "type": "array", "minItems": 2, "maxItems": 4,
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["cause", "mechanism", "support"],
+                            "description": (
+                                "cause    = 那个反常结果的起因; "
+                                "mechanism = 这个起因**如何**导致反常行为(把它和"
+                                "起因连起来的那一步); "
+                                "support  = 补充事实(可选)"),
+                        },
+                        "text": {"type": "string",
+                                 "description": "这条原子事实, 一句话"},
+                    },
+                    "required": ["role", "text"],
+                },
                 "description": (
-                    "玩家必须说中的 2-4 条原子事实, 按认知顺序排列。"
-                    "合起来才构成完整答案; 只说中其中一条不算猜中。"
-                    "例: ['退潮时礁石才露出水面', '灯的作用是标出礁石位置',"
-                    "'涨潮后继续亮灯反而会误导船只']"),
+                    "玩家必须说中的 2-4 条原子事实。**必须恰好有一条 cause "
+                    "和一条 mechanism** —— 代码会要求玩家同时说中这两条才算"
+                    "通关, 只说中其中一条不算。"
+                    "例: [{\"role\":\"cause\",\"text\":\"退潮时礁石露出水面\"},"
+                    "{\"role\":\"mechanism\",\"text\":\"亮灯是标出礁石位置, "
+                    "涨潮后继续亮反而误导船只\"}]"),
             },
             "fair_clues": {
                 "type": "array", "minItems": 1,
@@ -794,9 +877,17 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读一遍, 有问题就**�
 ② 谜底**直接解释**了谜面的反常点。换个原因也说得通(靠"恰好") -> 改成只能是这样。
    谜底讲的是"另一段情节"、答非所问 -> 改成正面回答。
 ③ **盖住谜底, 只读谜面, 自己猜一遍。**
-   一读就猜出答案 -> 谜面写得太白, 删掉那些直接指向答案的词, 只留"反常"。
+   一读就猜出答案 -> 谜面写得太白, 删掉那些**直接把答案说出口**的词。
    (典型泄露: 谜面末句把结果演完了; 谜面里出现了答案的关键词;
     提示直接指向谜底核心)
+
+   ⚠ **但不要连"可回溯的线索"一起删掉。**
+   删的是"答案本身", 留的是"知道答案后回看能指向它的事实"。
+   改完后谜面里**必须至少还剩一条这样的线索**(见 fair_clues)——
+   否则题目会变成"答案完全依赖题面外的私人往事", 观众无从推理, 只能
+   靠猜套路。这两者的区别:
+     ✗ 该删: "他明白同伴把水换成了沙子"      (答案说出口了)
+     ✓ 该留: "他倒过水壶, 一滴水都没有"      (回看才知道为什么要倒)
 
 **还要看它够不够有意思:**
 ④ 谜底是"亲人去世 / 怀念亡者 / 赎罪"吗? 如果连续几道都是这类, 或者
@@ -1102,8 +1193,7 @@ class PuzzleWriter:
                 answer=(d.get("answer") or "").strip() or None,
                 hints=[h.strip() for h in (d.get("hints") or []) if h and h.strip()][:3],
                 title=(d.get("title") or "").strip() or None,
-                solve_atoms=[str(a).strip() for a in (d.get("solve_atoms") or [])
-                             if str(a).strip()][:4],
+                solve_atoms=_norm_atoms(d.get("solve_atoms")),
                 fair_clues=[str(c).strip() for c in (d.get("fair_clues") or [])
                             if str(c).strip()][:4],
                 usage=res.usage, model=res.model)
@@ -1198,26 +1288,41 @@ class PuzzleWriter:
             elif r0.verdict != P.SOLVE:
                 # 还不是揭晓 -> 让裁判来定夺
                 if judge_solve:
-                    try:
-                        solved, jerr = self.judge(puzzle, answer, text,
-                                                  solve_atoms)
-                        if solved:
-                            r0.verdict = P.SOLVE
-                            if not r0.comment:
-                                r0.comment = "答对了！"
-                            log.info("裁判判定猜中: %r", text[:30])
-                    except Exception as e:   # 裁判失败不影响正常裁决
-                        log.warning("裁判调用失败(忽略): %s", e)
+                    jr = self.judge(puzzle, answer, text, solve_atoms)
+                    _fill_coverage(r0, jr)
+                    if jr.solved:
+                        r0.verdict = P.SOLVE
+                        if not r0.comment:
+                            r0.comment = "答对了！"
+                        log.info("裁判判定猜中: %r", text[:30])
+                    elif jr.failed:
+                        # 裁判**技术失败**(网关抖动/空返回) —— 这不是"没猜中"。
+                        # 但**第一层的裁决仍然有效**: 它已经明确给了 是/不是/无关,
+                        # 不该因为复核失败就把它抹掉(实测: 把一条好好的"是"
+                        # 变成"未判定", 观众看到的是"系统坏了", 其实系统没事)。
+                        # 只有当第一层没给出可用裁决时才降级。
+                        log.warning("裁判技术失败, 保留第一层裁决 %s: %r",
+                                    r0.verdict, text[:30])
+                        if not r0.verdict:
+                            r0.verdict = P.UNAVAILABLE
+                            r0.status = "unavailable"
             else:
                 # 裁决自己给了揭晓 -> **仍要裁判复核**, 不通过就降级。
                 # 这一步是"揭晓"的唯一可信来源。
                 if judge_solve:
-                    try:
-                        solved, _ = self.judge(puzzle, answer, text, solve_atoms)
-                    except Exception as e:
-                        log.warning("裁判复核异常(按未猜中处理): %s", e)
-                        solved = False
-                    if not solved:
+                    jr = self.judge(puzzle, answer, text, solve_atoms)
+                    _fill_coverage(r0, jr)
+                    if jr.failed:
+                        # 复核**没做成** ≠ 观众猜错了。
+                        # 降成"无关"等于把"我们的故障"说成"你的猜测无关",
+                        # 会主动把观众带偏。降到"未判定", 题目不结束。
+                        log.warning("裁判复核技术失败, 本条按未判定: %r",
+                                    text[:30])
+                        r0.verdict = P.UNAVAILABLE
+                        r0.status = "unavailable"
+                        if not r0.comment:
+                            r0.comment = "刚才网络抖了一下，再发一次吧"
+                    elif not jr.solved:
                         log.info("裁决自称揭晓但裁判否决, 降级为无关: %r",
                                  text[:30])
                         r0.verdict = "无关"
@@ -1241,11 +1346,36 @@ class PuzzleWriter:
         `solve_atoms` 是出题时定下的原子事实, 一并给裁判参考, 让"说中了几条"
         有据可依, 而不是每次凭感觉理解一段文学谜底。
         """
+    def judge(self, puzzle: str, answer: str, text: str,
+              solve_atoms: Optional[list] = None) -> JudgeResult:
+        """裁判: 观众的这条提问是否说中了核心谜底?
+
+        单独一次**强制工具**调用 —— 实测拆出来问, 模型才肯判。
+
+        **不返回 bool, 而是返回覆盖结果**, 且 solved 由**代码**按 atom 角色算:
+
+            solved = is_guess and cause_hit and mechanism_hit
+                     and 命中了 cause atom 和 mechanism atom
+
+        为什么还要卡 atom: 只信模型给的 cause_hit/mechanism_hit, 等于把判断权
+        又交回给它 —— 它说 true 就是 true。加上"matched_atoms 里必须真的包含
+        一条 cause 和一条 mechanism", 才有**代码层的一致性校验**:
+        模型说"说清机制了", 但一条 mechanism atom 都没命中 -> 不通过。
+
+        atom 没有 role(老数据)时退化为只看 cause/mechanism 两个布尔,
+        不会因为缺 role 就把所有人卡死。
+        """
         atoms = [a for a in (solve_atoms or []) if a]
         atom_txt = ""
         if atoms:
-            atom_txt = ("\n【要说到的事实(编号从 0 开始)】\n"
-                        + "\n".join(f"{i}. {a}" for i, a in enumerate(atoms)))
+            lines = []
+            for i, a in enumerate(atoms):
+                if isinstance(a, dict):
+                    lines.append(f"{i}. [{a.get('role','?')}] {a.get('text','')}")
+                else:
+                    lines.append(f"{i}. {a}")
+            atom_txt = ("\n【要说到的事实(编号从 0 开始, 方括号是角色)】\n"
+                        + "\n".join(lines))
         user = (f"【谜面】{puzzle}\n"
                 f"【谜底】{answer}\n"
                 f"{atom_txt}\n\n"
@@ -1258,16 +1388,34 @@ class PuzzleWriter:
             is_guess = bool(ti.get("is_guess", True))
             cause = bool(ti.get("cause_hit"))
             mech = bool(ti.get("mechanism_hit"))
-            atoms_hit = ti.get("matched_atoms") or []
+            hit = [int(x) for x in (ti.get("matched_atoms") or [])
+                   if isinstance(x, (int, float))]
             solved = is_guess and cause and mech
+            # ---- 代码层一致性校验: 说中机制就必须真的命中 mechanism atom ----
+            roles = {i: (a.get("role") if isinstance(a, dict) else None)
+                     for i, a in enumerate(atoms)}
+            if solved and any(r in ("cause", "mechanism") for r in roles.values()):
+                hit_roles = {roles.get(i) for i in hit}
+                if "cause" not in hit_roles or "mechanism" not in hit_roles:
+                    log.info("裁判称说中但 atom 覆盖不足(cause=%s mech=%s "
+                             "命中=%s), 判为未中: %r",
+                             "cause" in hit_roles, "mechanism" in hit_roles,
+                             hit, text[:30])
+                    solved = False
+            jr = JudgeResult(solved=solved, is_guess=is_guess, cause_hit=cause,
+                             mechanism_hit=mech, matched_atoms=hit,
+                             error=res.error)
             _detail("裁判 %r -> %s (猜测=%s 原因=%s 机制=%s 命中atom=%s)",
                     text[:40], "猜中" if solved else "未中",
-                    is_guess, cause, mech, atoms_hit)
-            return solved, res.error
+                    is_guess, cause, mech, hit)
+            return jr
         if res.text:
             t = res.text.strip()[:6]
-            return ("是" in t and "否" not in t and "不是" not in t), res.error
-        return False, res.error
+            ok = ("是" in t and "否" not in t and "不是" not in t)
+            return JudgeResult(solved=ok, is_guess=ok, cause_hit=ok,
+                               mechanism_hit=ok, error=res.error)
+        # 既没有 tool_input 也没有 text —— 这是**技术失败**, 不是"判否"。
+        return JudgeResult(failed=True, error=res.error or "裁判无有效返回")
 
     # ------------------------------------------------------------------
     def hint(self, puzzle: str, answer: str, level: int,

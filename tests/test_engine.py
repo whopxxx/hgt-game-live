@@ -562,6 +562,43 @@ def test_llm_failure_never_drops():
     check("提问最终有裁决", len(s.qa_log) >= 1, s.qa_log)
 
 
+def test_coverage_reaches_archive():
+    """裁判覆盖结果要**一路走到落盘** —— 这是复盘的关键数据。
+
+    只有"未中"两个字是没法改 prompt 的: 必须能看到是 cause 没中还是
+    mechanism 没中、命中了哪几条 atom。
+    """
+    print("[覆盖结果: 从出题一路带到落盘]")
+    cfg = mkcfg()
+    cfg.replay_burst_n = 0
+    eng = RoundEngine(cfg)
+    eng.start(0.0)
+    ATOMS = [{"role": "cause", "text": "他是后天失明的"},
+             {"role": "mechanism", "text": "灯是给别人照的, 免得撞到他"}]
+    eng.submit_riddle("他每晚点灯却不让光照到自己。为什么?", "他是盲人。",
+                      ["a", "b", "c"], title="T", solve_atoms=ATOMS,
+                      fair_clues=["谜面写了'不让光照到自己'"])
+    eng.tick(0.1)
+    eng.submit_danmaku(1, "甲", "#他是盲人吗", 0.2)
+    acts = eng.tick(0.3)
+    ans = [a for a in acts if a.kind.value == "answer"]
+    check("派发的 ANSWER 带上了 atoms",
+          ans and ans[0].payload.get("solve_atoms") == ATOMS,
+          ans[0].payload.get("solve_atoms") if ans else None)
+    qid = ans[0].payload["qid"]
+    eng.submit_qa([QAResult(qid=qid, verdict="不是", comment="方向不对",
+                            is_guess=True, cause_hit=True, mechanism_hit=False,
+                            matched_atoms=[0])], model="m")
+    eng.tick(0.4)
+    s = eng.snapshot()
+    arch = s.qa_archive[-1]
+    check("落盘记录带 cause_hit", arch.get("cause_hit") is True, arch)
+    check("落盘记录带 mechanism_hit", arch.get("mechanism_hit") is False, arch)
+    check("落盘记录带 matched_atoms", arch.get("matched_atoms") == [0], arch)
+    check("上屏记录**不含**内部字段",
+          "cause_hit" not in s.qa_log[-1], s.qa_log[-1])
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -575,7 +612,7 @@ def main():
              test_stop_and_stream_end, test_clock_jump, test_snapshot_keys,
              test_hint_order_and_dedup, test_commands_survive_burst_buffer,
              test_replay_detection, test_determinism,
-             test_llm_failure_never_drops]
+             test_llm_failure_never_drops, test_coverage_reaches_archive]
     for t in tests:
         t()
     print()

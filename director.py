@@ -332,7 +332,7 @@ class Director:
                     self._dispatch(self.engine.submit_riddle(
                         r.puzzle, r.answer, r.hints, r.title,
                         error=r.error, usage=r.usage, model=r.model,
-                        solve_atoms=r.solve_atoms))
+                        solve_atoms=r.solve_atoms, fair_clues=r.fair_clues))
                     if r.puzzle and not r.answer:
                         log.info("本题未解析出谜底, 揭晓时将重新生成")
                 self.push()
@@ -394,7 +394,11 @@ class Director:
                       answer=payload.get("answer", ""),
                       reason=payload.get("reason", ""),
                       winner=payload.get("winner", ""),
-                      reveal=text, qa=[r for r in snap.qa_log],
+                      reveal=text, qa=list(snap.qa_archive),
+                      # 出题时定下的原子事实与公平线索 —— 赛后复盘
+                      # "为什么这条没判中"时必须能对照它们。
+                      solve_atoms=payload.get("solve_atoms", []),
+                      fair_clues=payload.get("fair_clues", []),
                       ts=time.time(), model=model)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.cfg.puzzle_out_path)),

@@ -393,8 +393,8 @@ def test_judge():
     fc = FakeClient([LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
                      LLMResult(tool_input={"is_guess": True, "cause_hit": False, "mechanism_hit": False})])
     w = PuzzleWriter(client=fc)
-    yes, _ = w.judge("谜面", "谜底", "同伴的肉对吧")
-    no, _ = w.judge("谜面", "谜底", "他饿了吗")
+    yes = w.judge("谜面", "谜底", "同伴的肉对吧").solved
+    no = w.judge("谜面", "谜底", "他饿了吗").solved
     check("判中", yes is True, yes)
     check("判不中", no is False, no)
 
@@ -667,6 +667,59 @@ def test_main_regression_no_atoms_lost():
     check("两轮修改后 clues 非空", r.fair_clues == ["线索1"], r.fair_clues)
 
 
+def test_atom_role_gate():
+    print("[裁判: 说中机制就必须真的命中 mechanism atom]")
+    # 只信模型给的 cause_hit/mechanism_hit, 等于把判断权又交回给它。
+    # 加上"matched_atoms 必须包含 cause 和 mechanism"才是代码层校验。
+    from story.llm import JudgeResult
+    ATOMS = [{"role": "cause", "text": "退潮时礁石露出水面"},
+             {"role": "mechanism", "text": "亮灯标礁石位置, 涨潮后误导船只"}]
+    # ① 模型说都中了, 但 matched_atoms 只命中 support 之外的 0 -> 不通过
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": [0]})])
+    w = PuzzleWriter(client=fc)
+    jr = w.judge("谜面", "谜底", "退潮时礁石露出来", ATOMS)
+    check("只命中 cause 不算通关(缺 mechanism)", jr.solved is False,
+          f"solved={jr.solved} hit={jr.matched_atoms}")
+    # ② 两条都命中 -> 通过
+    fc2 = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": [0, 1]})])
+    w2 = PuzzleWriter(client=fc2)
+    jr2 = w2.judge("谜面", "谜底", "退潮礁石露出, 亮灯标位置, 涨潮误导", ATOMS)
+    check("两条都命中 -> 通关", jr2.solved is True, jr2)
+    # ③ 没有 role 的老数据 -> 不做 atom 校验, 不误杀
+    fc3 = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": []})])
+    w3 = PuzzleWriter(client=fc3)
+    jr3 = w3.judge("谜面", "谜底", "说清了", ["纯字符串1", "纯字符串2"])
+    check("老格式(无 role)不误杀", jr3.solved is True, jr3)
+
+
+def test_judge_technical_failure_not_downgraded_to_irrelevant():
+    print("[裁判技术失败: 不能伪装成'无关', 也不能抹掉第一层裁决]")
+    from story import parser as P
+    # 第一层给了"揭晓", 第二层裁判技术失败 -> 必须是"未判定", 不能结束题
+    fc = FakeClient([
+        LLMResult(tool_input={"answers": [{"id": 1, "verdict": "揭晓"}]}),
+        LLMResult(error="网关抖动"),          # 裁判失败, 无 tool_input 无 text
+    ])
+    w = PuzzleWriter(client=fc)
+    res, _ = w.answer("谜面", "谜底", [], 1, "甲", "同伴的肉对吧", True, None)
+    check("技术失败 -> 未判定(不是无关)", res[0].verdict == P.UNAVAILABLE, res)
+    check("标记为 unavailable", res[0].status == "unavailable", res)
+    # 第一层已经给了正常的"是" -> 复核失败不该把它抹掉
+    fc2 = FakeClient([
+        LLMResult(tool_input={"answers": [{"id": 2, "verdict": "是"}]}),
+        LLMResult(error="网关抖动"),
+    ])
+    w2 = PuzzleWriter(client=fc2)
+    res2, _ = w2.answer("谜面", "谜底", [], 2, "乙", "他是盲人吗", True, None)
+    check("复核失败保留第一层的'是'", res2[0].verdict == "是", res2)
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -674,6 +727,8 @@ def main():
               test_first_person_story_rejected,
               test_no_repeat_puzzles,
               test_riddle_check_retries_empty_tool_use, test_english_riddle_rejected_on_text_path,
+              test_atom_role_gate,
+              test_judge_technical_failure_not_downgraded_to_irrelevant,
               test_reviewer_keeps_solve_atoms,
               test_reviewer_can_replace_atoms_when_answer_changes,
               test_main_regression_no_atoms_lost,

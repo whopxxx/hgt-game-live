@@ -97,7 +97,12 @@ class QAResult:
 
 @dataclass
 class QARec:
-    """一条已完成的问答记录(用于展示 + 喂回 LLM 保持一致性)。"""
+    """一条已完成的问答记录(用于展示 + 喂回 LLM 保持一致性)。
+
+    除展示字段外, 还带**裁判覆盖结果** —— 那是复盘的关键数据:
+    只有"未中"两个字是没法改 prompt 的, 必须能看到是 cause 没中还是
+    mechanism 没中、命中了哪几条 atom。
+    """
 
     qid: int
     user_name: str
@@ -106,8 +111,15 @@ class QARec:
     comment: str = ""
     kind: str = "qa"       # "qa" | "hint" | "nudge"
     ts: float = 0.0
+    # ---- 裁判覆盖结果(仅落盘/复盘, 不上屏) ----
+    status: str = "ok"     # ok | unavailable
+    is_guess: Optional[bool] = None
+    cause_hit: Optional[bool] = None
+    mechanism_hit: Optional[bool] = None
+    matched_atoms: Optional[list] = None
 
     def to_json(self) -> dict[str, Any]:
+        # 上屏用: 只给前端展示需要的字段(不暴露内部判定细节)
         return {
             "qid": self.qid,
             "user_name": self.user_name,
@@ -116,6 +128,18 @@ class QARec:
             "comment": self.comment,
             "kind": self.kind,
         }
+
+    def to_archive(self) -> dict[str, Any]:
+        """落盘用: 展示字段 + 覆盖结果, 供赛后复盘。"""
+        d = self.to_json()
+        d.update({
+            "status": self.status,
+            "is_guess": self.is_guess,
+            "cause_hit": self.cause_hit,
+            "mechanism_hit": self.mechanism_hit,
+            "matched_atoms": self.matched_atoms,
+        })
+        return d
 
     def to_line(self) -> str:
         """喂回 LLM 的一行。"""
@@ -170,6 +194,10 @@ class Snapshot:
     solved_by: str = ""
     # ---- 问答流 ----
     qa_log: list[dict[str, Any]] = field(default_factory=list)
+    # 落盘专用的问答流(含裁判覆盖结果)。与 qa_log 分开: 前端不需要
+    # 也不该看到内部判定细节, 但复盘**必须**有 —— 否则只能看到"未中",
+    # 不知道是 cause 没中还是 mechanism 没中。
+    qa_archive: list[dict[str, Any]] = field(default_factory=list)
     qa_total: int = 0                       # 含已滑出快照的条数 -> 前端只追加不重排
     pending_count: int = 0                  # 排队中(未答)的提问数 -> "AI 正在思考…"
     # ---- 提示 / 空闲 ----
