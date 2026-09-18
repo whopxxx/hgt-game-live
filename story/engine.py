@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
 from .config import Config
@@ -170,12 +171,20 @@ class RoundEngine:
         self._danmaku: list[DanmakuItem] = []
         self._danmaku_cap = 60
         self._dm_seq = 0                    # 弹幕全局序号(单调递增)
-        self._burst_start: Optional[float] = None   # 当前缓冲窗口的起点
-        self._burst_last: Optional[float] = None    # 缓冲里最后一条的时刻
-        self._burst: list = []              # 窗口内缓冲的弹幕(待判定是否重放)
-        self._replays = 0                   # 判定为重放并丢弃的批次数
+        # ---- Q12: 重放识别 ----
+        # 主路径: 按平台 msg_id 精确去重(有 ID 时)。
+        # 降级路径: 没有 ID 时, 只在 reconnect guard 窗口内、且与最近历史
+        #   **大量精确重复**时才抑制(见 `_is_replay_locked`)。
+        #
+        # 早先的"1.5s 内 3 条 -> 整批丢弃 + 压制全场 5 秒"已删除:
+        # 它假设"真人不可能 1.5 秒连发 3 条", 而 40 人房间看到关键提示时
+        # 1.5 秒 3 条完全可能是真互动 —— 直播越热误伤越多。
+        self._seen_msg_ids: "OrderedDict[str, float]" = OrderedDict()
+        self._msg_id_cap = max(1, int(getattr(cfg, "msg_id_cache_size", 2000) or 2000))
+        self._guard_until = 0.0             # replay guard 到期时刻
+        self._replays = 0                   # 判定为重放并抑制的条数
+        self._dup_ids = 0                   # 因 msg_id 重复而丢弃的条数
         self._pending_acts: list[EngineAction] = []   # 攒着待发的即时动作
-        self._mute_until = 0.0              # 压制弹幕到这个时刻(重放期间)
         self._viewers: set[str] = set()
 
         # ---- 统计 ----
@@ -228,83 +237,102 @@ class RoundEngine:
             self._notice = "弹幕连接中断，正在重连…"
 
     def on_reconnect(self) -> None:
+        """新连接收到首帧 = 重连成功(Q12)。
+
+        **开一个 replay guard 窗口**: 抖音是在重连之后把那批旧弹幕原样
+        重发的, 所以"该防重放"这件事只在这个窗口内成立。出了窗口,
+        哪怕内容真的一模一样, 也当真人发言 —— 一个人在几分钟后一字不差
+        又说一遍, 本来就更可能是真的又问了。
+
+        注意这只影响**降级路径**(没有 msg_id 的消息)。有 ID 的走精确
+        去重, 任何时候都能识别, 不依赖这个窗口。
+        """
+        now = self._now(None)
         with self._lock:
             self._notice = "弹幕已重连"
+            self._guard_until = now + self.cfg.replay_guard_seconds
+            _detail("重放 guard 开启 %.0fs(至 %.0f)",
+                    self.cfg.replay_guard_seconds, self._guard_until)
 
     # ==================================================================
     # 输入: 弹幕(ws 线程 -> 消费线程)
     # ==================================================================
     def submit_danmaku(self, user_id, user_name: str, content: str,
-                       now: Optional[float] = None) -> list[EngineAction]:
-        """弹幕入口。先过"重放检测", 再交给 _accept_danmaku 真正处理。
+                       now: Optional[float] = None,
+                       message_id: str = "") -> list[EngineAction]:
+        """弹幕入口。先过**重放识别**, 再交给 `_accept_danmaku` 真正处理。
 
-        为什么需要重放检测: 实测抖音在**重连后会把之前整批弹幕原样重发**
+        为什么需要重放识别: 实测抖音在**重连后会把之前整批弹幕原样重发**
         (11 条挤在同一秒, 内容和一分钟前那批一模一样)。那批重放会:
           - 在弹幕轨道上又刷一遍(看着像乱飞)
           - 被当成新提问再答一遍(重复回答)
-        所以整批丢弃。
 
-        做法: **先缓冲, 后提交** —— 一个短时间窗内收到的先攒着, 窗口结束
-        时若条数正常就提交, 超阈值则整批丢弃。这样不必回滚已计票的提问。
+        ## Q12: 两条路径(分层降级)
+
+        **主路径 —— 有 `message_id` 就精确去重。** 平台消息 ID 是唯一的,
+        所以"同一条消息又来一遍"能被**精确**识别, 不看时间、不看密度、
+        不看内容。真人爆发(40 人同时刷)永不误杀, 因为每条 ID 都不同。
+
+        **降级 —— 没有 ID 时(或上游不给)**: 只在 **reconnect guard**
+        窗口内, 且与最近历史**大量精确重复**时才抑制(见 `_is_replay_locked`)。
+        单纯"来得很密"不再构成重放证据 —— 那正是旧机制误杀真人的原因。
         """
         now = self._now(now)
         with self._lock:
             if self._stopped:
                 _detail("弹幕丢弃[已停播] %s: %s", user_name, content[:30])
                 return []
-            # replay_burst_n <= 0: 关掉重放检测(测试用), 直接处理。
-            if self.cfg.replay_burst_n <= 0:
+            # ---- 主路径: msg_id 精确去重 ----
+            if message_id:
+                if message_id in self._seen_msg_ids:
+                    _detail("弹幕丢弃[msg_id 重复 %s] %s: %s",
+                            message_id, user_name, content[:30])
+                    self._dup_ids += 1
+                    return []
+                self._seen_msg_ids[message_id] = now
+                # 有界: 超了就丢最旧的。重放只会紧跟在重连之后, 所以
+                # 只需要记住"最近的"那批 —— 2000 条足够覆盖任何真实重放。
+                while len(self._seen_msg_ids) > self._msg_id_cap:
+                    self._seen_msg_ids.popitem(last=False)
                 return self._accept_danmaku(str(user_id), user_name,
-                                            content, now)
-            # 压制期内: 重放往往分批(每 1.5s 窗口刚好凑够阈值丢一批),
-            # 批次之间会漏掉零头。所以命中重放后**压制一段时间**,
-            # 把整个重放过程一次性挡掉。
-            if now < self._mute_until:
-                _detail("弹幕丢弃[重放压制中 %.1fs] %s: %s",
-                        self._mute_until - now, user_name, content[:30])
-                return []
-            # 距上一条超过一个窗口 -> 这是**新的一波**。
-            # 先把上一波提交掉(它已经安全了: 攒了这么久都没超阈值),
-            # 再开始新的一波并重置计数。
-            # (用 _burst_last 而不是 _burst_start 判断: 否则隔 20 秒来一条的
-            #  真人节奏会被算成"40 秒内涌入 3 条"而误判为重放。)
-            if (self._burst_last is None
-                    or now - self._burst_last > self.cfg.replay_burst_ms / 1000.0):
-                if self._burst:
-                    # 提交上一波, 它产生的即时动作(#提示/#下一题)先存着,
-                    # 由下一次 tick 统一发出(scheduler 是唯一的动作发出者)。
-                    self._pending_acts.extend(self._flush_burst())
-                self._burst_start = now
-            self._burst.append((str(user_id), user_name, content, now))
-            self._burst_last = now
-            if len(self._burst) >= self.cfg.replay_burst_n:
-                log.warning("疑似弹幕重放(%.0fms 内涌入 %d 条), 丢弃整批并压制 %.1fs",
-                            (self._burst_last - self._burst_start) * 1000,
-                            len(self._burst), self.cfg.replay_mute_s)
-                self._burst = []
-                self._burst_start = None
-                self._burst_last = None
+                                            content, now, message_id)
+            # ---- 降级路径: 没有 ID, 只在 guard 窗口内查"历史重复" ----
+            if self._is_replay_locked(user_id, content, now):
                 self._replays += 1
-                self._mute_until = now + self.cfg.replay_mute_s
-            return []
+                return []
+            return self._accept_danmaku(str(user_id), user_name, content, now)
 
-    def _flush_burst(self) -> list[EngineAction]:
-        """把缓冲区里的弹幕真正收下(调用方须持锁)。
+    def _is_replay_locked(self, user_id, content: str, now: float) -> bool:
+        """降级路径的判据(调用方须持锁)。返回 True = 判定为重放, 丢弃。
 
-        返回这批里产生的**即时动作**(如 #提示 / #下一题)。
-        以前这里是 `-> None`, 把返回值丢了 —— 结果 `#提示` / `#下一题`
-        这两个指令**彻底失效**(观众发了没反应)。现在收集起来交给 tick。
+        两个条件**同时**满足才算:
+          ① 现在处于 reconnect guard 窗口内 —— 重放只在刚重连后发生;
+          ② 这条与 `_danmaku`(最近 60 条)里的**同一指纹**已经出现过
+             >= `replay_guard_min_repeats` 次 —— 重放的特征是"与刚才
+             收到过的消息**大量精确重复**", 而不是"来得很密"。
+
+        为什么要 ②: 重连之后**真人也会正常发言**。只看 ① 就等于
+        "刚重连就无差别丢弃", 只是把误杀换了个触发条件。
+
+        指纹 = (user_id, 归一化内容)。用归一化而不是原文, 是因为同一句
+        话在重放里可能带不同的空白/表情装饰。
         """
-        buf, self._burst = self._burst, []
-        self._burst_start = None
-        self._burst_last = None
-        acts: list[EngineAction] = []
-        for wid, name, content, ts in buf:
-            try:
-                acts.extend(self._accept_danmaku(wid, name, content, ts))
-            except Exception as e:
-                log.error("弹幕处理异常: %s", e)
-        return acts
+        if now >= self._guard_until:
+            return False
+        try:
+            fp = (str(user_id), P.simplify_for_dedupe(content, 200))
+        except Exception:                       # noqa: BLE001
+            return False
+        hits = 0
+        for d in self._danmaku:
+            if str(d.user_id) == fp[0] and \
+                    P.simplify_for_dedupe(d.content, 200) == fp[1]:
+                hits += 1
+        if hits >= self.cfg.replay_guard_min_repeats:
+            log.info("疑似重放(guard 内, 指纹已出现 %d 次): %s: %s",
+                     hits, user_id, content[:30])
+            return True
+        return False
 
     def _phase_ack_locked(self, user_name: str, text: str,
                           now: float) -> list[EngineAction]:
@@ -341,7 +369,7 @@ class RoundEngine:
         return [EngineAction(ActionKind.BROADCAST, {"phase_changed": False})]
 
     def _accept_danmaku(self, wid, user_name, content,
-                        now) -> list[EngineAction]:
+                        now, message_id: str = "") -> list[EngineAction]:
         """真正处理一条弹幕(调用方须持锁)。"""
         if True:
             is_cmd = content.strip().startswith(CMD_PREFIX)
@@ -358,7 +386,7 @@ class RoundEngine:
                 return []
             self._dm_seq += 1
             self._danmaku.append(DanmakuItem(wid, user_name, content, is_cmd,
-                                             now, self._dm_seq))
+                                             now, self._dm_seq, message_id))
             if len(self._danmaku) > self._danmaku_cap:
                 self._danmaku = self._danmaku[-self._danmaku_cap:]
             self._viewers.add(wid)
@@ -689,13 +717,9 @@ class RoundEngine:
         with self._lock:
             if self._stopped:
                 return []
-            # 只有"**安静下来**"才提交缓冲 —— 即距最后一条已超过窗口时长。
-            # 用 _burst_last(最后一条的时刻)判断, 而不是 _burst_start,
-            # 否则连续来消息时窗口会一直被重置, 攒着不提交。
-            if (self._burst and self._burst_last is not None
-                    and now - self._burst_last > self.cfg.replay_burst_ms / 1000.0):
-                self._pending_acts.extend(self._flush_burst())
             # 先把攒着的即时动作取出来, 和本次 tick 的动作合并后一起返回
+            # (Q12 之后没有缓冲窗口了, 所以 _pending_acts 的写入者只剩
+            #  极少数路径 —— 保留它是为了"tick 是唯一动作发出者"这条纪律)
             carry, self._pending_acts = self._pending_acts, []
             ph = self.phase
             if ph == Phase.SETTING:

@@ -36,9 +36,8 @@ def check(name, cond, extra=""):
 
 
 def mkcfg(**kw):
-    # 测试默认**关掉重放检测**(replay_burst_n=0): 否则每条弹幕都要等
-    # 缓冲窗口才提交, 所有测试都得改成异步写法。重放检测有专门的用例覆盖。
-    kw.setdefault("replay_burst_n", 0)
+    # Q12 之后 `submit_danmaku` **默认就是同步的**(没有缓冲窗口了),
+    # 不再需要 `replay_burst_n=0` 那个开关 —— 它随旧机制一起删掉了。
     kw.setdefault("no_llm", True)
     return Config(sim_path="x", **kw)
 
@@ -58,10 +57,10 @@ def boot(cfg):
 
 
 def say(eng, clk, uid, name, text, gap=20.0):
-    """发一条弹幕并**提交**(引擎现在会先缓冲一小会儿做重放检测)。
+    """发一条弹幕 -> 推进时钟 -> tick, 返回那次 tick 的动作。
 
-    真人节奏: 发一条 -> 过一会儿 -> tick 提交。测试里统一用这个帮手。
-    返回那次 tick 产生的动作列表(提交与派发往往发生在同一次 tick)。
+    注意 `submit_danmaku` **自己也可能同步返回动作**(如 `#提示`)——
+    Q12 之后不再有缓冲, 所以想拿那些动作应直接读它的返回值。
     """
     eng.submit_danmaku(uid, name, text)
     clk.advance(gap)
@@ -69,18 +68,16 @@ def say(eng, clk, uid, name, text, gap=20.0):
 
 
 def say_many(eng, clk, items, gap=20.0):
-    """连续发多条弹幕, 让它们**全部提交但不派发**。
+    """连续发多条弹幕(每条之间推 gap), **不** tick。
 
-    每条之间推 20 秒(远超重放窗口), 所以:
-      - 不会被误判为重放
-      - 每条到达时, 前一条所在的窗口已结束 -> 自动提交
-    最后 tick 一次, 让它们进入 pending 队列(还没派发)。
+    刻意不 tick: 这些测试要的是"消息已入队、但还没派发"的中间状态。
+    Q12 之后 `submit_danmaku` 同步入队, 所以不再需要旧版的
+    `_flush_burst()` 收尾 —— 但**仍然不能** tick, 否则 QA 阶段会立刻
+    派发 ANSWER, 调用方就看不到 pending 队列了。
     """
     for uid, name, text in items:
         eng.submit_danmaku(uid, name, text)
         clk.advance(gap)
-    if eng._burst:
-        eng._flush_burst()
 
 
 def kinds(acts):
@@ -492,55 +489,177 @@ def test_hint_order_and_dedup():
           eng.snapshot().hint_count)
 
 
-def test_commands_survive_burst_buffer():
-    print("[指令不能被缓冲吞掉]")
-    # 实测 bug: _flush_burst 曾把 _accept_danmaku 的返回值丢掉,
-    # 导致 #提示 / #下一题 这两个指令**彻底失效**(观众发了没反应)。
-    # 这里钉住: 走生产配置(缓冲开启)时, 指令仍要能生效。
-    eng, clk = boot(Config(sim_path="x", no_llm=True))
+def test_commands_are_not_swallowed():
+    print("[指令不被吞掉]")
+    # 实测 bug: 早先的缓冲路径曾把 _accept_danmaku 的返回值丢掉,
+    # 导致 #提示 / #下一题 **彻底失效**(观众发了没反应)。
+    # Q12 删掉了缓冲, 指令现在**同步**返回动作 —— 这里钉住它仍生效。
+    eng, clk = boot(mkcfg())
     clk.advance(60)          # 过掉 #提示 的 20 秒节流
-    eng.submit_danmaku("u1", "甲", "#提示")
-    clk.advance(2)           # 过缓冲窗口
-    acts = eng.tick()
-    check("#提示 生效(缓冲不吞动作)",
+    acts = eng.submit_danmaku("u1", "甲", "#提示")
+    check("#提示 生效(同步返回)",
           any(a.kind == ActionKind.HINT for a in acts), kinds(acts))
     # #下一题 同理
     clk.advance(30)
-    eng.submit_danmaku("u1", "甲", "#下一题")
-    clk.advance(2)
-    acts = eng.tick()
+    acts = eng.submit_danmaku("u1", "甲", "#下一题")
     check("#下一题 生效",
           any(a.kind == ActionKind.REVEAL for a in acts), kinds(acts))
 
 
-def test_replay_detection():
-    print("[重连重放: 整批挡掉, 但别误伤真人]")
-    # 生产配置(重放检测开启)
-    eng, clk = boot(Config(sim_path="x", no_llm=True))
-    # ① 真人节奏: 每条隔 20 秒, 不该被误判
-    for q in ["#是父母吗", "#是兄弟吗", "#是同学吗"]:
-        eng.submit_danmaku("u1", "甲", q)
-        clk.advance(20)
-        eng.tick()
-    check("真人节奏不误判", eng._replays == 0, eng._replays)
-    check("真人弹幕正常上屏", len(eng._danmaku) == 3, len(eng._danmaku))
-    dm0 = len(eng._danmaku)
-    # ② 重连重放: 11 条同一瞬间涌进 -> 整批丢弃
-    for q in ["111", "#是爱人的电话吗", "#是人打来的电话吗", "#是亲人打来的电话吗",
-              "#是儿女吗", "#是父母吗", "[捂脸]", "?", "#是谁", "?", "#母亲去世了吗"]:
-        eng.submit_danmaku("u2", "乙", q)
-    clk.advance(3)
-    eng.tick()
-    check("重放被识别", eng._replays == 1, eng._replays)
-    check("重放整批不上屏", len(eng._danmaku) == dm0, len(eng._danmaku))
-    check("重放不计票", eng._probe()["pending"] == 0, eng._probe())
-    # ③ 压制期过后, 新观众说话应正常
-    clk.advance(10)
-    dm1 = len(eng._danmaku)
-    eng.submit_danmaku("u3", "丙", "#新问题")
-    clk.advance(20)
-    eng.tick()
-    check("压制期后恢复正常", len(eng._danmaku) == dm1 + 1, len(eng._danmaku))
+def test_msg_id_dedupe():
+    """Q12 主路径: 同一个 msg_id 来两次 -> 第二次丢弃。"""
+    print("\n[Q12] msg_id 精确去重")
+    eng, clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "甲", "#第一次", message_id="m1")
+    check("第一条进屏", len(eng._danmaku) == 1, len(eng._danmaku))
+    clk.advance(5)          # 越过那条 2s 成对判重(见下), 单独验证 msg_id 去重
+    eng.submit_danmaku("u1", "甲", "#第一次", message_id="m1")
+    check("**同一 ID 第二条被丢弃**", len(eng._danmaku) == 1, len(eng._danmaku))
+    check("计入 dup_ids", eng._dup_ids == 1, eng._dup_ids)
+    # 不同 ID + 相同内容 -> 都要保留(ID 方案比内容指纹强的地方)
+    clk.advance(5)
+    eng.submit_danmaku("u1", "甲", "#第一次", message_id="m2")
+    check("**不同 ID 同内容都保留**", len(eng._danmaku) == 2, len(eng._danmaku))
+
+
+def test_msg_id_beats_pairwise_dedupe():
+    """msg_id 去重发生在**那条 2s 成对判重之前**吗?
+
+    不是 —— 2s 成对判重是更早的、独立的一道闸(同一人同一内容 2 秒内
+    再来一条, 实测抖音会成对推送)。两条路径**并存**且各管一段:
+      - 2s 成对判重: 挡"抖音把同一条推两次", 不依赖 msg_id;
+      - msg_id 去重:  挡"重连后整批重放", 不依赖时间/内容。
+    这里钉住它们**都**有效, 且不会互相破坏。
+    """
+    print("\n[Q12] msg_id 与 2s 成对判重并存")
+    eng, clk = boot(mkcfg())
+    # 同一人同一内容、2 秒内、**不同** msg_id -> 被 2s 规则挡住
+    eng.submit_danmaku("u1", "甲", "#同一句", message_id="a1")
+    eng.submit_danmaku("u1", "甲", "#同一句", message_id="a2")
+    check("**2s 内同一人同一内容被挡**", len(eng._danmaku) == 1,
+          len(eng._danmaku))
+    # 不同人的相同内容 -> 都要保留(2s 规则只管同一人)
+    eng.submit_danmaku("u2", "乙", "#同一句", message_id="b1")
+    check("**不同人的相同内容保留**", len(eng._danmaku) == 2,
+          len(eng._danmaku))
+
+
+def test_msg_id_cache_is_bounded():
+    print("\n[Q12] msg_id 去重表有界")
+    eng, clk = boot(mkcfg(msg_id_cache_size=5))
+    for i in range(20):
+        eng.submit_danmaku("u1", "甲", f"#问题{i}", message_id=f"m{i}")
+    check("表不超过上限", len(eng._seen_msg_ids) <= 5, len(eng._seen_msg_ids))
+    # 最旧的已被挤出 -> 再来一次不会被判重(这是有界的代价, 但 2000 的
+    # 默认容量远超任何真实重放, 所以实际不会漏)
+    eng.submit_danmaku("u1", "甲", "#问题0", message_id="m0")
+    check("被挤出的旧 ID 不再判重", eng._dup_ids == 0, eng._dup_ids)
+
+
+def test_distinct_viewers_burst_is_not_replay():
+    """**§9.3 第一条**: 3 个不同观众 500ms 内各发一条不同问题 -> 不判重放。
+
+    这正是旧机制会误杀的场景(1.5s 内 3 条 -> 整批丢 + 压制 5 秒)。
+    """
+    print("\n[Q12] 多人爆发不误杀(3 人 500ms)")
+    eng, clk = boot(mkcfg())
+    rows = [("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
+            ("u3", "丙", "#是同学吗")]
+    for uid, name, q in rows:
+        eng.submit_danmaku(uid, name, q)      # clock 不动 = 同一瞬间
+        clk.advance(0.5)
+    check("**零重放判定**", eng._replays == 0, eng._replays)
+    check("**三条全部上屏**", len(eng._danmaku) == 3, len(eng._danmaku))
+
+
+def test_ten_viewers_one_second_is_not_replay():
+    """**§9.3 第二条**: 10 个不同观众 1 秒内发言 -> 不判重放。"""
+    print("\n[Q12] 十人 1 秒内爆发不误杀")
+    eng, clk = boot(mkcfg())
+    for i in range(10):
+        eng.submit_danmaku(f"u{i}", f"观众{i}", f"#问题{i}")
+        clk.advance(0.1)
+    check("**零重放判定**", eng._replays == 0, eng._replays)
+    check("**十条全部上屏**", len(eng._danmaku) == 10, len(eng._danmaku))
+
+
+def test_reconnect_guard_only_after_reconnect():
+    """没有重连 -> guard 关着 -> 就算内容重复也不判重放。"""
+    print("\n[Q12] 没重连时不启用 guard")
+    eng, clk = boot(mkcfg())
+    for _ in range(5):
+        eng.submit_danmaku("u1", "甲", "#同一句")
+        clk.advance(3)          # 越过 2s 成对判重, 单独验证 guard 没开
+    check("**无重连 => 零重放判定**", eng._replays == 0, eng._replays)
+    check("全部上屏", len(eng._danmaku) == 5, len(eng._danmaku))
+
+
+def test_reconnect_replay_suppressed():
+    """**§9.3 第三条**: 重连后重复刚才完全相同的 8 条 -> 全部抑制。"""
+    print("\n[Q12] 重连后重放被抑制")
+    eng, clk = boot(mkcfg())
+    msgs = [("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
+            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
+            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗"),
+            ("u1", "甲", "#是父母吗"), ("u2", "乙", "#是兄弟吗")]
+    # 先正常收下这批(建立"最近历史"基线)。间隔 3s 避开 2s 成对判重。
+    for uid, name, q in msgs:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(3.0)
+    before = len(eng._danmaku)
+    check("基线已建立", before == len(msgs), before)
+    # 重连 -> 开 guard
+    eng.on_reconnect()
+    clk.advance(1.0)
+    # 同样的 8 条再来一遍
+    for uid, name, q in msgs:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(0.2)
+    check("**重放被识别**", eng._replays > 0, eng._replays)
+    check("**重放不再上屏**", len(eng._danmaku) == before, len(eng._danmaku))
+
+
+def test_reconnect_mixed_old_and_new():
+    """**§9.3 第四条**: 重连后 6 条旧 + 2 条新 -> 旧抑制、新保留。"""
+    print("\n[Q12] 重连后新旧混合")
+    eng, clk = boot(mkcfg())
+    # 每条内容都不同, 且间隔 3s —— 避免撞上那条 2s 成对判重(那是另一道闸,
+    # 这里要单独考察 guard)。每条重复 3 次才够 guard 的 min_repeats。
+    old = [("u1", "甲", "#旧一"), ("u1", "甲", "#旧一"), ("u1", "甲", "#旧一"),
+           ("u2", "乙", "#旧二"), ("u2", "乙", "#旧二"), ("u2", "乙", "#旧二")]
+    for uid, name, q in old:
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(3.0)
+    before = len(eng._danmaku)
+    check("基线 6 条都上屏", before == 6, before)
+    eng.on_reconnect()
+    clk.advance(0.5)
+    for uid, name, q in old:                   # 6 条旧的重来
+        eng.submit_danmaku(uid, name, q)
+        clk.advance(0.2)
+    after_old = len(eng._danmaku)
+    check("**旧消息被抑制**", after_old == before, (before, after_old))
+    # 2 条全新的
+    eng.submit_danmaku("u3", "丙", "#全新的问题一")
+    clk.advance(0.2)
+    eng.submit_danmaku("u4", "丁", "#全新的问题二")
+    check("**新消息保留**", len(eng._danmaku) == before + 2,
+          (before, len(eng._danmaku)))
+
+
+def test_guard_expires():
+    """guard 过窗口就失效 —— 几分钟后又说一遍是真人, 不是重放。"""
+    print("\n[Q12] guard 到期后不再判重放")
+    eng, clk = boot(mkcfg(replay_guard_seconds=10.0))
+    for _ in range(5):
+        eng.submit_danmaku("u1", "甲", "#同一句")
+        clk.advance(0.5)
+    before = len(eng._danmaku)
+    eng.on_reconnect()
+    clk.advance(11)                            # 越过 guard 窗口
+    eng.submit_danmaku("u1", "甲", "#同一句")
+    check("**窗口外不判重放**", eng._replays == 0, eng._replays)
+    check("正常上屏", len(eng._danmaku) == before + 1, len(eng._danmaku))
 
 
 def test_determinism():
@@ -576,7 +695,6 @@ def test_coverage_reaches_archive():
     """
     print("[覆盖结果: 从出题一路带到落盘]")
     cfg = mkcfg()
-    cfg.replay_burst_n = 0
     eng = RoundEngine(cfg)
     eng.start(0.0)
     ATOMS = [{"role": "cause", "text": "他是后天失明的"},
@@ -1697,7 +1815,7 @@ def test_setting_question_gets_ack():
     eng = RoundEngine(mkcfg(), clock=clk)
     eng.start()                                   # -> SETTING
     check("确实在 SETTING", eng.phase == Phase.SETTING, eng.phase)
-    # replay_burst_n=0(测试默认) -> submit_danmaku 直接处理并返回动作。
+    # Q12 之后 submit_danmaku 同步处理并返回动作。
     acts = eng.submit_danmaku("u1", "甲", "#他瞎了吗")
     check("产出了动作", bool(acts), acts)
     rows = _sys_rows(eng)
@@ -1843,8 +1961,17 @@ def main():
              test_restate_on_idle, test_hints_not_reset_by_chat,
              test_history_trim, test_transcript_bounded,
              test_stop_and_stream_end, test_clock_jump, test_snapshot_keys,
-             test_hint_order_and_dedup, test_commands_survive_burst_buffer,
-             test_replay_detection, test_determinism,
+             test_hint_order_and_dedup, test_commands_are_not_swallowed,
+             # ---- Q12: 重放识别重做 ----
+             test_msg_id_dedupe,
+             test_msg_id_cache_is_bounded,
+             test_distinct_viewers_burst_is_not_replay,
+             test_ten_viewers_one_second_is_not_replay,
+             test_reconnect_guard_only_after_reconnect,
+             test_reconnect_replay_suppressed,
+             test_reconnect_mixed_old_and_new,
+             test_guard_expires,
+             test_determinism,
              test_llm_failure_never_drops, test_coverage_reaches_archive,
              test_reveal_payload_carries_atoms,
              # ---- Q4 / Q5 ----

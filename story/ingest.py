@@ -102,13 +102,17 @@ class _StdoutToLog:
 class ChatEvent:
     """从 ws 线程传到消费线程的轻量事件。"""
 
-    __slots__ = ("user_id", "user_name", "content", "ts")
+    __slots__ = ("user_id", "user_name", "content", "ts", "message_id")
 
-    def __init__(self, user_id, user_name, content, ts):
+    def __init__(self, user_id, user_name, content, ts, message_id=""):
         self.user_id = user_id
         self.user_name = user_name
         self.content = content
         self.ts = ts
+        #: 平台消息唯一 ID(Q12)。空串 = "这条没有 ID", 引擎会退回到
+        #: reconnect guard 的指纹去重。**不要**用 `0` 当缺失标记 ——
+        #: 它是个合法整数, 拿来当哨兵会让所有缺失 ID 的消息互相判重。
+        self.message_id = message_id
 
 
 class DanmakuSource(Protocol):
@@ -132,6 +136,10 @@ class CallbackFetcher(DanmakuFetcher):
         self._on_chat = on_chat
         self._on_control = on_control
         self._on_frame = None       # 收到任何 WS 帧时的回调(由 LiveSource 设)
+        #: 本 fetcher **第一个** WS 帧到达时的回调(Q12)。由 LiveSource 设。
+        #: 用来把"新连接真的连上了"变成一个可观察事件 —— 见 `_wsOnMessage`。
+        self._on_first_frame = None
+        self._first_frame_seen = False
         # 给上游的 requests.Session 加默认超时 —— 否则网络一抖, 它的
         # 无超时 HTTP 请求会永久挂起, 把抓取线程钉死(见 add_default_timeout)。
         try:
@@ -194,6 +202,25 @@ class CallbackFetcher(DanmakuFetcher):
                 self._on_frame()
         except Exception:
             pass
+        # ---- Q12: "新连接真的连上了" ----
+        # 这一帧属于一个**刚建好的**连接, 而我们之前从没收到过它的帧 ——
+        # 说明重连成功。只在**每实例一次**地报出去。
+        #
+        # 为什么这个信号以前不存在、以及为什么现在必须有: websocket 在
+        # 上游内部自动重连这条快路径**完全不上报**(watchdog 只看"停摆
+        # 120 秒", 安静房间不会触发)。于是"抖音重连后把之前整批弹幕重放
+        # 一遍"这件事没有任何可观察的起点 —— 早年只能靠"1.5 秒 3 条"
+        # 这种流量启发式去猜, 那会误杀真人, Q12 把它换掉。
+        # (用 getattr 兜底: SimSource 用 __new__ 造半成品实例驱动解析路径,
+        #  没有走 __init__, 这些属性都不存在。)
+        if not getattr(self, "_first_frame_seen", True):
+            self._first_frame_seen = True
+            cb = getattr(self, "_on_first_frame", None)
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    log.exception("首帧回调异常(忽略)")
         return super()._wsOnMessage(ws, message)
 
     def _parseChatMsg(self, payload):
@@ -204,10 +231,19 @@ class CallbackFetcher(DanmakuFetcher):
         if getattr(self, "_expired", False):
             return
         m = ChatMessage().parse(payload)
+        # ---- Q12: 平台消息唯一 ID ----
+        # `Common.msg_id` 是 protobuf 字段 2(vendor/.../douyin.py:475)。
+        # betterproto 对缺失的 `common` 返回默认实例, `.msg_id` 得 `0` ——
+        # 那表示"这条没有 ID", 转成空串交给引擎走降级路径。
+        #
+        # **不能**把 `0` 当成一个真实 ID: 缺失 ID 的消息会全部拿到 `0`,
+        # 于是第二条起全部互相判重、被静默丢弃。这是这套改动最容易踩的坑。
+        raw_mid = getattr(getattr(m, "common", None), "msg_id", 0) or 0
+        mid = str(raw_mid) if raw_mid else ""
         # 立即交接: 不做任何重活, 不在此线程调 LLM。
         try:
             self._on_chat(ChatEvent(m.user.id, m.user.nick_name, m.content,
-                                    time.monotonic()))
+                                    time.monotonic(), mid))
         except Exception as e:
             log.error("on_chat 回调异常: %s", e)
         # 保留 JSONL 落库
@@ -264,11 +300,18 @@ class LiveSource:
 
     def __init__(self, cfg, inbox: "queue.Queue[ChatEvent]",
                  on_stream_end: Optional[Callable[[], None]] = None,
-                 on_reconnect: Optional[Callable[[], None]] = None):
+                 on_reconnect: Optional[Callable[[], None]] = None,
+                 on_reconnected: Optional[Callable[[], None]] = None):
         self.cfg = cfg
         self.inbox = inbox
         self._on_stream_end = on_stream_end
+        #: "**正在重建**" —— watchdog 判定停摆后调用(语义见 `_watch`)。
         self._on_reconnect = on_reconnect
+        #: "**重连成功了**"(Q12) —— 新连接的**第一个真实 WS 帧**到达时调用。
+        #: 与 `_on_reconnect` 是两件事: 前者是"我要重建了", 后者是"新的
+        #: 真的连上了"。重放识别只关心后者 —— 因为抖音是在**重连之后**
+        #: 把那批旧弹幕原样重发的。
+        self._on_reconnected = on_reconnected
         self._stop = threading.Event()
         self._fetcher: Optional[CallbackFetcher] = None
         self._last_event = time.monotonic()   # 最后一条**弹幕**(业务用)
@@ -304,7 +347,22 @@ class LiveSource:
                             proxy=self.cfg.proxy,
                             no_proxy=self.cfg.no_proxy)
         f._on_frame = self._on_frame
+        f._on_first_frame = self._on_first_frame
         return f
+
+    def _on_first_frame(self) -> None:
+        """新连接的第一个真实帧 —— 这才是"重连成功"(Q12)。
+
+        注意它**不替代** `_on_reconnect`: 那个是 watchdog 的"我要重建了"
+        (而且只在停摆 120s 后触发), 服务于 `reconnect_fails` 告警链。
+        这里纯粹是给引擎一个"重放可能马上要来了"的起点。
+        """
+        log.info("弹幕连接已建立(收到首帧)")
+        if self._on_reconnected:
+            try:
+                self._on_reconnected()
+            except Exception:
+                log.exception("on_reconnected 回调异常(忽略)")
 
     def _run(self) -> None:
         self._fetcher = self._build()
@@ -504,7 +562,10 @@ class SimSource:
         self._loop_items: list[dict] = []
         self._controls: list[dict] = []
         self._loop_enabled = False
-        self._auto_id = 900000
+        self._auto_id = 900000             # 缺省**用户** id 的计数器
+        #: 合成**消息** id 的计数器(Q12)。与 `_auto_id` 分属不同命名空间,
+        #: 免得用户 id 撞上消息 id。基准取 9 亿, 远离真实平台 id 的量级。
+        self._msg_id = 900_000_000
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # 用一个不落库的 fetcher 实例驱动真解析路径
@@ -564,6 +625,15 @@ class SimSource:
         f = self._ensure_fetcher()
         m = ChatMessage()
         m.common.method = "WebcastChatMessage"
+        # ---- Q12: 合成一个**单调递增**的 msg_id ----
+        # 不设的话每条都是 `msg_id=0` -> 引擎判成"没有 ID"; 而如果哪天
+        # 有人把 `0` 当成真实 ID, 第二条起就全被去重丢掉了。
+        #
+        # **计数器不随 loop 重置**: 循环播放每遍都产生新 ID, 所以 loop
+        # 不会被误判成重放(它的语义是"又演一遍", 不是"同一批消息重发")。
+        # 真·重复 ID 的场景由专门的测试夹具覆盖。
+        self._msg_id += 1
+        m.common.msg_id = self._msg_id
         m.user.nick_name = rec["user_name"]
         uid = rec.get("user_id")
         if uid is None:
@@ -657,8 +727,10 @@ class StdinSource:
                     if a.strip() and not a.strip().startswith("#"):
                         name, content = a.strip(), b.strip()
                 self._auto_id += 1
+                self._msg_id += 1
                 self.inbox.put_nowait(ChatEvent(self._auto_id, name, content,
-                                                time.monotonic()))
+                                                time.monotonic(),
+                                                str(self._msg_id)))
         except Exception as e:
             log.error("stdin 读取结束: %s", e)
 

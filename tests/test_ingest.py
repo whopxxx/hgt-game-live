@@ -7,13 +7,17 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import queue
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from danmaku import ChatMessage           # 从 danmaku 转出(它会先把 vendor 加进路径)
 from story.config import Config
 from story.ingest import CallbackFetcher, ChatEvent, SimSource, StdinSource
 
@@ -212,6 +216,92 @@ def test_expired_fetcher_drops_data() -> None:
         os.unlink(tmp.name)
 
 
+def test_synth_msg_ids_are_distinct() -> None:
+    """Q12: sim/stdin 必须给**互不相同**的合成 msg_id。
+
+    坑: 不设 `msg_id` 时每条都是 `0`。引擎把"有 ID"和"ID 是 0"区分开
+    (0 -> 空串 -> 走降级路径), 但一旦哪天有人图省事把 0 当成真实 ID,
+    第二条起就全被判重丢掉了。这里钉住 sim 路径产出的 ID 两两不同。
+    """
+    print("\n[6] 合成 msg_id 互不相同(Q12)")
+    with tempfile.TemporaryDirectory() as d:
+        script = os.path.join(d, "s.jsonl")
+        with io.open(script, "w", encoding="utf-8") as f:
+            for i in range(3):
+                f.write(json.dumps({
+                    "at_ms": i * 100, "user_name": f"观众{i}",
+                    "content": f"#问题{i}"}, ensure_ascii=False) + "\n")
+        cfg = Config(sim_path=script, sim_loop_gap=1, no_llm=True)
+        q: "queue.Queue" = queue.Queue()
+        src = SimSource(cfg, q)
+        src._load()
+        for it in src._loop_items:
+            src._emit(it)
+        ids = []
+        while not q.empty():
+            ids.append(q.get_nowait().message_id)
+        src._fetcher._fp.close()
+        check("收到 3 条", len(ids) == 3, ids)
+        check("**ID 两两不同**", len(set(ids)) == 3, ids)
+        check("**没有空 ID**", all(ids), ids)
+
+
+def test_first_frame_callback_fires_once() -> None:
+    """Q12: 新连接的**首个** WS 帧触发一次回调, 之后不再触发。
+
+    这是"重连成功"的信号 —— 引擎靠它开 replay guard。多触发会不停重置
+    guard 窗口, 不触发则重放识别失效。
+    """
+    print("\n[7] 首帧回调只触发一次(Q12)")
+    f = CallbackFetcher.__new__(CallbackFetcher)
+    f._expired = False
+    f._first_frame_seen = False
+    f._on_frame = None
+    hits = []
+    f._on_first_frame = lambda: hits.append(1)
+
+    class _WS:
+        pass
+
+    # 首帧标记在 `_wsOnMessage` 里, 而它会转发给父类做真实解析 ——
+    # 把父类方法换成 no-op, 只验我们插入的那段标记逻辑。
+    parent = CallbackFetcher.__mro__[1]
+    orig = parent._wsOnMessage
+    parent._wsOnMessage = lambda self, ws, msg: None
+    try:
+        f._wsOnMessage(_WS(), "frame1")
+        f._wsOnMessage(_WS(), "frame2")
+        f._wsOnMessage(_WS(), "frame3")
+    finally:
+        parent._wsOnMessage = orig
+    check("**只触发一次**", len(hits) == 1, len(hits))
+
+
+def test_missing_common_means_empty_id() -> None:
+    """没有 `common.msg_id` 的消息 -> 空 ID(走降级), **不是** '0'。"""
+    print("\n[8] 缺失 msg_id -> 空串(Q12)")
+    f = CallbackFetcher.__new__(CallbackFetcher)
+    f._expired = False
+    got = []
+    f._on_chat = lambda ev: got.append(ev)
+    f._on_control = None
+    f.keep_all = False
+    f.out_path = os.devnull
+    import collections
+    f._counts = collections.Counter()
+    f._fp = io.open(os.devnull, "w", encoding="utf-8")
+    m = ChatMessage()
+    m.user.id = 1
+    m.user.nick_name = "甲"
+    m.content = "#问题"
+    # 刻意不设 m.common.msg_id
+    f._parseChatMsg(m.SerializeToString())
+    check("收到事件", len(got) == 1, len(got))
+    if got:
+        check("**message_id 是空串而不是 '0'**", got[0].message_id == "",
+              repr(got[0].message_id))
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -223,6 +313,10 @@ def main() -> int:
     test_expired_fetcher_drops_data()
     test_callback_fetcher_guard()
     test_chat_parse_roundtrip()
+    # ---- Q12 ----
+    test_synth_msg_ids_are_distinct()
+    test_first_frame_callback_fires_once()
+    test_missing_common_means_empty_id()
     print("\n" + "=" * 60)
     if FAIL:
         print(f"  {FAIL} 项失败")

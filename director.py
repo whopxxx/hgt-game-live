@@ -281,7 +281,8 @@ class Director:
         if self.cfg.live_id:
             return LiveSource(self.cfg, self.inbox,
                               on_stream_end=self._on_stream_end,
-                              on_reconnect=self._on_reconnect)
+                              on_reconnect=self._on_reconnect,
+                              on_reconnected=self._on_reconnected)
         if self.cfg.sim_path:
             return SimSource(self.cfg, self.inbox,
                              on_stream_end=self._on_stream_end)
@@ -294,6 +295,14 @@ class Director:
         """弹幕连接在重建。连续失败多次 -> 让引擎记下来, 页面能显示异常。"""
         self.engine.on_disconnect()
         self.engine.reconnect_fails = fails
+
+    def _on_reconnected(self) -> None:
+        """新连接收到首帧 = 重连成功(Q12)。
+
+        引擎据此开一个 replay guard: 抖音重连后会把断线期间的弹幕原样
+        重发一遍, 而这件事只有在"刚重连"的窗口里才需要防。
+        """
+        self.engine.on_reconnect()
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -843,8 +852,9 @@ class Director:
                 # 弹幕原文走 DEBUG: 平时不刷屏(-v 时才看得到)。
                 # 真正值得看的(谁问了什么、AI 怎么答的)由 submit_qa 那边记。
                 log.debug("弹幕 %s: %s", ev.user_name, ev.content)
-                for a in self.engine.submit_danmaku(ev.user_id, ev.user_name,
-                                                    ev.content):
+                for a in self.engine.submit_danmaku(
+                        ev.user_id, ev.user_name, ev.content,
+                        message_id=getattr(ev, "message_id", "")):
                     self._run_action(a)
             except Exception as e:
                 log.error("submit_danmaku 异常: %s", e)

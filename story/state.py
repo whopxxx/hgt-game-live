@@ -173,6 +173,11 @@ class DanmakuItem:
     is_command: bool = False
     ts: float = 0.0
     seq: int = 0
+    #: 平台消息唯一 ID(Q12)。空串 = 上游没给(此时引擎走 reconnect
+    #: guard 的降级去重)。**放最后** —— 这个 dataclass 是位置构造的
+    #: (见 engine 里 `DanmakuItem(wid, ..., is_cmd, now, seq)`),
+    #: 插在中间会让所有现有位置参数错位。
+    message_id: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {

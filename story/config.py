@@ -129,17 +129,17 @@ class Config:
     qa_inflight_timeout: float = 25.0     # 在途回答超时 -> 退回队列重试
     qa_retry_max: int = 2                 # 提问重试上限, 超了给"无关"兜底
     qa_dedupe_seconds: float = 600.0      # 同一人同一问题去重窗口
+    # ---- Q12: 重放识别 ----
     # 实测: 抖音在**重连后会把之前的弹幕重放一遍**(18:09 那批会在 18:11 原样
-    # 再来一次)。10 分钟的窗口足够盖住重放, 又不至于误杀真人重复提问
-    # (一个人在 10 分钟里一字不差问两遍, 本来就该当成同一问)。
-    replay_burst_ms: int = 1500           # 同一瞬间涌进来这么多毫秒内的弹幕 -> 疑似重放
-    replay_burst_n: int = 3               # 且条数 >= 这个数
-    replay_mute_s: float = 5.0            # 命中重放后压制这么久(整个重放过程一次挡掉)
-    # 测试时可以设 replay_burst_n=0 直接关掉重放检测(见 tests/test_engine.py),
-    # 免得每条弹幕都要等缓冲窗口。
-    # 阈值定 3 而不是更大: 缓冲期内的弹幕要等窗口结束才提交, 阈值越大,
-    # "重放还没被识破就漏出去"的暴露窗口越长。真人不可能 1.5 秒内连发 3 条
-    # 指令, 所以 3 足够安全, 又几乎不留暴露窗口。
+    # 再来一次)。识别分两条路:
+    #   主路径: 平台 msg_id 精确去重(不依赖下面任何参数)。
+    #   降级:   上游没给 ID 时, 只在"刚重连"的窗口内、且与最近历史大量
+    #           精确重复时才抑制。
+    # **旧的"1.5s 内 3 条就整批丢弃 + 压制全场 5 秒"已删除** —— 它假设
+    # "真人不可能 1.5 秒连发 3 条", 40 人房间看到关键提示时这假设不成立。
+    replay_guard_seconds: float = 20.0    # 重连后开多久的重复检测窗口(方案 §9.2 建议 10~20s)
+    replay_guard_min_repeats: int = 3     # guard 内同一指纹出现几次判定为重放
+    msg_id_cache_size: int = 2000         # msg_id 去重表上限(防内存无界增长)
     pending_cap: int = 40                 # 待答队列硬上限, 溢出丢最旧
     max_question_len: int = 60            # 单条提问长度上限
 
@@ -314,6 +314,21 @@ class Config:
             warns.append(
                 f"phase_ack_seconds({self.phase_ack_seconds}) <= 0: "
                 f"非 QA 阶段的 #问题 提示不会节流, 多人同发时会刷屏。"
+            )
+        if self.replay_guard_seconds <= 0:
+            warns.append(
+                f"replay_guard_seconds({self.replay_guard_seconds}) <= 0: "
+                f"重连后的重放不会被识别(只在没有 msg_id 时才走这条路)。"
+            )
+        if self.replay_guard_min_repeats <= 0:
+            warns.append(
+                f"replay_guard_min_repeats({self.replay_guard_min_repeats}) <= 0: "
+                f"重连后会把**所有**没带 ID 的弹幕都当成重放丢掉, 真人也被误杀。"
+            )
+        if self.msg_id_cache_size <= 0:
+            warns.append(
+                f"msg_id_cache_size({self.msg_id_cache_size}) <= 0: "
+                f"去重表立刻被清空, msg_id 去重形同虚设。"
             )
         return warns
 
