@@ -845,11 +845,25 @@ _TOOL_CHECK = {
                       "description": "修好的 3 条提示。合格时原样回传"},
             "solve_atoms": {
                 "type": "array", "minItems": 2, "maxItems": 4,
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["cause", "mechanism", "support"],
+                            "description": "cause = 反常的起因; "
+                                           "mechanism = 这个起因如何导致那个反常行为; "
+                                           "support = 补充事实(可选)",
+                        },
+                        "text": {"type": "string",
+                                 "description": "这条原子事实, 一句话"},
+                    },
+                    "required": ["role", "text"],
+                },
                 "description": (
-                    "玩家必须说中的 2-4 条原子事实, **按角色顺序**排列: "
-                    "第 1 条是 cause(反常的起因), 第 2 条是 mechanism"
-                    "(这个起因如何导致那个反常行为), 其余是 support。"
+                    "玩家必须说中的 2-4 条原子事实。**结构与生成器完全一致**"
+                    "(role + text 对象) —— 以前这里是 string[], 审稿人一回传 "
+                    "role 就退化了。必须恰好有一条 cause 和一条 mechanism。"
                     "只要改动了 answer 或核心机制, 必须**重新生成**这组; "
                     "没动就原样回传。"),
             },
@@ -1053,9 +1067,16 @@ class PuzzleWriter:
             log.info("出题第 %d 稿仍不合格: %s | %s", attempts,
                      why[:60], r.puzzle[:40])
             _detail("审稿意见全文: %s", why)
-            # 不合格但**题目本身是完整的**: 留着当兜底, 免得全失败
+            # 不合格但**题目本身是完整的**: 留着当兜底, 免得全失败。
+            # **必须带上 solve_atoms / fair_clues** —— 这里是"所有稿都没正式
+            # 通过, 拿最后一稿兜底"的路径, 少了它们新裁判链会悄悄退化成
+            # "凭一段文学谜底猜感觉", 而日志上完全看不出来(实测踩过)。
             last = RiddleResult(puzzle=r.puzzle, answer=r.answer, hints=r.hints,
-                                title=r.title, error=f"不合格: {why}")
+                                title=r.title,
+                                solve_atoms=list(r.solve_atoms),
+                                fair_clues=list(r.fair_clues),
+                                usage=r.usage, model=r.model,
+                                error=f"不合格: {why}")
             bad.append(r.puzzle)
             _remember(seen_why, why)
         return last
@@ -1082,14 +1103,19 @@ class PuzzleWriter:
         注意**空 tool_input**: 网关的强制工具调用偶发返回空 input。那种
         必须当成"**审稿没做成**"(ok=False 且没有改稿), 让上层重出。
         """
-        atoms = [str(a).strip() for a in (solve_atoms or []) if str(a).strip()]
-        clues = [str(c).strip() for c in (fair_clues or []) if str(c).strip()]
+        # 归一成 [{"role","text"}] —— **不要** str(a): 对 {"role":...,"text":...}
+        # 会变成 "{'role': 'cause', 'text': '...'}" 那种字符串, 属于隐式数据损坏。
+        atoms = _norm_atoms(solve_atoms)
+        clues = [c["quote"] if isinstance(c, dict) else str(c)
+                 for c in (fair_clues or [])]
+        clues = [c.strip() for c in clues if c and c.strip()]
         user = (f"【谜面】{puzzle}\n"
                 f"【谜底】{answer or '(空)'}\n"
                 f"【提示】{' / '.join(hints or []) or '(空)'}")
         if atoms:
             user += ("\n【现有 solve_atoms(改了谜底就重出, 否则原样带回)】\n"
-                     + "\n".join(f"{i}. {a}" for i, a in enumerate(atoms)))
+                     + "\n".join(f"{i}. [{a['role']}] {a['text']}"
+                                 for i, a in enumerate(atoms)))
         if clues:
             user += ("\n【现有 fair_clues(必须至少保留一条)】\n"
                      + "\n".join(f"- {c}" for c in clues))
@@ -1099,9 +1125,12 @@ class PuzzleWriter:
             user += f"\n\n【已知问题, 必须改掉】{must_fix}"
 
         def _pick(ti: dict) -> tuple:
-            """从审稿返回里取 atoms/clues, 空则沿用原稿。"""
-            a = [str(x).strip() for x in (ti.get("solve_atoms") or [])
-                 if str(x).strip()][:4]
+            """从审稿返回里取 atoms/clues, 空则沿用原稿。
+
+            atoms 走 `_norm_atoms` —— 审稿人现在也回传 role/text 对象,
+            **不再降级成字符串**。老数据(字符串数组)仍能兼容。
+            """
+            a = _norm_atoms(ti.get("solve_atoms"))
             c = [str(x).strip() for x in (ti.get("fair_clues") or [])
                  if str(x).strip()][:4]
             return (a or atoms), (c or clues)
@@ -1331,21 +1360,6 @@ class PuzzleWriter:
         return results, res.error
 
     # ------------------------------------------------------------------
-    def judge(self, puzzle: str, answer: str, text: str,
-              solve_atoms: Optional[list] = None) -> tuple[bool, Optional[str]]:
-        """裁判: 观众的这条提问是否说中了核心谜底?
-
-        单独一次**强制工具**调用 —— 实测拆出来问, 模型才肯判。
-
-        **不返回 bool, 而是返回覆盖结果** —— 由代码算 solved:
-            solved = is_guess and cause_hit and mechanism_hit
-        为什么: 让模型直接吐一个 `solved: true` 时, 它只要觉得"沾到边"就给
-        true(实测"纪念""跟燃气管有关"都被判过猜中)。拆成 cause/mechanism
-        两个更具体的问题, 它就难以含糊过去; 最终判断权在代码手里。
-
-        `solve_atoms` 是出题时定下的原子事实, 一并给裁判参考, 让"说中了几条"
-        有据可依, 而不是每次凭感觉理解一段文学谜底。
-        """
     def judge(self, puzzle: str, answer: str, text: str,
               solve_atoms: Optional[list] = None) -> JudgeResult:
         """裁判: 观众的这条提问是否说中了核心谜底?

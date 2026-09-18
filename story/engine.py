@@ -718,6 +718,12 @@ class RoundEngine:
             "reason": reason,
             "winner": winner if reason == "solved" else "",
             "puzzle": self._puzzle, "answer": self._answer,
+            # 出题时定下的原子事实与公平线索 —— **必须一路带到 archive**。
+            # director._archive_reveal() 早就读这两个字段了, 但 payload 一直
+            # 没给, 于是落盘里恒为空数组, 赛后复盘"为什么这条没判中"时
+            # 对照不了。实测踩过: 结构齐了, 数据没流过去。
+            "solve_atoms": list(self._solve_atoms),
+            "fair_clues": list(self._fair_clues),
             "transcript": self._transcript_locked(),
         })]
 

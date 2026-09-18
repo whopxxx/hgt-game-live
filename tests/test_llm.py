@@ -590,7 +590,8 @@ def test_reviewer_keeps_solve_atoms():
     # puzzle/answer/hints, atoms 被丢掉 —— 于是只要经过一次审稿, engine
     # 拿到的 _solve_atoms 就是空数组, judge 悄悄退回"凭感觉判"。
     # 新机制**看起来生效, 其实没有**。
-    ATOMS = ["退潮时礁石露出水面", "亮灯是标出礁石位置"]
+    ATOMS = [{"role": "cause", "text": "退潮时礁石露出水面"},
+             {"role": "mechanism", "text": "亮灯是标出礁石位置"}]
     CLUES = ["谜面写了'只在退潮亮灯'"]
     fc = FakeClient([
         # 出题: 带 atoms
@@ -619,11 +620,13 @@ def test_reviewer_keeps_solve_atoms():
 
 def test_reviewer_can_replace_atoms_when_answer_changes():
     print("[审稿: 改了谜底就必须重出 atoms]")
-    NEW_ATOMS = ["他打嗝", "惊吓能止嗝"]
+    NEW_ATOMS = [{"role": "cause", "text": "他打嗝"},
+                 {"role": "mechanism", "text": "惊吓能止嗝"}]
     fc = FakeClient([
         LLMResult(tool_input={"puzzle": "他要一杯水, 酒保却掏枪。为什么?",
                               "answer": "旧答案(错的)。", "hints": ["a", "b", "c"],
-                              "solve_atoms": ["旧1", "旧2"],
+                              "solve_atoms": [{"role": "cause", "text": "旧1"},
+                                              {"role": "mechanism", "text": "旧2"}],
                               "fair_clues": ["旧线索"]}),
         # 审稿改了谜底, 同时给出**新的** atoms
         LLMResult(tool_input={"ok": False, "note": "谜底不对, 换成打嗝",
@@ -645,7 +648,8 @@ def test_main_regression_no_atoms_lost():
     print("[回归: reviewer 修 2 轮后 atoms 仍不为空]")
     # 这是 reviewer 特别要求的端到端测试: 生成带 atoms -> 审稿改题(两轮)
     # -> 最终 RiddleResult 仍有 atoms。
-    ATOMS = ["A1", "A2"]
+    ATOMS = [{"role": "cause", "text": "A1"},
+             {"role": "mechanism", "text": "A2"}]
     fc = FakeClient([
         LLMResult(tool_input={"puzzle": "一稿。为什么?", "answer": "一稿底。",
                               "hints": ["a", "b", "c"],
@@ -720,6 +724,103 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
     check("复核失败保留第一层的'是'", res2[0].verdict == "是", res2)
 
 
+def test_check_tool_schema_matches_generator():
+    """Q0.1: 审稿工具和出题工具的 solve_atoms **必须是同一种结构**。
+
+    以前 _TOOL_CHECK 是 string[], _TOOL_RIDDLE 是 {role,text} 对象 ——
+    审稿人一旦回传 atoms, role 信息就退化了, 而链路上看不出来。
+    """
+    from story.llm import _TOOL_CHECK, _TOOL_RIDDLE
+    a = _TOOL_CHECK["input_schema"]["properties"]["solve_atoms"]
+    b = _TOOL_RIDDLE["input_schema"]["properties"]["solve_atoms"]
+    check("两边 items 类型一致", a["items"]["type"] == b["items"]["type"],
+          (a["items"].get("type"), b["items"].get("type")))
+    check("都是 object(带 role/text)", a["items"]["type"] == "object",
+          a["items"])
+    check("role 枚举一致",
+          a["items"]["properties"]["role"]["enum"]
+          == b["items"]["properties"]["role"]["enum"], a["items"])
+    check("都要求 role+text",
+          a["items"]["required"] == ["role", "text"] == b["items"]["required"],
+          (a["items"]["required"], b["items"]["required"]))
+
+
+def test_reviewer_structured_atoms_survive():
+    """Q0.2: 审稿人回传结构化 atoms 时, **不能**被 str(dict) 损坏。
+
+    以前 _check_riddle 里是 `str(a).strip()`, 对 {"role":...} 会变成
+    "{'role': 'cause', 'text': '...'}" 那种字符串 —— 隐式数据损坏。
+    """
+    ATOMS = [{"role": "cause", "text": "退潮时礁石露出水面"},
+             {"role": "mechanism", "text": "亮灯是标出礁石位置"}]
+    fc = FakeClient([
+        LLMResult(tool_input={"puzzle": "守塔人只在退潮亮灯。为什么?",
+                              "answer": "礁石露出水面, 亮灯标位置。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": ["线索"]}),
+        # 审稿改了谜面, 原样带回**结构化** atoms
+        LLMResult(tool_input={"ok": False, "note": "补地点",
+                              "puzzle": "守塔人在海角, 只在退潮亮灯。为什么?",
+                              "answer": "礁石露出水面, 亮灯标位置。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": ["线索"]}),
+        LLMResult(tool_input={"ok": True}),
+    ])
+    w = PuzzleWriter(client=fc)
+    r = w.gen_riddle()
+    check("atoms 仍是结构化对象", r.solve_atoms == ATOMS, r.solve_atoms)
+    check("没有被 str() 损坏",
+          all(isinstance(a, dict) for a in r.solve_atoms), r.solve_atoms)
+    # 审稿请求里给它的现有 atoms 也该是 [role] text 形式
+    check("审稿请求展示 role",
+          "[cause]" in fc.calls[1]["user"], fc.calls[1]["user"][-300:])
+
+
+def test_fallback_last_draft_keeps_atoms():
+    """Q0.3: 所有稿都未通过时的**兜底稿**不能丢 atoms/clues。
+
+    这是"拿最后一稿兜底"的路径 —— 少了 atoms, 新裁判链会悄悄退化成
+    "凭一段文学谜底猜感觉", 而日志上完全正常。
+    """
+    ATOMS = [{"role": "cause", "text": "A1"},
+             {"role": "mechanism", "text": "A2"}]
+    CLUES = ["线索1"]
+    bad = {"puzzle": "一稿。为什么?", "answer": "底。", "hints": ["a", "b", "c"],
+           "solve_atoms": ATOMS, "fair_clues": CLUES}
+    fc = FakeClient([
+        LLMResult(tool_input=dict(bad)),
+        LLMResult(tool_input={"ok": False, "note": "不行", "puzzle": "",
+                              "answer": "", "hints": []}),
+        LLMResult(tool_input=dict(bad, puzzle="二稿。为什么?")),
+        LLMResult(tool_input={"ok": False, "note": "还是不行", "puzzle": "",
+                              "answer": "", "hints": []}),
+    ])
+    w = PuzzleWriter(client=fc)
+    r = w.gen_riddle(max_attempts=2)
+    check("兜底稿仍有谜面", bool(r.puzzle), r)
+    check("兜底稿 err 标记不合格", (r.error or "").startswith("不合格"), r.error)
+    check("兜底稿**保住了** solve_atoms", r.solve_atoms == ATOMS, r.solve_atoms)
+    check("兜底稿**保住了** fair_clues", r.fair_clues == CLUES, r.fair_clues)
+
+
+def test_no_dead_judge_definition():
+    """Q0.5: 不能留着返回 tuple 的旧 judge() 定义(误导性 dead code)。"""
+    import inspect
+
+    from story.llm import JudgeResult, PuzzleWriter
+    src = inspect.getsource(PuzzleWriter.judge)
+    check("judge 只定义一次", src.count("def judge(") == 1)
+    check("judge 返回 JudgeResult",
+          inspect.signature(PuzzleWriter.judge).return_annotation
+          in (JudgeResult, "JudgeResult"),
+          inspect.signature(PuzzleWriter.judge).return_annotation)
+    # 旧定义会留下这个签名 —— 全局搜一遍确认没有第二份
+    import story.llm as M
+    whole = inspect.getsource(M)
+    check("全文没有第二处 tuple[bool 签名的 judge",
+          "-> tuple[bool, Optional[str]]" not in whole)
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -743,7 +844,12 @@ def main():
               test_open_question_with_hypothesis_can_solve,
               test_llm_failure_returns_unavailable_not_irrelevant,
               test_hint_not_repeated,
-              test_hint_and_reveal, test_tool_actually_requested):
+              test_hint_and_reveal, test_tool_actually_requested,
+              # ---- Q0: 链路缺陷回归 ----
+              test_check_tool_schema_matches_generator,
+              test_reviewer_structured_atoms_survive,
+              test_fallback_last_draft_keeps_atoms,
+              test_no_dead_judge_definition):
         t()
     print()
     if FAIL[0]:

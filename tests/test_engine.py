@@ -599,6 +599,37 @@ def test_coverage_reaches_archive():
           "cause_hit" not in s.qa_log[-1], s.qa_log[-1])
 
 
+def test_reveal_payload_carries_atoms():
+    """Q0.4 回归: REVEAL payload 必须带上 solve_atoms / fair_clues。
+
+    这条链路曾经**结构性断裂**: director._archive_reveal() 已经读这两个
+    字段了, 但 engine 的 REVEAL payload 从来没给, 于是落盘里恒为空数组,
+    赛后复盘"为什么这条没判中"时对照不了任何东西 —— 而日志上一切正常。
+    """
+    atoms = [{"role": "cause", "text": "路上埋了东西"},
+             {"role": "mechanism", "text": "他要每天去看"}]
+    clues = ["谜面写了\"每天\""]
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle("他每天绕远路回家。为什么？", "那条路上有他埋的东西。",
+                      ["想想路"], title="绕路",
+                      solve_atoms=atoms, fair_clues=clues)
+    # say() 内部已经 tick 过, ANSWER 在它返回的动作里
+    ans = [a for a in say(eng, clk, "u1", "甲", "#他是要去看什么东西吗")
+           if a.kind == ActionKind.ANSWER]
+    check("派发了 ANSWER", len(ans) == 1, ans)
+    qid = ans[0].payload["qid"]
+    acts = eng.submit_qa([QAResult(qid=qid, verdict="揭晓")])
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    check("猜中产生了 REVEAL", len(rev) == 1, acts)
+    p = rev[0].payload
+    check("REVEAL payload 带 solve_atoms", p.get("solve_atoms") == atoms,
+          p.get("solve_atoms"))
+    check("REVEAL payload 带 fair_clues", p.get("fair_clues") == clues,
+          p.get("fair_clues"))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -612,7 +643,8 @@ def main():
              test_stop_and_stream_end, test_clock_jump, test_snapshot_keys,
              test_hint_order_and_dedup, test_commands_survive_burst_buffer,
              test_replay_detection, test_determinism,
-             test_llm_failure_never_drops, test_coverage_reaches_archive]
+             test_llm_failure_never_drops, test_coverage_reaches_archive,
+             test_reveal_payload_carries_atoms]
     for t in tests:
         t()
     print()
