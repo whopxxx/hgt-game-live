@@ -40,7 +40,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from story.config import Config, from_args          # noqa: E402
 from story.engine import RoundEngine                # noqa: E402
-from story.ingest import (ChatEvent, LiveSource,    # noqa: E402
+from story.ingest import (ChatEvent, InteractionEvent,  # noqa: E402
+                          LiveSource,
                           SimSource, StdinSource)
 from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
@@ -887,6 +888,13 @@ class Director:
             except queue.Empty:
                 continue
             try:
+                # ---- Step 11: 按类型分发 ----
+                # 两种事件走**同一个队列**(少一条并发链), 靠类型区分。
+                # 互动事件**不**走 submit_danmaku —— 它不是一条提问。
+                if isinstance(ev, InteractionEvent):
+                    for a in self.engine.submit_interaction(ev):
+                        self._run_action(a)
+                    continue
                 # 弹幕原文走 DEBUG: 平时不刷屏(-v 时才看得到)。
                 # 真正值得看的(谁问了什么、AI 怎么答的)由 submit_qa 那边记。
                 log.debug("弹幕 %s: %s", ev.user_name, ev.content)
@@ -895,7 +903,7 @@ class Director:
                         message_id=getattr(ev, "message_id", "")):
                     self._run_action(a)
             except Exception as e:
-                log.error("submit_danmaku 异常: %s", e)
+                log.error("submit 异常: %s", e)
 
     def _scheduler(self) -> None:
         """唯一驱动 tick 的线程。"""

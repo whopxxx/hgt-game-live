@@ -112,6 +112,19 @@ class Config:
     out_path: str = os.path.join("data", "danmaku.jsonl")
     puzzle_out_path: str = os.path.join("data", "puzzle.jsonl")
     keep_all: bool = False
+    #: Step 11: Like/Gift 是否进入**业务链**(Director -> Engine)。
+    #:
+    #: 与 `keep_all` **正交** —— 这是本 Step 的核心:
+    #:     keep_all       = 诊断用: 把所有消息类型都落 JSONL
+    #:     interaction_enabled = 业务用: 让 Like/Gift 走业务事件通路
+    #:
+    #: 早先 Like/Gift 的解析被 `keep_all` 顺手挡住(`if not self.keep_all:
+    #: return`), 于是"想收礼物"就必须开全量落库。那是**职责耦合**: 一个
+    #: 是存储策略, 一个是业务能力。现在两者独立:
+    #:     keep_all=False + interaction_enabled=True  -> Like/Gift 进业务链
+    #:     keep_all=True                              -> 诊断类型照旧全落
+    #:     keep_all=False + interaction_enabled=False -> Like/Gift 不进业务链
+    interaction_enabled: bool = True
 
     # ---- 代理(抓取弹幕用) ----
     # 抖音必须走代理时填这里。留空则自动读环境变量

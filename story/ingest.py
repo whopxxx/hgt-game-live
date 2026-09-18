@@ -30,7 +30,8 @@ from typing import Callable, Optional, Protocol
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from danmaku import ChatMessage, ControlMessage, DanmakuFetcher  # noqa: E402
+from danmaku import (ChatMessage, ControlMessage,       # noqa: E402
+                    DanmakuFetcher, GiftMessage, LikeMessage)
 from .config import parse_proxy  # noqa: E402
 
 log = logging.getLogger("story.ingest")
@@ -115,6 +116,48 @@ class ChatEvent:
         self.message_id = message_id
 
 
+class InteractionEvent:
+    """Like / Gift 这类**业务互动**事件(Step 11)。
+
+    与 `ChatEvent` 分开: 它们的字段与用途完全不同 —— 聊天走问答链,
+    互动走 Summon 计量链(Step 13)。混成一个事件类型会让"这是不是一条
+    提问"在每个消费点都要重新判断。
+
+    字段刻意保持**协议原样**(不做业务换算): Step 11 只负责把真实协议
+    送进业务链, "多少次点赞 = 1 Summon"是 Step 13 的事。这样 Step 12
+    采集到的真实语义可以直接喂给 Step 13, 中间不掺一层翻译。
+    """
+
+    __slots__ = ("kind", "user_id", "user_name", "ts", "message_id",
+                 "count", "total", "gift_id", "gift_name",
+                 "combo_count", "repeat_count", "total_count",
+                 "repeat_end", "group_id", "trace_id")
+
+    def __init__(self, kind, user_id=None, user_name=None, ts=0.0,
+                 message_id="", count=0, total=0, gift_id="", gift_name="",
+                 combo_count=0, repeat_count=0, total_count=0,
+                 repeat_end=0, group_id="", trace_id=""):
+        self.kind = kind              # "like" / "gift"
+        self.user_id = user_id
+        self.user_name = user_name
+        self.ts = ts
+        #: 平台消息唯一 ID(`common.msg_id`)。空串 = 没有 ID。
+        #: **不要**用 0 当缺失标记(见 ChatEvent 的同一说明)。
+        self.message_id = message_id
+        # ---- like ----
+        self.count = count
+        self.total = total
+        # ---- gift ----
+        self.gift_id = gift_id
+        self.gift_name = gift_name
+        self.combo_count = combo_count
+        self.repeat_count = repeat_count
+        self.total_count = total_count
+        self.repeat_end = repeat_end
+        self.group_id = group_id
+        self.trace_id = trace_id
+
+
 class DanmakuSource(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
@@ -131,10 +174,15 @@ class CallbackFetcher(DanmakuFetcher):
     def __init__(self, live_id, out_path, on_chat: Callable[[ChatEvent], None],
                  on_control: Optional[Callable[[str], None]] = None,
                  keep_all: bool = False, proxy: Optional[str] = None,
-                 no_proxy: Optional[str] = None):
-        super().__init__(live_id, out_path, keep_all=keep_all)
+                 no_proxy: Optional[str] = None,
+                 on_interaction: Optional[Callable] = None,
+                 interaction_enabled: bool = False):
+        super().__init__(live_id, out_path, keep_all=keep_all,
+                         interaction_enabled=interaction_enabled)
         self._on_chat = on_chat
         self._on_control = on_control
+        #: Step 11: Like/Gift 的业务回调。空 = 只落库(老行为)。
+        self._on_interaction = on_interaction
         self._on_frame = None       # 收到任何 WS 帧时的回调(由 LiveSource 设)
         #: 本 fetcher **第一个** WS 帧到达时的回调(Q12)。由 LiveSource 设。
         #: 用来把"新连接真的连上了"变成一个可观察事件 —— 见 `_wsOnMessage`。
@@ -228,6 +276,63 @@ class CallbackFetcher(DanmakuFetcher):
         """
         self._first_frame_seen = False
         return super()._wsOnOpen(ws)
+
+    def _on_like(self, m):
+        """一条点赞 -> InteractionEvent。
+
+        **代际检查与 chat 一致**: 被 watchdog 作废的旧连接不该再往业务层
+        塞数据(见 `_parseChatMsg` 里那段说明)。
+        """
+        if getattr(self, "_expired", False):
+            return
+        if self._on_interaction is None:
+            return
+        try:
+            self._on_interaction(self._like_event(m))
+        except Exception as e:                  # noqa: BLE001
+            log.error("on_interaction(like) 回调异常: %s", e)
+
+    def _on_gift(self, m):
+        """一个礼物 -> InteractionEvent。"""
+        if getattr(self, "_expired", False):
+            return
+        if self._on_interaction is None:
+            return
+        try:
+            self._on_interaction(self._gift_event(m))
+        except Exception as e:                  # noqa: BLE001
+            log.error("on_interaction(gift) 回调异常: %s", e)
+
+    # ---- 协议 -> 事件(纯映射, 不做业务换算) ----
+    def _like_event(self, m) -> "InteractionEvent":
+        raw_mid = getattr(getattr(m, "common", None), "msg_id", 0) or 0
+        return InteractionEvent(
+            kind="like",
+            user_id=getattr(getattr(m, "user", None), "id", None),
+            user_name=getattr(getattr(m, "user", None), "nick_name", None),
+            ts=time.monotonic(),
+            message_id=str(raw_mid) if raw_mid else "",
+            count=int(getattr(m, "count", 0) or 0),
+            total=int(getattr(m, "total", 0) or 0))
+
+    def _gift_event(self, m) -> "InteractionEvent":
+        raw_mid = getattr(getattr(m, "common", None), "msg_id", 0) or 0
+        u = getattr(m, "user", None)
+        g = getattr(m, "gift", None)
+        return InteractionEvent(
+            kind="gift",
+            user_id=getattr(u, "id", None),
+            user_name=getattr(u, "nick_name", None),
+            ts=time.monotonic(),
+            message_id=str(raw_mid) if raw_mid else "",
+            gift_id=str(getattr(m, "gift_id", "") or ""),
+            gift_name=str(getattr(g, "name", "") or ""),
+            combo_count=int(getattr(m, "combo_count", 0) or 0),
+            repeat_count=int(getattr(m, "repeat_count", 0) or 0),
+            total_count=int(getattr(m, "total_count", 0) or 0),
+            repeat_end=int(getattr(m, "repeat_end", 0) or 0),
+            group_id=str(getattr(m, "group_id", "") or ""),
+            trace_id=str(getattr(m, "log_id", "") or ""))
 
     def _parseChatMsg(self, payload):
         # 代际检查: 这个回调可能来自**已经被废弃的旧连接** —— 旧线程卡在
@@ -340,6 +445,18 @@ class LiveSource:
         self._last_event = time.monotonic()
         self.inbox.put_nowait(ev)
 
+    def _on_interaction(self, ev) -> None:
+        """Like/Gift 业务事件 -> 同一个 inbox。
+
+        用**同一个队列**: 消费线程已经是单线程、已有背压处理, 再开一条
+        队列只会多一处要维护的并发与关停顺序。事件类型靠 `isinstance`
+        区分(见 director 的分发)。
+
+        **不更新 `_last_event`** —— 它是"最后一条弹幕", 用来判"房间还有
+        没有人在说话"。收到礼物不代表有人提问。
+        """
+        self.inbox.put_nowait(ev)
+
     def _on_frame(self) -> None:
         """收到任何 WS 帧 —— 说明链路还活着。
 
@@ -363,7 +480,10 @@ class LiveSource:
         f = CallbackFetcher(self.cfg.live_id, out, self._on_chat,
                             self._on_control, keep_all=self.cfg.keep_all,
                             proxy=self.cfg.proxy,
-                            no_proxy=self.cfg.no_proxy)
+                            no_proxy=self.cfg.no_proxy,
+                            on_interaction=self._on_interaction,
+                            interaction_enabled=getattr(
+                                self.cfg, "interaction_enabled", False))
         f._on_frame = self._on_frame
         f._on_first_frame = self._on_first_frame
         return f

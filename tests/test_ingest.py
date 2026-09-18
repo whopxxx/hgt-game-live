@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from danmaku import ChatMessage, DanmakuFetcher   # 从 danmaku 转出(它会先把 vendor 加进路径)
 from story.config import Config
-from story.ingest import CallbackFetcher, ChatEvent, SimSource, StdinSource
+from story.ingest import (CallbackFetcher, ChatEvent, InteractionEvent,
+                          LiveSource, SimSource, StdinSource)
 
 # 测试用的脚本一律放这里(受版本控制)。**绝不要**引用 data/ 下的文件:
 # data/*.jsonl 被 .gitignore 排除, 在干净的 checkout(CI)上不存在。
@@ -531,6 +532,179 @@ def test_livesource_terminates_on_stream_end() -> None:
         restore()
 
 
+# ======================================================================
+# Step 11 — InteractionEvent plumbing
+# ======================================================================
+def _mk_cb_fetcher(events, interaction=True):
+    """造一个半成品 CallbackFetcher(沿用 test_chat_parse_roundtrip 的手法)。"""
+    import collections, tempfile
+    f = CallbackFetcher.__new__(CallbackFetcher)
+    f._on_chat = lambda e: None
+    f._on_control = None
+    f._on_interaction = events.append if interaction else None
+    f.keep_all = False
+    f.interaction_enabled = interaction
+    f._expired = False
+    f._counts = collections.Counter()
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                      encoding="utf-8")
+    f.out_path = tmp.name
+    tmp.close()
+    f._fp = open(tmp.name, "a", encoding="utf-8")
+    return f, tmp.name
+
+
+def test_like_reaches_business_chain_without_keep_all() -> None:
+    """**核心**: keep_all=False + interaction_enabled=True -> Like 仍进业务链。
+
+    这是 Step 11 要解的那个耦合: 早先 `_parseLikeMsg` 开头就是
+    `if not self.keep_all: return`, 于是"想收礼物"必须开全量落库。
+    """
+    print("\n[11a] keep_all=False 也能收 Like")
+    events = []
+    f, path = _mk_cb_fetcher(events)
+    try:
+        from danmaku import LikeMessage
+        m = LikeMessage()
+        m.count = 3
+        m.total = 520
+        m.user.id = 7
+        m.user.nick_name = "甲"
+        m.common.msg_id = 999
+        f._parseLikeMsg(m.SerializeToString())
+        check("Like 进了业务链", len(events) == 1, events)
+        if events:
+            ev = events[0]
+            check("kind=like", ev.kind == "like", ev.kind)
+            check("count 原样带过", ev.count == 3, ev.count)
+            check("total 原样带过", ev.total == 520, ev.total)
+            check("msg_id 原样带过", ev.message_id == "999", ev.message_id)
+        check("keep_all=False 时**不**落库",
+              f._counts.get("like", 0) == 0, f._counts)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_gift_reaches_business_chain_without_keep_all() -> None:
+    """Gift 同理 —— 业务与落库解耦。"""
+    print("\n[11b] keep_all=False 也能收 Gift")
+    events = []
+    f, path = _mk_cb_fetcher(events)
+    try:
+        from danmaku import GiftMessage
+        m = GiftMessage()
+        m.gift_id = 12345
+        m.gift.name = "玫瑰"
+        m.combo_count = 2
+        m.repeat_count = 2
+        m.total_count = 5
+        m.group_id = 88
+        m.log_id = "trace-abc"
+        m.user.id = 9
+        m.user.nick_name = "乙"
+        m.common.msg_id = 1001
+        f._parseGiftMsg(m.SerializeToString())
+        check("Gift 进了业务链", len(events) == 1, events)
+        if events:
+            ev = events[0]
+            for field, want in (("kind", "gift"), ("gift_id", "12345"),
+                                ("gift_name", "玫瑰"), ("combo_count", 2),
+                                ("repeat_count", 2), ("total_count", 5),
+                                ("group_id", "88"), ("trace_id", "trace-abc"),
+                                ("message_id", "1001")):
+                check(f"{field} 原样带过", getattr(ev, field) == want,
+                      (field, getattr(ev, field), want))
+        check("keep_all=False 时不落库", f._counts.get("gift", 0) == 0)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_interaction_disabled_blocks_business_chain() -> None:
+    """interaction_enabled=False + keep_all=False -> 不进业务链。"""
+    print("\n[11c] interaction_enabled=False -> 不进业务链")
+    events = []
+    f, path = _mk_cb_fetcher(events, interaction=False)
+    try:
+        f.interaction_enabled = False
+        from danmaku import GiftMessage, LikeMessage
+        lm = LikeMessage(); lm.count = 1; lm.total = 1
+        f._parseLikeMsg(lm.SerializeToString())
+        gm = GiftMessage(); gm.gift_id = 1; gm.gift.name = "x"
+        f._parseGiftMsg(gm.SerializeToString())
+        check("Like 没进业务链", len(events) == 0, events)
+        check("Gift 没进业务链", len(events) == 0, events)
+        check("也没落库", sum(f._counts.values()) == 0, f._counts)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_keep_all_still_logs_diagnostics() -> None:
+    """keep_all=True -> 诊断类型(Member/Social/Emoji)保持既有能力。"""
+    print("\n[11d] keep_all=True 诊断类型照旧")
+    events = []
+    f, path = _mk_cb_fetcher(events)
+    try:
+        f.keep_all = True
+        from danmaku import MemberMessage, SocialMessage
+        mm = MemberMessage(); mm.user.id = 1; mm.user.nick_name = "丙"
+        f._parseMemberMsg(mm.SerializeToString())
+        sm = SocialMessage(); sm.user.id = 2; sm.user.nick_name = "丁"
+        f._parseSocialMsg(sm.SerializeToString())
+        f._fp.flush()
+        check("member 落了库", f._counts.get("member", 0) == 1, f._counts)
+        check("social 落了库", f._counts.get("social", 0) == 1, f._counts)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_expired_fetcher_drops_interaction() -> None:
+    """作废连接不该再往业务层塞互动事件(与 chat 同一条纪律)。"""
+    print("\n[11e] 作废连接的互动被丢弃")
+    events = []
+    f, path = _mk_cb_fetcher(events)
+    try:
+        f._expired = True
+        from danmaku import LikeMessage
+        m = LikeMessage(); m.count = 1; m.total = 1
+        f._parseLikeMsg(m.SerializeToString())
+        check("被丢弃", len(events) == 0, events)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_engine_submit_interaction_is_noop_stub() -> None:
+    """Step 11: Engine 的入口是 **characterization stub** —— 不改状态。"""
+    print("\n[11f] Engine submit_interaction 是 no-op 占位")
+    from story.engine import RoundEngine
+    eng = RoundEngine(Config(sim_path="x", no_llm=True))
+    before = (eng.phase, eng.round_index, eng._qa_total)
+    acts = eng.submit_interaction(object())
+    check("返回空动作", acts == [], acts)
+    check("阶段/题号/QA 计数都没变",
+          (eng.phase, eng.round_index, eng._qa_total) == before,
+          (eng.phase, eng.round_index, eng._qa_total))
+    check("None 也不炸", eng.submit_interaction(None) == [])
+
+
+def test_livesource_routes_interaction_to_inbox() -> None:
+    """LiveSource 把互动事件放进**同一个** inbox(消费线程统一分发)。"""
+    print("\n[11g] LiveSource 路由互动到 inbox")
+    cfg = Config(sim_path="x", no_llm=True)
+    inbox: queue.Queue = queue.Queue()
+    src = LiveSource(cfg, inbox)
+    ev = InteractionEvent(kind="like", count=1, total=1)
+    src._on_interaction(ev)
+    got = inbox.get_nowait()
+    check("进了 inbox", got is ev, got)
+    check("是 InteractionEvent 而不是 ChatEvent",
+          not isinstance(got, ChatEvent), type(got))
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -542,6 +716,14 @@ def main() -> int:
     test_expired_fetcher_drops_data()
     test_callback_fetcher_guard()
     test_chat_parse_roundtrip()
+    # ---- Step 11: InteractionEvent plumbing ----
+    test_like_reaches_business_chain_without_keep_all()
+    test_gift_reaches_business_chain_without_keep_all()
+    test_interaction_disabled_blocks_business_chain()
+    test_keep_all_still_logs_diagnostics()
+    test_expired_fetcher_drops_interaction()
+    test_engine_submit_interaction_is_noop_stub()
+    test_livesource_routes_interaction_to_inbox()
     # ---- Q12 ----
     test_synth_msg_ids_are_distinct()
     test_first_frame_callback_fires_once()

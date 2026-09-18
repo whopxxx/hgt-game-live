@@ -75,10 +75,15 @@ def _suppress_stdout():
 class DanmakuFetcher(DouyinLiveWebFetcher):
     """只把需要的事件写成 JSONL, 其余丢弃。"""
 
-    def __init__(self, live_id, out_path, keep_all=False):
+    def __init__(self, live_id, out_path, keep_all=False,
+                 interaction_enabled=False):
         super().__init__(live_id, abogus_file=os.path.join(_VENDOR, "a_bogus.js"))
         self.out_path = out_path
         self.keep_all = keep_all
+        #: Step 11: Like/Gift 是否**解析并交给业务回调**。
+        #: 与 `keep_all` 解耦 —— 见 `story.config` 里那条注释。
+        #: 这个基类自己没有业务回调, 它是给 `CallbackFetcher` 用的开关。
+        self.interaction_enabled = interaction_enabled
         self._fp = None
         self._counts = {}
         #: **永久终止**标志 —— 见 `terminate()`。与 `stop()` 是两件事:
@@ -103,24 +108,45 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         print(f"[{kind}] {user_name}: {content}" if content
               else f"[{kind}] {user_name}", flush=True)
 
+    # ---- Step 11: 业务钩子(基类 no-op, 由 CallbackFetcher 覆盖) ----
+    def _on_like(self, msg):
+        """一条点赞。基类什么都不做 —— 只落库的用法不受影响。"""
+
+    def _on_gift(self, msg):
+        """一个礼物。基类什么都不做。"""
+
     # ---- 覆盖消息解析 ----
     def _parseChatMsg(self, payload):
         m = ChatMessage().parse(payload)
         self._emit("chat", m.user.id, m.user.nick_name, m.content)
 
     def _parseGiftMsg(self, payload):
-        if not self.keep_all:
+        # Step 11: 同 `_parseLikeMsg` —— 业务与落库解耦。
+        if not (self.keep_all or self.interaction_enabled):
             return
         m = GiftMessage().parse(payload)
-        self._emit("gift", m.user.id, m.user.nick_name,
-                   f"{m.gift.name}x{m.combo_count}",
-                   {"gift_name": m.gift.name, "count": m.combo_count})
+        if self.keep_all:
+            self._emit("gift", m.user.id, m.user.nick_name,
+                       f"{m.gift.name}x{m.combo_count}",
+                       {"gift_name": m.gift.name,
+                        "gift_id": str(getattr(m, "gift_id", "") or ""),
+                        "combo_count": m.combo_count,
+                        "repeat_count": getattr(m, "repeat_count", 0),
+                        "total_count": getattr(m, "total_count", 0)})
+        self._on_gift(m)
 
     def _parseLikeMsg(self, payload):
-        if not self.keep_all:
+        # Step 11: 业务开关与落库开关**分开**。想收礼物不该被迫开全量落库。
+        if not (self.keep_all or self.interaction_enabled):
             return
         m = LikeMessage().parse(payload)
-        self._emit("like", m.user.id, m.user.nick_name, None, {"count": m.count})
+        # 落库仍只在 keep_all 时做(那是存储策略, 归 keep_all 管)。
+        if self.keep_all:
+            self._emit("like", m.user.id, m.user.nick_name, None,
+                       {"count": m.count, "total": m.total,
+                        "msg_id": str(getattr(getattr(m, "common", None),
+                                              "msg_id", 0) or "")})
+        self._on_like(m)
 
     def _parseMemberMsg(self, payload):
         if not self.keep_all:

@@ -307,6 +307,31 @@ class RoundEngine:
     # ==================================================================
     # 输入: 弹幕(ws 线程 -> 消费线程)
     # ==================================================================
+    def submit_interaction(self, ev: Any = None,
+                           now: Optional[float] = None
+                           ) -> list[EngineAction]:
+        """互动事件入口(Step 11: **characterization stub**)。
+
+        ## 这一步为什么是 no-op
+
+        Step 11 只打通"Like/Gift 能进业务链"这条路, **不记 Summon**、
+        不调 AI、不改 UI。真正的计量在 Step 13(Summon Ledger), 而它必须
+        等 Step 12 拿到真实协议语义之后才能写 —— 在证据之前实现累计器,
+        等于拿猜测当规格。
+
+        所以这里只是个**契约占位**: 定义好入口形状(收什么、返回什么),
+        让 Step 13 往里填。它现在返回空动作列表, 不碰任何状态。
+
+        ## 为什么要有这个占位(而不是 Step 13 直接加)
+
+        有了它, director 的分发逻辑、ingest 的事件类型、以及"keep_all 与
+        interaction_enabled 解耦"这三件事可以在**没有业务逻辑**的情况下
+        独立验证(测试直接打这个入口)。Step 13 填进来时, 那些 plumbing
+        测试一行都不用改。
+        """
+        # 故意的 no-op: 不改任何状态, 不产生动作。
+        return []
+
     def submit_danmaku(self, user_id, user_name: str, content: str,
                        now: Optional[float] = None,
                        message_id: str = "") -> list[EngineAction]:
