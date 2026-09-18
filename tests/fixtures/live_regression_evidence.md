@@ -57,10 +57,15 @@ idx=13  run.log 行 14255  20:31:05   小区里新搬来的护士小吴…
 
 ---
 
-## 3. 四类候选的原始结论 — 修正后的边界
+## 3. 四类候选的原始结论 — 全部 insufficient
 
-任务书 §20 Step 00 列了四类。实际勘察后，**只有一类证据充分**，
-其余三类的 conclusion 是 `insufficient`。以下是修正后的结论。
+任务书 §20 Step 00 列了四类。实际勘察后，**这四类均没有达到 deterministic
+fixture 所需的证据标准，因此全部标记为 `insufficient`**，没有一类被固化。
+
+调查过程中另发现一条证据充分的真实缺陷（`canonical_fact_conflict`，
+idx=7 / qid=665），它**不属于原任务书的四类**，见 §4。
+
+以下是四类各自的 insufficient 理由。
 
 ### 3.1 `timeline_contradiction` → **insufficient**
 
@@ -75,7 +80,7 @@ qid=665 表面上涉及"钟表时间"，容易被归到这一类。**不能这�
 
 ### 3.2 `role_mapping_drift` → **insufficient**
 
-idx=4（地铁让座）有两处原始 Judge I/O，comment 分别为：
+idx=4（地铁让座）有两处原始 Answer/verdict I/O，comment 分别为：
 
 ```text
 run.log:4093  "方向仍是上下级，反了"      （qid=286，verdict=不是）
@@ -104,18 +109,24 @@ puzzle.jsonl:108  qid=174  status=unavailable  verdict=未判定  touched_fact_i
 
 ### 3.4 `canonical_parallel_story` → **insufficient**
 
-`run.log` 是 DETAIL 级，确实含 **1408 行完整 Judge 输入**
-（`【事实表(判定依据)】`）与 **1407 行完整 Judge 输出**（`结果={"answers"…`）。
-所以"原始证据不足"这个担忧**不成立**。
+当前冻结日志确认有大量完整的 **Answer/verdict I/O**：
 
-但**没有找到一个干净、独立、证据充分的案例**：Final Judge 接受了一整套
-与 canonical facts 冲突的平行解释并判中。
+```text
+1408 行含【事实表(判定依据)】(Answer 阶段的输入)
+1407 行含 结果={"answers": …}  (Answer 阶段的输出, 对应 _TOOL_ANSWER)
+```
 
-qid=665 只是一个**局部** canonical fact conflict（单个谓词冲突），
-不是"一整套平行故事被接受"。把它再复制一份标成 `canonical_parallel_story`
-会把同一个缺陷记两遍，并制造一个不存在的类别。
+但这**并不能自动证明存在完整 Final Judge I/O**。两者是两个不同的模型阶段
+（详见 §6），schema 也不同。
 
-因此：**不创建旧任务书列出的 `tests/fixtures/live_judge_regressions.jsonl`。**
+本次**没有找到**一条证据充分的案例，能够证明 **Final Judge**
+接受了一整套与 canonical facts 冲突的平行解释并判 SOLVE。
+qid=665 只是一个**局部** Answer 阶段的谓词冲突，不是"一整套平行故事被接受"，
+并且它 `solution_candidate=false`，**根本没有进入 Final Judge**。
+
+因此 `canonical_parallel_story` 仍为 `insufficient`，
+**不创建**旧任务书列出的 `tests/fixtures/live_judge_regressions.jsonl`。
+
 
 ---
 
@@ -135,7 +146,7 @@ run.log:       行 7795–7802
 
 ```text
 run.log:7795  弹幕收下[提问 #665] 晚来: 钟出故障走快了之后再停止吗
-run.log:7797  user=【谜面】…【事实表(判定依据)】…（证明 facts 真的进了 Judge 输入）
+run.log:7797  user=【谜面】…【事实表(判定依据)】…（证明 facts 真的进了 Answer 阶段的输入）
 run.log:7799  结果={"answers": [{"id": 1, "verdict": "是",
                                 "solution_candidate": false,
                                 "touched_fact_ids": ["f1", "f2"],
@@ -144,6 +155,13 @@ run.log:7800  点评泄露谜底, 已丢弃: '快了二十分钟，但不是故�
 run.log:7801  裁决 '钟出故障走快了之后再停止吗' -> 是 (碰事实=['f1', 'f2'] 候选=False)
 run.log:7802  答 '钟出故障走快了之后再停止吗' -> 1.4s 是
 ```
+
+注意 7799 的 schema 是 `{"answers": [...]}`，对应 `_TOOL_ANSWER`
+（`emit_verdict`），即 **Answer/verdict 阶段**，**不是** Final Judge。
+该条 `solution_candidate=false`，因此本题**从未进入 Final Judge**
+（判定门在 `story/llm.py` 的 `if not judge_solve or not answer or
+not r0.solution_candidate: return`），run.log 行 7795–7802 区间内
+也**没有任何 `emit_judgement` 行**。
 
 **为什么 expected verdict 是「不是」**：
 
@@ -184,7 +202,42 @@ verdict 分布:  不是 302 ／ 是 237 ／ 无关 115
 
 ---
 
-## 6. 本次未做的事
+## 6. 两个模型阶段必须严格区分（Answer/verdict ≠ Final Judge）
+
+这是本文档最容易读错的地方，单独列一节。
+
+`PuzzleWriter.answer()` 内部其实是**两层**，用不同的 system prompt、不同的
+工具、不同的 schema、不同的日志标签：
+
+| | Answer/verdict 阶段 | Final Judge 阶段 |
+|---|---|---|
+| 入口 | 每条提问都走 | **只有 `solution_candidate=true` 才走** |
+| 代码 | `story/llm.py` `answer()` | `story/llm.py` `judge()` |
+| system | `ANSWER_SYSTEM`（503 字） | `JUDGE_SYSTEM`（1349 字） |
+| 工具 | `_TOOL_ANSWER` = `emit_verdict` | `_TOOL_JUDGE` = `emit_judgement` |
+| 输出 schema | `{"answers":[{"id","verdict","solution_candidate","touched_fact_ids","comment"}]}` | `{"is_guess","cause_hit","mechanism_hit","key_fact_hit","matched_atoms"}` |
+| 日志标签 | `裁决 '…' -> 是/不是/无关` | `裁判 '…' -> 未中/命中` |
+| 日志行样例 | 7801 | 418 |
+
+因此：
+
+- `结果={"answers": …}` 是 **Answer/verdict 输出**，**不是** Final Judge 输出。
+- `【事实表(判定依据)】` 是 **Answer/verdict 输入**（`ANSWER_SYSTEM` 里
+  "依据【事实表】判断提问"），**不是** Final Judge 输入。
+- Final Judge 的输入是 `【谜面】/【谜底】/【要说到的事实(编号从 0 开始…)】/观众的提问`，
+  **不含** `【事实表(判定依据)】` 这个标题。
+
+> ⚠️ 这一点直接关系到后续 Step 05/07，因为那两步要专门验证
+> 「**Final Judge 是否真正把 facts 当 canonical world**」。
+> 如果在这里把 Answer 阶段误当成 Final Judge，那两步的基线判断就会建立
+> 在一个错误的"我以为 Judge 已经看过 facts"的前提上。
+
+本次固化的 qid=665 属于 **Answer/verdict 阶段**（`stage: "answer"`），
+其 `solution_candidate=false`，**没有** Final Judge 参与。
+
+---
+
+## 7. 本次未做的事
 
 - 未修改 `story/*.py` / `director.py` / Prompt / Answer / Judge / Engine。
 - 未创建 synthetic 的 role / timeline / action / parallel-story fixture。
