@@ -21,9 +21,9 @@ from story.puzzle import (  # noqa: E402
     has_closing_question, is_first_person, quote_in_puzzle,
 )
 from story.quality import (  # noqa: E402
-    Quotas, check_signature, choose_blueprint, cross_puzzle_gate,
-    FAMILY_SHAPES, check_tables, is_structurally_duplicate, signature_of,
-    validate_blueprint, validate_spec,
+    QUALITY_POLICY_VERSION, Quotas, check_signature, choose_blueprint,
+    cross_puzzle_gate, FAMILY_SHAPES, check_tables, is_structurally_duplicate,
+    signature_of, validate_blueprint, validate_spec,
 )
 
 FAIL = [0]
@@ -77,7 +77,7 @@ def good_spec(**kw) -> PuzzleSpec:
                        domain="maritime", emotion_mode="neutral",
                        relation="stranger", time_shape="habitual"),
                    prompt_version="riddle-v3",
-                   quality_policy_version="quality-v3")
+                   quality_policy_version=QUALITY_POLICY_VERSION)
     for k, v in kw.items():
         setattr(s, k, v)
     return s

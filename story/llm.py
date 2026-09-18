@@ -30,8 +30,8 @@ from typing import Optional
 from . import parser as P
 from .config import LLMConfig
 from .puzzle import (
-    DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, SOLUTION_SHAPES,
-    TIME_SHAPES,
+    DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, REVEAL_MODES,
+    SOLUTION_SHAPES, TIME_SHAPES,
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec, SolveAtom,
     normalize_for_match, quote_in_puzzle,
 )
@@ -786,8 +786,8 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v3"
-CHECK_PROMPT_VERSION = "check-v3"
+RIDDLE_PROMPT_VERSION = "riddle-v4"
+CHECK_PROMPT_VERSION = "check-v4"
 ANSWER_PROMPT_VERSION = "answer-v3"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
@@ -818,6 +818,31 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
   8 小时直播实测 69% 的题都坍缩成这个形状。
 - **不要总是亲人去世 / 怀念亡者 / 赎罪。**
 - 不要靠"恰好"或巧合解释。
+
+═══ 情绪 ≠ 揭晓结构: 两条轴**严格正交** ═══
+这两件事**互相独立**, 别把它们焊在一起:
+- `emotion_mode` = 整道题读起来**是什么气氛**(伤感 / 温暖 / 中性 / 荒诞…)。
+- `reveal_mode` = 揭晓那一刻, 观众**重新理解了什么**(结构)。
+一道温暖气氛的题可以是"身份倒置", 一道冷峻的题也可以是"普通解释"。
+**不要**为了表达"温暖"就写成"普通解释", 也不要为了表达"悬疑"就硬凑翻转。
+
+`reveal_mode` 取值与含义:
+- `recontextualization`  同一件事被放进新语境, 意义全变
+- `identity_flip`        某人/某物的身份与表面相反
+- `meaning_flip`         某件物品的真实意义与表面用途相反
+- `causal_flip`          因果被倒置(以为的因其实是果)
+- `goal_flip`            行为的目的与表面动机相反
+- `hidden_stakes`        表面平常, 真实的利害关系完全不同
+- `perspective_flip`     视角/时间/空间被错认
+- `straight_explanation` 没有翻转, 就是正面解释为什么会这样
+
+**`straight_explanation` 是允许的, 但不要默认用它。** 大多数好题都有某种
+翻转; 连续多道都写成正面解释, 观众会觉得"都是这个套路"。
+
+═══ 隐藏规则/流程**不是**默认解法 ═══
+"某个机构有条规定 / 某种仪式必须那样做"这类题可以做, 但**不要当默认**。
+只有当规则本身就是最有趣的那一点时才用。代码会统计你有多依赖它
+(`procedural_rule_dependency`), 连续太多会被拒。
 
 把心思放在: 隐藏功能(行为的真实用途不是表面那个)、信息差、规则约束、
 空间/时间错认、身份误认、物品被错当成另一样。
@@ -1065,11 +1090,28 @@ _TOOL_RIDDLE = {
                     "past_trauma": {"type": "boolean"},
                     "long_term_profession": {"type": "boolean"},
                     "repeated_ritual": {"type": "boolean"},
+                    "reveal_mode": {
+                        "type": "string", "enum": list(REVEAL_MODES),
+                        "description": (
+                            "揭晓结构: 揭晓那一刻观众**重新理解了什么**。"
+                            "与 emotion_mode **严格正交** —— 那条轴是气氛, "
+                            "这条轴是结构。**不要**因为气氛温暖就写 "
+                            "straight_explanation。"),
+                    },
+                    "procedural_rule_dependency": {
+                        "type": "boolean",
+                        "description": (
+                            "这道题是否**主要靠**题面之外的制度性设定成立"
+                            "(某机构的规定 / 必须遵守的流程 / 仪式规矩)。"
+                            "如实回答 —— 隐藏规则不是默认解法, 代码会按最近"
+                            "窗口限额。普通的生活常识/物理规律**不算**。"),
+                    },
                 },
                 "required": ["mechanism_family", "solution_shape", "domain",
                              "relation", "emotion_mode", "time_shape",
                              "death", "past_trauma", "long_term_profession",
-                             "repeated_ritual"],
+                             "repeated_ritual", "reveal_mode",
+                             "procedural_rule_dependency"],
                 "description": (
                     "这道题**实际**是什么形状。必须如实回传 —— 代码会拿它"
                     "跟 blueprint **逐项严格比对**, 任何一项不一致都会被拒。"
@@ -1279,6 +1321,22 @@ _TOOL_CHECK = {
                     "past_trauma": {"type": "boolean"},
                     "long_term_profession": {"type": "boolean"},
                     "repeated_ritual": {"type": "boolean"},
+                    "reveal_mode": {
+                        "type": "string", "enum": list(REVEAL_MODES),
+                        "description": (
+                            "**改完之后**这道题的揭晓结构: 揭晓那一刻观众"
+                            "重新理解了什么。与 emotion_mode **严格正交** ——"
+                            "别因为气氛是 grief 就报 straight_explanation。"),
+                    },
+                    "procedural_rule_dependency": {
+                        "type": "boolean",
+                        "description": (
+                            "**改完之后**这道题是否主要靠制度性设定成立"
+                            "(机构规定 / 流程 / 仪式规矩)。这是**单题**的"
+                            "观察值 —— 只判断这一道, **不要**考虑'最近已经"
+                            "太多规则题了', 你看不到别的题, 全局配额由代码"
+                            "层负责。"),
+                    },
                 },
                 "description": (
                     "**改完之后**这道题实际是什么形状。必须**如实重新判断**, "
@@ -1347,6 +1405,49 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
 
 **只看这一道题。** 不要去评判"最近连续几题都是……" —— 你**看不到**
 别的题, 全局分布由代码层控制。凭猜测去改只会改错。
+
+═══ v4: 逐项查这五条内部一致性 ═══
+这些是**单题内部**的语义检查, 与"最近题像不像"无关。任一条不成立且
+改不动, 就该 rewrite。
+
+1. **时间线一致(timeline consistency)**
+   谜面里出现的时刻/先后顺序, 必须能与谜底自洽。别出现"谜面说三点
+   发生, 谜底却说那是四点的后果"这种对不上的地方。
+2. **身份一致(role consistency)**
+   一个人的身份、称谓、他与别人的关系, 在谜面与谜底里必须是同一个。
+   别让"母亲"在下文变成"姐姐", 别让同一件事的施动者前后换人。
+3. **动作连续(action continuity)**
+   谜面描述的动作序列要能真的发生 —— 先做 A 才可能有 B, 别让因果
+   顺序颠倒或中间缺一环。凡是"他先 X 然后 Y"的写法, X 必须真的能
+   导致 Y 或至少不与 Y 冲突。
+4. **线索可回溯(recontextualized clue)**
+   改完之后, 谜面里仍要有**至少一条**这样的句子: 读者当时看着平常,
+   知道谜底后回看能指着它说"原来这句早就在暗示"。这就是 fair_clues。
+   一条都没有 = 没有公平推理路径 = rewrite。
+5. **隐藏规则依赖(hidden-rule dependency)**
+   如实判断这道题是不是**主要靠**题面之外的制度性设定成立(某机构的
+   规定 / 必须遵守的流程 / 仪式规矩)。**普通的生活常识与物理规律不算。**
+   把结论填进 `observed_signature.procedural_rule_dependency`。
+
+═══ 情绪 ≠ 揭晓结构(评审时也要分开) ═══
+- `emotion_mode` 是**气氛**(读起来是伤感/温暖/中性/荒诞…)。
+- `reveal_mode` 是**结构**(揭晓时观众重新理解了什么)。
+两者**正交**。不要因为一道题气氛温暖就把它报成 straight_explanation,
+也不要因为气氛冷峻就硬说它有翻转。**如实报你读到的那个。**
+
+**`reveal_mode adherence`**: 若上面给了【本题 Blueprint 硬约束】, 里面
+有一个目标 `reveal_mode`。你必须**如实**判断这道题实际是什么结构 ——
+**不要**为了通过而照抄目标值。如果实际结构与目标不符, 那是一个要报
+上来的观察, 不是要你圆过去的东西。
+
+═══ 职责边界(冻结) ═══
+- 你**只**审这一道题的语义质量与内部一致性。
+- 你**如实回传** `procedural_rule_dependency` / `reveal_mode` /
+  `observed_signature` 的其余字段。
+- 你**不**读取"最近 10 题"的配额状态 —— 你根本看不到它们。
+- 你**不**因为"最近已经太多规则题 / 太多悲情题"而自行 rewrite。
+  全局配额是**代码层**的事(`signature_counts` / `check_signature` /
+  `cross_puzzle_gate`), 不由你兼管。你照自己的单题判断给结论即可。
 """
 
 

@@ -9,6 +9,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
+from story.llm import RIDDLE_PROMPT_VERSION  # noqa: E402
+from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
 
 
@@ -1409,8 +1411,9 @@ def test_archive_writes_full_schema():
                       "solution_shape": "hidden_function_explains_behavior",
                       "domain": "maritime"},
     })
-    sp.prompt_version = "riddle-v3"
-    sp.quality_policy_version = "quality-v3"
+    # 绑定当前常量, 别写死版本串 —— 否则每次 bump 都要回来改测试。
+    sp.prompt_version = RIDDLE_PROMPT_VERSION
+    sp.quality_policy_version = QUALITY_POLICY_VERSION
     sp.metrics = {"generation_attempts": 2, "generation_latency_ms": 4123,
                   "review_calls": 1, "review_decision": "fix",
                   "review_issues": ["第一人称"], "rewrite_count": 0, "ok": True}
@@ -1428,9 +1431,10 @@ def test_archive_writes_full_schema():
               "reason", "metrics"):
         check(f"archive 有 {k}", k in rec, sorted(rec))
     check("spec_version=2", rec.get("spec_version") == 2, rec.get("spec_version"))
-    check("prompt_version 落盘", rec.get("prompt_version") == "riddle-v3", rec)
+    check("prompt_version 落盘",
+          rec.get("prompt_version") == RIDDLE_PROMPT_VERSION, rec)
     check("policy_version 落盘",
-          rec.get("quality_policy_version") == "quality-v3", rec)
+          rec.get("quality_policy_version") == QUALITY_POLICY_VERSION, rec)
     check("facts 落盘", len(rec.get("facts") or []) == 1, rec.get("facts"))
     check("blueprint 落盘",
           rec.get("blueprint", {}).get("mechanism_family") == "hidden_function",
@@ -2049,8 +2053,9 @@ def test_archive_records_source():
                       "solution_shape": "hidden_function_explains_behavior",
                       "domain": "maritime"},
     })
-    sp.prompt_version = "riddle-v3"
-    sp.quality_policy_version = "quality-v3"
+    # 绑定当前常量, 别写死版本串 —— 否则每次 bump 都要回来改测试。
+    sp.prompt_version = RIDDLE_PROMPT_VERSION
+    sp.quality_policy_version = QUALITY_POLICY_VERSION
     d.engine.submit_riddle(sp.puzzle, sp.answer, [], solve_atoms=sp.solve_atoms,
                            fair_clues=sp.fair_clues, spec=sp, source="pool")
     acts = d.engine._enter_revealing_locked(0.0, "giveup", "")

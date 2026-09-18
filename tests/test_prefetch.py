@@ -29,6 +29,7 @@ from story.puzzle import (  # noqa: E402
     SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import Phase  # noqa: E402
 
 FAIL = [0]
@@ -83,7 +84,7 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             domain="maritime", emotion_mode="neutral",
             relation="stranger", time_shape="habitual"),
         prompt_version="riddle-v3",
-        quality_policy_version="quality-v3",
+        quality_policy_version=QUALITY_POLICY_VERSION,
         metrics={"generation_attempts": 2, "review_calls": 1,
                  "rewrite_count": 0, "review_decision": "pass",
                  "review_latency_ms_total": 3310,

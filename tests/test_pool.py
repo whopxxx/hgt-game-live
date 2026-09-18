@@ -26,6 +26,7 @@ from story.puzzle import (  # noqa: E402
     SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import Phase  # noqa: E402
 
 FAIL = [0]
@@ -81,7 +82,7 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             domain="maritime", emotion_mode="neutral",
             relation="stranger", time_shape="habitual"),
         prompt_version="riddle-v3",
-        quality_policy_version="quality-v3",
+        quality_policy_version=QUALITY_POLICY_VERSION,
         metrics={"generation_attempts": 2, "review_calls": 1,
                  "rewrite_count": 0, "review_decision": "pass",
                  "review_latency_ms_total": 3310,
@@ -986,7 +987,7 @@ def test_policy_mismatch_add_rejected():
         check("**没有写盘**", not os.path.exists(cfg.pool_path))
         ok, why = PuzzlePool._validate_pool_spec(s)
         check("理由里两个版本号都在(spec=…, current=…)",
-              "quality-v2" in why and "quality-v3" in why, why)
+              "quality-v2" in why and QUALITY_POLICY_VERSION in why, why)
 
 
 def test_policy_missing_add_rejected():
@@ -1127,6 +1128,10 @@ def test_policy_bump_auto_quarantines_old_stock():
     """
     print("\n[9f] policy bump 机制(两个方向)")
     from story.quality import QUALITY_POLICY_VERSION
+    # "下一版"**不能写死**成某个串 —— 否则常量一 bump 到那个串, 本测试
+    # 就反过来变成"版本 == 当前"(Step 04 bump 到 v4 时正是这样把自己
+    # 绊倒的)。这里显式构造一个**必定不同于当前**的版本号。
+    other = QUALITY_POLICY_VERSION + "-next"
     with tmpdir() as d:
         cfg = mkcfg(d)
         # 盘上是"当前版本"的 3 道(即 bump 前的正常库存)
@@ -1148,11 +1153,11 @@ def test_policy_bump_auto_quarantines_old_stock():
                         answer="第四个谜底。",
                         fair_clues=[FairClue(quote="第四道完全不同的题",
                                              supports_atoms=["a1"])])
-        nxt.quality_policy_version = "quality-v4"
+        nxt.quality_policy_version = other
         check("(a) 版本 != 当前 -> 入池被拒", pool.add(nxt) is False)
         ok, why = PuzzlePool._validate_pool_spec(nxt)
         check("(a) 理由里同时有 spec 版本与 current 版本",
-              "quality-v4" in why and QUALITY_POLICY_VERSION in why, why)
+              other in why and QUALITY_POLICY_VERSION in why, why)
         # 这条是 (a) 的**真正含义**: 现在盘上那 3 道是"当前版本",
         # 一旦常量上调, 它们就变成 (a) 那一类 -> stock 归零。
         check("(a) 3 道旧库存此刻仍算库存(因为现在它们还是当前版本)",

@@ -319,10 +319,19 @@ class PuzzleBlueprint:
         RIDDLE 的 user 消息、由 `_review()` 拼进审稿消息。所以往这里加一行
         就是**改生产行为**, 不是改数据结构。
 
-        Step 01 刻意**不**在这里暴露 `reveal_mode`: 让生成器正式理解这个
-        字段(并同步 prompt version / tool schema / regression)是 Step 04
-        的事。在那之前先塞进去, 等于让模型对着一个它没被告知过语义的枚举
-        值自由发挥, 反而会污染 observed_signature。
+        ## 为什么这里**仍然**没有 reveal_mode 这一行
+
+        Step 01 刻意不暴露它; Step 04 让模型**理解**了这个字段的语义
+        (RIDDLE_SYSTEM / CHECK_SYSTEM 的正交说明 + 两边 tool schema),
+        但**没有**在这里暴露一个"目标值"。
+
+        理由是顺序: 这一行印出去的是**调度器想要的** reveal_mode。在
+        Step 02 的 reveal 调度器落地之前, `self.reveal_mode` 恒为默认值,
+        印出去只会给模型一个"永远等于 straight_explanation 的伪目标",
+        反而污染 observed_signature(模型会以为题目就该是普通解释)。
+
+        等 Step 02 有了真正的 reveal 选择器, 再加这一行 —— 那时它才是
+        一个有信息量的约束, 也才配得上 `reveal_mode adherence` 检查。
         """
         flags = [k for k in ("death", "past_trauma", "long_term_profession",
                              "repeated_ritual") if getattr(self, k)]

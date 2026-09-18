@@ -32,6 +32,16 @@ from .puzzle import (
 
 #: 每次改配额规则都要动这里, 并写进 archive —— 下一轮直播才能比较版本。
 #:
+#: v4(Step 04):
+#:   - Prompt 升到 riddle-v4 / check-v4, Reviewer 增加五项单题语义检查:
+#:     时间线一致 / 身份一致 / 动作连续 / 线索可回溯 / 隐藏规则依赖;
+#:   - `reveal_mode` 与 `procedural_rule_dependency` 作为 **observed**
+#:     signature 字段由 Reviewer 如实回传(见 `puzzle.PuzzleSignature`);
+#:   - 冻结职责边界: Reviewer 只判单题, **不**读最近窗口配额; 全局配额
+#:     归代码层(`signature_counts` / `check_signature` / `cross_puzzle_gate`)。
+#: 所以 v3 与 v4 的 archive **不可直接比较**: v4 的 signature 多了两维观
+#: 察值, 且 v4 的题是在"审查者会查这五项一致性"的前提下产出的。
+#:
 #: v3(第二轮 review):
 #:   - `time_shape` 退出 blueprint 硬比对, 降为 observed metadata
 #:     (v2 里它只有一个默认值 instant, 把大量合理题判死);
@@ -40,7 +50,7 @@ from .puzzle import (
 #:   - 兜底题结构化为 PuzzleSpec。
 #: 所以 v2 与 v3 的 archive **不可直接比较**: v2 的 signature.time_shape
 #: 是"被强制成 instant", v3 的是"如实观察"。
-QUALITY_POLICY_VERSION = "quality-v3"
+QUALITY_POLICY_VERSION = "quality-v4"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10

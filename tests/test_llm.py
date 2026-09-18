@@ -9,7 +9,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from story.llm import LLMResult, PuzzleWriter  # noqa: E402
+from story.llm import (  # noqa: E402
+    RIDDLE_PROMPT_VERSION, LLMResult, PuzzleWriter,
+)
+from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 
 FAIL = [0]
 
@@ -129,6 +132,9 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
             "emotion_mode": "neutral", "time_shape": "instant",
             "death": False, "past_trauma": False,
             "long_term_profession": False, "repeated_ritual": False,
+            # ---- v4 新增的 observed 字段 ----
+            "reveal_mode": "meaning_flip",
+            "procedural_rule_dependency": False,
         },
     }
     d.update(kw)
@@ -160,7 +166,9 @@ def sig_ok():
             "domain": "maritime", "relation": "stranger",
             "emotion_mode": "neutral", "time_shape": "instant",
             "death": False, "past_trauma": False,
-            "long_term_profession": False, "repeated_ritual": False}
+            "long_term_profession": False, "repeated_ritual": False,
+            "reveal_mode": "meaning_flip",
+            "procedural_rule_dependency": False}
 
 
 def review_ok(puzzle=None, **kw):
@@ -248,12 +256,16 @@ def test_gen_spec_returns_puzzle_spec():
           [(c.quote, spec.puzzle) for c in spec.fair_clues])
     check("signal 来自模型自报", spec.signature.domain == "maritime",
           spec.signature)
-    check("prompt_version 写上", spec.prompt_version == "riddle-v3",
+    # 断言的是"写的就是当前常量", 不是某个写死的版本串 —— 否则每次
+    # bump prompt/policy 版本都要来改测试(Step 04 就是这么被绊到的)。
+    check("prompt_version 写成当前常量",
+          spec.prompt_version == RIDDLE_PROMPT_VERSION,
           spec.prompt_version)
-    check("quality_policy_version 写上",
-          spec.quality_policy_version == "quality-v3",
+    check("quality_policy_version 写成当前常量",
+          spec.quality_policy_version == QUALITY_POLICY_VERSION,
           spec.quality_policy_version)
-    back = PuzzleSpec.from_dict(spec.to_archive())
+    from story.puzzle import PuzzleSpec as _PS
+    back = _PS.from_dict(spec.to_archive())
     check("archive round trip", back.puzzle == spec.puzzle
           and len(back.facts) == 4, back)
 
@@ -1008,6 +1020,183 @@ def test_reviewer_structured_atoms_survive():
           "[cause]" in fc.calls[1]["user"], fc.calls[1]["user"][-700:])
     check("审稿请求带上 atom id", "id=a1" in fc.calls[1]["user"],
           fc.calls[1]["user"][-700:])
+
+
+# ======================================================================
+# Step 04 — Riddle / Reviewer v4
+# ======================================================================
+def test_v4_prompt_versions_bumped():
+    """Step 04: prompt 版本必须真的升到 v4(否则档案无法区分两代题)。"""
+    print("\n[V4-1] riddle/check prompt 版本")
+    from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
+    check("RIDDLE_PROMPT_VERSION == riddle-v4",
+          RIDDLE_PROMPT_VERSION == "riddle-v4", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v4",
+          CHECK_PROMPT_VERSION == "check-v4", CHECK_PROMPT_VERSION)
+
+
+def test_v4_signature_schema_has_new_dimensions():
+    """Step 04: 两个新 observed 维度必须进**两个**工具的 schema。
+
+    只在出题侧加 = Reviewer 回传不了; 只在审稿侧加 = 生成器报不了。
+    两边都要有, 且枚举/类型一致。
+    """
+    print("\n[V4-2] riddle + check 的 signature schema 都带新维度")
+    from story.llm import _TOOL_CHECK, _TOOL_RIDDLE
+    from story.puzzle import REVEAL_MODES
+    rs = _TOOL_RIDDLE["input_schema"]["properties"]["signature"]
+    cs = _TOOL_CHECK["input_schema"]["properties"]["observed_signature"]
+    for name, sch in (("riddle", rs), ("check", cs)):
+        props = sch["properties"]
+        check(f"{name}: 有 reveal_mode", "reveal_mode" in props, sorted(props))
+        check(f"{name}: reveal_mode 枚举 == REVEAL_MODES",
+              props["reveal_mode"]["enum"] == list(REVEAL_MODES))
+        check(f"{name}: 有 procedural_rule_dependency",
+              "procedural_rule_dependency" in props, sorted(props))
+        check(f"{name}: procedural 是 boolean",
+              props["procedural_rule_dependency"]["type"] == "boolean")
+    check("riddle: 两个新字段都在 required 里",
+          {"reveal_mode", "procedural_rule_dependency"}
+          <= set(rs["required"]), rs["required"])
+
+
+def test_v4_check_system_freezes_reviewer_scope():
+    """Step 04 冻结的职责边界必须写进 Prompt —— 否则模型会去兼管全局配额。"""
+    print("\n[V4-3] CHECK_SYSTEM 冻结 Reviewer 职责")
+    from story.llm import CHECK_SYSTEM
+    check("明说只看这一道题", "只看这一道题" in CHECK_SYSTEM)
+    check("明说看不到别的题", "看不到" in CHECK_SYSTEM)
+    check("明说不读最近窗口配额",
+          "最近" in CHECK_SYSTEM and ("配额" in CHECK_SYSTEM))
+    check("明说全局配额归代码层",
+          "代码层" in CHECK_SYSTEM or "代码" in CHECK_SYSTEM)
+    check("点明 emotion/reveal 正交", "正交" in CHECK_SYSTEM)
+    # 五项 v4 语义检查
+    for kw in ("时间线", "身份", "动作", "线索", "隐藏规则"):
+        check(f"含 v4 检查项: {kw}", kw in CHECK_SYSTEM)
+    check("提到 reveal_mode adherence",
+          "adherence" in CHECK_SYSTEM, "adherence")
+
+
+def test_v4_riddle_system_states_orthogonality():
+    """Step 04: 出题端也要知道 emotion/reveal 正交 + 隐藏规则非默认。"""
+    print("\n[V4-4] RIDDLE_SYSTEM 说明正交与规则依赖")
+    from story.llm import RIDDLE_SYSTEM
+    check("点明两条轴正交", "正交" in RIDDLE_SYSTEM)
+    check("列出 reveal_mode 取值", "recontextualization" in RIDDLE_SYSTEM)
+    check("提醒不要默认 straight_explanation",
+          "straight_explanation" in RIDDLE_SYSTEM
+          and "默认" in RIDDLE_SYSTEM)
+    check("提醒隐藏规则不是默认解法",
+          "隐藏规则" in RIDDLE_SYSTEM or "隐藏规章" in RIDDLE_SYSTEM)
+
+
+def test_v4_observed_fields_flow_to_signature():
+    """Step 04: Reviewer 回传的两个新字段必须真的落到 spec.signature。
+
+    这是端到端的: Prompt/schema 只是一半, 数据必须能穿过去。
+    """
+    print("\n[V4-5] 新字段端到端落到 signature")
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("reveal_mode 落到 signature",
+          spec.signature.reveal_mode == "meaning_flip",
+          spec.signature.reveal_mode)
+    check("procedural_rule_dependency 落到 signature",
+          spec.signature.procedural_rule_dependency is False,
+          spec.signature.procedural_rule_dependency)
+    # 再经 archive 往返一次, 不许丢
+    from story.puzzle import PuzzleSpec as _PS
+    back = _PS.from_dict(spec.to_archive())
+    check("archive 往返后 reveal_mode 仍在",
+          back.signature.reveal_mode == "meaning_flip",
+          back.signature.reveal_mode)
+    check("archive 往返后 procedural 仍在",
+          back.signature.procedural_rule_dependency is False)
+
+
+def test_v4_reviewer_observed_reveal_wins_over_generator():
+    """Step 04: 审稿人的 observed 值优先于生成器自报 —— 配额靠它。
+
+    生成器说 straight_explanation, 审稿人读完说是 identity_flip:
+    最终 signature 必须是审稿人的判断(它是读过成品的人)。
+    """
+    print("\n[V4-6] 审稿人的 reveal_mode 覆盖生成器自报")
+    gen_sig = {"mechanism_family": "hidden_function",
+               "solution_shape": "hidden_function_explains_behavior",
+               "domain": "maritime", "relation": "stranger",
+               "emotion_mode": "neutral", "time_shape": "instant",
+               "death": False, "past_trauma": False,
+               "long_term_profession": False, "repeated_ritual": False,
+               "reveal_mode": "straight_explanation",       # 生成器自报
+               "procedural_rule_dependency": False}
+    obs = dict(gen_sig)
+    obs["reveal_mode"] = "identity_flip"                 # 审稿人观察
+    obs["procedural_rule_dependency"] = True
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(signature=gen_sig)),
+        LLMResult(tool_input=review_ok(observed_signature=obs)),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("reveal_mode 采用审稿人的 identity_flip",
+          spec.signature.reveal_mode == "identity_flip",
+          spec.signature.reveal_mode)
+    check("procedural_rule_dependency 采用审稿人的 True",
+          spec.signature.procedural_rule_dependency is True,
+          spec.signature.procedural_rule_dependency)
+
+
+def test_v4_reviewer_cannot_see_recent_quota():
+    """Step 04 硬边界: 审稿请求里**不得**出现最近窗口的配额状态。
+
+    Reviewer 没有完整的最近题窗口, 所以全局配额导演权不能回到 LLM。
+    这条从**请求体**上验证 —— 只断言 Prompt 措辞是不够的。
+    """
+    print("\n[V4-7] 审稿请求不带最近配额")
+    recent = [{"mechanism_family": "hidden_function",
+               "solution_shape": "hidden_function_explains_behavior"}] * 3
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.gen_spec(blueprint=fc.default_blueprint, recent=recent)
+    chk = fc.calls[1]
+    check("审稿请求里没有 recent_signatures 块",
+          "recent_signatures" not in chk["user"], chk["user"][-400:])
+    check("审稿请求里没有『最近 N 题』配额计数",
+          "已出现" not in chk["user"] and "配额" not in chk["user"],
+          chk["user"][-400:])
+
+
+def test_v4_apply_review_keeps_new_fields_on_fix():
+    """Step 04: fix 路径也要保住两个新字段(不能只在 pass 路径生效)。"""
+    print("\n[V4-8] fix 路径保住新字段")
+    P2 = "守塔人只在退潮时亮灯, 涨潮后熄灭。为什么?"
+    obs = sig_ok()
+    obs["reveal_mode"] = "goal_flip"
+    obs["procedural_rule_dependency"] = True
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_fix(P2, observed_signature=obs)),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("fix 后谜面已改", spec.puzzle == P2, spec.puzzle)
+    check("fix 后 reveal_mode 是审稿人的 goal_flip",
+          spec.signature.reveal_mode == "goal_flip", spec.signature.reveal_mode)
+    check("fix 后 procedural 是审稿人的 True",
+          spec.signature.procedural_rule_dependency is True,
+          spec.signature.procedural_rule_dependency)
+
+
+def test_v4_policy_version_is_v4():
+    """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
+    print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
+    from story.quality import QUALITY_POLICY_VERSION
+    check("当前政策是 quality-v4",
+          QUALITY_POLICY_VERSION == "quality-v4", QUALITY_POLICY_VERSION)
 
 
 def test_rejected_spec_never_returned():
@@ -2070,7 +2259,17 @@ def main():
               test_answer_uses_facts_block,
               test_answer_forbids_inventing_facts,
               test_solution_candidate_definition,
-              test_text_fallback_solution_heuristic):
+              test_text_fallback_solution_heuristic,
+              # ---- Step 04: Riddle / Reviewer v4 ----
+              test_v4_prompt_versions_bumped,
+              test_v4_signature_schema_has_new_dimensions,
+              test_v4_check_system_freezes_reviewer_scope,
+              test_v4_riddle_system_states_orthogonality,
+              test_v4_observed_fields_flow_to_signature,
+              test_v4_reviewer_observed_reveal_wins_over_generator,
+              test_v4_reviewer_cannot_see_recent_quota,
+              test_v4_apply_review_keeps_new_fields_on_fix,
+              test_v4_policy_version_is_v4):
         t()
     print()
     if FAIL[0]:
