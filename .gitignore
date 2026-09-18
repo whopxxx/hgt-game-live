@@ -1,0 +1,27 @@
+# ---- 运行时产物: 不入库 ----
+# 日志 / 弹幕 / 题库都会随时间无限增长, 且含观众昵称, 不该进版本库。
+data/*.log
+data/*.jsonl
+data/*.png
+data/*.txt
+
+# 临时调试脚本(我排查时随手写的, 用 _ 前缀)
+data/_*.py
+
+# Chrome 直播窗口的用户数据目录(160MB+)
+data/_liveprofile/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,277 @@
+"""用本机无头 Chrome 验证实际布局，截图写入 data/preview.png。零新依赖。
+
+喂的是**海龟汤真实形态**的快照(谜面 + 问答流 + 揭晓)。
+"""
+import html
+import json
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+CHROME = Path("C:/Program Files/Google/Chrome/Application/chrome.exe")
+
+CHECK = r'''
+window.socket = null;
+window.WebSocket = class { constructor() { window.socket = this; } };
+window.addEventListener("load", async () => {
+  await document.fonts.ready;
+  const errors = [];
+  const check = (ok, message) => { if (!ok) errors.push(message); };
+
+  const mkQa = (n) => Array.from({length: n}, (_, i) => ({
+    qid: i + 1, user_name: "观众" + i, text: "问题编号" + (i + 1) + "：他是不是瞎了",
+    // 刻意避开「无关」——它会触发折叠, 干扰基础渲染断言。
+    // (折叠行为有单独的测试 ⑪)
+    verdict: ["是","不是","是","是"][i % 4], comment: "点评" + i, kind: "qa"
+  }));
+  const send = (o) => socket.onmessage({data: JSON.stringify(Object.assign({
+    phase: "qa", puzzle_index: 1, puzzle: "一个男人走进餐厅，点了一碗海龟汤，喝了一口就冲出去自杀了。为什么？",
+    revealed_answer: "", qa_log: [], qa_total: 0, pending_count: 0,
+    hint_count: 0, hint_text: "", next_puzzle_ms: null, puzzle_elapsed_ms: 45000,
+    story_index: 1, danmaku: [], stats: {questions: 0, answered: 0, solved: 0, dropped: 0, viewers_seen: 3}
+  }, o))});
+
+  try {
+    // ⓪ 弹幕: 服务端每次推"最近 N 条"窗口, 前端必须只放没见过的
+    //    (否则每次推送整个窗口重放一遍 = "弹幕乱飞")
+    let dmNodes = () => document.querySelectorAll("#danmaku .dm").length;
+    send({danmaku: [
+      {seq: 1, user_name: "甲", content: "一", is_command: false},
+      {seq: 2, user_name: "乙", content: "二", is_command: false},
+    ]});
+    const n2 = dmNodes();
+    // 再推同一个窗口(模拟 4Hz 重复推送) -> 不应新增
+    send({danmaku: [
+      {seq: 1, user_name: "甲", content: "一", is_command: false},
+      {seq: 2, user_name: "乙", content: "二", is_command: false},
+    ]});
+    check(dmNodes() === n2, "重复推同一窗口不应重放弹幕 (got " + dmNodes() + ")");
+    // 窗口滑动 + 新的一条 -> 只新增那一条
+    send({danmaku: [
+      {seq: 2, user_name: "乙", content: "二", is_command: false},
+      {seq: 3, user_name: "丙", content: "三", is_command: false},
+    ]});
+    check(dmNodes() === n2 + 1, "只应新增第 3 条, 实际新增 "
+          + (dmNodes() - n2));
+
+    // ① 谜面 + 问答流追加
+    send({qa_log: mkQa(3), qa_total: 3});
+    check(document.querySelectorAll(".qa-row").length === 3, "应渲染 3 行问答");
+    send({qa_log: mkQa(6), qa_total: 6});
+    check(document.querySelectorAll(".qa-row").length === 6, "应追加到 6 行");
+    // 追加不丢旧内容(现在整窗重画, 所以按内容而非节点身份断言)
+    send({qa_log: mkQa(8), qa_total: 8});
+    check(document.querySelectorAll(".qa-row").length === 8, "应到 8 行");
+    check(document.querySelector(".qa-row").textContent.includes("问题编号1"),
+          "最旧一行内容应保留");
+    // 裁决徽章
+    check(document.querySelector(".verdict"), "缺少裁决徽章");
+    check(document.querySelector(".qa-row .q .who").textContent.includes("观众0"),
+          "缺少发言者名字");
+
+    // ② 提示行: 只在问答流里出现一次, 不再有单独的提示条(避免重复显示)
+    send({qa_log: mkQa(2).concat([{qid: -1, user_name: "提示", text: "注意汤的味道",
+          verdict: "", comment: "", kind: "hint"}]), qa_total: 3, hint_count: 1,
+          hint_text: "注意汤的味道"});
+    check(document.querySelector(".qa-row.kind-hint"), "缺少提示行");
+    check(document.getElementById("hintbar").classList.contains("hidden"),
+          "提示条不应显示(提示只走问答流, 否则重复)");
+    // 再推一次**同一条**提示: 不应重复上屏
+    const hintRows1 = document.querySelectorAll(".qa-row.kind-hint").length;
+    send({qa_log: mkQa(2).concat([{qid: -1, user_name: "提示", text: "注意汤的味道",
+          verdict: "", comment: "", kind: "hint"}]), qa_total: 4, hint_count: 2,
+          hint_text: "注意汤的味道"});
+    check(document.querySelectorAll(".qa-row.kind-hint").length === hintRows1,
+          "同一条提示不应重复上屏");
+    // 换一条**不同**的提示: 应正常上屏
+    send({qa_log: mkQa(2).concat([
+          {qid: -1, user_name: "提示", text: "注意汤的味道", verdict: "", comment: "", kind: "hint"},
+          {qid: -2, user_name: "提示", text: "他以前也喝过一次", verdict: "", comment: "", kind: "hint"}
+        ]), qa_total: 5, hint_count: 2, hint_text: "他以前也喝过一次"});
+    check(document.querySelectorAll(".qa-row.kind-hint").length === hintRows1 + 1,
+          "不同的新提示应上屏");
+
+    // ③ 思考中
+    send({qa_log: mkQa(2), qa_total: 2, pending_count: 4});
+    check(!document.getElementById("thinking").classList.contains("hidden"),
+          "排队时应显示'思考中'");
+    send({qa_log: mkQa(2), qa_total: 2, pending_count: 0});
+    check(document.getElementById("thinking").classList.contains("hidden"),
+          "无排队时应隐藏'思考中'");
+
+    // ④ 揭晓覆盖层
+    send({phase: "revealed", qa_log: mkQa(4), qa_total: 4,
+          revealed_answer: "多年前他遭遇海难，同伴给他喝的其实是同伴自己的肉。",
+          solved: true, solved_by: "观众戊", next_puzzle_ms: 25000});
+    check(!document.getElementById("reveal").classList.contains("hidden"),
+          "揭晓层未显示");
+    check(document.getElementById("reveal-body").textContent.includes("海难"),
+          "揭晓内容缺失");
+    check(document.getElementById("reveal-next").textContent.includes("25"),
+          "下一题倒计时缺失");
+
+    // ④.5 揭晓时谜面必须隐藏(否则两层文字叠在一起 = "字被遮挡")
+    check(document.getElementById("puzzle").classList.contains("hidden"),
+          "揭晓时谜面应隐藏, 避免与谜底叠字");
+    check(parseFloat(getComputedStyle(document.getElementById("reveal-body")).fontSize) > 0,
+          "谜底字号应有效");
+
+    // ⑤ 换题: 谜面/问答流被清空
+    send({phase: "qa", puzzle_index: 2, story_index: 2,
+          puzzle: "一个女人每天给丈夫做同样的汤，丈夫却死了。为什么？",
+          revealed_answer: "", qa_log: [], qa_total: 0});
+    check(document.getElementById("puzzle").textContent.includes("女人"),
+          "新谜面未更新");
+    check(document.querySelectorAll(".qa-row").length === 0, "换题后问答流应清空");
+    check(document.getElementById("reveal").classList.contains("hidden"),
+          "换题后揭晓层应隐藏");
+    check(!document.getElementById("puzzle").classList.contains("hidden"),
+          "换题后谜面应重新显示");
+    check(document.getElementById("puzzle-index").textContent.includes("2"),
+          "题号未更新");
+
+    // ⑥ 谜面完整显示(不截断)
+    const long = "他每天都要数一遍楼梯，从一楼数到顶楼。有一天他数到一半就不数了，第二天人们发现他死在了楼梯间。为什么？";
+    send({puzzle_index: 3, story_index: 3, puzzle: long, qa_log: [], qa_total: 0});
+    check(document.getElementById("puzzle").textContent === long, "谜面被截断");
+
+    // ⑦ 调试面板宽度切换
+    for (const debug of [false, true]) {
+      document.getElementById("stage").classList.toggle("debug-on", debug);
+      document.getElementById("content").style.transition = "none";
+      const c = document.getElementById("content").getBoundingClientRect();
+      const st = document.getElementById("stage").getBoundingClientRect();
+      check(c.left >= st.left - 1 && c.right <= st.right + 1, "内容溢出舞台 debug=" + debug);
+    }
+    document.getElementById("stage").classList.remove("debug-on");
+
+    // ⑧ 长问答流可滚
+    send({puzzle_index: 4, story_index: 4, puzzle: "测试滚动用的谜面。",
+          qa_log: mkQa(40), qa_total: 40});
+    const qaBox = document.getElementById("qa");
+    check(qaBox.scrollHeight > qaBox.clientHeight,
+          "40 条问答应溢出可滚 (scrollH=" + qaBox.scrollHeight +
+          " clientH=" + qaBox.clientHeight + ")");
+
+    // ⑨ DOM 行数封顶: 远超上限也不卡(每行必须能不断更新)
+    //   连续推 300 条, 断言 DOM 行数被压在上限内, 且最后一条确实上屏
+    for (let n = 41; n <= 300; n += 20) {
+      const win = [];
+      for (let i = Math.max(1, n - 39); i <= n; i++) {
+        win.push({qid: i, user_name: "观众" + i, text: "问题" + i,
+                  verdict: "是", comment: "", kind: "qa"});
+      }
+      send({puzzle_index: 4, story_index: 4, puzzle: "测试。",
+            qa_log: win, qa_total: n});
+    }
+    // 再推最后一窗口, 保证末尾正好是 300
+    const finalWin = [];
+    for (let i = 261; i <= 300; i++) {
+      finalWin.push({qid: i, user_name: "观众" + i, text: "问题" + i,
+                     verdict: "是", comment: "", kind: "qa"});
+    }
+    send({puzzle_index: 4, story_index: 4, puzzle: "测试。",
+          qa_log: finalWin, qa_total: 300});
+    const rows = document.querySelectorAll("#qa-body .qa-row");
+    check(rows.length <= 60, "DOM 行数应封顶(<=60), 实际 " + rows.length);
+    check(rows.length > 0, "封顶后仍应有行");
+    const lastRow = document.querySelector("#qa-body .qa-row:last-child");
+    check(lastRow && lastRow.textContent.includes("问题300"),
+          "最新一条必须上屏: " + (lastRow && lastRow.textContent));
+
+    // ⑩ 常驻互动提示: QA 阶段显示, 揭晓时隐藏
+    send({phase: "qa", puzzle_index: 5, story_index: 5, puzzle: "新谜面。",
+          qa_log: [], qa_total: 0, hint_text: "", revealed_answer: ""});
+    const prompt = document.getElementById("prompt");
+    check(!prompt.classList.contains("hidden"), "QA 阶段应显示互动提示");
+    check(prompt.textContent.includes("#你的问题"),
+          "互动提示应说明发送格式: " + prompt.textContent);
+    send({phase: "revealed", puzzle_index: 5, story_index: 5,
+          revealed_answer: "谜底。", qa_log: [], qa_total: 0});
+    check(prompt.classList.contains("hidden"), "揭晓时应隐藏互动提示");
+
+    // ⑩.5 单条「无关」不得把上一条重复画出来
+    //     (实测 bug: 折叠起点算错, [是, 无关] 会把"是"那行画两遍)
+    send({phase: "qa", puzzle_index: 7, story_index: 7, puzzle: "重复测试。",
+          qa_log: [
+            {qid: 1, user_name: "甲", text: "唯一问题A", verdict: "是", comment: "", kind: "qa"},
+            {qid: 2, user_name: "乙", text: "唯一问题B", verdict: "无关", comment: "", kind: "qa"},
+          ], qa_total: 2});
+    const dupRows = [...document.querySelectorAll(".qa-row")].map(r => r.textContent);
+    check(dupRows.length === 2, "单条无关应显示 2 行, 实际 " + dupRows.length);
+    check(dupRows.filter(t => t.includes("唯一问题A")).length === 1,
+          "'唯一问题A' 不应重复出现: " + JSON.stringify(dupRows));
+    check(dupRows.filter(t => t.includes("唯一问题B")).length === 1,
+          "'唯一问题B' 不应重复出现: " + JSON.stringify(dupRows));
+
+    // ⑪ 连续「无关」折叠: 只留最近 2 条 + 一行"已折叠"
+    const mkIrr = (from, to) => {
+      const a = [];
+      for (let i = from; i <= to; i++) {
+        a.push({qid: i, user_name: "观众" + i, text: "无关问题" + i,
+                verdict: "无关", comment: "", kind: "qa"});
+      }
+      return a;
+    };
+    // 6 条连续无关 -> 折叠 4 条, 显示 2 条 + 1 行折叠提示
+    send({phase: "qa", puzzle_index: 6, story_index: 6, puzzle: "折叠测试。",
+          qa_log: mkIrr(1, 6), qa_total: 6});
+    const irrRows = [...document.querySelectorAll(".qa-row")];
+    const fold = document.querySelector(".qa-row.kind-fold");
+    check(fold, "连续无关应出现折叠行");
+    check(fold && fold.textContent.includes("4"),
+          "折叠行应标出折叠了几条: " + (fold && fold.textContent));
+    check(irrRows.length === 3, "6 条无关应显示为 2 条 + 1 折叠行, 实际 " + irrRows.length);
+    // 只留最近两条(无关问题5 / 无关问题6)
+    const shownTexts = irrRows.map(r => r.textContent).join("|");
+    check(!shownTexts.includes("无关问题1：") && !shownTexts.includes("无关问题2："),
+          "被折叠的旧无关不应出现在列表里: " + shownTexts);
+    check(shownTexts.includes("无关问题6"), "最近的无关应保留");
+    // 无关被打断时, 两段各自折叠
+    const mixed = mkIrr(7, 9).concat(
+      [{qid: 10, user_name: "甲", text: "关键问题", verdict: "是", comment: "", kind: "qa"}])
+      .concat(mkIrr(11, 13));
+    send({phase: "qa", puzzle_index: 6, story_index: 6, puzzle: "折叠测试。",
+          qa_log: mixed, qa_total: 13});
+    check(document.querySelectorAll(".qa-row.kind-fold").length === 2,
+          "两段无关应各自折叠成 2 行, 实际 "
+          + document.querySelectorAll(".qa-row.kind-fold").length);
+    check(document.querySelector(".qa-row:not(.kind-fold) .q")
+          || document.body.textContent.includes("关键问题"),
+          "关键的'是'问答必须保留");
+  } catch (e) { errors.push(e.stack); }
+  const result = document.createElement("pre");
+  result.id = "test-result"; result.hidden = true;
+  result.textContent = JSON.stringify(errors);
+  document.body.appendChild(result);
+});
+'''
+
+
+def main():
+    source = (ROOT / "web/index.html").read_text(encoding="utf-8")
+    source = source.replace('href="/style.css"', 'href="' + (ROOT / "web/style.css").as_uri() + '"')
+    source = source.replace('<script src="/app.js"></script>',
+                            "<script>" + CHECK + "</script><script src=\"" +
+                            (ROOT / "web/app.js").as_uri() + '\"></script>')
+    with tempfile.TemporaryDirectory(dir=ROOT / "data") as tmp:
+        page = Path(tmp) / "test.html"
+        page.write_text(source, encoding="utf-8")
+        result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu",
+                                 "--no-first-run", "--hide-scrollbars",
+                                 "--user-data-dir=" + str(Path(tmp) / "profile"),
+                                 "--window-size=1080,1920", "--virtual-time-budget=7000",
+                                 "--screenshot=" + str(ROOT / "data/preview.png"),
+                                 "--dump-dom", page.as_uri()], capture_output=True, timeout=45)
+        dom = result.stdout.decode("utf-8", errors="replace")
+        match = re.search(r'<pre id="test-result"[^>]*>(.*?)</pre>', dom, re.S)
+        assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
+        errors = json.loads(html.unescape(match[1]))
+        assert not errors, errors
+    print("PASS: 问答追加/提示行/思考中/揭晓层/换题清空/不截断/调试宽度/长流可滚；data/preview.png")
+
+
+if __name__ == "__main__":
+    main()

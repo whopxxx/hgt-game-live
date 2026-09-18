@@ -1,0 +1,671 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""弹幕接入层。
+
+两个输入源, 同一个接口 `DanmakuSource`:
+    - LiveSource  接真实抖音房间(包 CallbackFetcher)
+    - SimSource   离线回放脚本, 走真实 protobuf + 真实 _parseChatMsg
+    - StdinSource 手打弹幕
+
+关键设计: 三者最终都调用 DanmakuFetcher._parseChatMsg(payload)。
+所以离线测试测的是**真实路径**, 不是平行假实现。
+
+线程规则(硬约束):
+    _parseChatMsg 运行在 websocket 读线程上。它只做 queue.put_nowait 后立即返回,
+    绝不做 LLM/网络/重活 —— 否则会卡住全部弹幕并堵塞 socket。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+import functools
+import json
+import logging
+import os
+import queue
+import sys
+import threading
+import time
+from typing import Callable, Optional, Protocol
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from danmaku import ChatMessage, ControlMessage, DanmakuFetcher  # noqa: E402
+from .config import parse_proxy  # noqa: E402
+
+log = logging.getLogger("story.ingest")
+
+
+# ======================================================================
+def add_default_timeout(session, timeout=(5, 10)):
+    """给 requests.Session 的所有请求加默认超时。
+
+    **为什么必须加**: 上游 liveMan.py 里有多处**没有 timeout** 的请求
+    (实测至少两处: `get_room_status()` 的 session.get, 以及 `ttwid`
+    property 里的 session.get)。网络一抖, 这些请求会**永久挂起** ——
+    而它们跑在抓取线程上, 于是线程**杀都杀不掉**(Python 线程无法强杀,
+    只能等它自己跑完)。这是"重启后新连接也建不起来"的根本原因。
+
+    补在 `Session.request` 这一层(而不是只补 `get`), 这样上游以后用
+    `post()` / `put()` 也一并覆盖。
+
+    timeout=(连接超时, 读取超时), 单位秒。
+    """
+    original_request = session.request
+
+    @functools.wraps(original_request)
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", timeout)
+        return original_request(method, url, **kwargs)
+
+    session.request = request_with_timeout
+    return session
+
+
+class _StdoutToLog:
+    """把第三方库的 print() 收进 logging。
+
+    上游 liveMan.py 里散落着 `print(f"【聊天msg】…")` 之类的调试输出。
+    它们**直接写 stdout**, 走不到我们的 logging 里 —— 一开播就刷屏,
+    把真正有用的日志淹没(尤其是"首条消息加载"时那一大片)。
+
+    这里在抓取线程运行期间临时把 sys.stdout 换成这个代理, 把每行转成
+    log.debug。不改变上游任何代码。
+    """
+
+    def __init__(self, logger):
+        self._log = logger
+        self._buf = ""
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                self._log.debug("[lib] %s", line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._log.debug("[lib] %s", self._buf.strip())
+            self._buf = ""
+
+    # 有些库会检查 isatty / encoding, 给两个无害实现
+    def isatty(self):
+        return False
+
+    @property
+    def encoding(self):
+        return "utf-8"
+
+
+class ChatEvent:
+    """从 ws 线程传到消费线程的轻量事件。"""
+
+    __slots__ = ("user_id", "user_name", "content", "ts")
+
+    def __init__(self, user_id, user_name, content, ts):
+        self.user_id = user_id
+        self.user_name = user_name
+        self.content = content
+        self.ts = ts
+
+
+class DanmakuSource(Protocol):
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+
+
+# ======================================================================
+class CallbackFetcher(DanmakuFetcher):
+    """DanmakuFetcher + 聊天回调。danmaku.py 一字不改。
+
+    覆盖 _parseChatMsg 而非 _emit: _emit 太晚(在 _fp.write() 之后、被多种
+    消息共用); _parseChatMsg 全保真且无需 socket。
+    """
+
+    def __init__(self, live_id, out_path, on_chat: Callable[[ChatEvent], None],
+                 on_control: Optional[Callable[[str], None]] = None,
+                 keep_all: bool = False, proxy: Optional[str] = None,
+                 no_proxy: Optional[str] = None):
+        super().__init__(live_id, out_path, keep_all=keep_all)
+        self._on_chat = on_chat
+        self._on_control = on_control
+        self._on_frame = None       # 收到任何 WS 帧时的回调(由 LiveSource 设)
+        # 给上游的 requests.Session 加默认超时 —— 否则网络一抖, 它的
+        # 无超时 HTTP 请求会永久挂起, 把抓取线程钉死(见 add_default_timeout)。
+        try:
+            add_default_timeout(self.session, timeout=(5, 10))
+        except Exception as e:
+            log.warning("给 session 加超时失败(忽略): %s", e)
+        # 代理: 抖音必须走代理时, WebSocket 升级请求也得走, 否则会被
+        # 代理/网关拒掉(实测: 502 Bad Gateway, 响应头带 proxy-status,
+        # 那是代理自己加的 —— 说明请求到了代理, 但它没转成功)。
+        self._proxy = parse_proxy(proxy)
+        self._no_proxy = no_proxy
+        # 代际编号: 每次重建 +1。旧线程"诈尸"回来时, 靠它认领自己已过期,
+        # 不再往业务层塞数据(见 _parseChatMsg)。
+        self.generation = 0
+        self._expired = False       # 被 watchdog 标记作废后, 不再处理任何数据
+        if self._proxy:
+            log.info("弹幕连接走代理: %s (%s)", proxy, self._proxy[2])
+
+    def start(self):
+        """启动连接。有代理时**临时**给 WebSocketApp.run_forever 注入代理参数。
+
+        为什么要临时打补丁: 上游 `liveMan.py` 把 `run_forever()` 写成无参调用,
+        而 websocket-client 的代理参数只能通过 run_forever 的关键字传进去。
+        这里在连接期间替换掉 run_forever, 连上后再还原 —— 不改上游一行代码。
+        """
+        if not self._proxy:
+            return super().start()
+        import websocket as _ws_mod
+        orig = _ws_mod.WebSocketApp.run_forever
+        host, port, ptype = self._proxy
+        skip = [s.strip() for s in (self._no_proxy or "").split(",") if s.strip()]
+
+        def patched(self_ws, *a, **kw):
+            kw.setdefault("http_proxy_host", host)
+            kw.setdefault("http_proxy_port", port)
+            if ptype != "http":
+                kw.setdefault("proxy_type", ptype)
+            if skip:
+                kw.setdefault("http_no_proxy", skip)
+            return orig(self_ws, *a, **kw)
+
+        _ws_mod.WebSocketApp.run_forever = patched
+        try:
+            return super().start()
+        finally:
+            _ws_mod.WebSocketApp.run_forever = orig
+
+    def _wsOnMessage(self, ws, message):
+        """收到**任何** WebSocket 帧 —— 先记时间戳, 再交给上游解析。
+
+        为什么在这里打点: watchdog 之前只看"多久没弹幕", 但**安静的房间
+        本来就没弹幕** —— 于是好好的连接每 2 分钟被误判成"停摆"重连一次。
+
+        实际上服务器一直在推帧(心跳 ack、在线人数、礼物、系统事件)。
+        只要还有帧进来, 链路就是活的。这里给 `_on_frame` 回调打点,
+        watchdog 用它判断"连接还活着吗", 而弹幕时间只用于业务展示。
+        """
+        try:
+            if self._on_frame:
+                self._on_frame()
+        except Exception:
+            pass
+        return super()._wsOnMessage(ws, message)
+
+    def _parseChatMsg(self, payload):
+        # 代际检查: 这个回调可能来自**已经被废弃的旧连接** —— 旧线程卡在
+        # 某个请求上, watchdog 已经起了新 fetcher, 十分钟后旧请求突然返回,
+        # 旧线程又活过来继续塞消息。若不挡, 就会新旧两路数据一起进来。
+        # (用 getattr 兜底: 测试里常用 __new__ 造半成品实例, 没有该属性。)
+        if getattr(self, "_expired", False):
+            return
+        m = ChatMessage().parse(payload)
+        # 立即交接: 不做任何重活, 不在此线程调 LLM。
+        try:
+            self._on_chat(ChatEvent(m.user.id, m.user.nick_name, m.content,
+                                    time.monotonic()))
+        except Exception as e:
+            log.error("on_chat 回调异常: %s", e)
+        # 保留 JSONL 落库
+        self._emit("chat", m.user.id, m.user.nick_name, m.content)
+
+    def _emit(self, kind, user_id=None, user_name=None, content=None,
+              extra=None):
+        """和上游一样落库, 但**不 print**。
+
+        上游 `_emit` 末尾有一句 `print(f"[{kind}] …")` —— 每来一条弹幕就
+        在终端刷一行, 把真正的日志淹没。这里只去掉那句 print, 落库/计数
+        逻辑原样保留(直接调用父类实现后再撤掉输出做不到, 所以重写这一小段)。
+        """
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "kind": kind,
+            "user_id": str(user_id) if user_id is not None else None,
+            "user_name": user_name,
+            "content": content,
+        }
+        if extra:
+            rec.update(extra)
+        try:
+            self._fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._fp.flush()
+        except Exception as e:
+            log.warning("落库失败(忽略): %s", e)
+        self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def _parseControlMsg(self, payload):
+        m = ControlMessage().parse(payload)
+        if m.status == 3:
+            log.info("收到下播信号")
+            if self._on_control:
+                try:
+                    self._on_control("stream_ended")
+                except Exception as e:
+                    log.error("on_control 回调异常: %s", e)
+            # 实测: ws 未建立时 stop() 会抛 AttributeError, 必须 guard
+            try:
+                self.stop()
+            except Exception as e:
+                log.warning("stop() 失败(忽略): %s", e)
+
+
+# ======================================================================
+class LiveSource:
+    """接真实直播间。
+
+    danmaku.py 的重连退避永不重置(既有 bug), 会话后期一次抖动就丢最多 60s,
+    且之后一直慢。这里用 watchdog: 监测停摆 -> **重建**一个全新 fetcher
+    (退避归零)。不改 danmaku.py。
+    """
+
+    def __init__(self, cfg, inbox: "queue.Queue[ChatEvent]",
+                 on_stream_end: Optional[Callable[[], None]] = None,
+                 on_reconnect: Optional[Callable[[], None]] = None):
+        self.cfg = cfg
+        self.inbox = inbox
+        self._on_stream_end = on_stream_end
+        self._on_reconnect = on_reconnect
+        self._stop = threading.Event()
+        self._fetcher: Optional[CallbackFetcher] = None
+        self._last_event = time.monotonic()   # 最后一条**弹幕**(业务用)
+        self._last_frame = time.monotonic()   # 最后一个 **WS 帧**(判活用)
+        self._restarts = 0
+        self._restart_lock = threading.Lock()
+        self._consecutive_fails = 0      # 连续重建失败次数
+        self._thread: Optional[threading.Thread] = None
+        self._watchdog: Optional[threading.Thread] = None
+
+    # ------------------------------------------------------------------
+    def _on_chat(self, ev: ChatEvent) -> None:
+        self._last_event = time.monotonic()
+        self.inbox.put_nowait(ev)
+
+    def _on_frame(self) -> None:
+        """收到任何 WS 帧 —— 说明链路还活着。
+
+        和 `_last_event`(弹幕)分开: 安静的房间可能很久没弹幕, 但服务器
+        一直在推心跳/在线人数。用**帧**判活才不会误判重连。
+        """
+        self._last_frame = time.monotonic()
+
+    def _on_control(self, kind: str) -> None:
+        if kind == "stream_ended" and self._on_stream_end:
+            self._on_stream_end()
+
+    def _build(self) -> CallbackFetcher:
+        out = os.path.abspath(self.cfg.out_path)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        f = CallbackFetcher(self.cfg.live_id, out, self._on_chat,
+                            self._on_control, keep_all=self.cfg.keep_all,
+                            proxy=self.cfg.proxy,
+                            no_proxy=self.cfg.no_proxy)
+        f._on_frame = self._on_frame
+        return f
+
+    def _run(self) -> None:
+        self._fetcher = self._build()
+        self._last_event = time.monotonic()
+        self._run_fetcher(self._fetcher)
+
+    def _watch(self) -> None:
+        interval = max(5.0, self.cfg.stall_seconds / 4)
+        while not self._stop.wait(interval):
+            # 判活看**帧**(任何数据), 不看弹幕 —— 安静的房间没弹幕是正常的,
+            # 用它判活会把好连接每 2 分钟误杀一次。
+            idle = time.monotonic() - self._last_frame
+            if idle < self.cfg.stall_seconds:
+                if self._consecutive_fails:
+                    log.info("弹幕连接已恢复(之前连续重建失败 %d 次)",
+                             self._consecutive_fails)
+                    self._consecutive_fails = 0
+                continue
+            self._restarts += 1
+            self._consecutive_fails += 1
+            log.warning("弹幕停摆 %.0fs, 重建抓取连接(第 %d 次, 连续失败 %d 次)",
+                        idle, self._restarts, self._consecutive_fails)
+            self._restart()
+            if self._on_reconnect:
+                try:
+                    # 告诉上层"这是第几次连续失败" —— 连续多次就是真断了,
+                    # 页面可以据此显示"弹幕连接异常"而不是假装在直播。
+                    self._on_reconnect(self._consecutive_fails)
+                except TypeError:
+                    try:
+                        self._on_reconnect()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            # 重建后立刻把计时器归零, 给新连接一个完整的窗口
+            # (否则下一轮 tick 又会判定"还在停摆"而反复重建)
+            self._last_event = time.monotonic()
+            self._last_frame = time.monotonic()
+            # 连续失败太多次 -> 别再无脑重试, 把问题**显式喊出来**。
+            # 之前的毛病是静默失败: 画面还在放谜题, 但弹幕全收不到,
+            # 只有翻日志才发现。
+            if self._consecutive_fails == self.cfg.reconnect_alert_after:
+                log.error("=" * 56)
+                log.error("弹幕连接连续重建 %d 次仍未恢复!", self._consecutive_fails)
+                log.error("可能原因: 网络不通 / 房间已下播 / 被抖音风控 / 代理问题")
+                log.error("画面上的谜题仍在继续, 但**观众的弹幕收不到了**。")
+                log.error("请检查网络后重启, 或 Ctrl-C 退出。")
+                log.error("=" * 56)
+
+    def _restart(self) -> None:
+        """停摆时重建抓取连接。
+
+        抖音的 WS 有个麻烦特性: 心跳能发出去, 但服务端**不再推数据**,
+        socket 也一直不断 —— 所以 `run_forever()` 不会自己返回。
+
+        重建的三条纪律:
+          ① **标记旧 fetcher 作废**(`_expired=True`) —— 即使它卡在某个请求上
+             后来又"诈尸"返回, 也不会再往业务层塞数据。
+          ② **只等 2 秒**, 绝不用 `join()` 无参调用 —— 否则 watchdog 自己
+             也会被一起卡死。
+          ③ 不等旧线程死干净就起新的 —— 新连接在独立 socket 上, 不受影响。
+        """
+        if not self._restart_lock.acquire(blocking=False):
+            log.debug("已有重建在进行, 跳过")
+            return
+        try:
+            old = self._fetcher
+            if old is not None:
+                # ① 先作废: 从这一刻起, 旧线程再吐数据一律丢弃
+                old._expired = True
+                old.generation = -1
+                self._force_close(old)
+                # ② 只给 2 秒; 收不掉就算了 —— 新连接不依赖它
+                t_old = self._thread
+                if t_old is not None and t_old.is_alive():
+                    t_old.join(timeout=2.0)
+                    if t_old.is_alive():
+                        log.warning("旧抓取线程 2s 未退出, 已作废并放弃它, "
+                                    "直接起新连接")
+            self._last_event = time.monotonic()
+            self._last_frame = time.monotonic()
+            self._fetcher = self._build()
+            self._fetcher.generation = self._restarts
+            self._thread = threading.Thread(target=self._run_quiet, daemon=True,
+                                            name="live-fetcher")
+            self._thread.start()
+        finally:
+            self._restart_lock.release()
+
+    @staticmethod
+    def _force_close(f) -> None:
+        """尽最大努力让上游 fetcher 的 run_forever() 退出。
+
+        难点: `run_forever()` 卡在 `sock.recv()` 上, 而从**另一个线程**调
+        `ws.close()` 只是标记了关闭 + 关掉 socket, 并不会立刻唤醒阻塞中的
+        recv —— 实测旧线程 5 秒都不退出, 新旧两个抓取线程互相打架, 结果
+        谁也连不上(日志里"停摆 -> 重建 -> 又停摆"的死循环)。
+
+        做法: 除了 close, 还要**强行 shutdown 底层 socket**,
+        让 recv 立刻抛异常返回。
+        """
+        ws = getattr(f, "ws", None)
+        if ws is not None:
+            # ① 先拿到底层 socket 并 shutdown —— 这一步才能真正唤醒 recv
+            sock = getattr(ws, "sock", None)
+            if sock is not None:
+                try:
+                    import socket as _s
+                    sock.shutdown(_s.SHUT_RDWR)
+                except Exception:
+                    pass
+            # ② 再走正常 close(触发 on_close)
+            try:
+                ws.close()
+            except Exception:
+                pass
+        try:
+            f.stop()                       # 上游实现: self.ws.close()
+        except Exception:
+            pass
+        # ③ 兜底: 直接关掉 fetcher 持有的底层 socket
+        for attr in ("sock", "_sock"):
+            s = getattr(f, attr, None)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    def _run_quiet(self) -> None:
+        self._run_fetcher(self._fetcher)
+
+    @staticmethod
+    def _run_fetcher(f) -> None:
+        """跑抓取循环, 期间把上游的 print() 收进 logging。
+
+        上游 liveMan.py 会直接 print 各种调试信息(聊天msg/礼物/心跳…),
+        不接管的话开播就刷屏。这里只在本线程内换掉 sys.stdout。
+        """
+        old = sys.stdout
+        sys.stdout = _StdoutToLog(log)
+        try:
+            f.start()
+        except Exception as e:
+            log.error("抓取线程退出: %s", e)
+        finally:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+            sys.stdout = old
+
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="live-fetcher")
+        self._thread.start()
+        self._watchdog = threading.Thread(target=self._watch, daemon=True,
+                                          name="live-watchdog")
+        self._watchdog.start()
+        log.info("LiveSource 已启动: %s", self.cfg.live_id)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._fetcher is not None:
+            try:
+                self._fetcher.stop()
+            except Exception:
+                pass
+
+    @property
+    def restarts(self) -> int:
+        return self._restarts
+
+
+# ======================================================================
+class SimSource:
+    """离线回放脚本。时钟驱动, 可 loop 无人值守。
+
+    脚本每行一个 JSON:
+        {"at_ms":1000,"user_name":"观众A","content":"#上楼"}
+        {"at_ms":2000,"user_id":123,"user_name":"观众B","content":"#开门"}
+        {"loop":true}
+        {"control":"stream_ended"}
+
+    at_ms 是相对本轮开始的偏移。loop=true 时每轮从头重发。
+    经**真实** protobuf + **真实** _parseChatMsg —— 离线即真实路径。
+    """
+
+    def __init__(self, cfg, inbox: "queue.Queue[ChatEvent]",
+                 on_stream_end: Optional[Callable[[], None]] = None):
+        self.cfg = cfg
+        self.inbox = inbox
+        self._on_end = on_stream_end
+        self._script: list[dict] = []
+        self._loop_items: list[dict] = []
+        self._controls: list[dict] = []
+        self._loop_enabled = False
+        self._auto_id = 900000
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # 用一个不落库的 fetcher 实例驱动真解析路径
+        self._fetcher: Optional[CallbackFetcher] = None
+
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        path = self.cfg.sim_path
+        items: list[dict] = []
+        loop = False
+        with open(path, "r", encoding="utf-8") as f:
+            for ln, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("//"):
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError as e:
+                    log.error("脚本第 %d 行不是合法 JSON: %s", ln, e)
+                    continue
+                if rec.get("loop"):
+                    loop = True
+                elif rec.get("control"):
+                    items.append({"control": rec["control"]})
+                elif "content" in rec:
+                    items.append({
+                        "at_ms": int(rec.get("at_ms", 0)),
+                        "user_name": rec.get("user_name", "观众"),
+                        "user_id": rec.get("user_id"),
+                        "content": rec["content"],
+                    })
+        self._script = items
+        # loop 时不重发 control 行(否则会立刻结束)
+        self._loop_items = [it for it in items if "control" not in it]
+        self._controls = [it for it in items if "control" in it]
+        self._loop_enabled = loop
+        log.info("SimSource 载入 %d 条弹幕, loop=%s", len(self._loop_items), loop)
+
+    def _ensure_fetcher(self) -> CallbackFetcher:
+        """构造一个真 fetcher 用于驱动 _parseChatMsg。
+
+        用 /dev/null 等价的丢弃文件, 避免污染真实 JSONL。
+        """
+        if self._fetcher is None:
+            # 注意: 不调用 start(), 所以不会有 socket; 仅借用解析路径。
+            self._fetcher = CallbackFetcher.__new__(CallbackFetcher)
+            self._fetcher._on_chat = lambda ev: self.inbox.put_nowait(ev)
+            self._fetcher._on_control = None
+            self._fetcher.keep_all = False
+            self._fetcher.out_path = os.devnull
+            import collections
+            self._fetcher._counts = collections.Counter()
+            self._fetcher._fp = open(os.devnull, "w", encoding="utf-8")
+        return self._fetcher
+
+    def _emit(self, rec: dict) -> None:
+        f = self._ensure_fetcher()
+        m = ChatMessage()
+        m.common.method = "WebcastChatMessage"
+        m.user.nick_name = rec["user_name"]
+        uid = rec.get("user_id")
+        if uid is None:
+            self._auto_id += 1
+            uid = self._auto_id
+        m.user.id = int(uid)
+        m.content = rec["content"]
+        # 走真实解析路径
+        f._parseChatMsg(m.SerializeToString())
+
+    # ------------------------------------------------------------------
+    def _run(self) -> None:
+        self._load()
+        if not self._loop_items:
+            log.error("脚本没有可用弹幕行")
+            return
+        first_pass = True
+        while not self._stop.is_set():
+            # 每轮: 按 at_ms 排序回放
+            base = time.monotonic()
+            for rec in sorted(self._loop_items, key=lambda r: r["at_ms"]):
+                if self._stop.is_set():
+                    return
+                wait = rec["at_ms"] / 1000.0 - (time.monotonic() - base)
+                if wait > 0 and self._stop.wait(wait):
+                    return
+                try:
+                    self._emit(rec)
+                except Exception as e:
+                    log.error("模拟弹幕投递失败: %s", e)
+            # control 行只在第一遍发送
+            if first_pass:
+                first_pass = False
+                for c in self._controls:
+                    if c["control"] == "stream_ended":
+                        log.info("SimSource: 脚本触发 stream_ended")
+                        if self._on_end:
+                            self._on_end()
+                        return
+            if not self._loop_enabled:
+                return
+            # loop: 回放一遍后歇一会儿再来(海龟汤没有固定回合长度,
+            # 用一个够长的等待, 让脚本大致按一题的节奏循环)
+            if self._stop.wait(getattr(self.cfg, "sim_loop_gap", 20.0)):
+                return
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="sim-source")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ======================================================================
+class StdinSource:
+    """从标准输入手打弹幕。每行 '内容' 或 '名字: 内容'。"""
+
+    def __init__(self, cfg, inbox: "queue.Queue[ChatEvent]"):
+        self.cfg = cfg
+        self.inbox = inbox
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._auto_id = 800000
+
+    def _run(self) -> None:
+        log.info("StdinSource: 每行输入弹幕(如 `#上楼`), Ctrl+D 结束")
+        # Windows 上 sys.stdin 默认按 GBK 解码, 而输入/脚本基本是 UTF-8,
+        # 结果中文全变成乱码(实测: "甲:#他是盲人吗" -> "鐢?:#浠栨槸...")。
+        # 这里显式按 UTF-8 读, 坏字节用替换字符兜住, 不让它抛异常。
+        stream = sys.stdin
+        try:
+            stream = open(sys.stdin.fileno(), "r", encoding="utf-8",
+                          errors="replace", closefd=False)
+        except Exception:
+            try:
+                sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        try:
+            for line in stream:
+                if self._stop.is_set():
+                    return
+                line = line.rstrip("\n").rstrip("\r")
+                if not line.strip():
+                    continue
+                name, content = "我", line
+                if ":" in line:
+                    a, b = line.split(":", 1)
+                    if a.strip() and not a.strip().startswith("#"):
+                        name, content = a.strip(), b.strip()
+                self._auto_id += 1
+                self.inbox.put_nowait(ChatEvent(self._auto_id, name, content,
+                                                time.monotonic()))
+        except Exception as e:
+            log.error("stdin 读取结束: %s", e)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="stdin-source")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()

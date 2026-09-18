@@ -1,0 +1,18 @@
+[project]
+name = "douyin-danmaku"
+version = "0.1.0"
+description = "抖音直播弹幕抓取（仅抓取，落库 JSONL）"
+requires-python = ">=3.12"
+
+# 与仓库内 requirements.txt 保持一致，版本已实测锁定
+dependencies = [
+    "requests==2.31.0",
+    "betterproto==2.0.0b6",
+    "websocket-client==1.7.0",
+    "PyExecJS==1.5.1",
+    "mini-racer==0.12.4",
+]
+
+[tool.uv]
+# 依赖在 .venv 里，不往系统环境装
+package = false

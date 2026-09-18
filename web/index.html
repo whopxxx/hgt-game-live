@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 海龟汤直播</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <div id="content">
+
+      <!-- ============ 上半部: 谜面(大字, 固定) ============ -->
+      <section id="top">
+        <div id="puzzle-head">
+          <span id="puzzle-index"></span>
+          <span id="puzzle-timer"></span>
+          <span id="puzzle-elapsed"></span>
+        </div>
+        <div id="puzzle"></div>
+        <div id="reveal" class="hidden">
+          <div id="reveal-label">谜底揭晓</div>
+          <div id="reveal-body"></div>
+          <div id="reveal-next"></div>
+        </div>
+      </section>
+
+      <!-- ============ 下半部: 问答流(持续上滚) ============ -->
+      <section id="bottom">
+        <div id="qa-title">问答</div>
+        <div id="qa">
+          <div id="qa-body"></div>
+        </div>
+        <div id="prompt">发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓</div>
+        <div id="thinking" class="hidden">AI 正在思考…</div>
+        <div id="hintbar" class="hidden"></div>
+        <div id="stats"></div>
+      </section>
+
+      <!-- 弹幕流 -->
+      <div id="danmaku"></div>
+    </div>
+
+    <!-- 调试面板(独立列, 不遮挡内容) -->
+    <div id="debug" class="hidden">
+      <h3>调试</h3>
+      <div id="debug-body"></div>
+    </div>
+
+    <div id="conn" class="hidden">连接中…</div>
+    <div id="toast" class="hidden"></div>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
