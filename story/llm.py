@@ -1523,8 +1523,12 @@ _TOOL_JUDGE = {
                 "description": "是否说中了谜底里的关键事实/身份/物品(增强项, 非必需)",
             },
             "matched_atoms": {
-                "type": "array", "items": {"type": "integer"},
-                "description": "说中的 solve_atoms 序号(从 0 开始), 没有就留空",
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "说中的 solve_atoms 的 **id**(不是序号), 例如 [\"a1\","
+                    " \"a2\"]。没有就留空。用 id 而不是序号: 序号会随"
+                    " facts/atoms 被审稿人重排而漂移, 同一个序号在不同版本"
+                    "里指向不同的 atom。"),
             },
         },
         "required": ["is_guess", "cause_hit", "mechanism_hit"],
@@ -2388,10 +2392,13 @@ class PuzzleWriter:
             lines = []
             for i, a in enumerate(atoms):
                 if isinstance(a, dict):
-                    lines.append(f"{i}. [{a.get('role','?')}] {a.get('text','')}")
+                    # 带上 id —— Step 08 之后模型要按 **id** 回传命中项。
+                    aid = str(a.get("id", "") or "")
+                    lines.append(f"{aid or i}. [{a.get('role','?')}] "
+                                 f"{a.get('text','')}")
                 else:
                     lines.append(f"{i}. {a}")
-            atom_txt = ("\n【要说到的事实(编号从 0 开始, 方括号是角色)】\n"
+            atom_txt = ("\n【要说到的事实(id, 方括号是角色)】\n"
                         + "\n".join(lines))
         # ---- Step 07: 事实表进 Judge prompt ----
         # 收 `facts` 参数却不用, 等于"canonical facts 是唯一判定依据"这条
@@ -2427,14 +2434,49 @@ class PuzzleWriter:
             is_guess = bool(ti.get("is_guess", True))
             cause = bool(ti.get("cause_hit"))
             mech = bool(ti.get("mechanism_hit"))
-            hit = [int(x) for x in (ti.get("matched_atoms") or [])
-                   if isinstance(x, (int, float))]
+            # ---- Step 08: 命中项用 **atom id**, 老格式(序号)兼容读 ----
+            #
+            # 为什么必须换成 id: `matched_atoms` 原来存序号, 而序号是
+            # **位置** —— 审稿人重排/增删 atoms 之后, 同一个序号指向的
+            # 已经是另一条 atom。archive 里存下来的"命中 0 号"于是会
+            # 在下一版里被读成完全不同的东西(离线分析、复盘全错)。
+            # id 由生成器分配且随 atom 走, 不随位置漂移。
+            #
+            # 兼容: 老 archive 与老 fixture 里存的是整数序号, 仍按
+            # **当前位置**解析; 解析不出 id 的整数一律丢弃(不猜)。
+            roles, id_to_role = {}, {}
+            for i, a in enumerate(atoms):
+                if isinstance(a, dict):
+                    roles[i] = a.get("role")
+                    aid = str(a.get("id", "") or "")
+                    if aid:
+                        id_to_role[aid] = a.get("role")
+                        roles[aid] = a.get("role")
+                else:
+                    roles[i] = None
+            raw_hits = list(ti.get("matched_atoms") or [])
+            hit = []
+            hit_roles = set()
+            for x in raw_hits:
+                if isinstance(x, str):
+                    key = x.strip()
+                    if key in id_to_role:
+                        hit.append(key)
+                        hit_roles.add(id_to_role[key])
+                    elif key.isdigit() and int(key) < len(atoms):
+                        # 老格式的数字字符串: 当序号用
+                        i = int(key)
+                        hit.append(i)
+                        hit_roles.add(roles.get(i))
+                elif isinstance(x, (int, float)) and not isinstance(x, bool):
+                    # 老格式: 整数序号
+                    i = int(x)
+                    if 0 <= i < len(atoms):
+                        hit.append(i)
+                        hit_roles.add(roles.get(i))
             solved = is_guess and cause and mech
             # ---- 代码层一致性校验: 说中机制就必须真的命中 mechanism atom ----
-            roles = {i: (a.get("role") if isinstance(a, dict) else None)
-                     for i, a in enumerate(atoms)}
             if solved and any(r in ("cause", "mechanism") for r in roles.values()):
-                hit_roles = {roles.get(i) for i in hit}
                 if "cause" not in hit_roles or "mechanism" not in hit_roles:
                     log.info("裁判称说中但 atom 覆盖不足(cause=%s mech=%s "
                              "命中=%s), 判为未中: %r",

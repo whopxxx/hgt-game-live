@@ -942,6 +942,91 @@ def test_atom_role_gate():
     check("老格式(无 role)不误杀", jr3.solved is True, jr3)
 
 
+# ======================================================================
+# Step 08 — Stable atom IDs
+# ======================================================================
+def test_s08_judge_accepts_atom_ids():
+    """Step 08: 命中项用 **id** 回传, 而不是序号。"""
+    print("\n[S08-1] Judge 接受 atom id")
+    ATOMS = [{"id": "a1", "role": "cause", "text": "退潮时礁石露出水面"},
+             {"id": "a2", "role": "mechanism", "text": "亮灯标礁石位置"}]
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": ["a1", "a2"]})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "退潮礁石露出, 亮灯标位置", ATOMS)
+    check("id 命中 -> 通关", jr.solved is True, jr)
+    check("matched_atoms 保留 id 形式",
+          "a1" in jr.matched_atoms and "a2" in jr.matched_atoms,
+          jr.matched_atoms)
+
+
+def test_s08_judge_prompt_shows_atom_ids():
+    """Judge prompt 里必须能看到 atom id, 否则模型无从回传。"""
+    print("\n[S08-2] Judge prompt 展示 atom id")
+    ATOMS = [{"id": "a1", "role": "cause", "text": "退潮时礁石露出水面"},
+             {"id": "a2", "role": "mechanism", "text": "亮灯标礁石位置"}]
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": False, "mechanism_hit": False,
+        "matched_atoms": []})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.judge("谜面", "谜底", "x", ATOMS)
+    user = fc.calls[0]["user"]
+    check("prompt 里有 a1", "a1." in user or "a1 " in user, user[:300])
+    check("prompt 里有 a2", "a2." in user or "a2 " in user, user[:300])
+    check("不再说『编号从 0 开始』", "编号从 0 开始" not in user, user[:300])
+
+
+def test_s08_legacy_index_still_readable():
+    """老 archive / 老 fixture 存的是**序号** -> 仍要能读懂。"""
+    print("\n[S08-3] 老格式(整数序号)兼容读取")
+    ATOMS = [{"id": "a1", "role": "cause", "text": "原因"},
+             {"id": "a2", "role": "mechanism", "text": "机制"}]
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": [0, 1]})])          # 老格式: 序号
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "x", ATOMS)
+    check("老序号仍能通关", jr.solved is True, jr)
+
+
+def test_s08_unknown_atom_id_is_dropped():
+    """回传了不存在的 id -> 丢弃(不猜), 且不因此通关。"""
+    print("\n[S08-4] 不存在的 atom id 被丢弃")
+    ATOMS = [{"id": "a1", "role": "cause", "text": "原因"},
+             {"id": "a2", "role": "mechanism", "text": "机制"}]
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": ["a1", "a99"]})])   # a99 不存在
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "x", ATOMS)
+    check("a99 被丢弃", "a99" not in jr.matched_atoms, jr.matched_atoms)
+    check("缺 mechanism -> 不通关(代码层 gate 仍生效)",
+          jr.solved is False, jr)
+
+
+def test_s08_index_is_not_stable_across_reorder():
+    """**为什么必须用 id**: 序号是位置, 重排后就指向别的 atom。
+
+    这条是 Step 08 的动机本身: 同一句观众猜测, 在 atoms 被审稿人重排
+    之后, 用序号会解析成**另一条** atom。
+    """
+    print("\n[S08-5] 序号会漂移, id 不会")
+    before = [{"id": "a1", "role": "cause", "text": "原因"},
+              {"id": "a2", "role": "mechanism", "text": "机制"}]
+    after = [{"id": "a2", "role": "mechanism", "text": "机制"},
+             {"id": "a1", "role": "cause", "text": "原因"}]   # 重排
+    ti = {"is_guess": True, "cause_hit": True, "mechanism_hit": True,
+          "matched_atoms": ["a1", "a2"]}
+    fc = FakeClient([LLMResult(tool_input=ti)])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    check("重排前 id 命中 -> 通关", w.judge("谜面", "谜底", "x", before).solved)
+    fc2 = FakeClient([LLMResult(tool_input=ti)])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    check("**重排后同一条 id 仍通关**(序号做不到这点)",
+          w2.judge("谜面", "谜底", "x", after).solved)
+
+
 def test_judge_technical_failure_not_downgraded_to_irrelevant():
     print("[Q5: 裁判技术失败不能伪装成'无关', 也不抹掉第一层裁决]")
     # 第一层判"是" + candidate=true, 但裁判调用技术失败。
@@ -2327,6 +2412,12 @@ def main():
               test_no_repeat_puzzles,
               test_riddle_check_retries_empty_tool_use, test_english_riddle_rejected_on_text_path,
               test_atom_role_gate,
+              # ---- Step 08: stable atom IDs ----
+              test_s08_judge_accepts_atom_ids,
+              test_s08_judge_prompt_shows_atom_ids,
+              test_s08_legacy_index_still_readable,
+              test_s08_unknown_atom_id_is_dropped,
+              test_s08_index_is_not_stable_across_reorder,
               test_judge_technical_failure_not_downgraded_to_irrelevant,
               test_reviewer_keeps_solve_atoms,
               test_reviewer_can_replace_atoms_when_answer_changes,
