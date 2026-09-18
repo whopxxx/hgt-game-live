@@ -965,7 +965,19 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 - "是纪念死在海里的人"         -> false(万能悲情猜法)
 - "退潮时礁石才露出来, 亮灯是标礁石, 涨潮后继续亮反而误导船只" -> true
 
-【拿不准时, 把对应的那项填 false。】按工具字段**逐项返回**, 不要只回一个词。"""
+【拿不准时, 把对应的那项填 false。】按工具字段**逐项返回**, 不要只回一个词。
+
+═══ 【事实表】是 canonical world(Step 07)═══
+若用户消息里给了【事实表(判定依据)】:
+- **它是这道题唯一权威的事实集合。** 谜底只是叙事文本, 可能与事实表的
+  措辞不完全一致; 冲突时**以事实表为准**。
+- 观众的猜测若**与事实表里某条明确事实互斥**, 即使听起来"很接近",
+  也**必须判 false**。典型: 事实表说"指针被**人为拨快**", 观众说"钟
+  **出故障**走快了" —— 人为 vs 故障互斥, 判 false。
+- 判 true 时, 你说的机制必须能在事实表里找到对应的事实, 不能是谜底
+  叙事里的自由发挥。
+- 事实表没写的关键设定, **不得**自行补上(与 Answer 阶段同一条纪律)。
+"""
 
 
 #: Reviewer 必须**完整**回传的 observed signature 字段。
@@ -2381,8 +2393,26 @@ class PuzzleWriter:
                     lines.append(f"{i}. {a}")
             atom_txt = ("\n【要说到的事实(编号从 0 开始, 方括号是角色)】\n"
                         + "\n".join(lines))
+        # ---- Step 07: 事实表进 Judge prompt ----
+        # 收 `facts` 参数却不用, 等于"canonical facts 是唯一判定依据"这条
+        # 规则在裁判阶段不成立 —— Judge 只能拿谜底叙事去比, 而谜底是
+        # 生成器的自由文本, 可能与事实表措辞冲突(真实案例: 事实说"人为
+        # 拨快", 观众说"故障", Judge 因为看不到事实而放行)。
+        #
+        # 渲染格式与 Answer 阶段**共用** `_facts_block`, 两处措辞一致,
+        # 模型不必学两套。
+        facts_txt = ""
+        if facts:
+            flist = [f if isinstance(f, PuzzleFact) else PuzzleFact.from_dict(f)
+                     for f in facts]
+            flist = [f for f in flist if f.text]
+            if flist:
+                facts_txt = ("\n【事实表(判定依据, 唯一权威)】\n"
+                             + "\n".join(f"- {f.id} [{f.kind}] {f.text}"
+                                         for f in flist))
         user = (f"【谜面】{puzzle}\n"
-                f"【谜底】{answer}\n"
+                f"【谜底(叙事文本, 与事实表冲突时以事实表为准)】{answer}\n"
+                f"{facts_txt}"
                 f"{atom_txt}\n\n"
                 f"观众的提问：{text}\n\n"
                 f"这条提问覆盖了哪些？请逐项判断。")

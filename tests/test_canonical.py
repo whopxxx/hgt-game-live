@@ -182,14 +182,14 @@ def test_answer_prompt_does_include_canonical_facts():
     check("观众原话在 prompt 里", fx["viewer_text"] in user, user[-300:])
 
 
-def test_judge_prompt_omits_canonical_facts():
-    """Step 07 的靶子: **Final Judge 的 prompt 里没有事实表**。
+def test_judge_prompt_includes_canonical_facts():
+    """Step 07 **已修**: Final Judge 的 prompt 现在带事实表。
 
-    `judge()` 收了 `facts` 参数却从不使用 —— 它只看谜面/谜底/atoms。
-    于是"canonical facts 是唯一判定依据"这条规则在 Judge 阶段不成立。
-    这条现在断言的是**当前缺陷**(所以叫 omits)。
+    Step 05 时这条断言的是"缺失"(`judge()` 收了 `facts` 却不用)。
+    Step 07 把事实表送进裁判 prompt, 并声明它是 canonical world、
+    与谜底冲突时以它为准。
     """
-    print("\n[S05-4] Final Judge prompt **不含**事实表(当前缺陷)")
+    print("\n[S07-1] Final Judge prompt 现在**带**事实表")
     fx = load_fixture()
     facts, atoms = _spec_from_fixture(fx)
     cli = _ReplayClient(tool_input={
@@ -200,25 +200,18 @@ def test_judge_prompt_omits_canonical_facts():
             text="父亲被钟声叫走了", solve_atoms=atoms, facts=facts)
     user = cli.calls[0]["user"]
     check("judge prompt 有谜面", "谜面" in user, user[:120])
-    check("judge prompt 有谜底", "谜底" in user, user[:120])
-    # 当前状态: 事实表**不在**里面 —— Step 07 要把它加进去。
-    #
-    # ⚠️ 不能用"文本里有没有『人为拨快』"来判断: 那道事实的措辞**也会**
-    # 出现在【谜底】里(谜底本来就在讲同一件事)。用渲染后的**结构标记**
-    # `- f1 [core]` 才精确 —— 那是 `_facts_block` 独有的格式。
-    check("**judge prompt 目前没有事实表块**(Step 07 要修的点)",
-          "【事实表" not in user and "- f1 [" not in user, user[:400])
-    check("judge 也拿不到 f1 的 id(无 facts 块)", "- f1 [" not in user,
-          user[:400])
+    check("judge prompt 有事实表块", "【事实表" in user, user[:400])
+    # 用 `_facts_block` 独有的渲染标记做精确检测 —— 不能用"文本里有没有
+    # 『人为拨快』", 那句话**也**出现在谜底里(会假绿, Step 05 踩过)。
+    check("f1 以结构化形式出现(- f1 [core] …)", "- f1 [" in user, user[:400])
+    check("f2 也在里面", "- f2 [" in user, user[:500])
+    check("声明事实表是唯一权威",
+          "唯一权威" in user or "以事实表为准" in user, user[:600])
 
 
-def test_judge_facts_param_is_accepted_but_unused():
-    """`judge()` 签名收了 `facts`, 但**逐字**确认它没进 prompt。
-
-    这条比上一条更直接: 同一组参数传 facts / 不传 facts, 请求体**完全
-    相同** —— 说明该参数当前是死的。
-    """
-    print("\n[S05-5] facts 参数当前是死的(传与不传请求体相同)")
+def test_judge_facts_param_is_now_used():
+    """Step 07: `facts` 参数不再是死的 —— 传与不传请求体**必须不同**。"""
+    print("\n[S07-2] facts 参数现在真的被用")
     fx = load_fixture()
     facts, atoms = _spec_from_fixture(fx)
     ti = {"is_guess": True, "cause_hit": True, "mechanism_hit": True,
@@ -234,9 +227,32 @@ def test_judge_facts_param_is_accepted_but_unused():
     w2.judge(puzzle=fx["puzzle"], answer=fx["answer"], text="x",
              solve_atoms=atoms, facts=None)
 
-    check("传 facts 与不传 facts, judge 请求体完全相同(参数当前无效)",
-          c1.calls[0]["user"] == c2.calls[0]["user"],
-          "两者不同 -> 说明 facts 其实被用了")
+    check("传 facts 与不传, 请求体**不同**(参数生效)",
+          c1.calls[0]["user"] != c2.calls[0]["user"])
+    check("差异就是事实表块",
+          "【事实表" in c1.calls[0]["user"]
+          and "【事实表" not in c2.calls[0]["user"])
+    check("无 facts 时不出现空的『事实表』标题",
+          "【事实表" not in c2.calls[0]["user"], c2.calls[0]["user"][:200])
+
+
+def test_judge_explains_conflict_rule():
+    """Step 07: JUDGE_SYSTEM 必须写明"与事实表互斥 -> 判 false"。
+
+    光把事实塞进 prompt 不够 —— 模型得知道事实表**压倒**谜底叙事, 否则
+    它仍可能按谜底的措辞宽判(这正是 Step 05 复现的那条)。
+    """
+    print("\n[S07-3] JUDGE_SYSTEM 写明冲突规则")
+    from story.llm import JUDGE_SYSTEM
+    check("提到 canonical world 或唯一权威",
+          "canonical" in JUDGE_SYSTEM or "唯一权威" in JUDGE_SYSTEM)
+    check("明确冲突时以事实表为准",
+          "以事实表为准" in JUDGE_SYSTEM or "以事实表" in JUDGE_SYSTEM)
+    check("给出『互斥 -> false』的规则", "互斥" in JUDGE_SYSTEM, "")
+    check("举了人为拨快 / 故障这个真实例子",
+          "人为拨快" in JUDGE_SYSTEM and "故障" in JUDGE_SYSTEM)
+    check("禁止补事实表没写的设定",
+          "不得" in JUDGE_SYSTEM and "自行补" in JUDGE_SYSTEM)
 
 
 def main():
@@ -244,8 +260,9 @@ def main():
         test_fixture_is_the_real_one,
         test_answer_replay_returns_wrong_verdict,
         test_answer_prompt_does_include_canonical_facts,
-        test_judge_prompt_omits_canonical_facts,
-        test_judge_facts_param_is_accepted_but_unused,
+        test_judge_prompt_includes_canonical_facts,
+        test_judge_facts_param_is_now_used,
+        test_judge_explains_conflict_rule,
     ]
     for t in tests:
         t()
@@ -253,7 +270,7 @@ def main():
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} 项")
         return 1
-    print("PASS: Step 05 canonical regression —— 当前错误已复现(尚未修)")
+    print("PASS: canonical regression —— Step 05 复现, Step 07 已修 Judge")
     return 0
 
 
