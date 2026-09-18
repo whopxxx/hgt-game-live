@@ -249,17 +249,87 @@ A 到 80、B 下一条到 90 时真实总量只是 90, 按用户累加会错算�
 > 服务端路由、消息订阅差异、房间条件等。cursor 通常涉及恢复位置/会话
 > 状态, 不能仅凭"低频 Gift 不见了"就推导它按消息类型过滤。
 
-### 下一步(已定)
+### `/im/fetch/` 路线已放弃(实测空 body)
 
-1. **修连接层**: 用**本次直播实时取得**的 cursor + internal_ext 引导 WS。
-   已实现为 `/webcast/im/fetch/` -> protobuf `Response.cursor/internalExt`
-   (与外部工作实现同一路), **每次连接重新取**, 失败才回退;
-   日志会明确打出 `本次连接使用 dynamic / fallback`。
-2. **A/B 验证**: A = 旧写死 bootstrap(已有 A: 0 Gift);
-   B = 动态 bootstrap, **其余解析/handler/房间/礼物动作全部不变**。
-   - A:0 / B:有 Gift -> 强证据指向旧 bootstrap;
-   - 两边仍 0 -> 继续查其他 WS 参数/订阅, 而不是动 Gift accumulator。
-3. 再做 **两用户 Like smoke** 回答 §12B-Like 的口径问题。
+本环境实测: `/webcast/im/fetch/` **恒返回 HTTP 200 + 空 body**。
+试过的变体(全部 len=0, 返回头都是 `application/json`):
+
+```text
+resp_content_type=protobuf / json / 不带
+cursor 为空 / 为 d-1 形式
+internal_ext 为空 / 带 internal_src:dim
+```
+
+即: 请求被接受, 但服务端不按我们要求回数据。很可能是 `a_bogus` 的
+**签名范围**与该 endpoint 校验的参数集不一致。
+
+**决定: 不继续在这里投入**(追签名/cookie parity 的性价比已不划算),
+改走下面的本地生成路线。`_fetch_bootstrap_state()` 保留为诊断代码,
+**不再是生产 dynamic 的前置条件**。
+
+### 本地生成 bootstrap(当前 B 路径)
+
+外部当前实现 `JaneEyre3007/douyin-js` 的 `genCursorInternalExt()`
+**不经过任何 HTTP bootstrap**, 直接取 `Date.now()` 在**本地**构造:
+
+```text
+sec    = floor(now_ms / 1000)
+base   = sec << 32
+r      = base + random16
+h      = base + random32
+wrds_v = base + random16
+
+cursor       = t-{now_ms}_r-{r}_d-1_u-1_h-{h}
+internal_ext = internal_src:dim
+               |wss_push_room_id:{room_id}
+               |wss_push_did:{user_unique_id}
+               |first_req_ms:{now_ms}
+               |fetch_time:{now_ms}
+               |seq:1
+               |wss_info:0-{now_ms}-0-0
+               |wrds_v:{wrds_v}
+```
+
+其 README 称"本地还原 signature / cursor / internal_ext, 直接连接
+WebSocket"。
+
+> ⚠️ **这是"外部当前实现采用的做法", 不是"抖音官方协议定义"。**
+> 我们采用它是为了做一个**单变量实验**, 而不是因为我们知道这是官方算法。
+> 见 `vendor/douyin_fetcher/ws_bootstrap.py` 的边界说明。
+
+**旁证**: 另有旧实现同样直接使用这种时间戳形态的 cursor/internal_ext
+而非 HTTP bootstrap(例如 `fetch_time` 与 cursor 使用同一个毫秒值)。
+
+### 下一步的 A/B(单变量)
+
+```text
+A: 旧 fallback cursor/internal_ext(2024-07 写死值)   <- 已有 A: 0 Gift
+B: local-generated(JaneEyre 算法)                     <- 本轮
+其余: room / WS host / signature / handler / proto / 礼物操作 全部不变
+```
+
+- A:0 / B:有 Gift -> 强证据: 旧 stale bootstrap 影响了收到的消息集合;
+- 两边仍 0 -> bootstrap 假设**降级**, 转去查 WS host / `signature` 参数 /
+  身份与订阅条件。**仍然不是动 Gift accumulator 的理由。**
+
+有效性判据: 日志必须显示
+`【bootstrap】本次连接使用 local-generated now_ms=...`。
+
+### 另: method 探针已排除一个分支
+
+上一轮 257 条消息的分布是:
+
+```text
+member 167 + chat 65 + like 24 + social 1 = 257
+```
+
+四类**已经吃满** 257, 没有剩余空间给一个未知的新礼物 method。所以在那一轮
+连接里, **证据不支持**"礼物以另一个 method 名进来了、被 `continue` 静默
+丢弃"这个分支(前提是该轮 `method 汇总` 的 `unhandled` 为空)。
+
+### 仍待做
+
+**两用户 Like smoke** 回答 §12B-Like 的口径问题(room-wide vs per-user)。
 
 **在拿到 12B-Gift 的真实样本之前, Gift delta accumulator 依然禁止实现。**
 

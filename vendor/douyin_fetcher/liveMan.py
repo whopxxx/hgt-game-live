@@ -25,6 +25,7 @@ import websocket
 from py_mini_racer import MiniRacer
 
 from ac_signature import get__ac_signature
+from ws_bootstrap import generate_ws_bootstrap
 from protobuf.douyin import *
 
 from urllib3.util.url import parse_url
@@ -241,8 +242,31 @@ class DouyinLiveWebFetcher:
             nickname = user.get('nickname')
             print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
     
+    def _local_bootstrap(self, now_ms: int) -> dict:
+        """本地生成 cursor / internal_ext(Step 12B 的单变量实验)。
+
+        包装 `ws_bootstrap.generate_ws_bootstrap`, 注入 room / 身份 / 时钟。
+        **只做这一件事** —— 不碰任何其他连接参数。
+        """
+        return generate_ws_bootstrap(
+            room_id=self.room_id,
+            user_unique_id=self.user_unique_id,
+            now_ms=now_ms)
+
     def _fetch_bootstrap_state(self):
-        """连接 WS **之前**, 取本次直播的 cursor / internal_ext。
+        """⚠️ **实验/诊断用, 不再是生产路径**(Step 12B 起)。
+
+        实测在本项目环境里, `/webcast/im/fetch/` **恒返回 HTTP 200 + 空
+        body**(试过 protobuf/json/不带 resp_content_type、空 cursor、
+        d-1 cursor、带 internal_src, 全部 len=0), 返回头还是
+        `application/json` —— 说明请求被接受但服务端不按我们要求回数据,
+        很可能是 `a_bogus` 的签名范围与该 endpoint 校验的参数集不一致。
+
+        而外部当前实现提供了**完全不经它**的本地生成路径
+        (`ws_bootstrap.generate_ws_bootstrap`), 所以生产改走那条。
+        本函数保留下来只为将来诊断/对照, **不再作为 dynamic 的前置条件**。
+
+        原说明: 连接 WS 之前, 取本次直播的 cursor / internal_ext。
 
         ## 为什么必须动态取
 
@@ -375,34 +399,28 @@ class DouyinLiveWebFetcher:
         #
         # 回退值是**保命**用的: 万一详情接口拿不到状态, 也还能连上(至少
         # 与改动前行为一致), 不会因为这个改动把直播搞挂。
-        # ⚠️ **每次连接都重新取** —— 不做跨连接缓存。
+        # ---- Step 12B: 本地生成 bootstrap(单变量实验) ----
         #
-        # 早先写的是 "取一次, 存进 self.__bootstrap, 以后复用"。两个问题:
-        #   1) 第一次取**失败**时存的是 `{}`, 后续重连永远不再重试 ——
-        #      这一场就永远用回退常量了;
-        #   2) 第一次**成功**后一直复用旧值, 而 cursor 是会话状态,
-        #      重连本就该拿新的。
-        # 两者都会让 "dynamic bootstrap" 名不副实, 也会让 B 实验真假难辨:
-        # 日志说是动态, 实际用的是上一次(或回退值)。
-        boot = self._fetch_bootstrap_state() or {}
+        # 换掉那组**写死的 2024-07 值**(`t-1721106114633`)。旧值能连上,
+        # 能收 chat/member/like/social, 但**收不到 Gift**。
+        #
+        # 本地生成的做法来自外部当前实现(JaneEyre3007/douyin-js 的
+        # `genCursorInternalExt`)—— 它不经任何 HTTP bootstrap, 直接取
+        # `Date.now()` 构造这两个串。见 `ws_bootstrap.py` 的说明。
+        #
+        # ⚠️ 这是**单变量实验**: 只有 cursor/internal_ext 的来源变了,
+        # room / WS host / signature / handler / proto / 礼物操作全不动。
+        #
+        # 每次连接重新生成(时间戳本来就该是新的; 不做跨连接缓存 —— 缓存会
+        # 让"重连拿到新值"这件事失效, 也会让实验结果真假难辨)。
+        now_ms = int(time.time() * 1000)
+        boot = self._local_bootstrap(now_ms)
         self.__bootstrap = boot
-        # ---- dynamic 的判据是**两者同时来自同一次 /im/fetch/** ----
-        # 只要一个存在就标 dynamic, 会让日志写 dynamic 而 URL 其实是
-        # 新旧混搭 —— B 实验就变成假 B。缺任意一个都整组 fallback。
-        if boot.get("cursor") and boot.get("internal_ext"):
-            mode = "dynamic"
-        else:
-            mode = "fallback"
-        print(f"【bootstrap】本次连接使用 {mode} "
-              f"({'动态取得(cursor+internal_ext 同源)' if mode == 'dynamic' else '回退旧常量'})"
-              f"   <<< B-smoke 有效性判据", flush=True)
-        cursor = boot.get("cursor") or (
-            "d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1")
-        internal_ext = boot.get("internal_ext") or (
-            f"internal_src:dim|wss_push_room_id:{self.room_id}"
-            f"|wss_push_did:7319483754668557238"
-            f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1"
-            f"|wss_info:0-1721106114633-0-0|wrds_v:7392094459690748497")
+        mode = "local-generated"
+        print(f"【bootstrap】本次连接使用 {mode} now_ms={now_ms}"
+              f"   <<< B-smoke 有效性判据(应为 local-generated)", flush=True)
+        cursor = boot["cursor"]
+        internal_ext = boot["internal_ext"]
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
                "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
                "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"

@@ -18,7 +18,31 @@ pip 动态安装的包)。它承载抖音 Webcast 的传输层, 有些地方必�
 
 ---
 
-## patch 1 — 动态 WS bootstrap
+## patch 3 — 本地生成 WS bootstrap(当前生效路径)
+
+**文件**: `vendor/douyin_fetcher/ws_bootstrap.py`(新增) +
+`liveMan.py::_local_bootstrap` / `_connectWebSocket`
+
+**改动**: 新增纯函数 `generate_ws_bootstrap(room_id, user_unique_id,
+now_ms, rng)`, 按外部当前实现的做法**在本地**构造 `cursor` /
+`internal_ext`(以 `sec << 32` 为高位 + 随机低位, 时间戳取当前毫秒)。
+`_connectWebSocket()` 每次连接重新生成并使用它。
+
+**原因**: 上游写死的 2024-07 值能连上、能收 chat/member/like/social, 但
+**收不到 Gift**。见 patch 1 的对照说明。
+
+**证据来源与边界**: 做法来自外部实现 `JaneEyre3007/douyin-js` 的
+`genCursorInternalExt()`(其 README 称"本地还原 signature / cursor /
+internal_ext, 直接连接 WebSocket")。
+⚠️ 这是**外部当前实现采用的做法, 不是抖音官方协议定义**。我们采用它是
+为了做一个**单变量实验**: 只换 cursor/internal_ext 的来源, 其余
+(room / WS host / signature / handler / proto / 礼物操作)全不变。
+
+**升级 vendor 时**: 若上游已自带本地生成, 删除本 patch 跟随上游。
+
+---
+
+## patch 1 — 动态 WS bootstrap(/im/fetch, **已降级为诊断**)
 
 **文件**: `vendor/douyin_fetcher/liveMan.py`
 **改动**:
@@ -41,8 +65,13 @@ pip 动态安装的包)。它承载抖音 Webcast 的传输层, 有些地方必�
 外部可行的同源实现走的是 `/im/fetch/` + protobuf `LiveResponse`, 而我们
 自己的 `Response` proto 已经有那三个字段, 不需要新解析结构。
 
-**回退**: 取不到时用旧常量, 行为与改动前逐字一致 —— 不会因为这个改动
-把直播搞挂。日志会打 `【bootstrap】本次连接使用 dynamic / fallback`。
+**⚠️ 已降级(见 patch 3)**: 实测在本项目环境里该 endpoint **恒返回
+HTTP 200 + 空 body**(试过 protobuf/json/不带 resp_content_type、空
+cursor、d-1 cursor、带 internal_src, 全部 len=0; 返回头还是
+`application/json`)。很可能是 `a_bogus` 的签名范围与它校验的参数集不一致。
+
+**不要继续在这里投入。** 它保留为诊断/对照代码, **不再是生产 dynamic 的
+前置条件**。生产走 patch 3 的本地生成。
 
 **上游基线**: 本仓库 vendored 的版本, 未见版本号标注。
 对照实现: `cv-cat/DouYin_Spider`(master, 2026-09 观察)。
