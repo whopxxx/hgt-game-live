@@ -1,0 +1,169 @@
+{
+  "_README": [
+    "Step 12A: 互动协议特征化的**外部证据**清单。",
+    "",
+    "⚠️ 这不是 live sample, 也不是 fixture 回放数据。",
+    "它只记录「来源 + 观察」: 我们自己的 proto、外部同源实现、以及其 issue。",
+    "本文件里**没有任何**真实直播采样的字段值 —— 因为没有采样过。",
+    "",
+    "特别地: 不存在形如 {combo_count: 1 -> 2 -> 3} 的观察记录,",
+    "因为那正是 Step 12B 才要观察的东西。谁往这里加那条, 就是在把猜测写成证据。",
+    "",
+    "消费方: docs/interaction_protocol_characterization.md"
+  ],
+  "sources": [
+    {
+      "id": "our-proto",
+      "kind": "local_repo_file",
+      "path": "vendor/douyin_fetcher/protobuf/douyin.proto",
+      "note": "我们自己的协议定义, 可直接核对字段名与编号。"
+    },
+    {
+      "id": "external-impl",
+      "kind": "external_repo",
+      "repo": "cv-cat/DouYin_Spider",
+      "ref": "master @ 63ef397e0692dba13cd6da5cd784918a0eb6a314",
+      "note": "同为抖音 Webcast 协议的同源实现。仅供交叉印证, 不是我们的依赖。"
+    },
+    {
+      "id": "external-issue-88",
+      "kind": "external_issue",
+      "repo": "cv-cat/DouYin_Spider",
+      "number": 88,
+      "date": "2026-09-15",
+      "state_at_review": "open, 无作者回复",
+      "statement": "直播间只送了一个小心心, 但程序收到了两条相同的小心心礼物消息。"
+    }
+  ],
+  "confirmed": [
+    {
+      "claim": "LikeMessage 有 count(:2) 与 total(:3) 两个独立的 uint64 计数字段。",
+      "source": "our-proto",
+      "evidence_kind": "field_declaration",
+      "fields": [
+        "LikeMessage.count = 2",
+        "LikeMessage.total = 3"
+      ]
+    },
+    {
+      "claim": "GiftMessage 有 comboCount(:6) / repeatCount(:5) / totalCount(:29) / repeatEnd(:9) / groupCount(:4) / groupId(:11) / logId(:16) / traceId(:35)。",
+      "source": "our-proto",
+      "evidence_kind": "field_declaration",
+      "fields": [
+        "GiftMessage.giftId = 2",
+        "GiftMessage.groupCount = 4",
+        "GiftMessage.repeatCount = 5",
+        "GiftMessage.comboCount = 6",
+        "GiftMessage.repeatEnd = 9",
+        "GiftMessage.groupId = 11",
+        "GiftMessage.logId = 16",
+        "GiftMessage.totalCount = 29",
+        "GiftMessage.traceId = 35"
+      ]
+    },
+    {
+      "claim": "外层 Message.msgId(:3) 与内层 Common.msgId(:2) 是**两个不同**的字段。",
+      "source": "our-proto",
+      "evidence_kind": "field_declaration",
+      "fields": [
+        "Message.msgId = 3",
+        "Common.msgId = 2"
+      ],
+      "corollary": "Common 自己还有 logId(:12), 与 GiftMessage.logId(:16) 也不是同一个。"
+    },
+    {
+      "claim": "我们的采集层现在同时记录 envelope_msg_id 与 common_msg_id。",
+      "source": "our-proto",
+      "evidence_kind": "implementation_state",
+      "where": "danmaku.py::_wsOnMessage / _parseGiftMsg / _parseLikeMsg; story/ingest.py::InteractionEvent",
+      "note": "不假设两者相等, 也不预判哪个是幂等主键。"
+    },
+    {
+      "claim": "外部同源实现同样以 PushFrame -> gzip -> Response -> messagesList 的结构解析, 并按 WebcastGiftMessage / WebcastLikeMessage 分发。",
+      "source": "external-impl",
+      "evidence_kind": "implementation_reading"
+    },
+    {
+      "claim": "外部同源实现的 Gift 结构里 comboCount 被实际用作面向显示的 'xN' 数量。",
+      "source": "external-impl",
+      "evidence_kind": "implementation_reading",
+      "note": "这只说明它是显示用数量, **不**说明它等于本消息新增的礼物单位数。"
+    },
+    {
+      "claim": "外部同源实现的 Gift proto 比我们的简化(只有 giftId/comboCount/user/toUser/gift), 我们保留的字段更多。",
+      "source": "external-impl",
+      "evidence_kind": "implementation_reading",
+      "corollary": "做可靠计量的原始字段我们比它更全。"
+    },
+    {
+      "claim": "一次真实礼物**可能**产生两条相同的 GiftMessage。",
+      "source": "external-issue-88",
+      "evidence_kind": "reported_observation",
+      "note": "报告者只送了一个小心心, 程序收到两条相同的礼物消息; 该实现未做业务级幂等。"
+    }
+  ],
+  "derived_conclusions": [
+    {
+      "conclusion": "GiftMessage 数量 != 真实礼物单位数。",
+      "derives_from": [
+        "external-issue-88"
+      ],
+      "consequence": "禁止 '每收到一条 GiftMessage 就 +1'。"
+    },
+    {
+      "conclusion": "GiftMessage-per-unit 实现明确不安全, 会重复计数。",
+      "derives_from": [
+        "external-issue-88",
+        "external-impl"
+      ]
+    },
+    {
+      "conclusion": "哪些字段能作为稳定幂等键仍未确定 —— 两层 msg_id 都必须采。",
+      "derives_from": [
+        "our-proto"
+      ]
+    }
+  ],
+  "unknown_pending_12b": [
+    {
+      "id": "U1",
+      "question": "combo_count / repeat_count / total_count 哪个可作为累计绝对量?",
+      "why_it_matters": "决定 Gift accumulator 用哪个字段算增量。"
+    },
+    {
+      "id": "U2",
+      "question": "combo 更新是否 1->2->3(逐条递增), 还是只报最终值?",
+      "why_it_matters": "决定'新增单位数'能否由相邻差推出。"
+    },
+    {
+      "id": "U3",
+      "question": "group_id / trace_id 在一次 combo 内是否稳定?",
+      "why_it_matters": "决定能否用它们做 combo 级归并去重。"
+    },
+    {
+      "id": "U4",
+      "question": "envelope_msg_id 与 common_msg_id 的稳定性、以及 replay 行为?",
+      "why_it_matters": "决定幂等主键选哪一个。"
+    },
+    {
+      "id": "U5",
+      "question": "非 combo 礼物各计数字段的真实形态?",
+      "why_it_matters": "单发礼物与连击礼物可能完全不同, 不能只测一种。"
+    },
+    {
+      "id": "U6",
+      "question": "重连是否重放 gift? 哪些 ID 在重放中保持不变?",
+      "why_it_matters": "决定去重窗口要多大。"
+    },
+    {
+      "id": "U7",
+      "question": "Like.total 是否在同一 Session 内单调累计? 是否存在合法清零?",
+      "why_it_matters": "Like high-water 算法假设它单调; 若有合法清零需要显式处理。"
+    }
+  ],
+  "explicitly_not_recorded": [
+    "任何 {combo_count: 1 -> 2 -> 3} 形式的时间序列观察(未观察过)",
+    "任何真实直播间 ID / 用户昵称 / 礼物名 / 时间戳(未采集过)",
+    "任何由猜测填充的字段语义表"
+  ]
+}
