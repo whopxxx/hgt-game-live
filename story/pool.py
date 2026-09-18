@@ -31,9 +31,15 @@ background prefetch / build_pool 自动补池 / playtest。题池里的题靠
 
 4. **账本 fail closed, 池子 fail open**。两个文件的容错语义**不同**:
    `pool.jsonl` 是缓存(坏行跳过, 好题照用); `pool_used.jsonl` 是**账本**
-   —— 只要有一处读不全, 整个账本就不可信, 本次**一道都不交付**,
-   回落现场生成。因为"某道题不在 used 里"和"那行没读出来"从结果上
-   无法区分, 而前者意味着把已经播过的题再播一次。详见 `_read_jsonl`。
+   —— 只要有一处读不全**或读不懂**, 整个账本就不可信, 本次**一道都不
+   交付**, 回落现场生成。因为"某道题不在 used 里"和"那行没读出来"从
+   结果上无法区分, 而前者意味着把已经播过的题再播一次。读不懂同样
+   算坏: `null` / `{}` / `{"air":false}` 都是合法 JSON, 但它们和
+   "key 被写坏了"无法区分。详见 `_read_jsonl` 与 `_valid_used_record`。
+
+5. **入池与弹出走同一扇门**。`_validate_pool_spec()` 是唯一的准入
+   校验, `add()`(API 入口)与 `pop_next()`(磁盘入口)都调它。题池允许
+   手工灌池, 所以"入池时验过了"不能替代"弹出时再验一次"。
 
 ## 先落盘再交付(验收点 4 的核心不变式)
 
@@ -62,7 +68,8 @@ import random
 import time
 from typing import Any, Optional
 
-from .puzzle import (MECHANISM_FAMILIES, SOLUTION_SHAPES, PuzzleSpec)
+from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
+                     SOLUTION_SHAPES, TIME_SHAPES, PuzzleSpec)
 from .quality import (Quotas, cross_puzzle_gate, too_similar, validate_blueprint,
                       validate_spec)
 
@@ -92,6 +99,43 @@ def spec_key(spec: PuzzleSpec) -> str:
         str(getattr(spec, "answer", "") or ""),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:KEY_LEN]
+
+
+#: key 允许的字符集。`spec_key` 的输出恒为小写 hex。
+_HEX = frozenset("0123456789abcdef")
+
+
+def _valid_used_record(rec: Any) -> bool:
+    """这条 JSON 是不是一条**能解释**的 used 账本记录?
+
+    ## 为什么"合法 JSON"还不够
+
+    `strict=True` 只保证**解析得动**, 不保证**看得懂**:
+
+        {}
+        null
+        {"air": false}
+
+    三个都是合法 JSON。早先的加载循环对它们 `continue` 跳过, 于是账本
+    仍被判 `trustworthy=True` —— 可 fail closed 的定义是"读不出一处就
+    整体不信"。而这里我们同样分不清:
+
+        它本来就是垃圾      vs      它原本是一条已播记录, 但 key 被写坏了
+
+    后者意味着那道题会复活。所以 schema 不合法 == 账本不可信。
+
+    key 必须恰好是 `KEY_LEN` 位小写 hex: 这同时排除了"key 被截断"和
+    "key 被换成别的东西"两种损坏。`air` 必须是真正的 bool —— 缺失也
+    算坏, 因为 `_persist_used` 无条件和写它, 读不到说明行是残缺的。
+    """
+    if not isinstance(rec, dict):
+        return False
+    k = rec.get("key")
+    if not isinstance(k, str) or len(k) != KEY_LEN:
+        return False
+    if not all(c in _HEX for c in k):
+        return False
+    return isinstance(rec.get("air"), bool)
 
 
 def _read_jsonl(path: str, strict: bool = False) -> tuple:
@@ -246,16 +290,20 @@ class PuzzlePool:
             self._used = set()
             self._aired = set()
             for rec in used_recs:
-                if not isinstance(rec, dict):
-                    continue
-                k = rec.get("key")
-                if not k:
-                    continue
+                # schema 不对 == 读不懂 == 和坏行同等对待(fail closed)。
+                # `strict=True` 只挡得住"解析不动"的行, 挡不住 `null`
+                # 这种"解析得动但没意义"的行 —— 见 `_valid_used_record`。
+                if not _valid_used_record(rec):
+                    log.error("used 账本里有无法解释的记录, 整个账本判为"
+                              "不可信: %s", str(rec)[:120])
+                    self._used_trustworthy = False
+                    break
+                k = rec["key"]
                 # 注意: 记进 _used 的**只**该是题池交付过的题。老日志里
                 # 可能混着别的来源(早先的 bug), 这里无法分辨, 所以
                 # 一律算 —— 宁可少用一道题, 也不能复活一道。
                 self._used.add(k)
-                if rec.get("air"):
+                if rec["air"]:
                     self._aired.add(k)
 
             if not self._used_trustworthy:
@@ -304,6 +352,84 @@ class PuzzlePool:
             return len(self._used)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_pool_spec(spec: PuzzleSpec) -> tuple:
+        """池的**统一准入门**。返回 `(ok, why)`。
+
+        `add()`(API 入口)和 `pop_next()`(磁盘入口)都走这一扇门。
+
+        ## 为什么弹出时还要再验一次
+
+        Q8 的原则是"入池和弹出都不信任磁盘内容"。只验 `add()` 等于只
+        验了 API 入口 —— 而题池**允许手工灌池**(Q9 之前全靠它), 所以
+        `pool.jsonl` 里完全可能有一道 signature 被清空/改坏的题。那时:
+
+            validate_spec 通过(它不查 signature)
+            -> cross_puzzle_gate 拿 blueprint 临时顶替(看起来能用)
+            -> 交付 -> _submit_spec 传空 signature
+            -> engine 登记进 recent 的是空白
+            -> 后续全局配额看不见这道题 -> 配额被悄悄放松
+
+        所以同一个 `_validate_pool_spec` 必须在两个入口都跑。Q9 的自动
+        补池也复用这扇门。
+
+        ## 为什么六个分类字段都要验, 不只 mechanism/solution
+
+        `domain` / `relation` / `emotion_mode` 同样参与 `cross_puzzle_gate`
+        的配额统计(见 `quality._quota_conflicts`)。磁盘里写
+        `domain="乱写的值"` 的题目前仍能进池, 之后它计进
+        `domain:乱写的值` 这个桶 —— 而它实际会占掉别的领域的播出位,
+        等于绕过 `same_domain` 配额。`time_shape` 目前只统计不限额, 但
+        它是与 blueprint 严格比对的一维, 一并验掉。
+        """
+        if spec is None or not getattr(spec, "puzzle", ""):
+            return False, "空 spec / 空谜面"
+        if getattr(spec, "error", None):
+            return False, f"spec 带 error({str(spec.error)[:60]})"
+        try:
+            vr = validate_spec(spec)
+        except Exception:                       # noqa: BLE001
+            log.exception("池校验异常, 拒绝")
+            return False, "校验抛异常"
+        if not vr.ok:
+            return False, f"硬校验不过({vr.why()[:120]})"
+        if vr.fixable:
+            # fixable 是"审稿人改一句就能救", 但池子里的题**已经**应该
+            # 是审稿后的成品 —— 还留着 fixable 说明它没走完质量链。
+            return False, f"还有未修的 fixable({vr.must_fix()[:120]})"
+
+        # ---- signature 必须完整(P1) ----
+        #
+        # `validate_spec` **不**要求 signature 存在, 所以光靠它, 一道
+        # signature 全空的题也能进池。
+        sig = getattr(spec, "signature", None)
+        if sig is None:
+            return False, "缺 signature 对象"
+        core = (sig.mechanism_family, sig.solution_shape)
+        if not all(core):
+            return False, f"signature 缺核心维度({core})"
+        for name, val, allowed in (
+                ("mechanism_family", sig.mechanism_family, MECHANISM_FAMILIES),
+                ("solution_shape", sig.solution_shape, SOLUTION_SHAPES),
+                ("domain", sig.domain, DOMAINS),
+                ("relation", sig.relation, RELATIONS),
+                ("emotion_mode", sig.emotion_mode, EMOTION_MODES),
+                ("time_shape", sig.time_shape, TIME_SHAPES)):
+            if val not in allowed:
+                return False, f"signature.{name} 不在枚举内({val!r})"
+        # blueprint 被显式分配过 -> 顺带验它确实被执行了(与实时路径
+        # 的第三道门一致)。没分配过(自由生成)就跳过。
+        if getattr(spec, "blueprint_specified", False):
+            try:
+                vb = validate_blueprint(spec, spec.blueprint)
+            except Exception:                   # noqa: BLE001
+                log.exception("blueprint 校验异常, 拒绝")
+                return False, "blueprint 校验抛异常"
+            if not vb.ok:
+                return False, f"blueprint 校验不过({vb.why()[:120]})"
+        return True, ""
+
+    # ------------------------------------------------------------------
     def add(self, spec: PuzzleSpec, source: str = "manual") -> bool:
         """把一道题放进池子。**入池前重跑校验**。
 
@@ -313,61 +439,10 @@ class PuzzlePool:
         记录可能是老格式、可能被手改过。"文件里写着 approved"不是
         证据, 重新跑一遍代码判断才是。
         """
-        if spec is None or not getattr(spec, "puzzle", ""):
+        ok, why = self._validate_pool_spec(spec)
+        if not ok:
+            log.info("拒绝入池: %s", why)
             return False
-        if getattr(spec, "error", None):
-            log.info("拒绝入池: spec 带 error(%s)", str(spec.error)[:60])
-            return False
-        try:
-            vr = validate_spec(spec)
-        except Exception:                       # noqa: BLE001
-            log.exception("入池校验异常, 拒绝")
-            return False
-        if not vr.ok:
-            log.info("拒绝入池: 硬校验不过(%s)", vr.why()[:120])
-            return False
-        if vr.fixable:
-            # fixable 是"审稿人改一句就能救", 但池子里的题**已经**应该
-            # 是审稿后的成品 —— 还留着 fixable 说明它没走完质量链。
-            log.info("拒绝入池: 还有未修的 fixable(%s)", vr.must_fix()[:120])
-            return False
-        # ---- signature 必须有效(P1) ----
-        #
-        # `validate_spec` **不**要求 signature 存在, 所以光靠它, 一道
-        # signature 全空的题也能入池。弹出时 `cross_puzzle_gate` 会拿
-        # blueprint 临时顶替, 看起来还能工作 —— 但上屏时 `_submit_spec`
-        # 传的是 `spec.signature.to_dict()`, 也就是那个**空 dict**。
-        # engine 见它是非空 dict 就登记进 recent, 于是:
-        #     这道题实际播了 hidden_function -> recent 里记成空白
-        #     -> 下一题的全局配额看不见它 -> 配额被悄悄放松。
-        #
-        # 所以"完整 spec"在这里要更严格: signature 的核心维度必须存在
-        # 且枚举合法。老 archive 缺 signature 的题仍可被 `from_dict`
-        # 读出来, 但**不能直接成为池库存量** —— 要进池得走显式的
-        # 迁移/重新审批。
-        core = (spec.signature.mechanism_family, spec.signature.solution_shape)
-        if not all(core):
-            log.info("拒绝入池: signature 缺核心维度(%s)", core)
-            return False
-        if spec.signature.mechanism_family not in MECHANISM_FAMILIES:
-            log.info("拒绝入池: mechanism_family 不在枚举内(%s)",
-                     spec.signature.mechanism_family)
-            return False
-        if spec.signature.solution_shape not in SOLUTION_SHAPES:
-            log.info("拒绝入池: solution_shape 不在枚举内(%s)",
-                     spec.signature.solution_shape)
-            return False
-        # blueprint 被显式分配过 -> 顺带验它确实被执行了(与实时路径
-        # 的第三道门一致)。没分配过(自由生成)就跳过。
-        if getattr(spec, "blueprint_specified", False):
-            try:
-                vb = validate_blueprint(spec, spec.blueprint)
-            except Exception:                   # noqa: BLE001
-                log.exception("入池 blueprint 校验异常, 拒绝")
-                return False
-            if not vb.ok:
-                log.info("拒绝入池: blueprint 校验不过(%s)", vb.why()[:120])
-                return False
 
         with self._lock:
             k = spec_key(spec)
@@ -440,10 +515,11 @@ class PuzzlePool:
             quotas = Quotas.from_config(self.cfg)
             blocked: list[str] = []
             for spec in cands:
-                # ① 本体仍合格?
-                vr = validate_spec(spec)
-                if not vr.ok:
-                    blocked.append(f"{spec.puzzle[:20]}…: {vr.why()[:60]}")
+                # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
+                #    signature 可能在入池后被改坏, 只验 API 入口不够。
+                ok, why = self._validate_pool_spec(spec)
+                if not ok:
+                    blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
                     continue
                 # ② 与当前分布冲突?
                 bad = cross_puzzle_gate(spec, recent, quotas, spec.blueprint)

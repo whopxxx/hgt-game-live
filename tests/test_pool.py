@@ -824,6 +824,122 @@ def test_only_pool_source_writes_used_ledger():
         check("live_generate 不写 pool_used", n == 0, f"{n} 行")
 
 
+# ======================================================================
+# Q8 final boundary validation
+# ======================================================================
+def test_uninterpretable_used_records_disable_pool():
+    """P0: used 里出现**合法 JSON 但无法解释**的记录 -> 账本不可信。
+
+    `strict=True` 只挡得住"解析不动"的行。`null` / `{}` /
+    `{"air": false}` 全都是合法 JSON, 早先被静默 `continue` 跳过,
+    账本仍判 trustworthy=True。
+
+    但 fail closed 的定义是"读不出一处就整体不信" —— 因为我们同样
+    分不清"它本来就是垃圾"和"它原本是条已播记录, 但 key 被写坏了"。
+    后者意味着那道题复活。
+    """
+    print("\n[8a] used 记录无法解释 -> 整个账本不可信")
+    for raw in ('null', '{}', '{"air": false}', '{"key": "短key", "air": false}',
+                '{"key": "%s"}' % ("z" * 16), '[]'):
+        with tmpdir() as d:
+            cfg = mkcfg(d)
+            pool = PuzzlePool.open(cfg)
+            pool.add(good_spec())
+            check("先能交付(%s)" % raw,
+                  pool.pop_next(recent_signatures=[]) is not None)
+            _write_raw(cfg.pool_used_path, [raw])
+            pool2 = PuzzlePool.open(cfg)
+            check("账本不可信(%s)" % raw, pool2._used_trustworthy is False,
+                  f"{raw} -> {pool2._used_trustworthy}")
+            check("不交付(%s)" % raw,
+                  pool2.pop_next(recent_signatures=[]) is None)
+
+
+def test_valid_used_records_still_trustworthy():
+    """回归: 正常账本照常可信(别把 fail closed 做过头)。"""
+    print("\n[8b] 正常账本仍可信")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        got = pool.pop_next(recent_signatures=[])
+        check("交付成功", got is not None)
+        pool.mark_used(got, aired=True)
+        pool2 = PuzzlePool.open(cfg)
+        check("账本可信", pool2._used_trustworthy is True,
+              pool2._used_trustworthy)
+        check("已用的题不再交付",
+              pool2.pop_next(recent_signatures=[]) is None)
+        check("used 记了 1 条", pool2.used_count() == 1, pool2.used_count())
+
+
+def test_disk_tampered_signature_blocks_pop():
+    """P1: 磁盘里 signature 被改坏 -> **弹出时**就该拦住。
+
+    Q8 原则是"入池和弹出都不信任磁盘内容"。早先只有 `add()` 验
+    signature, 而题池允许手工灌池, 所以这条路真实存在:
+
+        add 一道好题 -> 手改 pool.jsonl 把 domain 换成乱写的值
+        -> 重启 -> validate_spec 通过(它不查 signature)
+        -> cross_puzzle_gate 拿 blueprint 顶替 -> 交付
+        -> 这道题计进 `domain:乱写的值` 桶而不是真实领域
+        -> 绕过 same_domain 配额。
+    """
+    print("\n[8c] 磁盘 signature 被改坏 -> 弹出时拦住")
+    for bad in ({"domain": "乱写的值"}, {"relation": "乱写的值"},
+                {"emotion_mode": "乱写的值"}, {"time_shape": "乱写的值"},
+                {"mechanism_family": ""}, {"solution_shape": ""},
+                {"mechanism_family": "不是枚举里的"}):
+        with tmpdir() as d:
+            cfg = mkcfg(d)
+            pool = PuzzlePool.open(cfg)
+            check("好题能入池(%s)" % bad, pool.add(good_spec()) is True)
+            recs = [json.loads(ln) for ln in
+                    open(cfg.pool_path, encoding="utf-8") if ln.strip()]
+            recs[0]["spec"]["signature"].update(bad)
+            _write_raw(cfg.pool_path,
+                       [json.dumps(r, ensure_ascii=False) for r in recs])
+            pool2 = PuzzlePool.open(cfg)
+            check("坏 signature 不交付(%s)" % bad,
+                  pool2.pop_next(recent_signatures=[]) is None)
+
+
+def test_disk_intact_signature_still_pops():
+    """回归: 磁盘上 signature 完好的题照常交付。"""
+    print("\n[8d] 磁盘 signature 完好 -> 照常交付")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        pool2 = PuzzlePool.open(cfg)
+        check("重启后仍能交付",
+              pool2.pop_next(recent_signatures=[]) is not None)
+
+
+def test_add_and_pop_share_one_gate():
+    """两个入口走**同一扇门**: 凡 add() 拒的, 磁盘上同形态也该拒。
+
+    这是"别在两处各复制一份校验"的回归护栏 —— 复制出来的两份迟早
+    会漂移, 而漂移的方向必然是其中一处变松。
+    """
+    print("\n[8e] add 与 pop 共用同一扇门")
+    from story.pool import PuzzlePool as _P
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        for bad_sig in (PuzzleSignature(),
+                        PuzzleSignature(mechanism_family="hidden_function"),
+                        PuzzleSignature(mechanism_family="hidden_function",
+                                        solution_shape="hidden_function_explains_behavior",
+                                        domain="乱写的值")):
+            s = good_spec()
+            s.signature = bad_sig
+            ok, why = _P._validate_pool_spec(s)
+            check("门拒绝(%s)" % (bad_sig.domain or bad_sig.mechanism_family or "空"),
+                  ok is False, why)
+        ok, why = _P._validate_pool_spec(good_spec())
+        check("门放行正常题", ok is True, why)
+
+
 def main():
     tests = [
         # 验收点 1
@@ -866,6 +982,12 @@ def main():
         test_accepts_valid_signature,
         test_blueprint_specified_is_revalidated_on_add,
         test_only_pool_source_writes_used_ledger,
+        # ---- Q8 final boundary validation ----
+        test_uninterpretable_used_records_disable_pool,
+        test_valid_used_records_still_trustworthy,
+        test_disk_tampered_signature_blocks_pop,
+        test_disk_intact_signature_still_pops,
+        test_add_and_pop_share_one_gate,
     ]
     for t in tests:
         t()
