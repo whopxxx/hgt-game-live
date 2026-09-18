@@ -595,13 +595,13 @@ def test_reconnect_guard_only_after_reconnect():
 
 
 def _connect_then_reconnect(eng) -> None:
-    """模拟"先连上过、再断线重连"。
+    """模拟一次**真实重连**。
 
-    Q12b 之后 `on_reconnect()` 对**首次**建连是 no-op(那时没有"之前
-    那批弹幕"可重放), 所以要真正开 guard 必须先走过一次连接。
+    Q12c 之后 `engine.on_reconnect()` 的语义是"已经确认发生了一次真实
+    重连" —— 它总是开 guard。首次/重连的区分在**传输层**
+    (`LiveSource`), 不在引擎这层, 所以这里不需要再调两次。
     """
-    eng.on_reconnect()          # 首次: 只标记
-    eng.on_reconnect()          # 这次才是真的重连 -> 开 guard
+    eng.on_reconnect()
 
 
 def test_reconnect_replay_suppressed():
@@ -656,33 +656,57 @@ def test_reconnect_mixed_old_and_new():
           (before, len(eng._danmaku)))
 
 
-def test_first_connect_does_not_arm_guard():
-    """Q12b: **首次建连不开 guard** —— 那时没有"之前那批"可重放。
+def test_reconnect_signal_end_to_end():
+    """**Q12c 装配测试**: 真正测 LiveSource -> Director/Engine 整条链。
 
-    开着只会让启动后的无 ID 消息白白进缓冲。
+    早先两层**各自**测了"首次过滤", 却没测它们串起来 —— 于是双重消耗
+    被漏掉了:
+
+        连接#1  LiveSource 吞掉            -> 引擎根本没收到
+        连接#2  LiveSource 放行 -> 引擎又当首次吞掉
+        连接#3  guard 才真正开             <- 第一次真实重连被白吃
+
+    现在只有 `LiveSource` 一层负责区分首次/重连。这条测试走**真实的**
+    LiveSource._on_first_frame -> director._on_reconnected -> engine,
+    而不是分别调两层的内部方法。
     """
-    print("\n[Q12b] 首次建连不开 guard")
-    eng, clk = boot(mkcfg())
-    eng.submit_danmaku("u1", "甲", "#先发一条")
-    clk.advance(3)
-    before = len(eng._danmaku)
-    eng.on_reconnect()                    # 首次建连
-    check("**guard 没开**", eng._guard_until == 0.0, eng._guard_until)
-    # 再发一条同样的: 不该被当作重放
-    eng.submit_danmaku("u1", "甲", "#先发一条")
-    check("**首次建连后不判重放**", eng._replays == 0, eng._replays)
-    check("正常上屏", len(eng._danmaku) == before + 1, len(eng._danmaku))
+    print("\n[Q12c] 重连信号整条链(首次不开 / 重连立即开)")
+    from director import Director
+    from story.ingest import LiveSource
+
+    cfg = mkcfg(live_id="123")
+    dr = Director(cfg)
+    # 造一个真 LiveSource, 接上 director 的回调(与 _build_source 一致)
+    src = LiveSource(cfg, dr.inbox,
+                     on_stream_end=dr._on_stream_end,
+                     on_reconnect=dr._on_reconnect,
+                     on_reconnected=dr._on_reconnected)
+    eng = dr.engine
+    check("初始 guard 关", eng._guard_until == 0.0, eng._guard_until)
+
+    # ---- 连接 #1 首帧: 不该开 guard ----
+    src._on_first_frame()
+    check("**首次建连: guard 不开**", eng._guard_until == 0.0,
+          eng._guard_until)
+
+    # ---- 连接 #2 首帧(真实重连): **立即**开 guard ----
+    src._on_first_frame()
+    check("**第一次重连: guard 立即开**", eng._guard_until > 0,
+          eng._guard_until)
+    if dr._prefetcher:
+        dr._prefetcher.shutdown()
 
 
-def test_true_reconnect_arms_guard():
-    """第二次建连(真正的重连)才开 guard。"""
-    print("\n[Q12b] 真重连开 guard")
+def test_engine_on_reconnect_always_arms():
+    """`engine.on_reconnect()` 语义纯化: 调用它 == 已确认真实重连。
+
+    首次/重连的区分不在这一层(那是 `LiveSource` 的责任)。引擎这层若
+    再挡一次, 就会把"第一次真实重连"吃掉。
+    """
+    print("\n[Q12c] engine.on_reconnect 总是开 guard")
     eng, clk = boot(mkcfg())
     eng.on_reconnect()
-    check("首次: 未开", eng._guard_until == 0.0, eng._guard_until)
-    clk.advance(5)
-    eng.on_reconnect()
-    check("**第二次: 开了**", eng._guard_until > 0, eng._guard_until)
+    check("**第一次调用就开**", eng._guard_until > 0, eng._guard_until)
 
 
 def test_guard_expires():
@@ -772,6 +796,70 @@ def test_msg_id_bypasses_pairwise_dedupe():
     eng.submit_danmaku("u2", "乙", "#另一句")
     check("**无 ID 时 2s 成对判重仍生效**", len(eng._danmaku) == 3,
           len(eng._danmaku))
+
+
+def test_guard_release_keeps_user_name():
+    """**Q12c**: 缓冲放行后 **user_name 必须完整保留**。
+
+    早先 pending 只存 `(user_id, content, ts, message_id)`, 放行时传
+    `user_name=""` —— 一条"疑似重放、后来证明是真人"的提问会变成匿名,
+    问答流/回答日志/猜中者姓名全错。
+    """
+    print("\n[Q12c] guard 放行保留观众名")
+    eng, clk = boot(mkcfg(replay_guard_min_repeats=5))
+    # baseline: 两条(各只出现一次 —— 正是"各不相同"的重放形态)
+    eng.submit_danmaku("u1", "甲观众", "#旧问题一")
+    clk.advance(3)
+    eng.submit_danmaku("u2", "乙观众", "#旧问题二")
+    clk.advance(3)
+    _connect_then_reconnect(eng)
+    clk.advance(0.5)
+    # 2 条疑似(命中 baseline) -> 进缓冲, 未达阈值 5
+    eng.submit_danmaku("u1", "甲观众", "#旧问题一")
+    clk.advance(0.2)
+    eng.submit_danmaku("u2", "乙观众", "#旧问题二")
+    clk.advance(0.2)
+    # 一条全新的 -> 打断 streak, 缓冲里的两条应被放行
+    eng.submit_danmaku("u3", "丙观众", "#全新的问题")
+    check("未判重放", eng._replays == 0, eng._replays)
+    names = [r.user_name for r in eng._danmaku if r.user_name]
+    check("**放行的消息带回了观众名**",
+          "甲观众" in names and "乙观众" in names, names)
+    check("**没有匿名(空 user_name)的条目**",
+          all(r.user_name for r in eng._danmaku),
+          [r.user_name for r in eng._danmaku])
+
+
+def test_guard_release_does_not_swallow_actions():
+    """**Q12c**: 缓冲里若是有即时动作的命令(`#提示`), 放行时动作不能丢。
+
+    早先 `_flush_guard_pending_locked()` 把 `_accept_danmaku` 的返回值
+    直接丢了。普通 `#问题` 主要只是入队所以看不出, 但 `#提示`/`#下一题`
+    产生的 HINT/REVEAL 会静默失效 —— 与 `_flush_burst` 曾踩的是同一类
+    bug("把消息补处理了" != "把动作也交付了")。
+    """
+    print("\n[Q12c] guard 放行不吞动作")
+    # 构造一个**只有放行才会产动作**的场景, 否则测不出"动作被吞":
+    #   - 当前这条用普通提问(在 QA 里只入队, 无动作);
+    #   - 缓冲里那条用 `#提示`(在 QA 里产 HINT)。
+    # 这样断言里出现的 HINT 只可能来自放行路径。
+    eng, clk = boot(mkcfg(replay_guard_min_repeats=5,
+                          replay_guard_seconds=300.0))
+    clk.advance(60)                              # 过 #提示 的 20s 节流
+    eng.submit_danmaku("u1", "甲", "#提示")       # baseline: 产 HINT
+    eng.submit_hint("提示文本")                   # 清掉在途标志
+    clk.advance(3)
+    _connect_then_reconnect(eng)
+    clk.advance(0.5)
+    clk.advance(60)                              # 再过节流(guard 仍开)
+    # 疑似命中 baseline -> 进缓冲, 本身不上屏
+    eng.submit_danmaku("u1", "甲", "#提示")
+    check("疑似已进缓冲", len(eng._guard_pending) == 1,
+          len(eng._guard_pending))
+    # 当前这条是普通提问(**本身不产动作**), 唯一可能的动作来自放行
+    acts = eng.submit_danmaku("u9", "新人", "#全新问题")
+    ks = [a.kind for a in acts]
+    check("**放行的 HINT 被交付了(没吞)**", ActionKind.HINT in ks, ks)
 
 
 def test_determinism():
@@ -2083,8 +2171,10 @@ def main():
              test_reconnect_guard_only_after_reconnect,
              test_reconnect_replay_suppressed,
              test_reconnect_mixed_old_and_new,
-             test_first_connect_does_not_arm_guard,
-             test_true_reconnect_arms_guard,
+             test_reconnect_signal_end_to_end,
+             test_engine_on_reconnect_always_arms,
+             test_guard_release_keeps_user_name,
+             test_guard_release_does_not_swallow_actions,
              test_guard_expires,
              test_incoming_streak_retroactively_suppressed,
              test_streak_broken_by_new_message,
