@@ -627,6 +627,91 @@ def policy_version() -> str:
 
 
 # ======================================================================
+# 6.5 Hint 焦点选择(方案 §31/§33)
+# ======================================================================
+def hint_focus(spec: PuzzleSpec, touched: Optional[set] = None,
+               max_unknown: int = 3) -> dict:
+    """挑出这条提示该**点拨哪个方向**。返回给 hint prompt 用的字典。
+
+    方案 §33 的优先级:
+
+        required solve atom -> 它引用的 facts -> 尚未 touched -> hintable
+
+    为什么必须由代码挑而不是让模型自己看: 提示是要**推进推理**的,
+    不是随机说一句谜面里的话。模型看不到 touched 集合(它在引擎里),
+    所以"哪个方向还没被探索过"这件事只有代码知道。
+
+    返回::
+
+        {
+          "focus_atom": "...",          # 该往哪个原子事实上引(文本)
+          "focus_facts": ["f2", ...],   # 它依赖、且还没被碰过的 fact id
+          "known_or_touched": ["f1"],   # 已被探索过 —— **不要再提**
+          "forbidden_core_terms": [...],# 一旦出现在提示里就等于泄底
+        }
+
+    注意 `touched` 的含义是"玩家群体**问过**这个方向", **不代表
+    他们已经知道该事实为真** —— 所以叫 touched 不叫 discovered。
+    已 touched 的方向不该再提示(浪费一条提示额度)。
+    """
+    touched = set(touched or ())
+    facts = spec.fact_by_id()
+
+    # ---- ① 只考虑 required 的 atoms: 通关必须说中的那几条 ----
+    atoms = spec.required_atoms() or list(spec.solve_atoms)
+
+    # ---- ② 优先挑"还有未 touched 依赖"的 atom ----
+    scored = []
+    for a in atoms:
+        deps = [fid for fid in (a.fact_ids or []) if fid in facts]
+        unknown = [fid for fid in deps if fid not in touched]
+        # hintable=False 的 fact 不能当提示方向(它是排除项或元信息)
+        usable = [fid for fid in unknown if getattr(facts[fid], "hintable", True)]
+        scored.append((len(usable), len(unknown), a, usable))
+
+    # 未 touched 依赖最多的 atom 优先 —— 那里最"欠点拨"。
+    # 全都被碰过时 (0,0,...) 会排在后面, 仍然给出一条"综合"提示。
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    _, _, atom, focus_ids = scored[0]
+
+    # ---- ③ 一个都没得挑(全 touched / 全 hintable=False) -> 退而求其次 ----
+    if not focus_ids:
+        for a in atoms:
+            deps = [fid for fid in (a.fact_ids or []) if fid in facts]
+            focus_ids = [fid for fid in deps
+                         if getattr(facts[fid], "hintable", True)]
+            if focus_ids:
+                atom = a
+                break
+
+    # ---- ④ 泄底词表: 提示里出现这些就等于把答案说了 ----
+    # 只收 **core + hidden** 的 fact —— support/exclusion 说出来顶多算
+    # 少给一次推理空间, 而 core hidden 就是谜底本身。
+    forbidden, seen = [], set()
+    for f in spec.core_hidden_facts():
+        # 太短的 fact 文本整句塞进"禁止出现"没意义(模型没法避免一个字),
+        # 所以这里给它**整条文本**作为"不要说出这个意思"的指引。
+        if len(f.text) >= 4 and f.text not in seen:
+            seen.add(f.text)
+            forbidden.append(f.text)
+    # 被挑中的 focus facts 也绝不能直接说出口 —— 提示是"往那边看",
+    # 不是"把那条事实念出来"。
+    for fid in focus_ids:
+        t = facts[fid].text
+        if fid not in touched and t not in seen:
+            seen.add(t)
+            forbidden.append(t)
+
+    return {
+        "focus_atom": atom.text,
+        "focus_facts": focus_ids[:max_unknown],
+        "focus_fact_texts": [facts[fid].text for fid in focus_ids[:max_unknown]],
+        "known_or_touched": sorted(touched),
+        "forbidden_core_terms": forbidden,
+    }
+
+
+# ======================================================================
 # 7. 自检: 模板表本身不能有死路
 # ======================================================================
 def check_tables() -> list:

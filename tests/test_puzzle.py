@@ -709,6 +709,54 @@ def test_quotas_from_config():
     check("缺字段时用默认", q2.window == 10 and q2.death == 2, q2)
 
 
+def test_hint_focus_picks_untouched_required_atom():
+    """Q6(方案 §33): 提示方向 = required atom -> 其 facts -> 未 touched -> hintable。"""
+    from story.quality import hint_focus
+    s = good_spec()
+    f = hint_focus(s, set())
+    check("挑出了一个方向", bool(f["focus_atom"]), f)
+    check("方向来自 required atom",
+          f["focus_atom"] in [a.text for a in s.required_atoms()],
+          f["focus_atom"])
+    check("给出了未 touched 的 fact id", bool(f["focus_facts"]), f)
+    check("给出的是 hintable 的 fact",
+          all(s.fact_by_id()[fid].hintable for fid in f["focus_facts"]), f)
+
+
+def test_hint_focus_avoids_touched_and_unhintable():
+    """Q6: 已 touched 的、以及 hintable=False 的 fact 都不能当提示方向。
+
+    `touched` 是"玩家问过这个方向"—— 再提示就是浪费一条提示额度。
+    `hintable=False` 的是排除项/元信息, 提示它等于把观众往反方向带。
+    """
+    from story.quality import hint_focus
+    s = good_spec()
+    # f3 是 hintable=False, f1 是 a1 的唯一依赖
+    check("f3 确实不可提示", not s.fact_by_id()["f3"].hintable)
+    # a1 只依赖 f1 -> 把 f1 标为 touched 后, 焦点该转向 a2
+    f = hint_focus(s, {"f1"})
+    check("避开已 touched 的 fact", "f1" not in f["focus_facts"], f)
+    check("转向了另一条 atom", "f2" in f["focus_facts"], f)
+    f2 = hint_focus(s, {"f1", "f2"})
+    check("全 touched 时仍给得出方向", bool(f2["focus_atom"]), f2)
+
+
+def test_hint_focus_forbids_core_hidden():
+    """Q6: core hidden fact 必须进"禁止说出"表 —— 说出来就是泄底。"""
+    from story.quality import hint_focus
+    s = good_spec()
+    f = hint_focus(s, set())
+    core = [x.text for x in s.core_hidden_facts()]
+    check("core hidden 都在禁止表里",
+          all(c in f["forbidden_core_terms"] for c in core),
+          f["forbidden_core_terms"])
+    check("禁止表没有重复项",
+          len(f["forbidden_core_terms"]) == len(set(f["forbidden_core_terms"])),
+          f["forbidden_core_terms"])
+    check("touched 集合如实带出", f["known_or_touched"] == [], f)
+
+
+
 def main():
     tests = [
         test_spec_roundtrip,
@@ -727,6 +775,9 @@ def main():
         test_validate_blueprint_flags,
         test_blueprint_mismatch_is_rejected_not_warned,
         test_time_shape_is_not_a_hard_constraint,
+        test_hint_focus_picks_untouched_required_atom,
+        test_hint_focus_avoids_touched_and_unhintable,
+        test_hint_focus_forbids_core_hidden,
         test_blueprint_flags_both_directions,
         test_legacy_spec_skips_blueprint_comparison,
         test_quota_blocks_after_two_deaths,

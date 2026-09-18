@@ -201,6 +201,9 @@ class Config:
     # 网关若不支持, 会记日志而不是默默假设生效。
     answer_temperature: float = 0.0
     judge_temperature: float = 0.0
+    # 提示的温度略高一点点: 同一方向可以说出不同角度的引导语,
+    # 完全不抖动会让第 2、3 条提示听起来像同一句(方案 §31)。
+    hint_temperature: float = 0.5
     review_temperature: float = 0.2
     generate_temperature: float = 0.8
 
