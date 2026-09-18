@@ -17,8 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.puzzle import (  # noqa: E402
     EMOTION_MODES, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
-    PuzzleSpec, REVEAL_MODES, SolveAtom, has_closing_question,
-    is_first_person, quote_in_puzzle,
+    PuzzleSpec, REVEAL_DEFAULT, REVEAL_MODES, SolveAtom,
+    has_closing_question, is_first_person, quote_in_puzzle,
 )
 from story.quality import (  # noqa: E402
     Quotas, check_signature, choose_blueprint, cross_puzzle_gate,
@@ -282,70 +282,70 @@ def test_reveal_mode_enum_is_reveal_only():
           set(REVEAL_MODES) & set(EMOTION_MODES))
 
 
-def test_reveal_and_procedural_roundtrip():
-    """Step 01: 新字段要能过 JSON round trip, 且**默认值不改变老行为**。
+def test_blueprint_reveal_mode_default_and_roundtrip():
+    """Step 01: `Blueprint.reveal_mode` 默认 `straight_explanation`。
 
-    `reveal_mode` 默认 `straight_explanation`(= 没有翻转结构), `procedural_
-    rule_dependency` 默认 False —— 这样一道**没写这两个字段**的题, 它的
-    语义与 Step 01 之前完全一致(旧的"普通解释题"), 不会因为升级代码
-    而突然被配额认成"有翻转"。
+    Blueprint 是**指令** —— 代码在出题前必须先给出一个确定的"往哪个方向
+    做", 所以它需要确定的默认值。(与之相对, `Signature.reveal_mode` 是
+    **观察结果**, 缺失即未知 —— 见下一条测试。)
     """
-    s = good_spec()
-    check("Blueprint 默认 reveal_mode",
-          s.blueprint.reveal_mode == "straight_explanation",
-          s.blueprint.reveal_mode)
-    check("Blueprint 默认 procedural_rule_dependency",
-          s.blueprint.procedural_rule_dependency is False,
-          s.blueprint.procedural_rule_dependency)
-    check("Signature 默认 reveal_mode",
-          s.signature.reveal_mode == "straight_explanation",
-          s.signature.reveal_mode)
-    check("Signature 默认 procedural_rule_dependency",
-          s.signature.procedural_rule_dependency is False,
-          s.signature.procedural_rule_dependency)
-
-    # 显式赋值 + round trip
-    s.blueprint.reveal_mode = "identity_flip"
-    s.blueprint.procedural_rule_dependency = True
-    s.signature.reveal_mode = "identity_flip"
-    s.signature.procedural_rule_dependency = True
-    d = s.to_dict()
-    check("to_dict 带 reveal_mode", d["blueprint"]["reveal_mode"] == "identity_flip",
-          d["blueprint"])
-    check("to_dict 带 procedural_rule_dependency",
-          d["blueprint"]["procedural_rule_dependency"] is True, d["blueprint"])
-    check("signature to_dict 带 reveal_mode",
-          d["signature"]["reveal_mode"] == "identity_flip", d["signature"])
-    s2 = PuzzleSpec.from_dict(d)
-    check("round trip 后 blueprint.reveal_mode 保持",
-          s2.blueprint.reveal_mode == "identity_flip", s2.blueprint.reveal_mode)
-    check("round trip 后 signature 两字段保持",
-          s2.signature.reveal_mode == "identity_flip"
-          and s2.signature.procedural_rule_dependency is True, s2.signature)
-    check("round trip 完全相等", s2.to_dict() == d, s2.to_dict())
-
-    # archive 也要带(复盘/配额都靠它)
-    a = s.to_archive()
-    check("archive 带 reveal_mode",
-          a["signature"]["reveal_mode"] == "identity_flip"
-          and a["blueprint"]["reveal_mode"] == "identity_flip", a["signature"])
-
-    # 非法值要回落到默认, 不能把坏值灌进配额桶
-    bad_d = {"blueprint": dict(d["blueprint"], reveal_mode="乱写的值"),
-             "signature": dict(d["signature"], reveal_mode="乱写的值")}
-    s3 = PuzzleSpec.from_dict(dict(d, **bad_d))
-    check("非法 reveal_mode 回落到默认",
-          s3.blueprint.reveal_mode == "straight_explanation"
-          and s3.signature.reveal_mode == "straight_explanation",
-          (s3.blueprint.reveal_mode, s3.signature.reveal_mode))
+    bp = PuzzleBlueprint()
+    check("Blueprint 默认 reveal_mode = straight_explanation",
+          bp.reveal_mode == REVEAL_DEFAULT, bp.reveal_mode)
+    bp.reveal_mode = "identity_flip"
+    d = bp.to_dict()
+    check("Blueprint to_dict 带 reveal_mode",
+          d["reveal_mode"] == "identity_flip", d)
+    check("Blueprint round trip 保持",
+          PuzzleBlueprint.from_dict(d).reveal_mode == "identity_flip",
+          PuzzleBlueprint.from_dict(d).reveal_mode)
+    # 非法值 -> 回落(Blueprint 需要确定指令, 不能留空)
+    check("Blueprint 非法 reveal_mode 回落到默认",
+          PuzzleBlueprint.from_dict(
+              {"reveal_mode": "乱写的值"}).reveal_mode == REVEAL_DEFAULT,
+          PuzzleBlueprint.from_dict({"reveal_mode": "乱写的值"}).reveal_mode)
 
 
-def test_legacy_spec_gets_reveal_defaults():
-    """Step 01: 老 archive(完全没有这两个字段)读进来要有确定的默认值。
+def test_blueprint_has_no_procedural_rule_dependency():
+    """Step 01 review-fix: `procedural_rule_dependency` **只属于 Signature**。
 
-    老记录不能因为"缺字段"就变成空字符串 —— 空串会掉进 `reveal:""` 这个
-    桶, 既不计入 `straight_explanation` 配额, 也不计入任何 quota, 于是
-    老题池整体**绕过**了 reveal 配额。必须显式回落。
+    v1.3 冻结: 它是 Reviewer 读完成品后回传的 **observed fact**, 第一版
+    只进入 `Signature / reviewer observed_signature / archive /
+    cross-puzzle quota`, **不要求 Blueprint 预先指定**。
+
+    放进 Blueprint 会制造一个"代码预先指定规则依赖"的来源 —— 而代码在
+    出题之前根本无从知道这道题会不会依赖某条内部流程。以后很容易被误用
+    成"让模型照抄的硬约束", 那恰恰是这个字段要避免的。
+    """
+    bp = PuzzleBlueprint()
+    check("Blueprint 没有 procedural_rule_dependency 字段",
+          not hasattr(bp, "procedural_rule_dependency"), dir(bp))
+    check("Blueprint.to_dict 不含 procedural_rule_dependency",
+          "procedural_rule_dependency" not in bp.to_dict(), bp.to_dict())
+    # 就算磁盘上写了这个键(比如老代码写的), 也不能被读成 blueprint 属性
+    loaded = PuzzleBlueprint.from_dict(
+        {"mechanism_family": "hidden_function",
+         "procedural_rule_dependency": True})
+    check("Blueprint.from_dict 忽略 procedural_rule_dependency",
+          not hasattr(loaded, "procedural_rule_dependency"), loaded)
+    # 但 Signature 上必须有, 而且是 bool
+    sig = PuzzleSignature()
+    check("Signature 有 procedural_rule_dependency",
+          sig.procedural_rule_dependency is False, sig)
+
+
+def test_legacy_signature_reveal_mode_is_unknown_not_straight():
+    """Step 01 review-fix: 老 Signature 的 `reveal_mode` 是 **unknown**, 不是 straight。
+
+    这是本轮 review 最实质的一条修正。`Signature` 是**观察结果**, 它上面
+    其余字段(`mechanism_family` / `domain` / `emotion_mode` / …)在缺失时
+    全部是 `""`。如果只有新加的 `reveal_mode` 默认成 `straight_explanation`,
+    那几百道历史题会被一律读成"普通解释", 离线分析就会得到一个**假的历史
+    结论**: "历史题全是 straight"。
+
+    "旧题借 `""` 绕过 reveal 配额"不是靠伪造 observed 数据解决的 ——
+    正确位置是 Step 03 的 `quality_policy_version + quarantine`: 旧 policy
+    题根本不参与 v4 live inventory。
     """
     old = PuzzleSpec.from_dict({
         "puzzle": "老谜面。为什么?", "answer": "老谜底。",
@@ -355,50 +355,91 @@ def test_legacy_spec_gets_reveal_defaults():
         "blueprint": {"mechanism_family": "hidden_function",
                       "solution_shape": "hidden_function_explains_behavior",
                       "domain": "maritime"}})
-    check("老 signature 的 reveal_mode 有默认值",
-          old.signature.reveal_mode == "straight_explanation",
-          old.signature.reveal_mode)
+    check("老 signature 的 reveal_mode 是空(未知)",
+          old.signature.reveal_mode == "", repr(old.signature.reveal_mode))
     check("老 signature 的 procedural_rule_dependency 是 False",
           old.signature.procedural_rule_dependency is False,
           old.signature.procedural_rule_dependency)
-    check("老 blueprint 同样有默认值",
-          old.blueprint.reveal_mode == "straight_explanation"
-          and old.blueprint.procedural_rule_dependency is False,
-          old.blueprint)
-    # 而且它仍然算 v2 spec(有 signature), 所以会进配额统计
+    check("老 blueprint 的 reveal_mode 是 straight(指令需要确定值)",
+          old.blueprint.reveal_mode == REVEAL_DEFAULT,
+          old.blueprint.reveal_mode)
+    # 与 signature 其余 observed 字段的语义一致
+    check("reveal_mode 与其余 observed 字段同语义(缺失即空)",
+          old.signature.mechanism_family != ""
+          and old.signature.emotion_mode == ""
+          and old.signature.reveal_mode == "",
+          old.signature.to_dict())
+    # 仍然算 v2 spec(有 signature), 所以会进配额统计
     from story.quality import _is_v2_spec
     check("老 signature 仍被认作 v2", _is_v2_spec(old))
 
 
-def test_reveal_mode_is_not_a_blueprint_hard_constraint():
-    """Step 01 只加数据结构, **不动** blueprint 逐项比对。
+def test_signature_reveal_mode_default_is_unknown():
+    """Step 01: `Signature.reveal_mode` 的**字段默认值**也必须是 `""`。
 
-    任务书 §20 Step 01 明确"不修改 Scheduler"。`reveal_mode` 与
-    `procedural_rule_dependency` 在这一步只是**记录**, 不能立刻变成会
-    拒稿的硬约束 —— 否则生成器还没被教过怎么写, 出题成功率会先崩一段。
+    这条是补的 —— 上面那条测试只走 `PuzzleSpec.from_dict()`, 而
+    `from_dict` 对缺失的 key 有**自己的**显式回落(`str(d.get(...) or "")`),
+    所以它根本碰不到 dataclass 的字段默认值。于是"把字段默认改回
+    `straight_explanation`"这个 mutation **不会让任何测试变红** ——
+    实测确认过。
 
-    这条测试是**边界钉**: Step 02 改的是配额/调度, 仍然不该把
-    reveal_mode 加进 `validate_blueprint` 的逐项比对名单。
+    但字段默认值并不是死代码: 任何直接构造 `PuzzleSignature()` 的地方
+    (测试、将来的 Reviewer 合并逻辑、离线分析脚本)拿到的就是它。
+    两处默认值必须一致, 否则同一个"未知"在两条路径上会读成两个值。
     """
-    bp = PuzzleBlueprint(mechanism_family="hidden_function",
-                         solution_shape="hidden_function_explains_behavior",
-                         domain="maritime", relation="stranger",
-                         emotion_mode="neutral", time_shape="habitual",
-                         reveal_mode="identity_flip",
-                         procedural_rule_dependency=True)
-    sp = good_spec()
-    sp.blueprint = bp
-    # signature 在 reveal/procedural 上与 blueprint 不一致 —— 但既然这两项
-    # 不是硬约束, 就不该因此拒稿(其余维度保持一致)。
-    sp.signature = PuzzleSignature(
-        mechanism_family="hidden_function",
-        solution_shape="hidden_function_explains_behavior",
-        domain="maritime", relation="stranger", emotion_mode="neutral",
-        time_shape="habitual",
-        reveal_mode="straight_explanation", procedural_rule_dependency=False)
-    r = validate_blueprint(sp, bp)
-    check("reveal/procedural 不一致不拒稿(Step 01 边界)",
-          r.ok, r.errors)
+    check("裸构造的 Signature.reveal_mode 是空",
+          PuzzleSignature().reveal_mode == "",
+          repr(PuzzleSignature().reveal_mode))
+    check("裸构造的 Blueprint.reveal_mode 是 straight(指令需要确定值)",
+          PuzzleBlueprint().reveal_mode == REVEAL_DEFAULT,
+          repr(PuzzleBlueprint().reveal_mode))
+    # 两条路径必须给出同一个答案
+    check("字段默认与 from_dict 一致",
+          PuzzleSignature().reveal_mode
+          == PuzzleSignature.from_dict({}).reveal_mode,
+          (PuzzleSignature().reveal_mode,
+           PuzzleSignature.from_dict({}).reveal_mode))
+
+
+def test_signature_reveal_mode_rejects_bad_value():
+    """Step 01: 非法 observed 值回 `""`(未知), **不**伪造成 straight。"""
+    d = {"puzzle": "x。为什么?", "answer": "y",
+         "signature": {"mechanism_family": "hidden_function",
+                       "solution_shape": "hidden_function_explains_behavior",
+                       "domain": "maritime", "reveal_mode": "乱写的值"}}
+    s = PuzzleSpec.from_dict(d)
+    check("非法 signature.reveal_mode -> 空",
+          s.signature.reveal_mode == "", repr(s.signature.reveal_mode))
+    # 合法值原样保留
+    d["signature"]["reveal_mode"] = "identity_flip"
+    check("合法 signature.reveal_mode 保留",
+          PuzzleSpec.from_dict(d).signature.reveal_mode == "identity_flip",
+          PuzzleSpec.from_dict(d).signature.reveal_mode)
+    # procedural 是 bool, 缺失即 False
+    check("signature.procedural_rule_dependency round trip",
+          PuzzleSpec.from_dict(
+              {"signature": {"procedural_rule_dependency": True}}
+          ).signature.procedural_rule_dependency is True)
+
+
+def test_describe_does_not_leak_reveal_mode():
+    """Step 01 review-fix: `describe()` 直接进生产 Prompt, 不能提前暴露新字段。
+
+    `_gen_spec_once()` 把它拼进 RIDDLE 的 user 消息(生成器),
+    `_review()` 把它拼进审稿消息。所以往这里加一行 = **改生产行为**。
+
+    Step 01 只做 schema/serialization; 让生成器/审稿人正式理解
+    `reveal_mode`(并同步 prompt version / tool schema / regression)
+    是 Step 04 的事。
+    """
+    txt = PuzzleBlueprint(reveal_mode="identity_flip").describe()
+    check("describe() 不出现 reveal_mode", "reveal_mode" not in txt, txt)
+    check("describe() 不出现 procedural_rule_dependency",
+          "procedural_rule_dependency" not in txt, txt)
+    # 但原有的硬约束字段必须还在(别为了删一行把整段弄坏)
+    for must in ("mechanism_family", "solution_shape", "domain",
+                 "relation", "emotion_mode", "time_shape"):
+        check(f"describe() 仍含 {must}", must in txt, txt)
 
 
 def test_legacy_atoms_migrate():
@@ -976,9 +1017,12 @@ def main():
         test_puzzle_format_checks,
         # ---- Step 01: reveal_mode / procedural_rule_dependency ----
         test_reveal_mode_enum_is_reveal_only,
-        test_reveal_and_procedural_roundtrip,
-        test_legacy_spec_gets_reveal_defaults,
-        test_reveal_mode_is_not_a_blueprint_hard_constraint,
+        test_blueprint_reveal_mode_default_and_roundtrip,
+        test_blueprint_has_no_procedural_rule_dependency,
+        test_legacy_signature_reveal_mode_is_unknown_not_straight,
+        test_signature_reveal_mode_default_is_unknown,
+        test_signature_reveal_mode_rejects_bad_value,
+        test_describe_does_not_leak_reveal_mode,
         test_legacy_atoms_migrate,
         test_validate_blueprint_flags,
         test_blueprint_mismatch_is_rejected_not_warned,

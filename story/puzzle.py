@@ -262,21 +262,21 @@ class PuzzleBlueprint:
     repeated_ritual: bool = False
 
     # ---- Step 01 新增(只记录, 不改调度) ----
-    #: 揭晓结构。**只描述"揭晓时观众重新理解了什么"**, 不混情绪。
-    #: 默认 `straight_explanation` —— 此时它的语义与 Step 01 之前完全
-    #: 一致("一道没有结构性翻转的普通题"), 所以升级代码不会让存量题
-    #: 突然被算成"有翻转"。
+    #: 揭晓结构 —— **代码希望这道题往哪个方向做**。
+    #:
+    #: 默认 `straight_explanation` 是刻意的: 它表达"代码没有特别指定翻转时
+    #: 的默认生成方向", 而不是"这是一道普通题"。Blueprint 是**指令**,
+    #: 所以它需要一个确定的默认指令 —— 这一点与 `Signature` 相反
+    #: (那边是**观察结果**, 缺失即未知, 见 `PuzzleSignature.reveal_mode`)。
     reveal_mode: str = REVEAL_DEFAULT
-    #: 这道题是否**主要依赖**题面之外的组织规定 / 内部流程 / 设备白名单 /
-    #: 店规这类制度性设定。用来压制"隐藏规定题"重新成为题库主色。
-    #:
-    #: 它**不等价于** `mechanism_family == "rule_constraint"`:
-    #: `hidden_function + 某设备有内部白名单` 与
-    #: `information_gap + 某岗位有未公开流程` 都可能把这里标成 True。
-    #:
-    #: Step 01 只让它能被记录与统计(Reviewer 回传 observed 值),
-    #: 但**不要求** Blueprint 预先指定 true/false。
-    procedural_rule_dependency: bool = False
+
+    # 注: 这里**刻意没有** `procedural_rule_dependency`。
+    #
+    # 它是**观察出来的事实**("这道题实际是否依赖题面之外的制度设定"),
+    # 不是代码能预先下达的指令 —— 代码在出题之前根本无从知道。所以它只
+    # 存在于 `PuzzleSignature`(Reviewer 读完成品后回传)。
+    # 放进 Blueprint 会制造一个"代码预先指定规则依赖"的来源, 以后很容易
+    # 被误用成"让模型照抄的硬约束", 那正是这个字段要避免的。
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -291,7 +291,6 @@ class PuzzleBlueprint:
             "long_term_profession": bool(self.long_term_profession),
             "repeated_ritual": bool(self.repeated_ritual),
             "reveal_mode": self.reveal_mode,
-            "procedural_rule_dependency": bool(self.procedural_rule_dependency),
         }
 
     @classmethod
@@ -311,12 +310,20 @@ class PuzzleBlueprint:
             long_term_profession=bool(d.get("long_term_profession", False)),
             repeated_ritual=bool(d.get("repeated_ritual", False)),
             reveal_mode=_pick(d.get("reveal_mode"), REVEAL_MODES, REVEAL_DEFAULT),
-            procedural_rule_dependency=bool(
-                d.get("procedural_rule_dependency", False)),
         )
 
     def describe(self) -> str:
-        """给生成器看的硬约束文本。"""
+        """给生成器看的硬约束文本。
+
+        ⚠️ **这个字符串直接进生产 Prompt** —— 它由 `_gen_spec_once()` 拼进
+        RIDDLE 的 user 消息、由 `_review()` 拼进审稿消息。所以往这里加一行
+        就是**改生产行为**, 不是改数据结构。
+
+        Step 01 刻意**不**在这里暴露 `reveal_mode`: 让生成器正式理解这个
+        字段(并同步 prompt version / tool schema / regression)是 Step 04
+        的事。在那之前先塞进去, 等于让模型对着一个它没被告知过语义的枚举
+        值自由发挥, 反而会污染 observed_signature。
+        """
         flags = [k for k in ("death", "past_trauma", "long_term_profession",
                              "repeated_ritual") if getattr(self, k)]
         return (
@@ -326,7 +333,6 @@ class PuzzleBlueprint:
             f"- relation(人物关系): {self.relation}\n"
             f"- emotion_mode(情绪基调): {self.emotion_mode}\n"
             f"- time_shape(时间形态, 参考): {self.time_shape}\n"
-            f"- reveal_mode(揭晓结构, 参考): {self.reveal_mode}\n"
             f"- 必须为真的标记: {', '.join(flags) if flags else '(无)'}\n"
             f"- 必须为假的标记: "
             f"{', '.join(k for k in ('death', 'past_trauma', 'long_term_profession', 'repeated_ritual') if not getattr(self, k))}"
@@ -358,7 +364,17 @@ class PuzzleSignature:
     # ---- Step 01 新增(只统计, 不参与蓝图逐项比对) ----
     #: 揭晓结构(observed)。与 blueprint 的 `reveal_mode` 同义, 但这里是
     #: **审稿人读完之后如实回传**的值 —— 配额统计用它, 不用自报值。
-    reveal_mode: str = REVEAL_DEFAULT
+    #:
+    #: 默认 **`""`(未知)**, 不是 `straight_explanation`。理由: Signature 是
+    #: **观察结果**, 它上面其余字段(`mechanism_family` / `domain` / …)在
+    #: 缺失时也都是 `""`。老题没有这个字段, 真实含义是"没观察过", 不是
+    #: "观察结果是普通解释"。若默认成 straight, 几百道历史题会被一律读成
+    #: straight, 离线分析就会得到"历史题全是普通解释"这个**假结论**。
+    #:
+    #: 那"旧题借 `""` 绕过 reveal 配额"怎么办? —— 不在这一步用伪造 observed
+    #: 数据去掩盖。正确位置是 Step 03: 旧 policy 题走 quarantine, 根本不
+    #: 参与 v4 live inventory。
+    reveal_mode: str = ""
     #: 是否主要依赖题面之外的制度性设定(observed)。由 Reviewer 单题判断,
     #: 代码只管最近窗口的配额。
     procedural_rule_dependency: bool = False
@@ -393,22 +409,16 @@ class PuzzleSignature:
             past_trauma=bool(d.get("past_trauma", False)),
             long_term_profession=bool(d.get("long_term_profession", False)),
             repeated_ritual=bool(d.get("repeated_ritual", False)),
-            reveal_mode=_pick(d.get("reveal_mode"), REVEAL_MODES, REVEAL_DEFAULT),
+            # 缺失 / 非法一律回 `""`(未知), **不**回落成 straight_explanation。
+            # 见字段注释: 那是把"没观察过"伪造成"观察结果是普通解释"。
+            reveal_mode=str(d.get("reveal_mode", "") or "")
+            if str(d.get("reveal_mode", "") or "") in REVEAL_MODES else "",
             procedural_rule_dependency=bool(
                 d.get("procedural_rule_dependency", False)),
         )
 
     def grief(self) -> bool:
         return self.emotion_mode in GRIEF_MODES
-
-    def strong_reveal(self) -> bool:
-        """有没有一个**明确的结构性翻转**(而不是正面解释)。
-
-        Step 02 的配额要用它数"最近 10 题里几道有强揭晓"。放在 Signature
-        上而不是各调用点自己写 `!= "straight_explanation"` —— 判据只有
-        一处, 将来加枚举值时不会漏。
-        """
-        return bool(self.reveal_mode) and self.reveal_mode != REVEAL_DEFAULT
 
     def trauma_ritual(self) -> bool:
         """既往创伤 + 长年怪规矩 —— 8 小时直播里 69% 的题都是这个形状。"""
