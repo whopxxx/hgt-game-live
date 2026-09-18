@@ -23,7 +23,7 @@ from story.puzzle import (  # noqa: E402
 from story.quality import (  # noqa: E402
     QUALITY_POLICY_VERSION, Quotas, check_signature, choose_blueprint,
     cross_puzzle_gate, FAMILY_SHAPES, check_tables, is_structurally_duplicate,
-    signature_counts, signature_of, validate_blueprint, validate_spec,
+    signature_counts, signature_of, validate_blueprint, validate_spec, _candidates,
 )
 
 FAIL = [0]
@@ -1104,6 +1104,196 @@ def test_s02_blueprint_carries_reveal_target():
           any(t != "straight_explanation" for t in targets), uniq)
 
 
+def test_closeout_hierarchy_family_probability_not_inflated_by_width():
+    """Blocker 3 核心: family 概率**不能**被它的展开宽度放大。
+
+    ## 这条测试怎么才算真的有效
+
+    我先写了"宽窄两个 family 占比接近"的版本, 结果**抓不住**真正的
+    宽度偏见 mutation —— 因为 `choose_family_shape` 每个 family 只挑一个
+    shape, shape 数量本身不直接乘彩票。真正会放大权重的是**笛卡尔积展开
+    宽度**(family 能展开出多少 emotion×domain×relation 组合)。
+
+    所以这里直接测**相关性**: 用 `_candidates()`(它就是那个笛卡尔积)
+    量出每个 family 的展开宽度, 再看实际调度占比。分层实现下两者
+    **不应正相关** —— 事实上最窄的两个 family(time_reinterpretation /
+    emotional_motive, 因为它们含被钉死成 grief 的 shape)占比最高, 正好
+    与"按宽度计权"相反。
+
+    修之前(大笛卡尔积 + 每 candidate 计权)它们会被系统性饿死。
+    """
+    print("\n[CO-5] family 概率不被展开宽度放大")
+    import random
+    from story.quality import FAMILY_SHAPES, family_headroom
+    # 空窗口 -> 所有 family 权重相同
+    w = family_headroom(Quotas(), [])
+    check("空窗口下各 family 权重相等",
+          len(set(round(v, 9) for v in w.values())) == 1, w)
+
+    # 用笛卡尔积宽度作为"老实现会给的权重"的代理
+    width = {}
+    for bp, _sig in _candidates(Quotas(), []):
+        width[bp.mechanism_family] = width.get(bp.mechanism_family, 0) + 1
+
+    N = 600
+    picks = {}
+    for s_ in range(N):
+        fam = choose_blueprint([], random.Random(s_)).mechanism_family
+        picks[fam] = picks.get(fam, 0) + 1
+
+    # 最窄 / 最宽的 family
+    narrow = min(width, key=lambda f: width[f])
+    widest = max(width, key=lambda f: width[f])
+    check("存在宽度差异(否则这条测试无意义)",
+          width[narrow] < width[widest], (narrow, widest))
+
+    exp = N / len(FAMILY_SHAPES)
+    # 最窄的那个**不能**被饿死 —— 老实现下它按宽度只该拿 ~5% 的票,
+    # 而均匀应当 ~8.3%。60% 的下限给了充足的采样余量。
+    check(f"最窄的 {narrow} 占比不低于均匀的 60%",
+          picks.get(narrow, 0) >= exp * 0.6,
+          f"{picks.get(narrow, 0)} vs expect~{exp:.0f}")
+    # 最宽的不能碾压
+    check(f"最宽的 {widest} 占比不超过均匀的 2 倍",
+          picks.get(widest, 0) <= exp * 2.0,
+          f"{picks.get(widest, 0)} vs expect~{exp:.0f}")
+    # 关键: 宽度与占比**不能**正相关。
+    # 注意别断言"最窄 >= 最宽" —— 两者都在均匀附近, 比较的是采样噪声,
+    # 那种断言会随 seed 抖动(实测 51 vs 59)。有意义的界是**比值**:
+    # 按宽度计权时最宽/最窄 ≈ 2592/1458 ≈ 1.78, 分层后应接近 1。
+    ratio = picks.get(widest, 0) / max(1, picks.get(narrow, 0))
+    check("最宽/最窄 的占比比接近 1(宽度没泄漏成概率)",
+          ratio < 1.5, f"ratio={ratio:.2f} "
+                       f"(widest={widest}:{picks.get(widest, 0)}, "
+                       f"narrow={narrow}:{picks.get(narrow, 0)})")
+
+
+def test_closeout_hierarchy_emotion_picked_before_shape():
+    """Blocker 3: emotion 是**独立一层**, 不是被 shape 顺带的。
+
+    选定 grief 时才允许进入被钉死成 grief 的 shape; 选别的情绪时那些
+    shape 就不是合法的。这条验两个方向。
+    """
+    print("\n[CO-6] emotion 层与 shape 层相容性")
+    from story.quality import (choose_family_shape, shape_is_compatible_with_emotion,
+                               _legal_shapes_for)
+    pinned_shape = "past_trauma_explains_current_ritual"
+    check("该 shape 被钉死成 grief",
+          shape_is_compatible_with_emotion(pinned_shape, "grief") is True)
+    check("warm 与该 shape 不相容",
+          shape_is_compatible_with_emotion(pinned_shape, "warm") is False)
+    # 选定 warm 时, time_reinterpretation 不该有合法 shape(它只有
+    # past_trauma... 这个被钉死的 + time_reinterpretation)
+    warm_shapes = _legal_shapes_for("time_reinterpretation", "warm")
+    check("warm 下 time_reinterpretation 无合法 shape",
+          pinned_shape not in warm_shapes, warm_shapes)
+    # 选定 grief 时可以进
+    grief_shapes = _legal_shapes_for("time_reinterpretation", "grief")
+    check("grief 下该 shape 合法", pinned_shape in grief_shapes, grief_shapes)
+    # 调度出的 blueprint 必须自洽
+    import random
+    for s in range(60):
+        bp = choose_blueprint([], random.Random(s))
+        check_ok = shape_is_compatible_with_emotion(bp.solution_shape,
+                                                    bp.emotion_mode)
+        if not check_ok:
+            check(f"seed={s} 调度结果 emotion/shape 不自洽",
+                  False, (bp.mechanism_family, bp.solution_shape,
+                          bp.emotion_mode))
+            break
+    else:
+        check("60 次调度的 emotion/shape 全部相容", True)
+
+
+def test_closeout_choose_reveal_mode_picks_by_deficit():
+    """Blocker 3: reveal 目标要按**缺口**选, 不是"没到上限就等权随机"。
+
+    `identity_flip` 已有 1 次而 `goal_flip` 0 次时, 应显著偏向
+    `goal_flip` —— 早先实现只看"是否超上限", 两者都未超时不会优先补缺口。
+    """
+    print("\n[CO-7] reveal 目标按缺口选")
+    import random
+    from story.quality import choose_reveal_mode
+    recent = [_sig(reveal_mode="identity_flip")]
+    picks = [choose_reveal_mode(recent, random.Random(s)) for s in range(200)]
+    n_id = picks.count("identity_flip")
+    n_goal = picks.count("goal_flip")
+    check("goal_flip(缺口 0 次) 比 identity_flip(已有 1 次) 更常被选",
+          n_goal > n_id, f"goal={n_goal} identity={n_id}")
+    check("两者都仍会出现(不是硬禁)",
+          n_goal > 0 and n_id > 0, f"goal={n_goal} identity={n_id}")
+
+
+def test_closeout_reveal_adherence_gate():
+    """Blocker 4: target != observed -> **拒绝**(不是只记录)。
+
+    冻结语义: target 是调度意图, observed 是 Reviewer 的事实观察,
+    quota 按 observed 统计。但 target != observed 意味着**这稿没执行
+    调度目标** —— 那是调度落空, 必须拒, 否则调度器形同虚设。
+    """
+    print("\n[CO-9] reveal adherence 闸门")
+    from story.quality import validate_reveal_adherence
+    s = good_spec()
+    s.blueprint_specified = True
+    s.blueprint.reveal_mode = "identity_flip"
+    s.signature.reveal_mode = "identity_flip"
+    check("一致 -> 通过", validate_reveal_adherence(s, s.blueprint) == [])
+    s.signature.reveal_mode = "goal_flip"
+    bad = validate_reveal_adherence(s, s.blueprint)
+    check("不一致 -> 拒绝", bad != [], bad)
+    check("理由里两个值都在",
+          "identity_flip" in bad[0] and "goal_flip" in bad[0], bad)
+    # 没观察值 -> 也拒(不能当成"一致")
+    s.signature.reveal_mode = ""
+    bad2 = validate_reveal_adherence(s, s.blueprint)
+    check("缺 observed -> 拒绝", bad2 != [], bad2)
+
+
+def test_closeout_adherence_skipped_without_assigned_blueprint():
+    """自由生成 / 未分配 blueprint 的题**不**做 adherence 比对。
+
+    为什么必须这样: `PuzzleBlueprint.reveal_mode` 的 dataclass 默认值是
+    `straight_explanation`(那是"代码没指定时的默认方向")。若不看
+    `blueprint_specified` 就比, **每一道自由生成的题都会被要求写成
+    普通解释** —— 这正是 Batch A closeout 里真实踩到的坑。
+    """
+    print("\n[CO-10] 未分配 blueprint 时不比对")
+    from story.quality import validate_reveal_adherence
+    s = good_spec()
+    s.blueprint_specified = False
+    s.blueprint.reveal_mode = "straight_explanation"    # dataclass 默认值
+    s.signature.reveal_mode = "identity_flip"           # 实际写成别的
+    check("未分配 -> 不判(不拒绝)", validate_reveal_adherence(s, s.blueprint) == [])
+    # 一旦标记为已分配, 同样的数据就会被拒
+    s.blueprint_specified = True
+    check("已分配 -> 同样的数据被拒",
+          validate_reveal_adherence(s, s.blueprint) != [])
+
+
+def test_closeout_same_reveal_mode_covers_straight():
+    """Blocker 3 cleanup: `straight_explanation` 也要受 `same_reveal_mode`。
+
+    正确语义: **任何** reveal_mode 都受 same_reveal_mode; straight 额外
+    还受 straight_explanation —— 实际上限是两者较严的那个。
+    早先 straight 只查 straight 配额, 于是 `same_reveal_mode=1,
+    straight_explanation=2` 时 straight 仍能出现两次, 违反"同一结构上限 1"。
+    """
+    print("\n[CO-8] same_reveal_mode 也覆盖 straight")
+    q = Quotas(same_reveal_mode=1, straight_explanation=2)
+    recent = [_sig(reveal_mode="straight_explanation")]
+    bad = check_signature(_sig(reveal_mode="straight_explanation"), recent, q)
+    check("same_reveal_mode=1 时 straight 也不能再来一次", bad != [], bad)
+    # straight_explanation 更严时同样生效
+    q2 = Quotas(same_reveal_mode=5, straight_explanation=1)
+    bad2 = check_signature(_sig(reveal_mode="straight_explanation"), recent, q2)
+    check("straight_explanation=1 时也不能再来一次", bad2 != [], bad2)
+    # 有翻转的结构不受 straight 专属配额影响
+    ok = check_signature(
+        _sig(reveal_mode="goal_flip", mechanism_family="object_misuse",
+             solution_shape="misunderstood_object"), [], Quotas())
+    check("翻转型不被 straight 配额误伤", ok == [], ok)
+
+
 def test_s02_quota_responsibility_stays_in_code():
     """Step 02 硬边界: 配额判断在**代码层**, 不在 Reviewer。
 
@@ -1290,6 +1480,13 @@ def main():
         test_s02_choose_reveal_mode_avoids_exhausted,
         test_s02_blueprint_carries_reveal_target,
         test_s02_quota_responsibility_stays_in_code,
+        # ---- Batch A closeout: hierarchical scheduler ----
+        test_closeout_hierarchy_family_probability_not_inflated_by_width,
+        test_closeout_hierarchy_emotion_picked_before_shape,
+        test_closeout_choose_reveal_mode_picks_by_deficit,
+        test_closeout_same_reveal_mode_covers_straight,
+        test_closeout_reveal_adherence_gate,
+        test_closeout_adherence_skipped_without_assigned_blueprint,
     ]
     for t in tests:
         t()

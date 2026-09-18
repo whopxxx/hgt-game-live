@@ -85,12 +85,14 @@ def mk_spec(**kw) -> PuzzleSpec:
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
             domain="maritime", relation="stranger",
-            emotion_mode="neutral", time_shape="habitual"),
+            emotion_mode="neutral", time_shape="habitual",
+            reveal_mode="meaning_flip"),
         signature=PuzzleSignature(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
             domain="maritime", emotion_mode="neutral",
-            relation="stranger", time_shape="habitual"),
+            relation="stranger", time_shape="habitual",
+            reveal_mode="meaning_flip"),
         # Step 03: 池准入门现在要求 spec 声明它属于**当前**质量政策。
         # 这里的题是"刚由 gen_spec 生成"的, 所以标当前版本才是忠实
         # 的 —— 留空会被正确地隔离(那正是隔离生效的证据, 但在本套件

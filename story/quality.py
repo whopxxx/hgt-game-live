@@ -480,17 +480,21 @@ def check_signature(sig: PuzzleSignature, recent: Optional[list],
     # 没有 observed reveal_mode(`""`)时**不判** —— 那是"没观察过", 不是
     # "普通解释"。拿未知当 straight 会把老题和历史统计一起弄脏。
     if sig.reveal_mode:
+        # **任何** reveal_mode 都受 same_reveal_mode 约束; straight 额外还
+        # 受 straight_explanation 约束 —— 实际上限是两者**较严**的那个。
+        # 早先写成 if/else 分支(straight 只查 straight 配额), 于是配置成
+        # `same_reveal_mode=1 / straight_explanation=2` 时 straight 仍能出现
+        # 两次, 违反"同一结构上限 1"的语义。
+        if c.get(f"reveal:{sig.reveal_mode}", 0) >= q.same_reveal_mode:
+            bad.append(f"最近 {q.window} 题里揭晓结构 {sig.reveal_mode} 已出现 "
+                       f"{c[f'reveal:{sig.reveal_mode}']} 次"
+                       f"(上限 {q.same_reveal_mode})")
         if (sig.reveal_mode == "straight_explanation"
                 and c.get("reveal:straight_explanation", 0)
                 >= q.straight_explanation):
             bad.append(f"最近 {q.window} 题里有 "
                        f"{c['reveal:straight_explanation']} 道'没有翻转的正面解释'"
                        f"(上限 {q.straight_explanation})")
-        if (sig.reveal_mode != "straight_explanation"
-                and c.get(f"reveal:{sig.reveal_mode}", 0) >= q.same_reveal_mode):
-            bad.append(f"最近 {q.window} 题里揭晓结构 {sig.reveal_mode} 已出现 "
-                       f"{c[f'reveal:{sig.reveal_mode}']} 次"
-                       f"(上限 {q.same_reveal_mode})")
     if (sig.emotion_mode == "neutral"
             and c.get("emotion:neutral", 0) >= q.neutral_emotion):
         bad.append(f"最近 {q.window} 题里有 {c['emotion:neutral']} 道中性情绪题"
@@ -572,30 +576,204 @@ def _shape_flags(shape: str, emotion_mode: str) -> dict:
     return f
 
 
+def shape_is_compatible_with_emotion(shape: str, emotion: str) -> bool:
+    """这个 solution_shape 能不能配这个 emotion?
+
+    `SHAPE_FLAGS` 里被**形状钉死**的情绪是硬约束(`past_trauma_...` 必然
+    grief)。没有钉死的 shape 可以自由搭任何情绪。
+    """
+    pinned = SHAPE_FLAGS.get(shape, {}).get("emotion_mode")
+    return pinned is None or pinned == emotion
+
+
+def _legal_shapes_for(fam: str, emotion: str) -> list:
+    """某个 family 下, 与选定 emotion **相容**的 shape。"""
+    return [sh for sh in FAMILY_SHAPES.get(fam, ())
+            if shape_is_compatible_with_emotion(sh, emotion)]
+
+
+def family_headroom(quotas: Quotas, recent: Optional[list]) -> dict:
+    """每个 family 还剩多少"配额余量" —— **在 family 层算一次**。
+
+    ## 为什么必须有这一步(而不是按展开后的 candidate 计权)
+
+    早先的实现把 `family × shape × emotion × domain × relation` **全展开**
+    成候选, 再给每个 candidate 乘所属 family 的 LRU 权重。那有个隐蔽的
+    后果:
+
+        普通 shape     -> 能搭全部 EMOTION_MODES  -> 展开项多
+        past_trauma    -> emotion 被钉死成 grief   -> 展开项少
+
+    即使两个 family 的 LRU 权重完全相同, 展开项多的那个也天然拿到更多
+    "彩票" —— 于是**后面的维度反过来污染了前面的选择概率**。这正是
+    hierarchical scheduler 要避免的。
+
+    所以权重必须在 **family 层**算一次, 与该 family 能展开出多少
+    emotion/domain/relation 无关。
+
+    返回 `{family: 权重}`, 权重构成:
+        - 该 family 在最近窗口内出现的次数越少, 权重越高(weighted-LRU);
+        - 没有任何合法 shape 的 family(比如选定 emotion 下全被钉死)
+          权重为 0 —— 它这一轮不可选。
+    """
+    rs = _recent(recent, quotas.window)
+    n = max(1, len(rs))
+    last_seen: dict = {}
+    for i, s in enumerate(rs):           # i=0 是最老的一条
+        if s.mechanism_family:
+            last_seen[s.mechanism_family] = i
+    counts = Counter(s.mechanism_family for s in rs if s.mechanism_family)
+
+    out = {}
+    for fam in FAMILY_SHAPES:
+        age = last_seen.get(fam, -1)
+        # age = -1: 最近窗口里从没出现 -> 最优先
+        base = 2.0 + 1.0 / n if age < 0 else 1.0 + (n - age) / n
+        # 出现次数越少越好(与 age 正交: age 看"多久没见", count 看"见了几次")
+        out[fam] = base / (1.0 + counts.get(fam, 0))
+    return out
+
+
+def _quota_allows(fam: str, shape: str, emotion: str,
+                  quotas: Quotas, recent: Optional[list]) -> bool:
+    """这个 (family, shape, emotion) 组合过不过**静态**配额?
+
+    只看与 domain/relation 无关的那几条(mechanism / shape / 情绪 /
+    trauma 等)。domain/relation 在最后一层单独查。
+    """
+    bp = PuzzleBlueprint(mechanism_family=fam, solution_shape=shape,
+                         domain="", relation="", emotion_mode=emotion)
+    sig = signature_of(bp)
+    c = signature_counts(recent, quotas.window)
+    if sig.mechanism_family and \
+            c.get(f"mech:{sig.mechanism_family}", 0) >= quotas.same_mechanism:
+        return False
+    if sig.solution_shape and \
+            c.get(f"shape:{sig.solution_shape}", 0) >= quotas.same_solution_shape:
+        return False
+    if emotion == "neutral" and \
+            c.get("emotion:neutral", 0) >= quotas.neutral_emotion:
+        return False
+    if sig.trauma_ritual() and c.get("trauma_ritual", 0) >= quotas.trauma_ritual:
+        return False
+    if sig.grief() and c.get("grief", 0) >= quotas.grief:
+        return False
+    if sig.death and c.get("death", 0) >= quotas.death:
+        return False
+    if sig.past_trauma and c.get("past_trauma", 0) >= quotas.past_trauma:
+        return False
+    if (sig.long_term_profession and sig.repeated_ritual
+            and c.get("profession_ritual", 0) >= quotas.profession_ritual):
+        return False
+    return True
+
+
+def choose_emotion(recent: Optional[list],
+                   rng: Optional[random.Random] = None,
+                   quotas: Optional[Quotas] = None) -> str:
+    """第 2 层: 独立按 observed 分布挑情绪(**不看 family/shape**)。
+
+    规则:
+      - `neutral` 达 `neutral_emotion` 上限后**不可选**;
+      - 其余尽量补"最近缺口": 最近窗口里出现得少的情绪优先。
+    """
+    rng = rng or random.Random()
+    q = quotas or Quotas()
+    c = signature_counts(recent, q.window)
+    ok = []
+    for emo in EMOTION_MODES:
+        if emo == "neutral" and c.get("emotion:neutral", 0) >= q.neutral_emotion:
+            continue
+        ok.append(emo)
+    if not ok:
+        return "neutral"      # 全堵死时的兜底(理论上不可达: neutral 之上还有别的)
+    # 缺口越大(计数越少)权重越高 —— 这就是"补最近缺口"。
+    weights = [1.0 / (1.0 + c.get(f"emotion:{e}", 0)) for e in ok]
+    total = sum(weights)
+    pick = rng.random() * total
+    acc = 0.0
+    for emo, w in zip(ok, weights):
+        acc += w
+        if pick <= acc:
+            return emo
+    return ok[-1]
+
+
+def choose_family_shape(recent: Optional[list], emotion: str,
+                        rng: Optional[random.Random] = None,
+                        quotas: Optional[Quotas] = None) -> tuple:
+    """第 3 层: 在**与选定 emotion 相容**的 shape 里, 按 family 权重选。
+
+    ⚠️ 关键: family 权重**在 family 层算一次**(`family_headroom`), 与
+    该 family 能展开出多少 shape/domain/relation **无关**。这样后面的维度
+    不会反过来改变 family 被选中的概率。
+
+    返回 `(family, shape)`; 全堵死时返回 `("", "")`。
+    """
+    rng = rng or random.Random()
+    q = quotas or Quotas()
+    weights = family_headroom(q, recent)
+    # 只留"在这一 emotion 下至少有一个合法 shape 且过静态配额"的 family
+    legal: list = []
+    for fam, w in weights.items():
+        if w <= 0:
+            continue
+        shapes = [sh for sh in _legal_shapes_for(fam, emotion)
+                  if _quota_allows(fam, sh, emotion, q, recent)]
+        if shapes:
+            legal.append((fam, shapes, w))
+    if not legal:
+        return "", ""
+    total = sum(w for _f, _s, w in legal)
+    pick = rng.random() * total
+    acc = 0.0
+    chosen = legal[-1]
+    for item in legal:
+        acc += item[2]
+        if pick <= acc:
+            chosen = item
+            break
+    fam, shapes, _w = chosen
+    # shape 在 family 内部等权随机 —— family 的概率已经在上面定死了,
+    # 这里不再额外引入与展开宽度相关的偏见。
+    return fam, shapes[rng.randrange(len(shapes))]
+
+
+def choose_domain_relation(recent: Optional[list], fam: str, shape: str,
+                           emotion: str,
+                           rng: Optional[random.Random] = None,
+                           quotas: Optional[Quotas] = None) -> tuple:
+    """第 4 层: 最后挑 domain / relation, 只受各自配额约束。
+
+    ⚠️ 这一层**绝不允许**反向影响 family 概率 —— 它在 family/shape 已经
+    定死之后才跑。
+    """
+    rng = rng or random.Random()
+    q = quotas or Quotas()
+    c = signature_counts(recent, q.window)
+    doms = [d for d in DOMAINS if c.get(f"domain:{d}", 0) < q.same_domain]
+    rels = [r for r in RELATIONS if c.get(f"relation:{r}", 0) < q.same_relation]
+    dom = doms[rng.randrange(len(doms))] if doms else DOMAINS[0]
+    rel = rels[rng.randrange(len(rels))] if rels else RELATIONS[0]
+    return dom, rel
+
+
 def _candidates(quotas: Quotas, recent: Optional[list]) -> list:
-    """列出当前**未超配额**的 blueprint 候选。
+    """列出当前**未超配额**的 blueprint 候选(扁平视图, 供内省/测试用)。
 
-    做法: 遍历 (family, shape) 搭配, 逐条过 `check_signature`。
-    死亡/创伤/长年规矩这些标记按 SHAPE_FLAGS 从解法形状推导
-    (past_trauma_explains_current_ritual 必然带 trauma+ritual),
-    所以 trauma_ritual 的严格配额在这里自然生效。
+    ⚠️ **这不是调度器**。真正的分级选择是
+    `choose_reveal_mode -> choose_emotion -> choose_family_shape ->
+    choose_domain_relation`(见 `choose_blueprint`)。
 
-    ## Step 02: 去掉"永远 neutral"的固定偏置
-
-    早先这里写死 `_shape_flags(shape, "neutral")` —— 每一道题的 blueprint
-    都被告知"你的情绪基调是 neutral", 于是模型把整场都写成中性。那不是
-    配额不够, 是**从来没有任何别的取值被选过**。
-
-    现在: 情绪按 `EMOTION_MODES` **逐层展开**成候选, 由 `check_signature`
-    的 `neutral_emotion` 配额把中性压到不再垄断。`SHAPE_FLAGS` 里被形状
-    钉死的情绪(例如 `past_trauma_explains_current_ritual` 必然是 grief)
-    仍然优先 —— 那是**结构性**的, 不该被情绪选择覆盖。
+    这个函数保留下来是给"我想看看现在有哪些合法组合"这类内省用的 ——
+    它是**大笛卡尔积**, 因此**不能**拿它的展开宽度去计权(那正是
+    hierarchical scheduler 要避免的"后面的维度污染前面的概率")。
+    调度路径不经过它。
     """
     c = signature_counts(recent, quotas.window)
     out = []
     for fam, shapes in FAMILY_SHAPES.items():
         for shape in shapes:
-            # 形状钉死的情绪优先; 没有钉死才允许自由选。
             pinned = SHAPE_FLAGS.get(shape, {}).get("emotion_mode")
             emotions = (pinned,) if pinned else EMOTION_MODES
             for emo in emotions:
@@ -644,9 +822,9 @@ REVEAL_PREFERENCE = (
 def choose_reveal_mode(recent: Optional[list],
                        rng: Optional[random.Random] = None,
                        quotas: Optional[Quotas] = None) -> str:
-    """为下一道题挑一个**未超配额**的 reveal_mode(observed 口径)。
+    """第 1 层: 按 **observed 缺口** 挑一个未超配额的 reveal_mode。
 
-    ## 为什么这是"目标"而不是"配额数据源"
+    ## 配额是 observed, 目标是 target
 
     配额统计的是 **observed**(Reviewer 读完回传的值, 见
     `signature_counts`)。这里返回的是**调度目标** —— 它是给生成器的
@@ -655,10 +833,14 @@ def choose_reveal_mode(recent: Optional[list],
       - 目标 -> 引导生成器往稀缺的结构走;
       - observed -> 真正记进最近窗口、参与配额的量。
 
-    如果模型不服从(要 identity_flip 结果写成 recontextualization),
-    observed 会如实记成后者, 配额也跟着按后者走 —— 不会因为"我们本来
-    想要 identity_flip"而假装那个缺口被填上了。这正是"配额反映观众
-    真实看到的分布"的含义。
+    ## "按缺口选"是什么意思
+
+    不是"没到上限就等权随机"。早先那样写, `identity_flip` 已经出现 1 次
+    而 `goal_flip` 是 0 次时并不会优先补 `goal_flip`。现在权重 = 1/(1+出现
+    次数), 所以**出现得越少越优先** —— 这才叫"补最近缺口"。
+
+    `straight_explanation` 额外承受 `straight_explanation` 上限, 且在
+    权重上**再降一档** —— 允许, 但永远最低优先级。
 
     挑不到(全被配额堵死)时返回 `straight_explanation` —— 永远有返回值,
     出题链不能因为配额算法卡死。
@@ -668,16 +850,23 @@ def choose_reveal_mode(recent: Optional[list],
     c = signature_counts(recent, q.window)
     ok_modes = []
     for mode in REVEAL_PREFERENCE:
-        if mode == "straight_explanation":
-            if c.get("reveal:straight_explanation", 0) >= q.straight_explanation:
-                continue
-        elif c.get(f"reveal:{mode}", 0) >= q.same_reveal_mode:
+        # 任何 reveal_mode 都受 same_reveal_mode 约束;
+        # straight 额外还受 straight_explanation 约束(取更严的那个)。
+        if c.get(f"reveal:{mode}", 0) >= q.same_reveal_mode:
+            continue
+        if (mode == "straight_explanation"
+                and c.get("reveal:straight_explanation", 0)
+                >= q.straight_explanation):
             continue
         ok_modes.append(mode)
     if not ok_modes:
         return "straight_explanation"
-    # 在"未超配额"的集合里随机 —— 但权重偏向更靠前的(更有翻转感)。
-    weights = [1.0 / (i + 1) for i in range(len(ok_modes))]
+    weights = []
+    for mode in ok_modes:
+        w = 1.0 / (1.0 + c.get(f"reveal:{mode}", 0))      # 缺口越大越优先
+        if mode == "straight_explanation":
+            w *= 0.25                                     # 再降一档
+        weights.append(w)
     total = sum(weights)
     pick = rng.random() * total
     acc = 0.0
@@ -703,56 +892,68 @@ def signature_of(bp: PuzzleBlueprint) -> PuzzleSignature:
 def choose_blueprint(recent: Optional[list],
                      rng: Optional[random.Random] = None,
                      quotas: Optional[Quotas] = None) -> PuzzleBlueprint:
-    """选一个**未超配额**的 blueprint, 偏向"越久没出现"的 mechanism_family。
+    """**分层**选一个 blueprint(方案 §11)。顺序是冻结的:
 
-    不是全排列随机(方案 §11)。权重用"越久没出现权重越高":
-        w(family) = 1 + 最近没出现的题数 / window
-    这样长期没用的 family 会被优先捞回来, 而完全随机会让它继续饿着。
+        observed recent
+          ↓ 1. reveal:  按缺口选 target(straight 永远最低优先级)
+          ↓ 2. emotion: 独立按 observed 分布选(neutral 有硬上限)
+          ↓ 3. family/shape: 只在与该 emotion **相容**的 shape 里选;
+          ↓                 family 权重**在 family 层算一次**
+          ↓ 4. domain/relation: 最后选
 
-    候选为空时(配额把所有组合都堵死了)退化为"最久没出现的 family",
-    保证**永远有返回值** —— 出题链不能因为配额算法而卡死。
+    ## 为什么必须是分层, 不是"大笛卡尔积抽彩票"
 
-    Step 02: 返回的 blueprint 上同时带上**目标 `reveal_mode`**
-    (由 `choose_reveal_mode` 按 rolling quota 选)。它是给生成器的方向,
-    不是配额数据源 —— 配额数的是 Reviewer 回传的 observed 值。
+    早先的做法是把 `family × shape × emotion × domain × relation` 全展开
+    成候选, 再给每个 candidate 乘 family 的 LRU 权重。问题: 一个 family
+    若能展开出更多 emotion/domain/relation 组合, 它就天然拿到更多彩票 ——
+    **后面的维度反过来污染了前面的选择概率**。例如"普通 shape"能搭全部
+    情绪、而"创伤 shape"的情绪被钉死成 grief, 那么即使两者 LRU 权重相同,
+    普通 shape 也会被系统性高估。
+
+    分层之后每一层只看自己那层的账, 概率不再跨层泄漏。
+
+    任何一层全堵死时都会退到兜底值, **永远有返回值** —— 出题链不能因为
+    配额算法卡死。
     """
     rng = rng or random.Random()
     q = quotas or Quotas()
+
+    # ---- 1. reveal(目标) ----
     target_reveal = choose_reveal_mode(recent, rng=rng, quotas=q)
-    cands = _candidates(q, recent)
-    if not cands:
+
+    # ---- 2. emotion(独立) ----
+    emotion = choose_emotion(recent, rng=rng, quotas=q)
+
+    # ---- 3. family / shape(与 emotion 相容) ----
+    fam, shape = choose_family_shape(recent, emotion, rng=rng, quotas=q)
+    if not fam:
+        # 该 emotion 下全被堵死 -> 退回"最久没出现的 family", 用它的第一个
+        # 合法 shape; 仍无合法 shape 就用第一个 shape(保底不卡死)。
         bp = _least_recently_seen(q, recent)
         bp.reveal_mode = target_reveal
+        shapes = _legal_shapes_for(bp.mechanism_family, emotion) or \
+            list(FAMILY_SHAPES.get(bp.mechanism_family, ("information_advantage",)))
+        bp.solution_shape = shapes[0]
+        bp.emotion_mode = emotion
+        dom, rel = choose_domain_relation(recent, bp.mechanism_family,
+                                          bp.solution_shape, emotion,
+                                          rng=rng, quotas=q)
+        bp.domain, bp.relation = dom, rel
         return bp
 
-    # ---- 权重: family 越久没出现, 权重越高 ----
-    rs = _recent(recent, q.window)
-    last_seen = {}
-    for i, s in enumerate(rs):       # i=0 是最老的一条
-        if s.mechanism_family:
-            last_seen[s.mechanism_family] = i
-    n = max(1, len(rs))
-    weights = []
-    for bp, _sig in cands:
-        age = last_seen.get(bp.mechanism_family, -1)
-        # age = -1 表示最近 window 里从没出现 -> 最优先
-        weights.append(1.0 + (n - age) / n if age >= 0 else 2.0 + 1.0 / n)
-
-    total = sum(weights)
-    if total <= 0:
-        bp = cands[rng.randrange(len(cands))][0]
-        bp.reveal_mode = target_reveal
-        return bp
-    pick = rng.random() * total
-    acc = 0.0
-    for (bp, _sig), w in zip(cands, weights):
-        acc += w
-        if pick <= acc:
-            bp.reveal_mode = target_reveal
-            return bp
-    bp = cands[-1][0]
-    bp.reveal_mode = target_reveal
-    return bp
+    # ---- 4. domain / relation(最后, 不影响上面) ----
+    dom, rel = choose_domain_relation(recent, fam, shape, emotion,
+                                      rng=rng, quotas=q)
+    flags = _shape_flags(shape, emotion)
+    return PuzzleBlueprint(
+        mechanism_family=fam, solution_shape=shape,
+        domain=dom, relation=rel,
+        emotion_mode=flags["emotion_mode"], time_shape=flags["time_shape"],
+        death=flags.get("death", False),
+        past_trauma=flags.get("past_trauma", False),
+        long_term_profession=flags.get("long_term_profession", False),
+        repeated_ritual=flags.get("repeated_ritual", False),
+        reveal_mode=target_reveal)
 
 
 def _least_recently_seen(quotas: Quotas,
@@ -836,6 +1037,74 @@ def too_similar(puzzle: str, used: list,
 
 
 def policy_version() -> str:    return QUALITY_POLICY_VERSION
+
+
+# ======================================================================
+# 6.4 Reveal adherence(Step 02 / Batch A closeout)
+# ======================================================================
+def validate_reveal_adherence(spec: PuzzleSpec,
+                              blueprint: Optional[PuzzleBlueprint] = None
+                              ) -> list:
+    """这道题**实际写成的** reveal 结构, 是不是调度器要的那个? 返回违规原因。
+
+    ## 为什么这是"拒绝", 不是"记录"
+
+    冻结的语义是:
+
+        target   = 调度器的**意图**(给生成器的方向)
+        observed = Reviewer 读完之后**如实回传**的事实
+        quota    = 按 observed 统计
+
+    但 `target != observed` 有一个直接含义: **这稿没有执行调度目标**。
+    它不是"观察到一个有趣偏差", 而是"这次调度落空了"。所以必须拒绝,
+    否则调度器形同虚设 —— 目标发出去、没人执行、代码也不管。
+
+    ## 为什么不能塞进 `validate_blueprint()`
+
+    `validate_blueprint` 在 **Reviewer 之前也会被调用**(生成器交稿时先
+    自查一遍)。而那时 `spec.signature` 是**生成器自报**的值 —— 拿它跟
+    blueprint 比, 等于让生成器自己验自己: 它只要照抄目标就能"通过",
+    observed 的独立性当场消失。
+
+    所以这一步单独成一个函数, 只在**两处**调用:
+
+        ① Reviewer 之后(此时 signature 是审稿人的 observed 值)
+        ② 题池最终准入(`PuzzlePool._validate_pool_spec`)
+           —— 挡住"test 期过了但盘上被改成不一致"的题
+
+    返回空列表 = 一致(或无法判定)。
+    """
+    if spec is None:
+        return []
+    bp = blueprint if blueprint is not None else getattr(spec, "blueprint", None)
+    if bp is None:
+        return []
+    # ⚠️ 只在 **blueprint 真的被分配过** 时才做比对。
+    #
+    # `PuzzleBlueprint.reveal_mode` 的 dataclass 默认值是
+    # `straight_explanation`(那是"代码没特别指定时的默认生成方向", 不是
+    # "这是一道普通题")。于是"自由生成 / 没有调度器"的题身上也会带着这个
+    # 默认值 —— 拿它当目标, 就会要求每一道自由生成的题都写成普通解释。
+    #
+    # `blueprint_specified` 正是"这次有没有真的分配目标"的显式标记
+    # (见 `PuzzleSpec.blueprint_specified` 的说明: 它由 gen_spec 显式写,
+    # **绝不从值推断**)。所以用它做闸门, 而不是看 reveal_mode 是否非空。
+    if not getattr(spec, "blueprint_specified", False):
+        return []
+    target = str(getattr(bp, "reveal_mode", "") or "")
+    if not target:
+        return []
+    sig = getattr(spec, "signature", None)
+    observed = str(getattr(sig, "reveal_mode", "") or "") if sig else ""
+    if not observed:
+        # 没观察到 -> **不能**当成"一致"。这是 v4 题必须完整回传的原因
+        # (见 `_OBSERVED_SIGNATURE_FIELDS`): 缺观察值等于绕开这一步。
+        return [f"缺少 observed reveal_mode, 无法确认是否执行了目标 "
+                f"{target!r}"]
+    if observed != target:
+        return [f"reveal 结构没执行调度目标: target={target!r}, "
+                f"observed={observed!r}"]
+    return []
 
 
 # ======================================================================

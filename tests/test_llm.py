@@ -154,7 +154,10 @@ def bp_for(fam="hidden_function",
     d = {"mechanism_family": fam, "solution_shape": shape, "domain": domain,
          "relation": relation, "emotion_mode": emotion, "time_shape": time_shape,
          "death": False, "past_trauma": False, "long_term_profession": False,
-         "repeated_ritual": False}
+         "repeated_ritual": False,
+         # 与 `sig_ok()` 的 observed reveal 一致 —— 否则 Batch A closeout 的
+         # reveal adherence 会(正确地)拒掉每一稿。
+         "reveal_mode": "meaning_flip"}
     d.update(flags)
     return PuzzleBlueprint(**d)
 
@@ -1197,6 +1200,135 @@ def test_v4_policy_version_is_v4():
     from story.quality import QUALITY_POLICY_VERSION
     check("当前政策是 quality-v4",
           QUALITY_POLICY_VERSION == "quality-v4", QUALITY_POLICY_VERSION)
+
+
+# ======================================================================
+# Batch A closeout — Reviewer 职责 / observed_signature fail closed
+# ======================================================================
+def test_closeout_check_tool_has_no_recent_window_rule():
+    """Blocker 1: **tool schema 也是给模型的指令**。
+
+    `CHECK_SYSTEM` 里冻结了"不因最近题分布 rewrite", 但 `_TOOL_CHECK`
+    的 decision description 里若还留着"机制与最近题高度重复"这种**条件**,
+    模型收到的是两条互相矛盾的指令 —— 全局调度权从后门回到了 LLM。
+
+    只查 user prompt 抓不到这条: 它藏在 tool schema 里。
+
+    ⚠️ 断言的是"没有任何**要求**跨题判断的措辞", **不是**"不许出现'最近'
+    这两个字" —— 明确**禁止**跨题判断的句子(如"不要因为最近几题都是这种
+    而 rewrite")是**好的**, 必须允许存在, 否则这条测试会逼着人删掉正确的
+    护栏。所以这里查的是那几个具体的**条件短语**。
+    """
+    print("\n[CO-1] _TOOL_CHECK 不含『跨题判断』条件")
+    import json as _json
+    from story.llm import _TOOL_CHECK
+    props = _TOOL_CHECK["input_schema"]["properties"]
+    dec = props["decision"]["description"]
+    # 这些是"要求模型去看最近题"的条件措辞 —— 必须消失
+    for bad in ("机制与最近题高度重复", "与最近题高度重复",
+                "最近题已经太多", "最近窗口内重复"):
+        check(f"decision 不含条件 {bad!r}", bad not in dec, bad)
+    # 整个 schema 里不该出现任何"配额/窗口计数"式的判断条件
+    blob = _json.dumps(_TOOL_CHECK, ensure_ascii=False)
+    for bad in ("已出现", "配额已满", "超过上限"):
+        check(f"tool schema 不含计数条件 {bad!r}", bad not in blob, bad)
+    # 必须**显式**把跨题判断推给代码层
+    check("decision 显式把跨题判断推给代码层",
+          "代码层" in dec or "cross_puzzle_gate" in dec, dec[-160:])
+
+
+def test_closeout_observed_signature_schema_is_complete():
+    """Blocker 2 第一层: nested required 必须覆盖**全部** observed 字段。
+
+    顶层 required 只保证 key 存在; 缺 nested required 时模型能只回
+    mechanism_family + solution_shape, 于是 reveal/procedural 被
+    `from_dict` 静默补默认值, v4 配额被绕过。
+    """
+    print("\n[CO-2] observed_signature 的 nested required 完整")
+    from story.llm import _OBSERVED_SIGNATURE_FIELDS, _TOOL_CHECK
+    sch = _TOOL_CHECK["input_schema"]["properties"]["observed_signature"]
+    req = set(sch.get("required") or [])
+    check("observed_signature 有 nested required", bool(req), req)
+    check("nested required == 契约字段表",
+          req == set(_OBSERVED_SIGNATURE_FIELDS),
+          (sorted(req), sorted(_OBSERVED_SIGNATURE_FIELDS)))
+    check("nested required 全是已声明的 properties",
+          req <= set(sch["properties"]), sorted(req - set(sch["properties"])))
+    for must in ("reveal_mode", "procedural_rule_dependency"):
+        check(f"{must} 在 nested required 里", must in req, sorted(req))
+
+
+def _obs_without(drop: str) -> dict:
+    """`sig_ok()` 去掉某一个字段 —— 模拟 Reviewer 只回了半套。"""
+    d = sig_ok()
+    d.pop(drop, None)
+    return d
+
+
+def test_closeout_incomplete_observed_signature_is_rejected():
+    """Blocker 2 第二层(代码): 不完整的 observed_signature **整稿拒**。
+
+    不能只靠 JSON schema —— 正确性不能押在模型遵守 schema 上。
+    Reviewer pass 但只回一半字段时, 若采用, `from_dict` 会把
+    `reveal_mode` 补成 `""`(不进任何 reveal 桶)、`procedural_rule_dependency`
+    补成 `False`(自动算不依赖规则) —— 两条 v4 配额同时被静默绕过。
+
+    验法: 让第 1 稿的审稿回**半套**, 然后看第 2 次出题的请求里有没有
+    把"observed_signature 缺字段"作为原因带回去(说明第 1 稿被拒了)。
+    """
+    print("\n[CO-3] 不完整的 observed_signature 不能采用")
+    for drop in ("reveal_mode", "procedural_rule_dependency",
+                 "emotion_mode", "domain"):
+        P2 = "守塔人只在退潮时亮灯。为什么?"
+        fc = FakeClient([
+            LLMResult(tool_input=riddle()),                       # 第 1 稿
+            LLMResult(tool_input=review_ok(                        # 半套观察
+                observed_signature=_obs_without(drop))),
+            LLMResult(tool_input=riddle(puzzle=P2)),              # 第 2 稿
+            LLMResult(tool_input=review_ok(P2)),                  # 完整
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        w.gen_spec(blueprint=fc.default_blueprint)
+        gen_reqs = [c["user"] for c in fc.calls
+                    if c["tool"] and c["tool"]["name"] == "emit_riddle"]
+        check(f"缺 {drop}: 第 1 稿被拒并把原因带回下一稿",
+              len(gen_reqs) >= 2 and "observed_signature 缺字段" in gen_reqs[-1],
+              gen_reqs[-1][-200:] if gen_reqs else "(无第 2 稿)")
+
+
+def test_closeout_incomplete_obs_never_lands_in_signature():
+    """半套 observed_signature **绝不能**成为最终 signature。
+
+    这是上一条的**结论断言**(不只看拒绝原因): 缺 reveal_mode 时,
+    最终 spec 的 reveal_mode **不能**是 `from_dict` 补出来的 `""`
+    当成"观察过" —— 它要么来自完整观察, 要么这稿根本没被采用。
+    """
+    print("\n[CO-3b] 半套观察值不会变成最终 signature")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_ok(
+            observed_signature=_obs_without("reveal_mode"))),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    # 稿被拒 -> 走到兜底题; 兜底题不该带 meaning_flip(那是审稿人的观察)
+    check("没有采用那半套观察值",
+          spec.signature.reveal_mode != "meaning_flip",
+          spec.signature.reveal_mode)
+
+
+def test_closeout_complete_observed_signature_is_accepted():
+    """回归: 完整的 observed_signature 照常采用(别把 fail closed 做过头)。"""
+    print("\n[CO-4] 完整的 observed_signature 正常采用")
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("采用了审稿人的 reveal_mode",
+          spec.signature.reveal_mode == "meaning_flip", spec.signature.reveal_mode)
+    check("采用了审稿人的 procedural",
+          spec.signature.procedural_rule_dependency is False,
+          spec.signature.procedural_rule_dependency)
 
 
 def test_rejected_spec_never_returned():
@@ -2269,7 +2401,13 @@ def main():
               test_v4_reviewer_observed_reveal_wins_over_generator,
               test_v4_reviewer_cannot_see_recent_quota,
               test_v4_apply_review_keeps_new_fields_on_fix,
-              test_v4_policy_version_is_v4):
+              test_v4_policy_version_is_v4,
+              # ---- Batch A closeout ----
+              test_closeout_check_tool_has_no_recent_window_rule,
+              test_closeout_observed_signature_schema_is_complete,
+              test_closeout_incomplete_observed_signature_is_rejected,
+              test_closeout_incomplete_obs_never_lands_in_signature,
+              test_closeout_complete_observed_signature_is_accepted):
         t()
     print()
     if FAIL[0]:

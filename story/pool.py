@@ -96,7 +96,8 @@ from typing import Any, Optional
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
                      SOLUTION_SHAPES, TIME_SHAPES, PuzzleSpec)
 from .quality import (QUALITY_POLICY_VERSION, Quotas, cross_puzzle_gate,
-                      too_similar, validate_blueprint, validate_spec)
+                      too_similar, validate_blueprint, validate_reveal_adherence,
+                      validate_spec)
 
 log = logging.getLogger("story.pool")
 
@@ -551,6 +552,17 @@ class PuzzlePool:
                 return False, "blueprint 校验抛异常"
             if not vb.ok:
                 return False, f"blueprint 校验不过({vb.why()[:120]})"
+            # reveal adherence(Step 02 / Batch A closeout): 池的最终准入
+            # 也要挡住"target 与 observed 不一致"的题 —— 实时路径已经拦过
+            # 一次, 但盘上的记录可能在入池后被改坏, 而且手工灌池完全绕开
+            # 实时路径。这是**第二处**(也是最后一处)调用点。
+            try:
+                ra = validate_reveal_adherence(spec, spec.blueprint)
+            except Exception:                   # noqa: BLE001
+                log.exception("reveal adherence 校验异常, 拒绝")
+                return False, "reveal adherence 校验抛异常"
+            if ra:
+                return False, f"reveal 未执行调度目标({'; '.join(ra)[:120]})"
         return True, ""
 
     # ------------------------------------------------------------------

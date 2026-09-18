@@ -37,7 +37,8 @@ from .puzzle import (
 )
 from .quality import (
     QUALITY_POLICY_VERSION, Quotas, ValidationResult, cross_puzzle_gate,
-    ngrams, too_similar, validate_blueprint, validate_spec,
+    ngrams, too_similar, validate_blueprint, validate_reveal_adherence,
+    validate_spec,
 )
 from .state import QAResult
 
@@ -967,6 +968,20 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 【拿不准时, 把对应的那项填 false。】按工具字段**逐项返回**, 不要只回一个词。"""
 
 
+#: Reviewer 必须**完整**回传的 observed signature 字段。
+#:
+#: 为什么用一个显式列表而不是"看看 PuzzleSignature 有哪些字段":
+#: 这个列表是**契约** —— 新增 observed 维度时必须同时被 schema 的
+#: nested required 和 `_apply_review` 的 fail-closed 检查覆盖, 否则新
+#: 维度会重演"缺字段 -> from_dict 静默补默认值 -> 配额被绕过"的老问题。
+#: 显式写出来, 加字段的人就会看到它。
+_OBSERVED_SIGNATURE_FIELDS = (
+    "mechanism_family", "solution_shape", "domain", "emotion_mode",
+    "relation", "time_shape", "death", "past_trauma",
+    "long_term_profession", "repeated_ritual",
+    "reveal_mode", "procedural_rule_dependency",
+)
+
 _TOOL_RIDDLE = {
     "name": "emit_riddle",
     "description": "输出一个海龟汤谜题",
@@ -1216,9 +1231,11 @@ _TOOL_CHECK = {
                     "rewrite = **推倒重出**。这些情况只能 rewrite: "
                     "没有公平推理路径 / 谜底依赖题面完全不存在的私人历史 / "
                     "核心机关本身不成立 / 多个互不相关机关硬拼 / "
-                    "违反 Blueprint / 机制与最近题高度重复 / "
+                    "违反 Blueprint / "
                     "答案不能唯一稳定解释反常点。\n"
-                    "⚠ 选 rewrite 时**不要**试图修补 —— 交回生成器重出。"),
+                    "⚠ 选 rewrite 时**不要**试图修补 —— 交回生成器重出。\n"
+                    "⚠ **不要**因为『最近几题都是这种』而 rewrite —— 你看不到"
+                    "别的题, 跨题分布由代码层 `cross_puzzle_gate()` 负责。"),
             },
             "issues": {
                 "type": "array", "items": {"type": "string"},
@@ -1343,6 +1360,26 @@ _TOOL_CHECK = {
                     "不要照抄原稿 —— 如果你把一道 hidden_function 的题改成了"
                     "创伤题材, 这里就要写 past_trauma_explains_current_ritual。"
                     "代码会用它做跨题配额, 报假的会污染全局分布。"),
+                # ⚠️ **每一个 observed 字段都必须给全**。
+                #
+                # 为什么 nested required 不能省: 顶层 required 只保证
+                # `observed_signature` 这个 key 存在, 不保证它**内容完整**。
+                # 少了 required, 模型完全可以只回 mechanism_family +
+                # solution_shape, 于是 `PuzzleSignature.from_dict` 把
+                # `reveal_mode` 静默补成 `""`、`procedural_rule_dependency`
+                # 补成 `False` —— v4 新加的两条配额就被**静默绕过**了:
+                # 没回 reveal 就不进任何 reveal 桶, 没回 procedural 就
+                # 自动算"不依赖规则"。
+                #
+                # 这是 fail closed 的第一层(第二层是 `_apply_review` 里的
+                # 代码校验 —— 正确性不能只押在模型遵守 JSON schema 上)。
+                "required": [
+                    "mechanism_family", "solution_shape", "domain",
+                    "emotion_mode", "relation", "time_shape",
+                    "death", "past_trauma", "long_term_profession",
+                    "repeated_ritual", "reveal_mode",
+                    "procedural_rule_dependency",
+                ],
             },
             "note": {"type": "string",
                      "description": "改了什么、为什么(一句话)"},
@@ -1677,6 +1714,22 @@ class PuzzleWriter:
                 last = spec
                 last.error = f"改稿后仍不合格: {why2}"
                 continue
+            # ---- ④.5 reveal adherence(Step 02 / Batch A closeout) ----
+            # 冻结语义: 调度器给了 target, 但这稿**实际写成**的 observed
+            # 结构不是它 —— 那意味着这次调度落空了, 必须拒。
+            # 位置很关键: 必须在 **Reviewer 之后**。放在这之前的
+            # `validate_blueprint` 里比, 比的是生成器**自报**的值, 它照抄
+            # 目标就能过, observed 的独立性当场消失。
+            if enforce_blueprint:
+                ra = validate_reveal_adherence(spec, bp)
+                if ra:
+                    log.info("出题第 %d 稿 reveal 未执行目标: %s",
+                             attempts, ra[:120])
+                    _remember(seen_why, "reveal 未执行: " + "; ".join(ra)[:120])
+                    bad.append(spec.puzzle)
+                    last = spec
+                    last.error = "reveal 未执行调度目标: " + "; ".join(ra)
+                    continue
             # ---- ⑤ 跨题门(全局分布, 方案 §20) ----
             # quota 必须从 **runtime Config** 读。早先读的是 LLMConfig,
             # 于是用户在 Config 里调 quota_death 之类**完全不生效** ——
@@ -2056,11 +2109,38 @@ class PuzzleWriter:
 
         # ---- signature: 审稿人的 observed_signature 优先 ----
         # 它读过改后的题, 比原稿的指纹更可信 —— 而配额就靠这个。
+        #
+        # ⚠️ **fail closed**: 不完整的 observed_signature 一律**拒绝**,
+        # 不能"缺什么就用 from_dict 的默认值补什么"。理由:
+        #   - 缺 `reveal_mode` -> `from_dict` 补 `""` -> 这道题**不进
+        #     任何 reveal 桶**, v4 的 reveal 配额被静默绕过;
+        #   - 缺 `procedural_rule_dependency` -> 补 `False` -> 自动算
+        #     "不依赖规则", 规则依赖配额同样被绕过。
+        # 而这两种缺失在数据上与"真的没观察过 / 真的不依赖"**无法区分**,
+        # 所以只能整稿拒(与 used 账本 fail closed 同一套推理)。
+        #
+        # 这是第二层; 第一层是 `_TOOL_CHECK` 的 nested required。两层都要
+        # —— JSON schema 由模型的工具调用遵守, 不能把正确性押在它身上。
         obs = ti.get("observed_signature")
+        obs_missing: list = []
+        if isinstance(obs, dict):
+            # 当前**全部** observed 字段。新增字段时这里必须同步, 否则新
+            # 维度会重演"静默补默认值"的老问题。
+            for name in _OBSERVED_SIGNATURE_FIELDS:
+                if obs.get(name) is None:
+                    obs_missing.append(name)
+        else:
+            obs_missing = list(_OBSERVED_SIGNATURE_FIELDS)
+
         has_obs = (isinstance(obs, dict)
-                   and bool(obs.get("mechanism_family") or obs.get("solution_shape")))
-        if has_obs:
+                   and bool(obs.get("mechanism_family")
+                            or obs.get("solution_shape")))
+        if has_obs and not obs_missing:
             sig = PuzzleSignature.from_dict(obs)
+        elif obs_missing and (changed or has_obs):
+            # 审稿给了(不全的)观察值, 或者它改了稿 —— 两种都不接受半套。
+            bad.append("observed_signature 缺字段(" + ", ".join(obs_missing) + ")")
+            sig = spec.signature
         elif changed:
             bad.append("observed_signature")
             sig = spec.signature

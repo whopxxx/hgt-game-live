@@ -75,12 +75,16 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
             domain="maritime", relation="stranger",
-            emotion_mode="neutral", time_shape="habitual"),
+            emotion_mode="neutral", time_shape="habitual",
+            # 与 signature 的 observed reveal 一致: Batch A closeout 的
+            # reveal adherence 会在 blueprint_specified=True 时比对两者。
+            reveal_mode="meaning_flip"),
         signature=PuzzleSignature(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
             domain="maritime", emotion_mode="neutral",
-            relation="stranger", time_shape="habitual"),
+            relation="stranger", time_shape="habitual",
+            reveal_mode="meaning_flip"),
         prompt_version="riddle-v3",
         quality_policy_version=QUALITY_POLICY_VERSION,
         metrics={"generation_attempts": 2, "review_calls": 1,
@@ -1255,6 +1259,58 @@ def test_gate_is_deterministic_pure_code():
     check("(对照) 合法题放行", ok2 is True)
 
 
+def test_closeout_adherence_blocks_pool_admission():
+    """池的最终准入也要挡住 reveal 不一致的题(手工灌池场景)。"""
+    print("\n[CO-11] 池准入挡住 reveal 不一致")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        s = good_spec()
+        s.blueprint.reveal_mode = "identity_flip"
+        s.signature.reveal_mode = "goal_flip"
+        check("不一致的题不能入池", pool.add(s) is False)
+        ok, why = PuzzlePool._validate_pool_spec(s)
+        check("理由提到 reveal", "reveal" in why, why)
+        # 一致的照常入池
+        s2 = good_spec()
+        check("一致的题正常入池", pool.add(s2) is True)
+
+
+def test_real_v3_to_v4_quarantine():
+    """Cleanup: **真实已经发生**的 v3 -> v4 隔离(不需要 monkeypatch)。
+
+    Batch A 的 Step 04 真的把 `QUALITY_POLICY_VERSION` 提到了 v4, 所以
+    这里可以直接放一条 **quality-v3** 的磁盘记录, 验证它此刻就是隔离态
+    —— 这比"构造一个 != 当前常量的版本"更贴事实。
+
+    与 9f 的区别: 9f 验的是**机制**(任意 mismatch 都拦); 这条验的是
+    **当前真实状态**(v3 现在到底是不是死的)。
+    """
+    print("\n[9i] 真实 v3 -> v4 隔离")
+    from story.quality import QUALITY_POLICY_VERSION
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        v3 = good_spec()
+        v3.quality_policy_version = "quality-v3"
+        _raw_pool(cfg.pool_path, v3)
+        pool = PuzzlePool.open(cfg)
+        check("当前政策确实是 v4",
+              QUALITY_POLICY_VERSION == "quality-v4", QUALITY_POLICY_VERSION)
+        check("pending 看得见(盘上有候选)", pool.pending_count() == 1,
+              pool.pending_count())
+        check("**stock == 0**(v3 已失去 live 资格)", pool.stock_count() == 0,
+              pool.stock_count())
+        check("**pop 返回 None**", pool.pop_next(recent_signatures=[]) is None)
+        check("**used == 0**(不算已播出)", pool.used_count() == 0,
+              pool.used_count())
+        # 当前版本(v4)的新题照常进来 -> 补池能补上
+        fresh = good_spec(puzzle="一件完全不同的新事。为什么?",
+                          answer="一个不同的新谜底。",
+                          fair_clues=[FairClue(quote="一件完全不同的新事",
+                                               supports_atoms=["a1"])])
+        check("v4 新题能入池", pool.add(fresh) is True)
+        check("入池后 stock == 1", pool.stock_count() == 1, pool.stock_count())
+
+
 def test_quarantine_is_not_deletion():
     """[9h] 隔离 == 保留 + live eligibility=false, 不是删除/迁移/重写。"""
     print("\n[9h] quarantine 不改盘、不迁移、不补版本号")
@@ -1333,6 +1389,8 @@ def main():
         test_mixed_current_and_old,
         test_policy_bump_auto_quarantines_old_stock,
         test_gate_is_deterministic_pure_code,
+        test_closeout_adherence_blocks_pool_admission,
+        test_real_v3_to_v4_quarantine,
         test_quarantine_is_not_deletion,
     ]
     for t in tests:
