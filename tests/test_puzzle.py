@@ -757,9 +757,70 @@ def test_hint_focus_forbids_core_hidden():
 
 
 
+def test_to_archive_roundtrip_is_lossless():
+    """Q8a: 生成溯源必须能存下来、读回来。
+
+    早先 `to_dict` 只写内容字段, 把 `usage/model/error/metrics` 全漏了,
+    于是任何"存下来再读回来"的路径(题池/复盘/离线分析)都会静默拿到
+    空 metrics —— 而 `metrics` 是 generation_attempts / review_calls /
+    rewrite_count / review_decision / review_latency_ms_total 唯一的家。
+
+    这个测试**故意赋非默认值**: 如果只比 `to_dict()` 自己, 漏掉的键在
+    两边都不出现, 断言照样过(现有 test_spec_roundtrip 就是这样)。
+    所以这里比的是**源对象 vs 读回来的对象**。
+    """
+    src = good_spec(
+        usage={"input_tokens": 1234, "output_tokens": 567},
+        model="claude-sonnet-4-5",
+        metrics={"generation_attempts": 3, "review_calls": 2,
+                 "rewrite_count": 1, "review_decision": "fix",
+                 "review_issues": ["人称"], "review_latency_ms_total": 4210,
+                 "generation_latency_ms": 18750, "ok": True},
+    )
+    back = PuzzleSpec.from_dict(src.to_archive())
+
+    check("metrics 活下来了", back.metrics == src.metrics,
+          f"got {back.metrics!r}")
+    check("usage 活下来了", back.usage == src.usage, f"got {back.usage!r}")
+    check("model 活下来了", back.model == src.model, f"got {back.model!r}")
+    check("error 活下来了", back.error == src.error, f"got {back.error!r}")
+    # to_dict 是 to_archive 的基础: 两者都不能漏
+    check("to_dict 也带 metrics", src.to_dict().get("metrics") == src.metrics,
+          src.to_dict().get("metrics"))
+    # 内容字段不能被顺手弄坏
+    check("内容字段无损", back.to_dict() == src.to_dict())
+    check("provenance 无损",
+          all(back.to_dict().get(k) == src.to_dict().get(k)
+              for k in ("usage", "model", "error", "metrics")))
+
+
+def test_old_records_without_provenance_still_load():
+    """Q8a: 现存 archive 绝大多数是这四把键出现**之前**写的。
+
+    实测 data/puzzle.jsonl 105 条里 103 条没有 spec_version。
+    它们必须照样能读 —— 读不出就退化成默认值, **绝不能抛**。
+    老记录 metrics 为空是**正确**语义("那时候还没记"), 不是损坏。
+    """
+    old = PuzzleSpec.from_dict({"puzzle": "老谜面。为什么?", "answer": "老谜底。",
+                                "facts": [], "solve_atoms": [], "fair_clues": []})
+    check("老记录能读", old.puzzle == "老谜面。为什么?", old.puzzle)
+    check("老记录 metrics 退化为空", old.metrics == {}, old.metrics)
+    check("老记录 usage 退化为 None", old.usage is None, old.usage)
+    check("老记录 model 退化为 None", old.model is None, old.model)
+    # 脏类型不能炸(手改过的文件/半截写入)
+    dirty = PuzzleSpec.from_dict({"puzzle": "x", "answer": "y",
+                                  "metrics": "not-a-dict",
+                                  "usage": ["also", "wrong"]})
+    check("脏 metrics 被忽略而不是抛", dirty.metrics == {}, dirty.metrics)
+    check("脏 usage 被忽略而不是抛", dirty.usage is None, dirty.usage)
+
+
 def main():
     tests = [
         test_spec_roundtrip,
+        # ---- Q8a ----
+        test_to_archive_roundtrip_is_lossless,
+        test_old_records_without_provenance_still_load,
         test_validate_spec_ok,
         test_duplicate_fact_id_rejected,
         test_atom_missing_fact_rejected,

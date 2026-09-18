@@ -395,6 +395,20 @@ class PuzzleSpec:
         return [f for f in self.facts
                 if f.kind == "core" and f.visibility == "hidden"]
 
+    #: 序列化时**必须**带上的非内容字段。
+    #:
+    #: 早先 `to_dict` 只写"内容字段"(puzzle/facts/atoms/...), 把
+    #: `usage/model/error/metrics` 全漏了。后果不是"少几个无关紧要的
+    #: 元信息", 而是**生成溯源整个丢失**: `metrics` 是
+    #: generation_attempts / review_calls / rewrite_count / review_decision /
+    #: review_latency_ms_total 唯一的家。任何"存下来再读回来"的用法
+    #: (题池、复盘、离线分析)都会静默拿到空 metrics。
+    #:
+    #: `_apply_review` 一直是**刻意**保留这四个字段的(llm.py), 说明
+    #: "该保留"早有共识 —— 只是 to_dict 没跟上。这里把它们显式列出来,
+    #: 免得以后再漏。
+    _PROVENANCE_KEYS = ("usage", "model", "error", "metrics")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id, "title": self.title,
@@ -408,6 +422,11 @@ class PuzzleSpec:
             "prompt_version": self.prompt_version,
             "quality_policy_version": self.quality_policy_version,
             "blueprint_specified": bool(self.blueprint_specified),
+            # ---- 生成溯源(见 _PROVENANCE_KEYS 的说明) ----
+            "usage": self.usage,
+            "model": self.model,
+            "error": self.error,
+            "metrics": dict(self.metrics or {}),
         }
 
     def to_archive(self) -> dict[str, Any]:
@@ -447,6 +466,18 @@ class PuzzleSpec:
             prompt_version=str(d.get("prompt_version", "") or ""),
             quality_policy_version=str(d.get("quality_policy_version", "") or ""),
             blueprint_specified=bool(d.get("blueprint_specified", False)),
+            # ---- 生成溯源 ----
+            # 用 `.get()` 而不是 `d[...]`: 现存 archive 里绝大多数
+            # (实测 data/puzzle.jsonl 105 条中 103 条)是这四把键出现
+            # **之前**写的, 必须照样能读出来 —— 读不出就退化成默认值,
+            # 绝不能抛异常。老记录的 metrics 为空是**正确**语义
+            # ("那时候还没记"), 不是数据损坏。
+            usage=(d.get("usage") if isinstance(d.get("usage"), dict)
+                   else None),
+            model=(str(d.get("model")) if d.get("model") else None),
+            error=(str(d.get("error")) if d.get("error") else None),
+            metrics=(dict(d.get("metrics"))
+                     if isinstance(d.get("metrics"), dict) else {}),
         )
         return spec
 
