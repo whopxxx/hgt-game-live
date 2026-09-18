@@ -290,20 +290,27 @@ class Director:
             results, err = self.writer.answer(
                 payload["puzzle"], payload.get("answer", ""),
                 payload.get("transcript", []), qid,
-                payload.get("user_name", ""), payload.get("text", ""))
+                payload.get("user_name", ""), payload.get("text", ""),
+                solve_atoms=payload.get("solve_atoms"))
             log.info("答 %r -> %.1fs %s", payload.get("text", "")[:16],
                      time.time() - t0,
                      (results[0].verdict if results else f"失败: {err}"))
             if not results:
-                # 解析不出 -> 立刻给一个中性的兜底裁决, 不让提问卡住
-                results = [QAResult(qid=qid, verdict="无关", comment="")]
+                # 解析不出 -> 给"未判定", **不是**"无关"。
+                # "无关"是断言"你的猜测与谜底无关", 那是错误信息, 会把观众
+                # 的思路带偏; "未判定"只说明系统这次没答上, 诚实且不误导。
+                results = [QAResult(qid=qid, verdict=P.UNAVAILABLE,
+                                    comment="刚才网络抖了一下，再发一次吧",
+                                    status="unavailable")]
             self._dispatch(self.engine.submit_qa(
                 results, error=err,
                 model=getattr(self.writer.client.cfg, "model", None)))
         except Exception as e:
             log.exception("回答异常: %s", e)
             self._dispatch(self.engine.submit_qa(
-                [QAResult(qid=qid, verdict="无关")], error=str(e)))
+                [QAResult(qid=qid, verdict=P.UNAVAILABLE,
+                          comment="刚才网络抖了一下，再发一次吧",
+                          status="unavailable")], error=str(e)))
         self.push()
 
     # ---- RIDDLE / HINT / REVEAL: 单 worker(低频) ----
@@ -324,7 +331,8 @@ class Director:
                         log.warning("出题失败: %s", r.error)
                     self._dispatch(self.engine.submit_riddle(
                         r.puzzle, r.answer, r.hints, r.title,
-                        error=r.error, usage=r.usage, model=r.model))
+                        error=r.error, usage=r.usage, model=r.model,
+                        solve_atoms=r.solve_atoms))
                     if r.puzzle and not r.answer:
                         log.info("本题未解析出谜底, 揭晓时将重新生成")
                 self.push()

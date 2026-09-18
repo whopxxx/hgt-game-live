@@ -83,8 +83,16 @@ class QAResult:
     """LLM 对一条提问的裁决。放这里(而非 llm.py)避免循环导入。"""
 
     qid: int
-    verdict: str           # 是 / 不是 / 无关 / 揭晓
+    verdict: str           # 是 / 不是 / 无关 / 揭晓 / 未判定
     comment: str = ""      # 模型附带的解释 -> 当作观众可见的点评
+    # ---- 覆盖结果(仅日志/复盘用, 不上屏) ----
+    # 裁判不再直接给 bool, 而是逐项报告覆盖情况, 由代码算 solved。
+    # 保留这些字段是为了事后能复盘"为什么这条没判中"。
+    status: str = "ok"              # ok / unavailable
+    is_guess: Optional[bool] = None
+    cause_hit: Optional[bool] = None
+    mechanism_hit: Optional[bool] = None
+    matched_atoms: Optional[list] = None
 
 
 @dataclass

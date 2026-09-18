@@ -272,7 +272,7 @@ def test_answer_enum_forced_by_schema():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 3, "verdict": "揭晓",
                                            "comment": "答对了！"}]}),
-        LLMResult(tool_input={"solved": True}),      # 裁判确认
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),      # 裁判确认
     ])
     w = PuzzleWriter(client=fc)
     res, _ = w.answer("谜面", "谜底", [], 3, "甲", "同伴的肉对吧")
@@ -295,7 +295,7 @@ def test_open_question_never_solves():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 1, "verdict": "是"}]}),
         # 故意备一个"裁判说猜中"的返回; 若闸门失效, 它就会被消费掉
-        LLMResult(tool_input={"solved": True}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
     ])
     w = PuzzleWriter(client=fc)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "他为什么跑")
@@ -312,7 +312,7 @@ def test_verdict_solve_must_pass_judge():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 1, "verdict": "揭晓"}]}),
         # 裁判否决
-        LLMResult(tool_input={"solved": False}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": False, "mechanism_hit": False}),
     ])
     w = PuzzleWriter(client=fc)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "他是不是饿了")
@@ -321,7 +321,7 @@ def test_verdict_solve_must_pass_judge():
     # 裁判确认 -> 保留揭晓
     fc2 = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 1, "verdict": "揭晓"}]}),
-        LLMResult(tool_input={"solved": True}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
     ])
     w2 = PuzzleWriter(client=fc2)
     res2, _ = w2.answer("谜面", "谜底", [], 1, "甲", "同伴的肉对吧")
@@ -343,10 +343,55 @@ def test_open_question_downgrades_solve():
           [c["tool"]["name"] for c in fc.calls])
 
 
+def test_open_question_with_hypothesis_can_solve():
+    print("[带因果假设的疑问句不能一票否决]")
+    # 实测 bug: 原来的规则是"含'为什么'就不可能 solved", 于是误伤了
+    # 这种**已经给出完整因果假设**的句子 —— 它完全可能是正确答案,
+    # 一票否决等于让说中的观众永远猜不中。
+    from story.llm import _is_open_question
+    # 带假设 -> 不是"纯索取", 必须送裁判
+    for t in ["为什么他每天多待十五分钟, 是因为以前灯晚亮十五分钟出过事故吗？",
+              "是不是有人死了",
+              "他是不是在纪念谁",
+              "说明他以前出过事故",
+              "同伴把肉给他吃了吗"]:
+        check(f"带假设: {t[:16]}", _is_open_question(t) is False, t)
+    # 纯索取 -> 仍然挡下
+    for t in ["为什么", "他怎么了", "什么"]:
+        check(f"纯索取: {t[:10]}", _is_open_question(t) is True, t)
+    # 端到端: 带假设的疑问句若裁决为揭晓, **不降级**(会走裁判复核)
+    fc = FakeClient([
+        LLMResult(tool_input={"answers": [{"id": 1, "verdict": "揭晓"}]}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                              "mechanism_hit": True}),      # 裁判确认
+    ])
+    w = PuzzleWriter(client=fc)
+    res, _ = w.answer("谜面", "谜底", [], 1, "甲",
+                      "是不是因为他以前出过事故才这样的")
+    check("带假设的疑问句不被降级",
+          res and res[0].verdict == "揭晓", res)
+    check("确实走了裁判复核(而不是被关键词一票否决)",
+          len(fc.calls) == 2, [c["tool"]["name"] for c in fc.calls])
+
+
+def test_llm_failure_returns_unavailable_not_irrelevant():
+    print("[LLM 故障不能伪装成'无关']")
+    # "无关"是断言"你的猜测与谜底无关" —— 那是**错误信息**, 会把观众的
+    # 思路带偏。失败时必须给中性的"未判定"。
+    from story import parser as P
+    check("UNAVAILABLE 常量存在", P.UNAVAILABLE == "未判定", P.UNAVAILABLE)
+    # 工具返回不可用 -> 结果里没有裁决 -> answer() 报错(上层转"未判定")
+    fc = FakeClient([LLMResult(error="网关抖动")])
+    w = PuzzleWriter(client=fc)
+    res, err = w.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗")
+    check("失败时没有臆造裁决", res == [], res)
+    check("带出错误信息", err is not None, err)
+
+
 def test_judge():
     print("[裁判]")
-    fc = FakeClient([LLMResult(tool_input={"solved": True}),
-                     LLMResult(tool_input={"solved": False})])
+    fc = FakeClient([LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
+                     LLMResult(tool_input={"is_guess": True, "cause_hit": False, "mechanism_hit": False})])
     w = PuzzleWriter(client=fc)
     yes, _ = w.judge("谜面", "谜底", "同伴的肉对吧")
     no, _ = w.judge("谜面", "谜底", "他饿了吗")
@@ -390,7 +435,7 @@ def test_tool_actually_requested():
     # answer() 现在会先问裁决、再问裁判(judge), 所以要多备一个 judge 结果
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 1, "verdict": "是"}]}),
-        LLMResult(tool_input={"solved": False}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": False, "mechanism_hit": False}),
         LLMResult(tool_input={"hint": "h"}),
         LLMResult(tool_input={"reveal": "r"}),
     ])
@@ -409,7 +454,7 @@ def test_answer_consults_judge():
     # 裁决给"是", 但裁判说猜中了 -> 应升级为"揭晓"
     fc = FakeClient([
         LLMResult(tool_input={"answers": [{"id": 5, "verdict": "是"}]}),
-        LLMResult(tool_input={"solved": True}),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True, "mechanism_hit": True}),
     ])
     w = PuzzleWriter(client=fc)
     res, _ = w.answer("谜面", "谜底", [], 5, "甲", "同伴的肉对吧")
@@ -553,7 +598,10 @@ def main():
               test_answer_rejects_bad_enum, test_answer_enum_forced_by_schema,
               test_answer_consults_judge, test_answer_judge_not_consulted_without_answer,
               test_judge, test_verdict_solve_must_pass_judge,
-              test_open_question_downgrades_solve, test_open_question_never_solves, test_hint_not_repeated,
+              test_open_question_downgrades_solve, test_open_question_never_solves,
+              test_open_question_with_hypothesis_can_solve,
+              test_llm_failure_returns_unavailable_not_irrelevant,
+              test_hint_not_repeated,
               test_hint_and_reveal, test_tool_actually_requested):
         t()
     print()

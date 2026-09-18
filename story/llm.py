@@ -316,18 +316,39 @@ _OPEN_Q_RE = re.compile(
     r"哪个|哪些|哪一|"
     r"多少|几点|什么时候|多久|多长|几次")
 
+# 出现这些词, 说明句子**已经给出了因果/假设**, 不再算"纯信息索取"。
+# 它可能就是说中了答案(哪怕以问句形式), 必须送裁判。
+_HYPOTHESIS_RE = re.compile(
+    r"是因为|是不是|说明|所以|因此|由于|为了|导致|"
+    r"才会|一定|肯定|应该|等于|意味着|就是|"
+    r"因为.{2,}所以|之所以")
+
 
 def _is_open_question(text: str) -> bool:
-    """判断是不是"开放疑问句"(在问信息, 而非断言一个可判真假的命题)。
+    """判断是不是"纯信息索取"的疑问句(而不是提出了一个可判真假的假设)。
 
-    只保留这一个**结构上就说不通**的硬规则: 疑问句在问信息, 不可能
-    同时"说出了谜底" —— 这是逻辑, 不是词表。
-    其余"是不是有效猜测"一律交给模型判(见 JUDGE_SYSTEM)。
+    用途**已经收窄** —— 它现在只用来挡住明显不可能猜中的句子, 不再
+    凭关键词一票否决通关资格。
+
+    为什么收窄(实测): 原来的规则是"含'为什么/怎么/什么'就不可能 solved",
+    于是误伤了这种**已经给出完整因果假设**的句子:
+        "为什么他每天多待十五分钟, 是因为以前灯晚亮十五分钟出过事故吗？"
+    这句话虽然带"为什么", 但它提出了一个具体的、可能正确的假设 ——
+    把它一票否决, 等于让说中答案的观众永远猜不中。
+
+    现在的判据: 带疑问词 **且** 没有任何"断言性"的连接词/结构, 才算纯索取。
+    只要句子里出现了"是因为/是不是/说明/所以/由于/为了/导致"这类
+    **给出因果的语言**, 就当作一个假设, 送裁判去判。
     """
     t = (text or "").strip()
     if not t:
         return True
-    return _OPEN_Q_RE.search(t) is not None
+    if _OPEN_Q_RE.search(t) is None:
+        return False        # 本来就不是疑问句 -> 不是"open question"
+    # 带因果断言 -> 是个假设, 不能一票否决
+    if _HYPOTHESIS_RE.search(t):
+        return False
+    return True
 
 
 @dataclass
@@ -489,11 +510,16 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
       男人愣了一下, 说了声"谢谢", 转身走了。为什么?
 谜底: 他打嗝打个不停, 想要杯水屏气止嗝。酒保看出他的困扰, 掏枪吓他——
       惊吓正是止嗝的偏方。嗝停了, 所以他道谢离开。
+solve_atoms: ["他在打嗝", "惊吓可以止嗝", "酒保掏枪是为了吓他"]
+fair_clues: ["谜面写了\"要一杯水\"——打嗝的人会想喝水屏气",
+             "谜面写了\"说了声谢谢\"——说明对方帮到了他"]
 
 例2
 谜面: 他每天把家里的垃圾桶提下楼, 却从不在周一丢。为什么?
 谜底: 周一早上收垃圾的车会经过他家楼下, 而车上的司机是他前妻的现任丈夫。
       他不想让对方看见自己一个人住, 每周只吃那几样东西。
+solve_atoms: ["周一收垃圾的车会来", "司机是他前妻的现任丈夫", "他不想被看到独居"]
+fair_clues: ["谜面写了\"却从不在周一丢\"——反常就在周一这个特定日子"]
 
 ═══ 一定要这样写 ═══
 - **要离奇、要荒诞。** 观众读完该是"啊？？"然后"哦——原来如此"。
@@ -501,12 +527,21 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
   某样东西被错当成另一样。**不要靠悲情**。
 - **别总是"亲人去世/怀念亡者"。** 那只是众多题材之一。连着几道都是
   丧亲、怀念、赎罪, 观众会腻 —— 换个完全不同的路子。
-- **谜面别把答案写出来。** 谜面只给"反常", 不给"线索"。
+- **谜面不能说破答案, 但必须有"公平线索"。**
+  知道谜底后回看谜面, 观众能指出"原来这个细节早就在暗示"。
+  谜面里**至少要有 1 个**这样的具体事实。反例(不合格): 答案完全依赖
+  题面从未出现的私人往事, 只能靠"作者说过去发生过某件事"才成立。
+
+═══ solve_atoms 和 fair_clues ═══
+- **solve_atoms**: 玩家必须说中的 2-4 条原子事实, 按认知顺序排列。
+  它们合起来才构成完整答案 —— 只说中其中一条不算猜中。
+- **fair_clues**: 谜面**原文里已经写着**的、回看能指向谜底的具体事实。
+  必须能在谜面里找到, 不能是谜底里的新信息。
 
 要点: 第三人称; 反常点要具体到能追问; 谜底要正面解释它, 不能靠"恰好"。
 自己编新题, 不要写"海龟汤""葬礼上杀姐姐"这类流传很广的老题。
 
-按工具字段填: puzzle(谜面) / answer(谜底) / hints(3条) / title(短标题)。"""
+按工具字段填: puzzle / answer / hints(3条) / solve_atoms / fair_clues / title。"""
 
 
 ANSWER_SYSTEM = """你是海龟汤的裁决机。依据谜底, 对提问给出裁决。
@@ -566,8 +601,12 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 
 【判 true 的唯一条件】同时满足两条:
   (a) 说出了谜底里**那个反常结果的原因**(不是别的细节);
-  (b) 说清了**关键机制**, 不了解谜底的人听完就明白了。
+  (b) 说清了**关键机制** —— 一个不了解谜底的人听完, 能明白"那个反常行为为什么因此发生"。
 需要你补一句"其实就是说……"才成立的, 是 false。
+
+【核心判断句】
+**猜到题材、情绪、人物关系、过去出过事, 都不等于猜到谜底。
+必须解释谜面里那个反常行为**为什么**发生 —— 说清把它和原因连起来的那一步。**
 
 【一律判 false】
 - 只是方向对或沾边 ("他和老板有关" / "跟记忆有关")
@@ -577,13 +616,23 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 - 提到谜底里的一个词, 但没说这个词起什么作用
 - 复述谜面
 - 同时抛好几个互不相干的猜测 ("是不是A，或者B，也可能是C")
+- **万能悲情猜法**(实测最常被宽判的一类 —— 它们听起来"接近", 其实什么都没解释):
+  "是纪念某个人" / "以前死过人" / "以前出过事故" / "因为害死过人" /
+  "他是在赎罪" / "为了怀念谁"
+  —— 除非这句话**同时说清了那个反常行为为什么因此产生**。
 
 【例】谜底 = "他泡茶是为了用水汽检测老旧燃气管线是否泄漏, 他在替全楼守命"
 - "他泡茶有别的目的"          -> false(太泛)
 - "他不爱喝茶"               -> false
 - "他是燃气检修工"            -> false(只给了身份, 没解释为什么要泡茶)
+- "他泡茶跟燃气管有关"         -> false(只命中了相关对象, 没说泡茶为什么有用)
 - "他泡茶是为了闻味道判断漏气"   -> true(说清了机制)
-- "他泡茶跟燃气管有关"         -> true(说到了核心那件事)
+- "他泡茶产生水汽, 借水汽看管线有没有漏" -> true(说清了机制)
+
+【例】谜底 = "灯塔只在退潮时亮, 因为退潮时礁石露出水面, 亮灯是为标出礁石位置"
+- "灯是为了引路"              -> false(没解释"为什么只在退潮亮")
+- "是纪念死在海里的人"         -> false(万能悲情猜法)
+- "退潮时礁石才露出来, 亮灯是标礁石, 涨潮后继续亮反而误导船只" -> true
 
 【拿不准时判 false。】只回答 true 或 false。"""
 
@@ -595,15 +644,34 @@ _TOOL_RIDDLE = {
         "type": "object",
         "properties": {
             "title": {"type": "string", "description": "谜题短标题(可不填)"},
-            "puzzle": {"type": "string", "description": "谜面: 2-4 句话的反常情境, 结尾必须是一个问句"},
+            "puzzle": {"type": "string",
+                       "description": "谜面: 2-3 句话的反常情境, 结尾必须是一个问句"},
             "answer": {"type": "string", "description": "谜底: 3-6 句话的合理解释"},
             "hints": {
                 "type": "array", "minItems": 3, "maxItems": 3,
                 "items": {"type": "string"},
                 "description": "3 条由浅入深的提示, 每条不超过 30 字, 不剧透",
             },
+            "solve_atoms": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {"type": "string"},
+                "description": (
+                    "玩家必须说中的 2-4 条原子事实, 按认知顺序排列。"
+                    "合起来才构成完整答案; 只说中其中一条不算猜中。"
+                    "例: ['退潮时礁石才露出水面', '灯的作用是标出礁石位置',"
+                    "'涨潮后继续亮灯反而会误导船只']"),
+            },
+            "fair_clues": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string"},
+                "description": (
+                    "谜面里**已经写着的**、知道答案后回看能指向谜底的具体事实。"
+                    "必须是谜面原文里出现过的内容, 不能是谜底里的新信息。"
+                    "例: ['谜面写了\"只按到比自家低一层\"',"
+                    "'谜面写了\"宁可爬二十层也不中途停\"']"),
+            },
         },
-        "required": ["puzzle", "answer", "hints"],
+        "required": ["puzzle", "answer", "hints", "solve_atoms", "fair_clues"],
     },
 }
 
@@ -704,14 +772,32 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读一遍, 有问题就**�
 
 _TOOL_JUDGE = {
     "name": "emit_judgement",
-    "description": "判断提问是否说中了核心谜底",
+    "description": "判断提问覆盖了谜底的哪些原子事实",
     "input_schema": {
         "type": "object",
         "properties": {
-            "solved": {"type": "boolean",
-                       "description": "true 当且仅当提问说出了谜底的关键真相"},
+            "is_guess": {
+                "type": "boolean",
+                "description": "这是不是一个关于剧情的具体说法(不是灌水/无意义/纯要答案)",
+            },
+            "cause_hit": {
+                "type": "boolean",
+                "description": "是否说出了那个反常结果的原因",
+            },
+            "mechanism_hit": {
+                "type": "boolean",
+                "description": "是否说清了关键机制(为什么这个原因会导致那个反常行为)",
+            },
+            "key_fact_hit": {
+                "type": "boolean",
+                "description": "是否说中了谜底里的关键事实/身份/物品(增强项, 非必需)",
+            },
+            "matched_atoms": {
+                "type": "array", "items": {"type": "integer"},
+                "description": "说中的 solve_atoms 序号(从 0 开始), 没有就留空",
+            },
         },
-        "required": ["solved"],
+        "required": ["is_guess", "cause_hit", "mechanism_hit"],
     },
 }
 
@@ -726,6 +812,12 @@ class RiddleResult:
     error: Optional[str] = None
     usage: Optional[dict] = None
     model: Optional[str] = None
+    # 通关判定用的原子事实: 玩家必须说中其中 **cause + mechanism** 才算猜中。
+    # 没有它, 裁判只能从一段文学谜底里"凭感觉"理解核心, 于是频繁宽判。
+    solve_atoms: list = field(default_factory=list)
+    # 谜面里已经写着、知道答案后回看能指向谜底的具体事实。
+    # 用来挡"答案完全依赖题面外的私人往事"那种不可推理的题。
+    fair_clues: list = field(default_factory=list)
 
 
 @dataclass
@@ -948,6 +1040,10 @@ class PuzzleWriter:
                 answer=(d.get("answer") or "").strip() or None,
                 hints=[h.strip() for h in (d.get("hints") or []) if h and h.strip()][:3],
                 title=(d.get("title") or "").strip() or None,
+                solve_atoms=[str(a).strip() for a in (d.get("solve_atoms") or [])
+                             if str(a).strip()][:4],
+                fair_clues=[str(c).strip() for c in (d.get("fair_clues") or [])
+                            if str(c).strip()][:4],
                 usage=res.usage, model=res.model)
         # 回退: 工具调用不可用时走宽容解析
         if res.text:
@@ -977,7 +1073,8 @@ class PuzzleWriter:
 
     # ------------------------------------------------------------------
     def answer(self, puzzle: str, answer: str, transcript: list, qid: int,
-               user_name: str, text: str, judge_solve: bool = True
+               user_name: str, text: str, judge_solve: bool = True,
+               solve_atoms: Optional[list] = None
                ) -> tuple[list[QAResult], Optional[str]]:
         """回答**一条**提问(逐条秒回)。返回 (results, error)。
 
@@ -1030,16 +1127,18 @@ class PuzzleWriter:
         # 直通**, 直接跳了揭晓。
         if answer:
             if _is_open_question(text):
-                # 疑问句在"问信息", 逻辑上不可能同时"说出了谜底"。
-                # 裁决若给了揭晓, 一律降级。
+                # **纯信息索取**(没有给出任何假设) —— 逻辑上不可能同时
+                # "说出了谜底"。这种才降级。带因果假设的疑问句不算,
+                # 它们会走下面那条路, 交给裁判判。
                 if r0.verdict == P.SOLVE:
-                    log.info("疑问句却裁决为揭晓, 降级为无关: %r", text[:30])
+                    log.info("纯疑问句却裁决为揭晓, 降级为无关: %r", text[:30])
                     r0.verdict = "无关"
             elif r0.verdict != P.SOLVE:
                 # 还不是揭晓 -> 让裁判来定夺
                 if judge_solve:
                     try:
-                        solved, jerr = self.judge(puzzle, answer, text)
+                        solved, jerr = self.judge(puzzle, answer, text,
+                                                  solve_atoms)
                         if solved:
                             r0.verdict = P.SOLVE
                             if not r0.comment:
@@ -1052,7 +1151,7 @@ class PuzzleWriter:
                 # 这一步是"揭晓"的唯一可信来源。
                 if judge_solve:
                     try:
-                        solved, _ = self.judge(puzzle, answer, text)
+                        solved, _ = self.judge(puzzle, answer, text, solve_atoms)
                     except Exception as e:
                         log.warning("裁判复核异常(按未猜中处理): %s", e)
                         solved = False
@@ -1065,21 +1164,44 @@ class PuzzleWriter:
         return results, res.error
 
     # ------------------------------------------------------------------
-    def judge(self, puzzle: str, answer: str, text: str) -> tuple[bool, Optional[str]]:
+    def judge(self, puzzle: str, answer: str, text: str,
+              solve_atoms: Optional[list] = None) -> tuple[bool, Optional[str]]:
         """裁判: 观众的这条提问是否说中了核心谜底?
 
         单独一次**强制工具**调用 —— 实测拆出来问, 模型才肯判。
+
+        **不返回 bool, 而是返回覆盖结果** —— 由代码算 solved:
+            solved = is_guess and cause_hit and mechanism_hit
+        为什么: 让模型直接吐一个 `solved: true` 时, 它只要觉得"沾到边"就给
+        true(实测"纪念""跟燃气管有关"都被判过猜中)。拆成 cause/mechanism
+        两个更具体的问题, 它就难以含糊过去; 最终判断权在代码手里。
+
+        `solve_atoms` 是出题时定下的原子事实, 一并给裁判参考, 让"说中了几条"
+        有据可依, 而不是每次凭感觉理解一段文学谜底。
         """
+        atoms = [a for a in (solve_atoms or []) if a]
+        atom_txt = ""
+        if atoms:
+            atom_txt = ("\n【要说到的事实(编号从 0 开始)】\n"
+                        + "\n".join(f"{i}. {a}" for i, a in enumerate(atoms)))
         user = (f"【谜面】{puzzle}\n"
-                f"【谜底】{answer}\n\n"
+                f"【谜底】{answer}\n"
+                f"{atom_txt}\n\n"
                 f"观众的提问：{text}\n\n"
-                f"这个提问是否**已经说出核心谜底**（不只是沾边，而是说中了关键真相）？")
+                f"这条提问覆盖了哪些？请逐项判断。")
         res = self.client.messages(JUDGE_SYSTEM, user, max_tokens=1200,
                                    tool=_TOOL_JUDGE)
-        if res.tool_input is not None:
-            verdict = bool(_unwrap_tool_input(res.tool_input).get("solved"))
-            _detail("裁判 %r -> %s", text[:40], "猜中" if verdict else "未中")
-            return verdict, res.error
+        ti = _unwrap_tool_input(res.tool_input) if res.tool_input else None
+        if isinstance(ti, dict) and "cause_hit" in ti:
+            is_guess = bool(ti.get("is_guess", True))
+            cause = bool(ti.get("cause_hit"))
+            mech = bool(ti.get("mechanism_hit"))
+            atoms_hit = ti.get("matched_atoms") or []
+            solved = is_guess and cause and mech
+            _detail("裁判 %r -> %s (猜测=%s 原因=%s 机制=%s 命中atom=%s)",
+                    text[:40], "猜中" if solved else "未中",
+                    is_guess, cause, mech, atoms_hit)
+            return solved, res.error
         if res.text:
             t = res.text.strip()[:6]
             return ("是" in t and "否" not in t and "不是" not in t), res.error

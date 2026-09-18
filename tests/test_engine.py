@@ -190,7 +190,16 @@ def test_inflight_timeout():
         clk.advance(11)
         eng.tick()
     s = eng.snapshot()
-    check("重试用尽给兜底裁决", any(r["verdict"] == "无关" for r in s.qa_log), s.qa_log)
+    # 重试用尽 -> 兜底裁决必须是**未判定**, 不是"无关"。
+    # "无关"是断言"你的猜测与谜底无关", 而这里其实是系统没答上 ——
+    # 说成"无关"会把观众的思路带偏。
+    check("重试用尽给'未判定'(不是'无关')",
+          any(r["verdict"] == "未判定" for r in s.qa_log), s.qa_log)
+    check("兜底不含'无关'",
+          not any(r["verdict"] == "无关" for r in s.qa_log), s.qa_log)
+    # '未判定' 不该进 LLM transcript —— 否则模型会以为它是一种合法裁决
+    check("'未判定'不进 transcript", eng._probe()["history"] == 0,
+          eng._probe()["history"])
 
 
 def test_dedupe_and_cap():

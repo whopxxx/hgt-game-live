@@ -72,6 +72,8 @@ class RoundEngine:
         self._puzzle_started: Optional[float] = None
         self._used_titles: list[str] = []
         self._hint_pool: list[str] = []      # AI 出题时附带的提示(备用)
+        # 出题时定下的原子事实 —— 传给裁判, 让"说中了几条"有据可依
+        self._solve_atoms: list[str] = []
         self._hints_shown: list[str] = []    # **实际展示过**的提示文本
         self._hints_given = 0
         self._hint_text = ""
@@ -339,7 +341,8 @@ class RoundEngine:
     def submit_riddle(self, puzzle: Optional[str], answer: Optional[str] = None,
                       hints: Optional[list] = None, title: Optional[str] = None,
                       error: Optional[str] = None, usage: Optional[dict] = None,
-                      model: Optional[str] = None, now: Optional[float] = None
+                      model: Optional[str] = None, now: Optional[float] = None,
+                      solve_atoms: Optional[list] = None
                       ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
@@ -356,6 +359,7 @@ class RoundEngine:
             self._answer = answer or ""
             self._title = title or ""
             self._hint_pool = list(hints or [])
+            self._solve_atoms = list(solve_atoms or [])
             self._hints_shown = []
             self._puzzle_index += 1
             self.round_index = self._puzzle_index
@@ -415,8 +419,12 @@ class RoundEngine:
                             verdict=r.verdict, comment=r.comment, kind="qa", ts=now)
                 self._append_qa_locked(rec)
                 self._answered_total += 1
-                self._verdict_counts[r.verdict] = \
-                    self._verdict_counts.get(r.verdict, 0) + 1
+                # 「未判定」是系统故障, 不是对观众猜测的评价 ——
+                # 不进"是/不是/无关"统计, 否则复盘时会把它算成一次
+                # "无关", 污染题目难度与猜中率。
+                if r.verdict != P.UNAVAILABLE:
+                    self._verdict_counts[r.verdict] = \
+                        self._verdict_counts.get(r.verdict, 0) + 1
                 acts.append(EngineAction(ActionKind.BROADCAST, {
                     "answer": rec.to_json(), "phase_changed": False}))
                 if r.verdict == P.SOLVE and \
@@ -555,9 +563,13 @@ class RoundEngine:
                 continue
             q.tries += 1
             if q.tries > self.cfg.qa_retry_max:
-                # 兜底: 绝不让提问被静默吞掉(直播上就是"卡了")
+                # 重试耗尽 —— 绝不让提问被静默吞掉(直播上就是"卡了")。
+                # 但兜底裁决必须是**未判定**, 不是"无关": 后者在断言
+                # "你的猜测与谜底无关", 而我们其实**根本没判断成功**。
                 rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
-                            verdict="无关", comment="", kind="qa", ts=now)
+                            verdict=P.UNAVAILABLE,
+                            comment="刚才网络抖了一下，再发一次吧",
+                            kind="qa", ts=now)
                 self._append_qa_locked(rec)
                 self._answered_total += 1
                 acts.append(EngineAction(ActionKind.BROADCAST, {
@@ -578,6 +590,7 @@ class RoundEngine:
             acts.append(EngineAction(ActionKind.ANSWER, {
                 "qid": q.qid, "user_name": q.user_name, "text": q.text,
                 "puzzle": self._puzzle, "answer": self._answer,
+                "solve_atoms": list(self._solve_atoms),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
             }))
@@ -658,6 +671,7 @@ class RoundEngine:
         self._setting_attempts = 0
         self._puzzle = ""
         self._answer = ""
+        self._solve_atoms = []
         self._title = ""
         self._pending.clear()
         self._inflight.clear()
@@ -722,8 +736,12 @@ class RoundEngine:
                 elif self._qa_log[i].qid >= 0:
                     break
             self._qa_log.insert(pos, rec)
-            self._history.append(rec)
-            self._trim_history_locked()
+            # 「未判定」**不进 transcript**: 它不是对这条提问的判断, 只是
+            # 系统这次没答上。喂回模型会让它以为"未判定"是一种合法裁决,
+            # 久而久之开始拿它敷衍。
+            if rec.verdict != P.UNAVAILABLE:
+                self._history.append(rec)
+                self._trim_history_locked()
         else:
             self._qa_log.append(rec)
         if len(self._qa_log) > 120:
