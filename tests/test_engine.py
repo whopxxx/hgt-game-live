@@ -174,30 +174,84 @@ def test_ordering_and_missing():
 
 
 def test_inflight_timeout():
-    print("[在途超时重试]")
-    eng, clk = boot(mkcfg(qa_inflight_timeout=10.0, qa_retry_max=2))
+    """超时 -> 直接判"未判定", **不重派**(Hotfix B)。
+
+    旧契约是"超时退回队列重试", 但 urllib 请求无法取消, 重派会叠加
+    并发 worker(真实故障: 1 个问题 -> 3 个 worker -> 12 个 HTTP)。
+    新契约是 fail-fast。
+    """
+    print("[在途超时 -> 未判定(不重派)]")
+    eng, clk = boot(mkcfg(qa_inflight_timeout=10.0))
     eng.submit_danmaku("u1", "甲", "#问题")
     eng.tick()
     check("在途 1", eng._probe()["inflight"] == 1, eng._probe())
     clk.advance(11)
-    eng.tick()
-    check("超时后回队列",
-          eng._probe()["pending"] == 1 and eng._probe()["inflight"] == 0, eng._probe())
-    for _ in range(4):
-        eng.tick()
-        clk.advance(11)
-        eng.tick()
+    acts = eng.tick()
+    p = eng._probe()
+    check("**超时后不回队列**", p["pending"] == 0, p)
+    check("**在途清空**(不再留一个假在途)", p["inflight"] == 0, p)
     s = eng.snapshot()
-    # 重试用尽 -> 兜底裁决必须是**未判定**, 不是"无关"。
+    # 兜底裁决必须是**未判定**, 不是"无关"。
     # "无关"是断言"你的猜测与谜底无关", 而这里其实是系统没答上 ——
     # 说成"无关"会把观众的思路带偏。
-    check("重试用尽给'未判定'(不是'无关')",
+    check("给'未判定'(不是'无关')",
           any(r["verdict"] == "未判定" for r in s.qa_log), s.qa_log)
     check("兜底不含'无关'",
           not any(r["verdict"] == "无关" for r in s.qa_log), s.qa_log)
     # '未判定' 不该进 LLM transcript —— 否则模型会以为它是一种合法裁决
     check("'未判定'不进 transcript", eng._probe()["history"] == 0,
           eng._probe()["history"])
+    # 关键: 超时后不得再派发任何 ANSWER(否则就是并发 worker 的来源)
+    ans = [a for a in acts if a.kind.value == "answer"]
+    check("**超时那一 tick 不派发 ANSWER**", not ans, [a.payload for a in ans])
+    for _ in range(4):
+        clk.advance(11)
+        acts = eng.tick()
+        ans = [a for a in acts if a.kind.value == "answer"]
+        check("后续 tick 也不再派发", not ans, [a.payload for a in ans])
+
+
+def test_no_duplicate_worker_per_qid():
+    """同一 qid 在任何时刻**最多一个**真实 worker(Hotfix B 的核心)。
+
+    现有 `test_inflight_timeout` 的盲区: 它用 `clk.advance()` 快进, 但**没有
+    worker 在飞** —— 所以看不见"旧 worker 还活着又派了一个新的"。这里让
+    worker 真的在途(用真实 pool), 再推进时钟, 断言不再产生第二个 ANSWER。
+    """
+    print("[同一 qid 不并发两个 worker]")
+    from story.engine import ActionKind
+    eng, clk = boot(mkcfg(qa_inflight_timeout=10.0))
+    eng.submit_danmaku("u1", "甲", "#问题")
+    first = [a for a in eng.tick() if a.kind == ActionKind.ANSWER]
+    check("首次派发 1 个 ANSWER", len(first) == 1, len(first))
+    qid = first[0].payload["qid"]
+    # 模拟"worker 卡住, 引擎等不到结果" —— 推进到超时之后
+    clk.advance(11)
+    acts = eng.tick()
+    more = [a for a in acts if a.kind == ActionKind.ANSWER]
+    check("**超时后不再派发第二个 ANSWER**", not more, [a.payload for a in more])
+    # 迟到结果必须被安全忽略(不是崩, 也不是写两条记录)
+    before = len(eng.snapshot().qa_log)
+    eng.submit_qa([QAResult(qid=qid, verdict="是")])
+    check("迟到结果被忽略, 不重复记录",
+          len(eng.snapshot().qa_log) == before, len(eng.snapshot().qa_log))
+
+
+def test_answer_payload_carries_qa_budget():
+    """ANSWER payload 要带上 QA 自己的短预算(Hotfix B)。
+
+    预算放在 payload 里跟着动作走, director 直接透传给 writer.answer()。
+    没有它, QA 就会吃全局 AI_TIMEOUT=60 / 重试 3 次。
+    """
+    print("[ANSWER 带 QA 时延预算]")
+    eng, clk = boot(mkcfg(qa_answer_timeout=8.0, qa_answer_retries=0))
+    eng.submit_danmaku("u1", "甲", "#问题")
+    ans = [a for a in eng.tick() if a.kind.value == "answer"]
+    check("派发了 ANSWER", len(ans) == 1, len(ans))
+    p = ans[0].payload
+    check("**payload 带 timeout**", p.get("timeout") == 8.0, p.get("timeout"))
+    check("**payload 带 max_retries**", p.get("max_retries") == 0,
+          p.get("max_retries"))
 
 
 def test_dedupe_and_cap():
@@ -876,8 +930,13 @@ def test_determinism():
 
 
 def test_llm_failure_never_drops():
+    """LLM 不回来时, 提问**最终**必须有裁决 —— 不能静默消失。
+
+    Hotfix B 之后这条路更短了: 第一次在途超时就直接给"未判定",
+    不再靠"重试 N 次才兜底"。
+    """
     print("[LLM 故障不丢提问]")
-    eng, clk = boot(mkcfg(qa_inflight_timeout=10.0, qa_retry_max=2))
+    eng, clk = boot(mkcfg(qa_inflight_timeout=10.0))
     eng.submit_danmaku("u1", "甲", "#问题")
     eng.tick()
     for _ in range(6):
@@ -885,6 +944,9 @@ def test_llm_failure_never_drops():
         eng.tick()
     s = eng.snapshot()
     check("提问最终有裁决", len(s.qa_log) >= 1, s.qa_log)
+    check("**且不再留下假在途**",
+          eng._probe()["inflight"] == 0 and eng._probe()["pending"] == 0,
+          eng._probe())
 
 
 def test_coverage_reaches_archive():
@@ -2153,6 +2215,7 @@ def test_ack_action_is_pure_broadcast():
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
+             test_no_duplicate_worker_per_qid, test_answer_payload_carries_qa_budget,
              test_dedupe_and_cap, test_solve_and_reveal, test_reveal_once,
              test_next_puzzle_cycle,
              test_timeline_hints_and_reveal, test_timeline_survives_busy_chat,

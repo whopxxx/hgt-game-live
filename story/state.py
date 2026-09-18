@@ -71,8 +71,13 @@ class PendingQ:
     user_name: str
     text: str              # 展示文本(已清洗)
     ts: float = 0.0
-    tries: int = 0         # 已重试次数
-    ready_at: float = 0.0  # 早于此时刻不派发(重试退避)
+    #: **已废弃**(Hotfix B): 早先超时会 `tries += 1` 并重派, 现在超时即
+    #: fail-fast 判"未判定", 不再重派也不会再读它。保留字段是为了不动
+    #: 构造点; 下次清理时连同 `qa_retry_max` 一起删。
+    tries: int = 0
+    #: 早于此时刻不派发。仍被派发循环读取(过滤尚未到点的条目), 但
+    #: 现在没有任何路径会把它设成未来时刻 —— 重派已取消。
+    ready_at: float = 0.0
 
     def to_brief(self) -> dict[str, Any]:
         return {"qid": self.qid, "user_name": self.user_name, "text": self.text}

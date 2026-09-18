@@ -600,7 +600,9 @@ class AnthropicMessagesClient:
     def messages(self, system: str, user: str,
                  max_tokens: Optional[int] = None,
                  tool: Optional[dict] = None,
-                 temperature: Optional[float] = None) -> LLMResult:
+                 temperature: Optional[float] = None,
+                 timeout: Optional[float] = None,
+                 max_retries: Optional[int] = None) -> LLMResult:
         """调用 /v1/messages。
 
         tool: 传 {"name","description","input_schema"} 时, 用 tool_choice
@@ -610,7 +612,20 @@ class AnthropicMessagesClient:
         temperature: 方案 §30。裁决/裁判要 0(消除抖动), 出题要 0.7~0.9
             (保持发散)。**网关若不支持这个参数, 我们不能默默假设生效** ——
             启动时会用一次探针调用确认, 见 `probe_temperature()`。
+
+        timeout / max_retries: **可选覆盖**, 默认 None = 沿用全局
+            (`AI_TIMEOUT` / `AI_MAX_RETRIES`)。只给需要不同预算的调用方用 ——
+            目前是直播 QA: 它的历史基线是 1.3~1.7 秒, 而全局 60s × 4 次
+            重试对直播是不可接受的(观众要等 4 分钟)。出题/审稿/试玩这些
+            低频任务仍然用全局的长预算。
+
+            为什么要有这个参数而不是给 QA 单独建一个 client: 全局
+            `AI_TIMEOUT` 一改会**同时**影响出题、审稿、提示、揭晓、裁判、
+            prefetch 和 playtest —— 那些确实需要长预算。按调用点传,
+            才能做到"只有 QA 收紧"。
         """
+        to = self.cfg.timeout if timeout is None else timeout
+        mr = self.cfg.max_retries if max_retries is None else max_retries
         body = {
             "model": self.cfg.model,
             "max_tokens": max_tokens or self.cfg.max_tokens,
@@ -637,11 +652,11 @@ class AnthropicMessagesClient:
         _detail("→ LLM %s max_tokens=%s system=%d字 user=%d字\n      user=%s",
                 tool_name, max_tokens or self.cfg.max_tokens,
                 len(system), len(user), _clip(user, 500))
-        for attempt in range(self.cfg.max_retries + 1):
+        for attempt in range(mr + 1):
             try:
                 req = urllib.request.Request(self._url, data=data,
                                             headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=self.cfg.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=to) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 r = self._parse(raw, want_tool=tool is not None,
                                 budget=body.get("max_tokens") or 0)
@@ -668,7 +683,7 @@ class AnthropicMessagesClient:
                 last_err = f"{type(e).__name__}: {e}"
                 log.warning("LLM 网络错误(%s), 第 %d 次重试…", last_err, attempt + 1)
 
-            if attempt < self.cfg.max_retries:
+            if attempt < mr:
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
                 time.sleep(min(backoff, 8.0))
 
@@ -1995,7 +2010,9 @@ class PuzzleWriter:
                user_name: str, text: str, judge_solve: bool = True,
                solve_atoms: Optional[list] = None,
                facts: Optional[list] = None,
-               spec: Optional[PuzzleSpec] = None
+               spec: Optional[PuzzleSpec] = None,
+               timeout: Optional[float] = None,
+               max_retries: Optional[int] = None
                ) -> tuple[list[QAResult], Optional[str]]:
         """回答**一条**提问(逐条秒回)。返回 (results, error)。
 
@@ -2025,7 +2042,9 @@ class PuzzleWriter:
         res = self.client.messages(ANSWER_SYSTEM, user, max_tokens=1500,
                                    tool=_TOOL_ANSWER,
                                    temperature=self._temperature(
-                                       "answer_temperature"))
+                                       "answer_temperature"),
+                                   timeout=timeout,
+                                   max_retries=max_retries)
         results: list[QAResult] = []
         if res.tool_input:
             for a in (_unwrap_tool_input(res.tool_input).get("answers") or []):

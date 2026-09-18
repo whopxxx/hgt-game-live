@@ -413,7 +413,12 @@ class Director:
                 payload.get("transcript", []), qid,
                 payload.get("user_name", ""), payload.get("text", ""),
                 solve_atoms=payload.get("solve_atoms"),
-                facts=payload.get("facts"))
+                facts=payload.get("facts"),
+                # QA 自己的短预算(见 config.qa_answer_timeout):
+                # 全局 AI_TIMEOUT=60/重试 3 次是给低频长任务定的, 直播问答
+                # 用那个会让观众等 4 分钟。
+                timeout=payload.get("timeout"),
+                max_retries=payload.get("max_retries"))
             log.info("答 %r -> %.1fs %s", payload.get("text", "")[:16],
                      time.time() - t0,
                      (results[0].verdict if results else f"失败: {err}"))
@@ -1004,7 +1009,11 @@ class Director:
                 except Exception:
                     pass
             if self._answer_pool:
-                self._answer_pool.shutdown(wait=False)
+                # cancel_futures: 还没开跑的排队任务直接丢掉。
+                # 注意它**取消不了已经开始的** urllib 请求 —— 那些只能等
+                # 自己超时(所以 QA 的 timeout 要短)。这里至少保证下播后
+                # 不再往池子里灌新工作。与 prefetch 那边的写法对齐。
+                self._answer_pool.shutdown(wait=False, cancel_futures=True)
             if self._prefetcher is not None:
                 # 不阻塞: 在途生成可能长达 90s(gen_spec 的 budget_s),
                 # 下播不该等它。

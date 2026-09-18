@@ -1010,7 +1010,23 @@ class RoundEngine:
     def _tick_qa_locked(self, now: float) -> list[EngineAction]:
         acts: list[EngineAction] = []
 
-        # ① 在途超时 -> 退回队列(带 retry_after, 避免同一 tick 内立刻重打)
+        # ① 在途超时 -> **直接判"未判定"**。
+        #
+        # 这里**绝不重派**。曾经的写法是 `q.ready_at = now + 1.0` 再塞回
+        # `_pending`, 但 urllib 请求**无法取消** —— 旧 worker 根本没死,
+        # 于是同一 qid 会同时存在多个 worker。2026-09-18 的真实故障:
+        # `qa_inflight_timeout=25` 远小于 worker 的真实最坏耗时
+        # (`AI_TIMEOUT=60` × (1+`AI_MAX_RETRIES=3`) ≈ 247s), 结果
+        #   worker A(13.3s 起) -> 25s 判超时 -> worker B(39.4s 起)
+        #   -> 又 25s -> worker C(05.6s 起)
+        # 三条提问记录(85.2s / 125.8s / 152.4s)其实是三个 worker 陆续回来,
+        # 不是一次调用打印三遍。每个 worker 内还有 4 次 HTTP, 最坏
+        # 1 个问题 -> 3 worker -> 12 个请求, 且并行。
+        #
+        # 为什么 fail-fast 是安全的: `submit_qa` 本来就丢弃"qid 已不在
+        # `_inflight`"的迟到结果, 所以旧 worker 最终返回时**已经被忽略**,
+        # 不会写坏状态。代价只是"观众要重发一次" —— 而当前行为是
+        # "等 152 秒然后收到 3 条重复记录"。
         stale = [qid for qid, t in self._inflight_at.items()
                  if now - t >= self.cfg.qa_inflight_timeout]
         for qid in stale:
@@ -1018,22 +1034,17 @@ class RoundEngine:
             self._inflight_at.pop(qid, None)
             if q is None:
                 continue
-            q.tries += 1
-            if q.tries > self.cfg.qa_retry_max:
-                # 重试耗尽 —— 绝不让提问被静默吞掉(直播上就是"卡了")。
-                # 但兜底裁决必须是**未判定**, 不是"无关": 后者在断言
-                # "你的猜测与谜底无关", 而我们其实**根本没判断成功**。
-                rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
-                            verdict=P.UNAVAILABLE,
-                            comment="刚才网络抖了一下，再发一次吧",
-                            kind="qa", ts=now)
-                self._append_qa_locked(rec)
-                self._answered_total += 1
-                acts.append(EngineAction(ActionKind.BROADCAST, {
-                    "answer": rec.to_json(), "phase_changed": False}))
-            else:
-                q.ready_at = now + 1.0        # 1 秒后才能重派
-                self._pending.insert(0, q)
+            # 绝不让提问被静默吞掉(直播上就是"卡了")。
+            # 但兜底裁决必须是**未判定**, 不是"无关": 后者在断言
+            # "你的猜测与谜底无关", 而我们其实**根本没判断成功**。
+            rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
+                        verdict=P.UNAVAILABLE,
+                        comment="刚才网络抖了一下，再发一次吧",
+                        kind="qa", ts=now)
+            self._append_qa_locked(rec)
+            self._answered_total += 1
+            acts.append(EngineAction(ActionKind.BROADCAST, {
+                "answer": rec.to_json(), "phase_changed": False}))
 
         # ② 派发: 逐条秒回, 并发上限 qa_max_inflight
         while len(self._inflight) < self.cfg.qa_max_inflight:
@@ -1053,6 +1064,11 @@ class RoundEngine:
                           if self._spec else []),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
+                # QA 自己的时延预算(见 config.qa_answer_timeout)。
+                # 放进 payload 而不是让 director 去读配置: 派发决策在这里,
+                # 预算就该跟这条动作一起走。
+                "timeout": self.cfg.qa_answer_timeout,
+                "max_retries": self.cfg.qa_answer_retries,
             }))
 
         # ③ 收尾与提示 —— **单一时间轴**:

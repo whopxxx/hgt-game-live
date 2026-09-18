@@ -126,9 +126,22 @@ class Config:
     # 逐条秒回: 1 条提问 = 1 次 AI 调用。
     # qa_max_inflight 是在途调用硬上限(用户指定 5) —— 人多时提问排队而非雪崩。
     qa_max_inflight: int = 5
-    qa_inflight_timeout: float = 25.0     # 在途回答超时 -> 退回队列重试
-    qa_retry_max: int = 2                 # 提问重试上限, 超了给"无关"兜底
+    qa_inflight_timeout: float = 25.0     # 在途回答超时 -> 直接判"未判定"(不重派)
+    qa_retry_max: int = 2                 # 已废弃(保留字段): fail-fast 后不再重派
     qa_dedupe_seconds: float = 600.0      # 同一人同一问题去重窗口
+    # ---- QA 的时延预算(与全局 AI_TIMEOUT 分开) ----
+    # 为什么 QA 要单独一套: 全局 AI_TIMEOUT=60 / AI_MAX_RETRIES=3 是给
+    # 出题/审稿/试玩那些**低频长任务**定的, 它们确实需要长预算。但直播
+    # 问答是**面对面**的 —— 观众等 4 分钟等于这条提问已经废了。
+    #
+    # 历史基线: 正常裁决 1.3~1.7 秒(2026-09-18 13:27 同机实测)。
+    # 8 秒 = 基线的 4~5 倍, 足够吸收抖动, 又不会让观众干等。
+    #
+    # 重试次数为 0 是**刻意的**: urllib 请求无法取消, 所以"超时后再发一次"
+    # 不会消灭旧请求, 只会多叠一个 worker —— 那正是这次要修的放大器。
+    # 传输层不重试, 重试的所有权归引擎(超时即 fail-fast 给"未判定")。
+    qa_answer_timeout: float = 8.0
+    qa_answer_retries: int = 0
     # ---- Q12: 重放识别 ----
     # 实测: 抖音在**重连后会把之前的弹幕重放一遍**(18:09 那批会在 18:11 原样
     # 再来一次)。识别分两条路:
@@ -330,6 +343,16 @@ class Config:
                 f"msg_id_cache_size({self.msg_id_cache_size}) <= 0: "
                 f"已按默认 2000 处理(引擎会钳回正数), 但显式设成 0 说明"
                 f"本意可能是想关掉去重 —— 那要改代码, 不是改这个值。"
+            )
+        if self.qa_answer_timeout <= 0:
+            warns.append(
+                f"qa_answer_timeout({self.qa_answer_timeout}) <= 0: "
+                f"QA 请求会立刻超时, 观众每条提问都会收到'未判定'。"
+            )
+        if self.qa_answer_retries < 0:
+            warns.append(
+                f"qa_answer_retries({self.qa_answer_retries}) < 0: "
+                f"已按 0 处理(不重试)。"
             )
         return warns
 

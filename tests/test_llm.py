@@ -37,9 +37,10 @@ class FakeClient:
         self.cfg = _FakeLLMCfg()
 
     def messages(self, system, user, max_tokens=None, tool=None,
-                 temperature=None):
+                 temperature=None, timeout=None, max_retries=None):
         self.calls.append({"system": system, "user": user, "tool": tool,
-                           "temperature": temperature})
+                           "temperature": temperature,
+                           "timeout": timeout, "max_retries": max_retries})
         if not self._results:
             return LLMResult(error="no more canned results")
         return self._results.pop(0)
@@ -1861,8 +1862,97 @@ def test_blueprint_specified_is_explicit_not_inferred():
 
 
 
+def test_messages_timeout_override():
+    """`messages()` 的 timeout / max_retries 覆盖(Hotfix B)。
+
+    默认不传 = 沿用全局(`AI_TIMEOUT` / `AI_MAX_RETRIES`), 行为与改动前完全
+    一致 —— 出题/审稿/试玩都依赖这一点。传了才生效。
+
+    用打桩的 urlopen 观察**真实**发出的请求, 而不是看函数签名。
+    """
+    import urllib.request
+    import urllib.error
+    from story.llm import AnthropicMessagesClient
+    from story.config import LLMConfig
+
+    cfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                    timeout=60.0, max_retries=3)
+    c = AnthropicMessagesClient(cfg)
+
+    seen = {"timeouts": [], "calls": 0}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return ('{"content":[{"type":"text","text":"hi"}],'
+                    '"usage":{"input_tokens":1,"output_tokens":1}}'
+                    ).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):
+        seen["calls"] += 1
+        seen["timeouts"].append(timeout)
+        return _Resp()
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        # ① 不传 -> 用全局 60
+        c.messages("s", "u")
+        check("**默认沿用全局 timeout=60**", seen["timeouts"][-1] == 60.0,
+              seen["timeouts"][-1])
+
+        # ② 传 timeout -> 用它
+        c.messages("s", "u", timeout=8.0)
+        check("**传了就用传的值**", seen["timeouts"][-1] == 8.0,
+              seen["timeouts"][-1])
+
+        # ③ max_retries=0 -> 失败时只打一次, 不重试
+        def boom(req, timeout=None):
+            seen["calls"] += 1
+            raise TimeoutError("timed out")
+        urllib.request.urlopen = boom
+        before = seen["calls"]
+        r = c.messages("s", "u", timeout=8.0, max_retries=0)
+        check("**max_retries=0 只请求一次**", seen["calls"] - before == 1,
+              seen["calls"] - before)
+        check("返回的是错误结果(不是抛异常)", r.error is not None, r.error)
+    finally:
+        urllib.request.urlopen = orig
+
+
+def test_answer_passes_qa_budget_to_client():
+    """`PuzzleWriter.answer()` 要把预算透传给 client.messages()。
+
+    这条防的是"加了参数但没接上" —— 那样 QA 仍会吃全局 60s。
+    """
+    from story.llm import PuzzleWriter
+
+    cli = FakeClient([LLMResult(tool_input={"answers": [
+        {"id": 1, "verdict": "是", "comment": "对"}]})])
+    w = PuzzleWriter(client=cli, runtime_cfg=runtime_cfg())
+    w.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗",
+             timeout=8.0, max_retries=0)
+    got = cli.calls[-1]
+    check("**answer() 把 timeout 透传给 client**",
+          got.get("timeout") == 8.0, got.get("timeout"))
+    check("**answer() 把 max_retries 透传给 client**",
+          got.get("max_retries") == 0, got.get("max_retries"))
+
+    # 不传 -> None(None 表示"沿用全局", 不能悄悄变成某个默认值)
+    cli2 = FakeClient([LLMResult(tool_input={"answers": [
+        {"id": 1, "verdict": "是", "comment": "对"}]})])
+    w2 = PuzzleWriter(client=cli2, runtime_cfg=runtime_cfg())
+    w2.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗")
+    got2 = cli2.calls[-1]
+    check("不传时为 None(沿用全局)", got2.get("timeout") is None
+          and got2.get("max_retries") is None, got2)
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
+              test_messages_timeout_override,
+              test_answer_passes_qa_budget_to_client,
               test_hard_rule_asks_reviewer_to_fix,
               test_reviewer_no_fix_falls_back_to_regen,
               test_first_person_story_rejected,
