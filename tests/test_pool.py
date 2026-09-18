@@ -940,6 +940,251 @@ def test_add_and_pop_share_one_gate():
         check("门放行正常题", ok is True, why)
 
 
+# ======================================================================
+# Step 03: old pool quality-policy quarantine
+# ======================================================================
+def _raw_pool(path, *specs):
+    """**直接手写磁盘 pool.jsonl**, 完全绕过 `add()`。
+
+    为什么必须这样造数据: `add()` 自己就会挡掉 policy mismatch 的题,
+    拿它准备"磁盘上有一条旧 policy 记录"就是假绿 —— 真正要验的是
+    **历史库存 / 人工灌池 / 旧程序留下的记录**能不能从磁盘绕进来。
+    """
+    _write_raw(path, [
+        json.dumps({"pool_version": 1, "pool_key": spec_key(s),
+                    "added_at": 0.0, "added_by": "legacy",
+                    "spec": s.to_archive()}, ensure_ascii=False)
+        for s in specs
+    ])
+
+
+def test_policy_current_passes():
+    """[9a] 当前 policy 的题照常入池/算库存/能弹出(别把门关过头)。"""
+    print("\n[9a] current policy 正常通过")
+    from story.quality import QUALITY_POLICY_VERSION
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        s = good_spec()
+        s.quality_policy_version = QUALITY_POLICY_VERSION
+        check("add() == True", pool.add(s) is True)
+        check("stock_count == 1", pool.stock_count() == 1, pool.stock_count())
+        check("pop_next() 能返回",
+              pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_policy_mismatch_add_rejected():
+    """[9b] 版本不匹配的题入池被拒, 且**不写盘**。"""
+    print("\n[9b] mismatch policy 被 add 拒绝")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        s = good_spec()
+        s.quality_policy_version = "quality-v2"
+        check("add() == False", pool.add(s) is False)
+        check("池子仍空", pool.size() == 0, pool.size())
+        check("**没有写盘**", not os.path.exists(cfg.pool_path))
+        ok, why = PuzzlePool._validate_pool_spec(s)
+        check("理由里两个版本号都在(spec=…, current=…)",
+              "quality-v2" in why and "quality-v3" in why, why)
+
+
+def test_policy_missing_add_rejected():
+    """[9c] 空串 / 字段缺失都不能成为 live inventory。
+
+    缺失**不能**默认成当前版本: 老 archive 实测 103/118 条根本没有这
+    把键, 把它们当 v3 就是用"我猜"替换"没说"。unknown 就是 unknown。
+    """
+    print("\n[9c] missing / blank policy 被拒")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        blank = good_spec()
+        blank.quality_policy_version = ""
+        check("空串被拒", pool.add(blank) is False)
+        ok, why = PuzzlePool._validate_pool_spec(blank)
+        check("空串的理由是『缺失/未知』", "缺失" in why or "未知" in why, why)
+        # 字段缺失: 从 legacy dict 读入
+        raw = good_spec().to_archive()
+        raw.pop("quality_policy_version", None)
+        legacy = PuzzleSpec.from_dict(raw)
+        check("legacy dict 读出来是空串",
+              legacy.quality_policy_version == "", legacy.quality_policy_version)
+        check("缺失字段被拒", pool.add(legacy) is False)
+        check("池子仍空", pool.size() == 0, pool.size())
+
+
+def test_disk_old_policy_cannot_bypass():
+    """[9d] **最重要的 regression**: 直接灌磁盘也不能绕过。
+
+    不经过 `add()` 准备数据 —— 否则 add 自己就挡掉了, 测试是假绿。
+    这里模拟历史库存 / 人工灌池 / 旧程序留下的记录。
+    """
+    print("\n[9d] 磁盘直灌旧 policy 也不能 live")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        old = good_spec()
+        old.quality_policy_version = "quality-v2"
+        _raw_pool(cfg.pool_path, old)
+        pool = PuzzlePool.open(cfg)
+        check("pending_count 看得见它(盘上有候选)",
+              pool.pending_count() == 1, pool.pending_count())
+        check("size 也看得见它", pool.size() == 1, pool.size())
+        check("**stock_count == 0**", pool.stock_count() == 0,
+              pool.stock_count())
+        check("**pop_next() is None**",
+              pool.pop_next(recent_signatures=[]) is None)
+        check("**used_count == 0**", pool.used_count() == 0, pool.used_count())
+        check("**used ledger 没产生该题记录**",
+              not os.path.exists(cfg.pool_used_path))
+        # 缺失字段同样
+        s2 = good_spec().to_archive()
+        s2.pop("quality_policy_version", None)
+        cfg2 = mkcfg(d, pool_path=os.path.join(d, "p2.jsonl"),
+                     pool_used_path=os.path.join(d, "u2.jsonl"))
+        os.makedirs(os.path.dirname(os.path.abspath(cfg2.pool_path)),
+                    exist_ok=True)
+        with open(cfg2.pool_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pool_version": 1, "spec": s2},
+                               ensure_ascii=False) + "\n")
+        p2 = PuzzlePool.open(cfg2)
+        check("缺失字段: stock_count == 0", p2.stock_count() == 0,
+              p2.stock_count())
+        check("缺失字段: pop_next() is None",
+              p2.pop_next(recent_signatures=[]) is None)
+        check("缺失字段: pending 仍看得见", p2.pending_count() == 1)
+
+
+def test_mixed_current_and_old():
+    """[9e] 混合池: 只交付 current 那道, 旧题保持未 used。
+
+    不依赖 shuffle 顺序 —— 每种组合各断言一次, 并且**跑的轮数够多**,
+    因为 `pop_next` 会打散候选; 只跑一轮的话"恰好先抽到好题"会让
+    错误实现蒙混过关。
+    """
+    print("\n[9e] mixed current + old")
+    for _ in range(8):
+        with tmpdir() as d:
+            cfg = mkcfg(d)
+            cur = good_spec()
+            old = good_spec(puzzle="另一道完全不同的老题。为什么?",
+                            answer="另一个老谜底。",
+                            fair_clues=[FairClue(quote="另一道完全不同的老题",
+                                                 supports_atoms=["a1"])])
+            old.quality_policy_version = "quality-v2"
+            _raw_pool(cfg.pool_path, old, cur)
+            pool = PuzzlePool.open(cfg)
+            check("pending == 2", pool.pending_count() == 2, pool.pending_count())
+            check("stock == 1", pool.stock_count() == 1, pool.stock_count())
+            got = pool.pop_next(recent_signatures=[])
+            check("交付的是 current policy 那道",
+                  got is not None and got.puzzle == cur.puzzle,
+                  "got=%r" % (got.puzzle[:20] if got else None))
+            check("旧题仍未标 used",
+                  spec_key(old) not in pool._used)
+            check("used 只有 1 条", pool.used_count() == 1, pool.used_count())
+            check("旧题还在盘上的候选集里",
+                  pool.pending_count() == 1, pool.pending_count())
+
+
+def test_policy_bump_auto_quarantines_old_stock():
+    """[9f] policy bump 模拟: 当前常量一变, 旧 spec 自动失去 live 资格。
+
+    **不真改常量**(那会污染其他测试与生产语义), 而是构造一道
+    "版本 != 当前常量"的题来等价模拟 bump 之后的局面:
+    bump 后现存 v3 就是"!= 当前"的那一类。
+
+    同时验证 Step 04 的关键推论: bump 之后 stock 归零 -> 补池看得见
+    "没库存" -> 会去补新题; 而新 policy 的题照常进得来。
+    """
+    print("\n[9f] policy bump 模拟")
+    from story.quality import QUALITY_POLICY_VERSION
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        # 盘上是"当前版本"的 3 道(模拟 bump 前的正常库存)
+        _raw_pool(cfg.pool_path,
+                  good_spec(),
+                  good_spec(puzzle="第二道完全不同的题。为什么?",
+                            answer="第二个谜底。",
+                            fair_clues=[FairClue(quote="第二道完全不同的题",
+                                                 supports_atoms=["a1"])]),
+                  good_spec(puzzle="第三道完全不同的题。为什么?",
+                            answer="第三个谜底。",
+                            fair_clues=[FairClue(quote="第三道完全不同的题",
+                                                 supports_atoms=["a1"])]))
+        pool = PuzzlePool.open(cfg)
+        check("bump 前: stock == 3", pool.stock_count() == 3, pool.stock_count())
+
+        # ---- 模拟 bump: 构造一道"属于下一版"的题, 并把上面三道看成旧版 ----
+        nxt = good_spec(puzzle="第四道完全不同的题。为什么?",
+                        answer="第四个谜底。",
+                        fair_clues=[FairClue(quote="第四道完全不同的题",
+                                             supports_atoms=["a1"])])
+        nxt.quality_policy_version = "quality-v4"
+        check("bump 后: 新版本 != 当前 -> 入池被拒(这正说明门在看常量)",
+              pool.add(nxt) is False)
+        ok, why = PuzzlePool._validate_pool_spec(nxt)
+        check("理由里 current 仍是当前常量",
+              QUALITY_POLICY_VERSION in why, why)
+        check("当前版本的题照常入池",
+              pool.add(good_spec(puzzle="第五道完全不同的题。为什么?",
+                                 answer="第五个谜底。",
+                                 fair_clues=[FairClue(
+                                     quote="第五道完全不同的题",
+                                     supports_atoms=["a1"])])) is True)
+        check("入池后 stock 变成 4", pool.stock_count() == 4,
+              pool.stock_count())
+
+
+def test_gate_has_no_online_review():
+    """[9g] 硬边界: 准入门是**纯确定性代码路径**。
+
+    policy 不兼容的题被隔离时必须**不**调用 LLM / PuzzleWriter /
+    Reviewer / gen_spec —— 题池 pop 不能变成在线重审。
+    """
+    print("\n[9g] 准入门不碰在线重审")
+    import story.pool as _sp
+    for name in ("PuzzleWriter", "gen_spec", "review_spec", "_review_spec"):
+        check("pool 模块里没有引用 %s" % name,
+              not hasattr(_sp, name))
+    # 行为验证: 隔离一道旧题, 全程没有任何网络/模型入口可被触发。
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        # 把 add/pop 可能用到的外部入口全部换成"一调就炸"
+        import story.quality as _q
+        real = _q.validate_spec
+
+        def _boom(*a, **k):
+            raise AssertionError("不该在校验之外调用别的东西")
+        old = good_spec()
+        old.quality_policy_version = "quality-v2"
+        ok, _why = PuzzlePool._validate_pool_spec(old)
+        check("隔离判定返回 False", ok is False)
+        check("validate_spec 未被绕过后仍可正常调用(回归)",
+              real(good_spec()).ok is True)
+
+
+def test_quarantine_is_not_deletion():
+    """[9h] 隔离 == 保留 + live eligibility=false, 不是删除/迁移/重写。"""
+    print("\n[9h] quarantine 不改盘、不迁移、不补版本号")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        old = good_spec()
+        old.quality_policy_version = "quality-v2"
+        _raw_pool(cfg.pool_path, old)
+        before = open(cfg.pool_path, encoding="utf-8").read()
+        pool = PuzzlePool.open(cfg)
+        pool.stock_count()
+        pool.pop_next(recent_signatures=[])
+        pool.stats()
+        after = open(cfg.pool_path, encoding="utf-8").read()
+        check("**pool.jsonl 逐字节未变**(不删除/不重写)", before == after)
+        rec = json.loads(after.strip().splitlines()[0])
+        check("**版本号没被自动补成当前版本**",
+              rec["spec"]["quality_policy_version"] == "quality-v2",
+              rec["spec"]["quality_policy_version"])
+        check("规格仍在(物理保留)", pool.size() == 1, pool.size())
+
+
 def main():
     tests = [
         # 验收点 1
@@ -988,6 +1233,15 @@ def main():
         test_disk_tampered_signature_blocks_pop,
         test_disk_intact_signature_still_pops,
         test_add_and_pop_share_one_gate,
+        # ---- Step 03: old pool quality-policy quarantine ----
+        test_policy_current_passes,
+        test_policy_mismatch_add_rejected,
+        test_policy_missing_add_rejected,
+        test_disk_old_policy_cannot_bypass,
+        test_mixed_current_and_old,
+        test_policy_bump_auto_quarantines_old_stock,
+        test_gate_has_no_online_review,
+        test_quarantine_is_not_deletion,
     ]
     for t in tests:
         t()

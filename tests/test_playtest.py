@@ -29,6 +29,7 @@ from story.puzzle import (  # noqa: E402
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
     SolveAtom,
 )
+from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import Phase  # noqa: E402
 
 FAIL = [0]
@@ -90,6 +91,11 @@ def mk_spec(**kw) -> PuzzleSpec:
             solution_shape="hidden_function_explains_behavior",
             domain="maritime", emotion_mode="neutral",
             relation="stranger", time_shape="habitual"),
+        # Step 03: 池准入门现在要求 spec 声明它属于**当前**质量政策。
+        # 这里的题是"刚由 gen_spec 生成"的, 所以标当前版本才是忠实
+        # 的 —— 留空会被正确地隔离(那正是隔离生效的证据, 但在本套件
+        # 里它只是噪音)。
+        quality_policy_version=QUALITY_POLICY_VERSION,
         metrics={"ok": True},
         blueprint_specified=True,
     )

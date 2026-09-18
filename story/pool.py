@@ -41,6 +41,26 @@ background prefetch / build_pool 自动补池 / playtest。题池里的题靠
    校验, `add()`(API 入口)与 `pop_next()`(磁盘入口)都调它。题池允许
    手工灌池, 所以"入池时验过了"不能替代"弹出时再验一次"。
 
+6. **quality policy 不兼容 = 隔离, 不是删除(Step 03)**。只有
+   `spec.quality_policy_version == quality.QUALITY_POLICY_VERSION` 的题
+   才是 live-eligible 库存。空串/缺失/别的版本一律挡在
+   `_validate_pool_spec()` 这扇门外 —— 于是它们**自然**地:
+
+       不计入 stock_count      -> 补池看得见"库存=0", 会去补新题
+       不能通过 add()          -> 新灌不进旧的
+       不会被 pop_next() 返回  -> 播不出来
+       不写 used ledger        -> quarantine != 已播出
+
+   但它们**仍然留在 `pool.jsonl` 里**(`load()` 不筛, `size()` /
+   `pending_count()` 仍看得见), 因为磁盘上的候选集合与"此刻能不能播"
+   是两回事。未来显式的离线 migration/re-review 之后它仍可能重新合法
+   —— 所以隔离**绝不**改版本号、**绝不**删行、**绝不**在线重审。
+
+   这一门同时是未来 policy bump 的开关: Step 04 把
+   `QUALITY_POLICY_VERSION` 提到 v4 时, 现存 v3 库存会因为这一条
+   自动失去 live eligibility, 而新生成的 v4 题照常补得进去 —— 不需要
+   任何额外的清理动作。
+
 ## 先落盘再交付(验收点 4 的核心不变式)
 
     pop_next()  -> 先把 `air:false` 行写盘+fsync, **才**把 spec 交出去
@@ -75,8 +95,8 @@ from typing import Any, Optional
 
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
                      SOLUTION_SHAPES, TIME_SHAPES, PuzzleSpec)
-from .quality import (Quotas, cross_puzzle_gate, too_similar, validate_blueprint,
-                      validate_spec)
+from .quality import (QUALITY_POLICY_VERSION, Quotas, cross_puzzle_gate,
+                      too_similar, validate_blueprint, validate_spec)
 
 log = logging.getLogger("story.pool")
 
@@ -347,7 +367,14 @@ class PuzzlePool:
             return len(self._items)
 
     def pending_count(self) -> int:
-        """池内**当前可用**(未用过)的题数。"""
+        """池内**磁盘上还有多少条没用过的候选**。
+
+        ⚠️ 这**不是**"此刻能播多少道": 它只减 `_used`, **不跑准入
+        校验**。所以 quality-policy 不兼容(隔离)的题、signature 被
+        磁盘改坏的题, **都**还算在这里面。要看"真能播的库存"用
+        `stock_count()`。两个数不等是**正常**的, 不要为了对齐而删题
+        —— 隔离项必须原样留在盘上。
+        """
         with self._lock:
             return sum(1 for s in self._items
                        if spec_key(s) not in self._used)
@@ -378,6 +405,11 @@ class PuzzlePool:
         **不跑校验** —— 一道 signature 被磁盘改坏的题照样被算进"库存"。
         补池据此判断"够不够"就会一直少补; 极端情况下库存看着有 3 道、
         实际 0 道能播, 补池却认为池子满了, 一道都不补。
+
+        **quality policy 隔离也走这条**(Step 03): 旧 policy 的题过不了
+        准入门, 所以一旦 `QUALITY_POLICY_VERSION` 上调, 盘上那批旧题
+        立刻不再计入库存 -> `stock_count` 归零 -> 补池开始补新题。
+        这正是"bump 版本号就自动完成隔离"的机制, 不需要额外的清理步骤。
 
         两个数的**语义不同**, 不是同一个量的两种写法:
             `pending_count` = 盘上有多少条候选
@@ -453,6 +485,31 @@ class PuzzlePool:
             return False, "空 spec / 空谜面"
         if getattr(spec, "error", None):
             return False, f"spec 带 error({str(spec.error)[:60]})"
+
+        # ---- quality policy 兼容门(Step 03) ----
+        #
+        # 只有**通过当前内容质量政策**的题才是 live-eligible 库存。
+        # 三种情况全部隔离, **不猜**:
+        #     ""(空串)  /  字段缺失  /  != 当前政策
+        #
+        # 为什么缺失**不能**默认成当前版本: 老 archive 实测 103/118 条
+        # 根本没有这把键(`data/puzzle.jsonl` 观察)。把它们当成 v3 等于
+        # 用"我猜它大概是 v3"替换"它没说是哪版" —— 而 `time_shape` 在
+        # v2/v3 之间的语义正好相反(v2 是被强制成 instant, v3 是如实
+        # 观察, 见 `quality.py` 的 QUALITY_POLICY_VERSION 注释), 猜错
+        # 方向就会把两版不可比较的 signature 混进同一个配额窗口。
+        # unknown 就是 unknown, 按隔离处理。
+        #
+        # 隔离**不等于删除**: quarantine 的题留在 `pool.jsonl` 里,
+        # 由本函数在每个入口一致地挡住即可 —— 见下面的语义说明。
+        spec_policy = str(getattr(spec, "quality_policy_version", "") or "")
+        if not spec_policy:
+            return False, "quality policy 缺失/未知(spec 没有声明过它属于哪一版政策)"
+        if spec_policy != QUALITY_POLICY_VERSION:
+            return False, (f"quality policy 不兼容"
+                           f"(spec={spec_policy!r}, "
+                           f"current={QUALITY_POLICY_VERSION!r})")
+
         try:
             vr = validate_spec(spec)
         except Exception:                       # noqa: BLE001
@@ -584,6 +641,10 @@ class PuzzlePool:
             for spec in cands:
                 # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
                 #    signature 可能在入池后被改坏, 只验 API 入口不够。
+                #    quality policy 不兼容的题也在这里被挡下, 而且
+                #    **在 `_persist_used` 之前** continue —— 所以隔离题
+                #    不会进 used ledger(quarantine != 已播出; 它将来
+                #    离线重审后仍可能重新合法)。
                 ok, why = self._validate_pool_spec(spec)
                 if not ok:
                     blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")

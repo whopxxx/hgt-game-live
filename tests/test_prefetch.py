@@ -194,6 +194,43 @@ def test_stock_count_excludes_invalid_spec():
               p2.stock_count())
 
 
+def test_stock_count_excludes_old_policy():
+    """**Step 03 的补池侧后果**: 旧 policy 库存必须对补池不可见。
+
+    `stock_count` 走的是 `_validate_pool_spec()`, 而 quality-policy
+    兼容门就在那扇门里 —— 所以旧 policy 题**会自动**不计入库存。
+    这条测的不是"补池自己判断 policy"(它没有、也不该有第二套判断),
+    而是**它天然继承了池子的单一准入门**。
+
+    为什么这条必须在 `test_prefetch.py` 里有一条: Step 04 把
+    `QUALITY_POLICY_VERSION` 提到 v4 之后, 盘上那批 v3 必须让
+    `stock_count` 归零, 否则补池会认为"池里已经有 10 道"而一道都不补
+    —— 那是 Step 04 能不能生效的唯一开关。
+    """
+    print("\n[A2b] stock_count 排掉旧 policy 题(补池据此补新题)")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        old = variant(200)
+        old.quality_policy_version = "quality-v1"
+        _write_raw(cfg.pool_path, [json.dumps(
+            {"pool_version": 1, "pool_key": spec_key(old),
+             "added_at": 0.0, "added_by": "legacy",
+             "spec": old.to_archive()}, ensure_ascii=False)])
+        pool = PuzzlePool.open(cfg)
+        check("pending_count 仍算它(1)", pool.pending_count() == 1,
+              pool.pending_count())
+        check("**stock_count 不算它(0)**", pool.stock_count() == 0,
+              pool.stock_count())
+        # 补池看到 stock=0 -> latch 启动 -> 真的去补
+        # (mkpf 的默认探针已经是 QA + 零压力, 低压力门会放行)
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=pool, executor=ex)
+        pf.on_tick()
+        check("**旧 policy 不挡补池(latch 已启动)**",
+              pf._refill_active is True)
+        check("**提交了一次生成**", ex.total == 1, ex.total)
+
+
 def test_stock_count_ignores_recent_window():
     """被当前窗口挡住的题**仍是库存** —— 那是"此刻能不能播", 不是
     "库存有没有"。等最近 N 题滚过去它就能用。"""
@@ -1257,6 +1294,7 @@ def main():
         # A. 库存与探针
         test_stock_count_excludes_used,
         test_stock_count_excludes_invalid_spec,
+        test_stock_count_excludes_old_policy,
         test_stock_count_ignores_recent_window,
         test_stock_count_limit_early_exit,
         test_ledger_trustworthy_is_read_only_view,
