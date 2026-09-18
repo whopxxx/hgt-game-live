@@ -225,13 +225,18 @@ A 到 80、B 下一条到 90 时真实总量只是 90, 按用户累加会错算�
 收到 WebcastGiftMessage 数量: 0
 ```
 
-排查结论:
+排查结论(措辞已收紧):
 
-- **不是我们丢帧** —— `gift` 在落盘里零痕迹; 不是 gift / 不是 like /
-  不是 chat / 也不是解析失败(本次会话日志里零 gift 字样, 且日志里唯一的
-  "解析失败"是前一天 17:34 的房间号问题)。
-- **分发表是好的** —— 同一次运行里 `member`(21 条)与 `like`(6 条)都正常
-  落盘, 证明 handler 注册与分发路径工作正常。
+- **只能说**: 在**已识别为 `WebcastGiftMessage`** 的那条路径上, 没有落盘、
+  没有解析记录 —— `gift` 零痕迹, 日志里零 gift 字样, 唯一的"解析失败"是
+  前一天 17:34 的房间号问题。
+- ⚠️ **不能说**"帧根本没进来"。当轮的 `_wsOnMessage()` 对未知
+  `msg.method` 是 `if fn is None: continue` —— **无痕丢弃**, 而且当时
+  **没有** pre-handler method 计数器。所以如果抖音换了礼物 method 名、
+  或发来一个我们没有注册的 Gift 相关 method, 它会静默消失, 我们**看不见**。
+  → 这正是 **method 探针是 B smoke 的必要前提**、而不是可选优化的原因。
+- **已确认的**: 同一次运行里 `member`(21 条)与 `like`(6 条)正常落盘 ->
+  对**这些**类型, handler 注册与分发路径工作正常。
 - **连接层有一个**已确认的缺陷: `_connectWebSocket()` 里的
   `cursor` / `internal_ext` / `first_req_ms` / `fetch_time` / `wrds_v`
   全是写死的 **2024-07** 状态(`t-1721106114633` ≈ 2024-07-16)。
@@ -246,8 +251,10 @@ A 到 80、B 下一条到 90 时真实总量只是 90, 按用户累加会错算�
 
 ### 下一步(已定)
 
-1. **修连接层**: 用**本次直播实时取得**的 cursor + internal_ext 引导 WS
-   (外部同源实现就是先请求 live detail 再连接)。这一步无论如何都该做。
+1. **修连接层**: 用**本次直播实时取得**的 cursor + internal_ext 引导 WS。
+   已实现为 `/webcast/im/fetch/` -> protobuf `Response.cursor/internalExt`
+   (与外部工作实现同一路), **每次连接重新取**, 失败才回退;
+   日志会明确打出 `本次连接使用 dynamic / fallback`。
 2. **A/B 验证**: A = 旧写死 bootstrap(已有 A: 0 Gift);
    B = 动态 bootstrap, **其余解析/handler/房间/礼物动作全部不变**。
    - A:0 / B:有 Gift -> 强证据指向旧 bootstrap;

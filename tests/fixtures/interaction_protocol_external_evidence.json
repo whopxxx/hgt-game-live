@@ -96,22 +96,22 @@
       "corollary": "做可靠计量的原始字段我们比它更全。"
     },
     {
-      "claim": "一次真实礼物**可能**产生两条相同的 GiftMessage。",
+      "claim": "外部项目的使用者报告: 只送了一个小心心, 该程序却观测到两条相同的礼物消息。",
       "source": "external-issue-88",
-      "evidence_kind": "reported_observation",
-      "note": "报告者只送了一个小心心, 程序收到两条相同的礼物消息; 该实现未做业务级幂等。"
+      "evidence_kind": "external_reported_observation",
+      "note": "⚠️ 这是**使用者报告**, 不是我们自己的实测, 且该 issue 至今 open、根因未确认。它只能支持「存在重复观测这一风险」, 不能作为「礼物一定会重复」的断言。"
     }
   ],
   "derived_conclusions": [
     {
-      "conclusion": "GiftMessage 数量 != 真实礼物单位数。",
+      "conclusion": "存在「一次送礼产生多条相同 GiftMessage 观测」的外部报告, 因此按消息计数有重复计费风险。",
       "derives_from": [
         "external-issue-88"
       ],
       "consequence": "禁止 '每收到一条 GiftMessage 就 +1'。"
     },
     {
-      "conclusion": "GiftMessage-per-unit 实现明确不安全, 会重复计数。",
+      "conclusion": "GiftMessage-per-unit 在**风险策略**上是禁止项; 真实重复率与根因待 12B 确认。",
       "derives_from": [
         "external-issue-88",
         "external-impl"

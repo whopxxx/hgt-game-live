@@ -18,14 +18,28 @@
 
 ## 为什么 Like 用 **total 的 high-water**, 不用 count 累加
 
-`LikeMessage` 同时有 `count`(本次)与 `total`(累计)。抖音的 `total` 是
-**同一 Session 内的累计值**, 而且**重连后会被重放**(实测: 一次下播变成
-每秒一次的重连 + 重复弹幕)。所以:
+`LikeMessage` 同时有 `count`(本次)与 `total`(累计)。
 
-    ✗ 用 count 累加  -> 重连重放时会重复计
-    ✗ 每次 total 相加 -> 那是累计值, 相加会立刻爆炸
-    ✗ session baseline 相减 -> 需要知道"本场开始时的 total", 而重连
-      之后那个基线会漂
+## 证据强度(不要升级这段表述)
+
+真实采集**只完成了单用户、无重连**的一小段(6 条样本), 在那段里观察到:
+
+    total 严格递增, count 表现为批次增量, sum(count) == 最后 total
+
+**尚未确认**:
+
+    - `total` 是全房间累计还是单用户累计(两种解释都兼容那 6 条)
+    - 重连时的 replay / reset 行为(那段样本里没有重连)
+
+所以下面选 high-water 是**当前保守的实现策略, 待 12B 验证**,
+不是"已被实测证明的唯一正确算法"。它之所以仍然更安全, 是因为:
+
+    ✗ 用 count 累加       -> 若重连会重放, 就会重复计
+    ✗ 每次 total 相加     -> total 是累计值, 相加会立刻爆炸
+    ✗ session baseline 相减 -> 需要"本场开始时的 total", 重连后基线会漂
+
+这三个风险**现在都还没被排除**, 所以选一个对它们都天然免疫的算法 ——
+即使将来证明"其实不会重放", high-water 也只是白保守, 不会算错。
 
 正确的是 **high-water(高水位)**:
 
@@ -43,9 +57,15 @@ rebase —— 见下面的说明)。
 
 ## total 倒退不 rebase
 
-`523 -> 320 -> 523` 是**合法**的(计数可能按窗口滚动, 或后端抖动)。
-把它当成"重新开始"会让我们重复发放; 把它当成异常去 rebase 会让
-high-water 失去意义。正确做法: **只取 max, 不解释倒退**。
+`523 -> 320 -> 523` 我们**只取 max, 不解释倒退**。
+
+这是**保守选择**: 倒退在当前样本里没出现过, 它到底是"按窗口滚动"
+还是"后端抖动"还是"合法的场次重置"**尚未实测**。把任一猜测写进代码
+都有代价 —— 当成"重新开始"会重复发放; 当成异常去 rebase 会让
+high-water 失去意义。只取 max 对这三种可能都安全。
+
+(若 12B 证明存在**合法的场次重置**, 那时再加一个显式的重置语义,
+而不是靠"倒退就 rebase"这种隐式行为。)
 
 ## 礼物: 这一步**只到 raw event**
 
@@ -94,12 +114,15 @@ class Reservation:
     """
 
     token: str
-    round_index: int = 0
-    spec_key: str = ""
+    round_index: int
+    spec_key: str
     created_at: float = 0.0
-    #: 这次预约占用了几个额度(目前恒为 1, 但留成字段以免将来改语义时
-    #: 要动所有调用点)。
-    amount: int = 1
+    # ⚠️ 刻意**没有** `amount`: 一次召唤恒占 1 个额度。
+    #
+    # 早先留了 amount 字段(且 reserve/commit 都接受), 于是一次预约可以
+    # 消费多个 Summon —— 那与"一次召唤 = 1"的冻结语义不符, 而且让
+    # available 的计算多出一个可以配错的旋钮。要改这个语义应当是一次
+    # 显式的设计决定, 不是留一个参数等着被误用。
 
 
 @dataclass
@@ -140,8 +163,8 @@ class SummonLedger:
     @property
     def available(self) -> int:
         """当前**可动用**的额度(扣掉占用中的预约)。"""
-        held = self.detective_reservation.amount \
-            if self.detective_reservation else 0
+        # 一次召唤恒占 1 —— 见 `Reservation` 上关于 amount 的说明。
+        held = 1 if self.detective_reservation else 0
         return max(0, self.unconsumed - held)
 
     @property
@@ -165,58 +188,89 @@ class SummonLedger:
         self.summon_earned_total += n
         return n
 
-    def reserve(self, token: str, round_index: int = 0, spec_key: str = "",
-                amount: int = 1, now: Optional[float] = None) -> bool:
-        """占住额度。成功返回 True。
+    def reserve(self, token: str, round_index: int, spec_key: str,
+                now: Optional[float] = None) -> bool:
+        """占住 1 个额度。成功返回 True。
 
-        已经有占用 -> False(不覆盖: 覆盖会让前一个 token 永远释放不了,
-        那笔额度就永久泄漏)。
+        ## 三个身份字段**全部必填且非空**
+
+        冻结的契约是 `token + round_index + spec_key` **三者一致**才算
+        同一次预约 —— 不是"调用方愿意传就检查"。
+
+        早先的写法是 `round_index: int = 0, spec_key: str = ""`, 且
+        commit/release 只在"传了"时才核对。那会让 Step 14 的迟到回调只要
+        **token 撞上**就能兑现或释放当前预约 —— 而 token 是调用方自己生成
+        的字符串, 撞上并非不可能。空 spec_key 更糟: 它让"哪一稿"这一维
+        整条失效, 跨稿的迟到回调完全挡不住。
+
+        所以这里:
+          - 三个参数都是**位置必填**(没有默认值, 传漏了是 TypeError);
+          - 值为空(空串)同样拒绝 —— 必填但传空等于没填。
         """
-        if self.detective_reservation is not None:
+        token = str(token or "").strip()
+        spec_key = str(spec_key or "").strip()
+        if not token or not spec_key:
+            log.warning("拒绝预约: token/spec_key 不能为空")
             return False
-        if self.available < max(1, int(amount or 1)):
+        # round_index 同样必填, 且必须是真整数 —— `None` 不是"第 0 题",
+        # 传 None 说明调用方没有身份信息, 一律拒绝(不能 int(None) 崩掉)。
+        if not isinstance(round_index, int) or isinstance(round_index, bool):
+            log.warning("拒绝预约: round_index 必须是整数(收到 %r)",
+                        round_index)
+            return False
+        if self.detective_reservation is not None:
+            # 不覆盖: 覆盖会让前一个 token 永远释放不了, 那笔额度永久泄漏。
+            return False
+        if self.available < 1:
             return False
         self.detective_reservation = Reservation(
-            token=str(token), round_index=int(round_index or 0),
-            spec_key=str(spec_key or ""),
-            created_at=float(now if now is not None else time.monotonic()),
-            amount=max(1, int(amount or 1)))
+            token=token, round_index=int(round_index),
+            spec_key=spec_key,
+            created_at=float(now if now is not None else time.monotonic()))
         return True
 
-    def commit(self, token: str, round_index: Optional[int] = None,
-               spec_key: Optional[str] = None) -> bool:
-        """预约兑现(真的召唤了)。成功返回 True 并扣减 available。
+    def commit(self, token: str, round_index: int, spec_key: str) -> bool:
+        """预约兑现(真的召唤了)。成功返回 True 并消耗 1 个额度。
 
-        `round_index` / `spec_key` 给了就一并核对 —— 跨题/跨稿的迟到
-        回调不该能兑现别人的预约。
+        三个身份字段**必须全部匹配** —— 见 `reserve` 的说明。
+        只匹配 token 就兑现, 是"迟到回调兑现了别人的预约"那条路。
         """
         r = self.detective_reservation
-        if r is None or r.token != str(token):
+        if r is None:
             return False
-        if round_index is not None and int(round_index) != r.round_index:
+        if not self._identity_matches(r, token, round_index, spec_key):
             return False
-        if spec_key is not None and str(spec_key) != r.spec_key:
-            return False
-        self.summon_consumed_total += r.amount
+        self.summon_consumed_total += 1
         self.detective_reservation = None
         return True
 
-    def release(self, token: str, round_index: Optional[int] = None,
-                spec_key: Optional[str] = None) -> bool:
+    def release(self, token: str, round_index: int, spec_key: str) -> bool:
         """预约作废(召唤失败/被打断)。额度**退回**, 不消耗。
 
-        身份核对与 `commit` 一致 —— 否则上一题的迟到 release 会把
-        当前这题的预约误释放。
+        身份核对与 `commit` **完全一致** —— 否则上一题/上一稿的迟到
+        release 会把当前这题的预约误释放。
         """
         r = self.detective_reservation
-        if r is None or r.token != str(token):
+        if r is None:
             return False
-        if round_index is not None and int(round_index) != r.round_index:
-            return False
-        if spec_key is not None and str(spec_key) != r.spec_key:
+        if not self._identity_matches(r, token, round_index, spec_key):
             return False
         self.detective_reservation = None
         return True
+
+    @staticmethod
+    def _identity_matches(r: "Reservation", token, round_index, spec_key) -> bool:
+        """预约身份三要素是否**全部**匹配。
+
+        抽成一个函数, 是因为 `commit` 与 `release` 必须用**同一套**判据 ——
+        两份手写的比较迟早会漂移, 而漂移的方向必然是其中一处变松。
+        """
+        try:
+            return (r.token == str(token or "").strip()
+                    and int(round_index) == r.round_index
+                    and r.spec_key == str(spec_key or "").strip())
+        except (TypeError, ValueError):
+            return False
 
     # ------------------------------------------------------------------
     # Like: high-water 换算
@@ -304,7 +358,6 @@ class SummonLedger:
                 "round_index": r.round_index,
                 "spec_key": r.spec_key,
                 "created_at": r.created_at,
-                "amount": r.amount,
             }),
             "likes_total_high_water": self.likes_total_high_water,
             "likes_bucket_consumed": self.likes_bucket_consumed,

@@ -118,6 +118,9 @@ class DouyinLiveWebFetcher:
         #: WS bootstrap 状态(动态获取)。None = 还没取过。
         #: 见 `_fetch_bootstrap_state`。
         self.__bootstrap = None
+        #: 原来这个值是以字面量硬编码在 WS URL 里的; 现在 bootstrap 也要用,
+        #: 提到一处定义, 避免两处各写一份(改一处忘一处)。
+        self.user_unique_id = "7319483754668557238"
         self.session = requests.Session()
         self.live_id = live_id
         self.host = "https://www.douyin.com/"
@@ -239,7 +242,7 @@ class DouyinLiveWebFetcher:
             print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
     
     def _fetch_bootstrap_state(self):
-        """连接 WS **之前**取一次本次直播的 cursor / internal_ext。
+        """连接 WS **之前**, 取本次直播的 cursor / internal_ext。
 
         ## 为什么必须动态取
 
@@ -249,34 +252,56 @@ class DouyinLiveWebFetcher:
             |first_req_ms:1721106114541|fetch_time:1721106114633|...
             wrds_v:7392094459690748497
 
-        (1721106114633 ms ≈ 2024-07-16)。`Response` 自己携带
+        (1721106114633 ms ~ 2024-07-16)。`Response` 自带
         `cursor`(:2) / `internalExt`(:5) / `liveCursor`(:11), 说明这是一套
-        **会话状态**, 本该由服务端在每次响应里推进 —— 写死几个月前的值
-        意味着告诉服务端"我要从那时开始收"。
+        **会话状态**, 本该由服务端在响应里推进 —— 写死几个月前的值等于
+        告诉服务端"我要从那时开始收"。
 
-        ## 实现
+        ## 为什么走 /webcast/im/fetch/ 而不是 /webcast/room/web/enter/
 
-        `get_room_status()` 打的 `/webcast/room/web/enter/` 响应里带
-        `data.room` 的状态字段。这里复用它(同一次请求就行, 不再多打一次),
-        取出 cursor/internal_ext; 取不到就**回退**到旧常量, 保证不会因为
-        这个改动连不上。
+        我第一版从 `/webcast/room/web/enter/` 的 JSON 里翻
+        `data.room.cursor`, 那是**猜** JSON 层级 —— 本地测试只能证明
+        "如果它返回这两个字段, 我们会用", **没有**证明真实响应真的带。
 
-        返回 dict: {"cursor": str, "internal_ext": str} 或 None。
+        同源外部实现的做法是:
+
+            GET /webcast/im/fetch/  (resp_content_type=protobuf)
+              -> 解析 **LiveResponse protobuf**
+              -> frame.cursor / frame.internalExt
+              -> 用于 WebSocket URL
+
+        我们自己的 `Response` 就是那个结构(cursor/internalExt/liveCursor
+        都在), 所以**不需要引入新的解析结构**, 直接复用。
+
+        ## 失败即回退
+
+        拿不到就返回 None, 调用方回退旧常量 —— 不会因为这个改动连不上。
         """
         try:
             msToken = generateMsToken()
             nonce = self.get_ac_nonce()
             signature = self.get_ac_signature(nonce)
-            url = ('https://live.douyin.com/webcast/room/web/enter/?aid=6383'
+            url = ('https://live.douyin.com/webcast/im/fetch/?aid=6383'
                    '&app_name=douyin_web&live_id=1&device_platform=web'
                    '&language=zh-CN&enter_from=page_refresh'
-                   '&cookie_enabled=true&screen_width=5120&screen_height=1440'
+                   '&cookie_enabled=true&screen_width=1536&screen_height=864'
                    '&browser_language=zh-CN&browser_platform=Win32'
-                   '&browser_name=Edge&browser_version=140.0.0.0'
-                   f'&web_rid={self.live_id}'
-                   f'&room_id_str={self.room_id}'
-                   '&enter_source=&is_need_double_stream=false'
-                   '&insert_task_id=&live_reason=&msToken=' + msToken)
+                   '&browser_name=Mozilla'
+                   '&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)'
+                   '%20AppleWebKit/537.36%20(KHTML,%20like%20Gecko)'
+                   '%20Chrome/126.0.0.0%20Safari/537.36'
+                   '&browser_online=true&tz_name=Asia/Shanghai'
+                   '&cursor=&internal_ext='
+                   '&host=https://live.douyin.com&aid=6383&live_id=1'
+                   '&did_rule=3&endpoint=live_pc&support_wrds=1'
+                   f'&user_unique_id={self.user_unique_id}'
+                   '&im_path=/webcast/im/fetch/&identity=audience'
+                   '&need_persist_msg_count=15&insert_task_id=&live_reason='
+                   f'&room_id={self.room_id}&heartbeatDuration=0'
+                   '&resp_content_type=protobuf&version_code=180800'
+                   '&webcast_sdk_version=1.0.14-beta.0'
+                   '&update_version_code=1.0.14-beta.0&compress=gzip'
+                   '&msToken=' + msToken)
             query = parse_url(url).query
             params = {i[0]: i[1] for i in [j.split('=') for j in query.split('&')]}
             a_bogus = self.get_a_bogus(params)
@@ -286,24 +311,41 @@ class DouyinLiveWebFetcher:
                 'Referer': f'https://live.douyin.com/{self.live_id}',
                 'Cookie': f'ttwid={self.ttwid};__ac_nonce={nonce}; '
                           f'__ac_signature={signature}',
+                'Accept': 'application/x-protobuf',
             })
             resp = self.session.get(url, headers=headers)
-            data = (resp.json() or {}).get('data') or {}
-            room = data.get('room') or {}
-            # 字段可能在不同层级, 都试一遍(服务端结构变过好几次)
-            cursor = (room.get('cursor')
-                      or (data.get('cursor'))
-                      or '')
-            internal_ext = (room.get('internal_ext')
-                            or data.get('internal_ext')
-                            or '')
-            if cursor or internal_ext:
-                print(f"【bootstrap】cursor/internal_ext 取自本次响应 "
-                      f"(cursor={'有' if cursor else '无'}, "
-                      f"internal_ext={'有' if internal_ext else '无'})")
-                return {"cursor": str(cursor), "internal_ext": str(internal_ext)}
-            print("【bootstrap】响应里没有 cursor/internal_ext, 回退旧常量")
-            return None
+            body = resp.content or b""
+            if not body:
+                print("【bootstrap】/im/fetch 返回空 body, 回退旧常量")
+                return None
+            # push 路径的 body 是 "PushFrame(内含 gzip 的 Response)"。
+            # fetch 直接回 Response; 这里两种都试, 免得依赖具体一种。
+            frame = None
+            for parse in ("direct", "pushframe"):
+                try:
+                    if parse == "direct":
+                        frame = Response().parse(body)
+                    else:
+                        pkg = PushFrame().parse(body)
+                        if pkg.payload:
+                            frame = Response().parse(gzip.decompress(pkg.payload))
+                    if frame is not None and (frame.cursor or frame.internal_ext):
+                        break
+                except Exception:
+                    frame = None
+            if frame is None:
+                print("【bootstrap】/im/fetch body 解析不出 Response, 回退旧常量")
+                return None
+            cursor = frame.cursor or ""
+            internal_ext = frame.internal_ext or frame.live_cursor or ""
+            if not (cursor or internal_ext):
+                print("【bootstrap】Response 里 cursor/internal_ext 都是空, "
+                      "回退旧常量")
+                return None
+            print(f"【bootstrap】cursor/internal_ext 取自 /im/fetch "
+                  f"(cursor={'有' if cursor else '无'}, "
+                  f"internal_ext={'有' if internal_ext else '无'})")
+            return {"cursor": str(cursor), "internal_ext": str(internal_ext)}
         except Exception as err:
             print(f"【bootstrap】取 bootstrap 状态失败, 回退旧常量: {err}")
             return None
@@ -321,10 +363,24 @@ class DouyinLiveWebFetcher:
         #
         # 回退值是**保命**用的: 万一详情接口拿不到状态, 也还能连上(至少
         # 与改动前行为一致), 不会因为这个改动把直播搞挂。
-        boot = self.__bootstrap
-        if boot is None:
-            boot = self._fetch_bootstrap_state() or {}
-            self.__bootstrap = boot
+        # ⚠️ **每次连接都重新取** —— 不做跨连接缓存。
+        #
+        # 早先写的是 "取一次, 存进 self.__bootstrap, 以后复用"。两个问题:
+        #   1) 第一次取**失败**时存的是 `{}`, 后续重连永远不再重试 ——
+        #      这一场就永远用回退常量了;
+        #   2) 第一次**成功**后一直复用旧值, 而 cursor 是会话状态,
+        #      重连本就该拿新的。
+        # 两者都会让 "dynamic bootstrap" 名不副实, 也会让 B 实验真假难辨:
+        # 日志说是动态, 实际用的是上一次(或回退值)。
+        boot = self._fetch_bootstrap_state() or {}
+        self.__bootstrap = boot
+        if boot.get("cursor") or boot.get("internal_ext"):
+            mode = "dynamic"
+        else:
+            mode = "fallback"
+        print(f"【bootstrap】本次连接使用 {mode} "
+              f"({'动态取得' if mode == 'dynamic' else '回退旧常量'})",
+              flush=True)
         cursor = boot.get("cursor") or (
             "d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1")
         internal_ext = boot.get("internal_ext") or (

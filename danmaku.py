@@ -84,6 +84,16 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         #: 与 `keep_all` 解耦 —— 见 `story.config` 里那条注释。
         #: 这个基类自己没有业务回调, 它是给 `CallbackFetcher` 用的开关。
         self.interaction_enabled = interaction_enabled
+        # ---- Step 12B: 原始 method 探针 ----
+        # 只统计**方法名与次数**, 不记 payload/昵称等内容, 不改业务逻辑。
+        # 位置很关键: 在 `handlers.get(msg.method)` **之前** —— 否则被丢弃的
+        # 类型(没有 handler 的)根本不会出现在统计里, 而我们正是要靠它
+        # 区分"服务端没给"与"给了但我们没处理"。
+        self.ws_frame_count = 0          # 收到的 WS 帧数
+        self.ws_message_count = 0        # 解出的内层消息数
+        self.method_counts = {}          # method -> 出现次数
+        self.unhandled_method_counts = {}  # method -> 没有 handler 的次数
+        self.parse_error_counts = {}     # method -> 解析抛异常的次数
         self._fp = None
         self._counts = {}
         #: **永久终止**标志 —— 见 `terminate()`。与 `stop()` 是两件事:
@@ -224,9 +234,26 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
                 self.terminate()
 
     # ---- 覆盖消息分发: 去掉噪音类型 + 让异常可见 ----
+    def _probe_bump(self, attr: str, key=None) -> None:
+        """探针自增。**惰性初始化** —— 测试常用 `__new__` 造半成品实例,
+        直接访问属性会 AttributeError。生产路径也一起受益(不会因为
+        漏初始化一个计数器就把整条弹幕链搞挂)。"""
+        if key is None:
+            setattr(self, attr, getattr(self, attr, 0) + 1)
+        else:
+            d = getattr(self, attr, None)
+            if not isinstance(d, dict):
+                d = {}
+                setattr(self, attr, d)
+            d[key] = d.get(key, 0) + 1
+
     def _wsOnMessage(self, ws, message):
+        self._probe_bump("ws_frame_count")
         package = PushFrame().parse(message)
         response = Response().parse(gzip.decompress(package.payload))
+        setattr(self, "ws_message_count",
+                getattr(self, "ws_message_count", 0)
+                + len(response.messages_list))
 
         if response.need_ack:
             ack = PushFrame(
@@ -270,8 +297,14 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
             })
 
         for msg in response.messages_list:
-            fn = handlers.get(msg.method)
+            # ---- 探针: 先计数, 再查 handler ----
+            # 必须在 handlers.get 之前 —— 让"服务端给了但我们没处理"的
+            # 类型也留下痕迹。
+            _m = msg.method
+            self._probe_bump("method_counts", _m)
+            fn = handlers.get(_m)
             if fn is None:
+                self._probe_bump("unhandled_method_counts", _m)
                 continue  # 排行榜/统计/心跳等一律忽略
             try:
                 # ---- envelope msg_id 必须传下去(Step 12 capture readiness) ----
@@ -292,9 +325,48 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
                 else:
                     fn(msg.payload)
             except Exception as e:
+                self._probe_bump("parse_error_counts", _m)
                 # 不再静默吞异常, 便于排障
                 print(f"!!! 解析 {msg.method} 失败: {type(e).__name__}: {e}",
                       file=sys.stderr, flush=True)
+
+    def method_summary(self) -> dict:
+        """连接级 method 汇总(供排查/落日志)。
+
+        它能一眼回答"礼物为什么没落盘"的四种可能:
+
+            method_counts 里没有 WebcastGiftMessage
+              -> 服务端/连接参数根本没给 Gift
+            method_counts 有, 但 unhandled_method_counts 也有
+              -> 分发表问题
+            handled 了但 parse_error_counts > 0
+              -> protobuf/解析问题
+            method 与解析都成功, 但业务事件没有
+              -> ingest/callback 问题
+
+        ⚠️ 只含方法名与计数, **不含任何 payload/用户内容**。
+        """
+        return {
+            "ws_frames": getattr(self, "ws_frame_count", 0),
+            "ws_messages": getattr(self, "ws_message_count", 0),
+            "methods": dict(sorted(
+                getattr(self, "method_counts", {}).items())),
+            "unhandled": dict(sorted(
+                getattr(self, "unhandled_method_counts", {}).items())),
+            "parse_errors": dict(sorted(
+                getattr(self, "parse_error_counts", {}).items())),
+        }
+
+    def log_method_summary(self, tag: str = "") -> None:
+        """把汇总打一行日志(连接建立/关闭时调用最有用)。"""
+        try:
+            s_ = self.method_summary()
+            print(f"【method 汇总{(' ' + tag) if tag else ''}】"
+                  f"frames={s_['ws_frames']} messages={s_['ws_messages']} "
+                  f"methods={s_['methods']} unhandled={s_['unhandled']} "
+                  f"parse_errors={s_['parse_errors']}", flush=True)
+        except Exception as e:                      # noqa: BLE001
+            print(f"【method 汇总】输出失败: {e}", flush=True)
 
     # ---- 静音父类噪音(心跳/连接提示/关闭) ----
     def _wsOnOpen(self, ws):
@@ -315,6 +387,8 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
 
     def _wsOnClose(self, ws, *args):
         # 父类会调 get_room_status()(需 a_bogus, 易失败/被风控), 这里不调
+        # 断开时打一次 method 汇总 —— 一次直播里最该看的排查信息。
+        self.log_method_summary("断开时")
         print(">>> WebSocket 已断开", file=sys.stderr, flush=True)
 
     # ---- 生命周期 ----

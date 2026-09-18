@@ -161,15 +161,60 @@ def test_reservation_holds_capacity():
     print("\n[S13-10] 预约占用额度")
     led = SummonLedger()
     led.earn(2)
-    check("预约成功", led.reserve("t1", round_index=1, spec_key="k1") is True)
+    check("预约成功",
+          led.reserve("t1", round_index=1, spec_key="k1") is True)
     check("available 扣到 1", led.available == 1, led.available)
     check("unconsumed 不变(还没结算)", led.unconsumed == 2, led.unconsumed)
     check("consumed 仍 0", led.summon_consumed_total == 0)
-    check("预约带着身份字段",
-          led.detective_reservation.token == "t1"
-          and led.detective_reservation.round_index == 1
-          and led.detective_reservation.spec_key == "k1",
-          led.detective_reservation)
+    r = led.detective_reservation
+    check("三个身份字段都记下了",
+          r.token == "t1" and r.round_index == 1 and r.spec_key == "k1", r)
+    check("Reservation 没有 amount 字段",
+          not hasattr(r, "amount"), dir(r))
+
+
+def test_reservation_requires_all_three_identity_fields():
+    """**Batch C closeout**: token / round_index / spec_key **全部必填**。
+
+    早先 `round_index=0, spec_key=""` 有默认值, 值空也放行 —— 于是
+    Step 14 的迟到回调只要 token 撞上就能兑现别人的预约, 而空 spec_key
+    让"哪一稿"这一维整条失效。冻结的契约是三者一致, 不是"愿意传就查"。
+    """
+    print("\n[S13-10b] 三要素必填")
+    led = SummonLedger()
+    led.earn(1)
+    # 位置参数必填 -> 少传是 TypeError
+    try:
+        led.reserve("t1")                      # type: ignore[call-arg]
+        check("少传身份字段应 TypeError", False, "没有报错")
+    except TypeError:
+        check("少传身份字段 -> TypeError", True)
+    # 传了但为空 -> 拒绝(必填但传空等于没填)
+    check("空 spec_key 被拒",
+          led.reserve("t1", round_index=1, spec_key="") is False)
+    check("空 token 被拒",
+          led.reserve("", round_index=1, spec_key="k") is False)
+    check("空 round 被拒",
+          led.reserve("t", round_index=None, spec_key="k") is False)
+    check("没有产生预约", led.detective_reservation is None)
+    # 三个都给了才成功
+    check("三要素齐全 -> 成功",
+          led.reserve("t1", round_index=1, spec_key="k1") is True)
+
+
+def test_commit_and_release_require_all_three():
+    """commit/release 也必须**三者全给**且全部匹配。"""
+    print("\n[S13-10c] commit/release 三要素严格匹配")
+    led = SummonLedger()
+    led.earn(1)
+    led.reserve("t1", round_index=7, spec_key="K7")
+    for fn_name in ("commit", "release"):
+        fn = getattr(led, fn_name)
+        try:
+            fn("t1")                            # type: ignore[call-arg]
+            check(f"{fn_name} 少传应 TypeError", False, "没有报错")
+        except TypeError:
+            check(f"{fn_name} 少传 -> TypeError", True)
 
 
 def test_commit_consumes():
@@ -177,7 +222,8 @@ def test_commit_consumes():
     led = SummonLedger()
     led.earn(2)
     led.reserve("t1", round_index=1, spec_key="k1")
-    check("commit 成功", led.commit("t1", round_index=1, spec_key="k1") is True)
+    check("commit 成功",
+          led.commit("t1", round_index=1, spec_key="k1") is True)
     check("consumed == 1", led.summon_consumed_total == 1,
           led.summon_consumed_total)
     check("预约已清", led.detective_reservation is None)
@@ -190,7 +236,8 @@ def test_release_refunds():
     led = SummonLedger()
     led.earn(1)
     led.reserve("t1", round_index=1, spec_key="k1")
-    check("release 成功", led.release("t1", round_index=1, spec_key="k1") is True)
+    check("release 成功",
+          led.release("t1", round_index=1, spec_key="k1") is True)
     check("consumed 仍 0", led.summon_consumed_total == 0,
           led.summon_consumed_total)
     check("available 回到 1", led.available == 1, led.available)
@@ -202,17 +249,37 @@ def test_reservation_cannot_be_stolen_by_stale_callback():
     led = SummonLedger()
     led.earn(1)
     led.reserve("t1", round_index=7, spec_key="K7")
-    check("错 token 的 commit 失败", led.commit("tX") is False)
+    check("错 token 的 commit 失败",
+          led.commit("tX", round_index=7, spec_key="K7") is False)
     check("错 round 的 commit 失败",
-          led.commit("t1", round_index=8) is False)
+          led.commit("t1", round_index=8, spec_key="K7") is False)
     check("错 spec_key 的 commit 失败",
           led.commit("t1", round_index=7, spec_key="K9") is False)
     check("预约仍在", led.detective_reservation is not None)
     check("错 round 的 release 也失败",
-          led.release("t1", round_index=8) is False)
+          led.release("t1", round_index=8, spec_key="K7") is False)
     check("预约仍在", led.detective_reservation is not None)
     check("正确的仍能兑现",
           led.commit("t1", round_index=7, spec_key="K7") is True)
+
+
+def test_one_reservation_consumes_exactly_one():
+    """一次召唤恒占 1 —— 不存在"一次预约消费多个"的路。"""
+    print("\n[S13-13b] 一次召唤恒占 1")
+    led = SummonLedger()
+    led.earn(5)
+    led.reserve("t1", round_index=1, spec_key="k1")
+    check("available 只扣 1", led.available == 4, led.available)
+    led.commit("t1", round_index=1, spec_key="k1")
+    check("consumed 恰好 +1", led.summon_consumed_total == 1,
+          led.summon_consumed_total)
+    check("consequently available == 4", led.available == 4, led.available)
+    # API 上没有 amount 旋钮
+    import inspect
+    for fn in (SummonLedger.reserve, SummonLedger.commit, SummonLedger.release):
+        check(f"{fn.__name__} 没有 amount 形参",
+              "amount" not in inspect.signature(fn).parameters,
+              sorted(inspect.signature(fn).parameters))
 
 
 def test_cannot_double_reserve():
@@ -220,8 +287,9 @@ def test_cannot_double_reserve():
     print("\n[S13-14] 不能重复预约")
     led = SummonLedger()
     led.earn(5)
-    check("第一次成功", led.reserve("t1") is True)
-    check("第二次被拒", led.reserve("t2") is False)
+    check("第一次成功", led.reserve("t1", round_index=1, spec_key="k1") is True)
+    check("第二次被拒",
+          led.reserve("t2", round_index=1, spec_key="k1") is False)
     check("原预约没被覆盖", led.detective_reservation.token == "t1",
           led.detective_reservation.token)
     check("available 只扣 1", led.available == 4, led.available)
@@ -230,10 +298,12 @@ def test_cannot_double_reserve():
 def test_cannot_reserve_without_capacity():
     print("\n[S13-15] 没额度不能预约")
     led = SummonLedger()
-    check("0 额度 -> 失败", led.reserve("t1") is False)
+    check("0 额度 -> 失败",
+          led.reserve("t1", round_index=1, spec_key="k1") is False)
     check("没有产生预约", led.detective_reservation is None)
     led.earn(1)
-    check("有额度 -> 成功", led.reserve("t1") is True)
+    check("有额度 -> 成功",
+          led.reserve("t1", round_index=1, spec_key="k1") is True)
 
 
 # ======================================================================
@@ -347,6 +417,9 @@ def main():
         test_commit_consumes,
         test_release_refunds,
         test_reservation_cannot_be_stolen_by_stale_callback,
+        test_reservation_requires_all_three_identity_fields,
+        test_commit_and_release_require_all_three,
+        test_one_reservation_consumes_exactly_one,
         test_cannot_double_reserve,
         test_cannot_reserve_without_capacity,
         test_gift_event_never_earns,

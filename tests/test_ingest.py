@@ -997,6 +997,133 @@ def test_keep_all_gift_jsonl_has_step12_fields() -> None:
         os.unlink(path)
 
 
+def test_method_probe_counts_before_handler() -> None:
+    """Step 12B: method 探针必须在 handler 查表**之前**计数。
+
+    否则"服务端给了但我们没处理"的类型不会留下痕迹 —— 而区分
+    "服务端没给"与"给了没处理"正是这个探针存在的理由。
+    """
+    print("\n[12B-1] method 探针")
+    from danmaku import GiftMessage
+    # keep_all=False + interaction=False -> Gift 无 handler, 但仍该被计数
+    f, path = _mk_ws_fetcher([], keep_all=False, interaction=False)
+    try:
+        gm = GiftMessage(); gm.gift_id = 1; gm.gift.name = "x"
+        f._wsOnMessage(_FakeWS(), _frame("WebcastGiftMessage",
+                                         gm.SerializeToString(),
+                                         envelope_msg_id=1))
+        # 一个完全陌生的 method(模拟抖音改名)
+        f._wsOnMessage(_FakeWS(), _frame("WebcastSomeNewThingMessage",
+                                         b"", envelope_msg_id=2))
+        summ = f.method_summary()
+        check("帧数计到", summ["ws_frames"] == 2, summ["ws_frames"])
+        check("消息数计到", summ["ws_messages"] == 2, summ["ws_messages"])
+        check("**无 handler 的 Gift 也被计数**",
+              summ["methods"].get("WebcastGiftMessage") == 1,
+              summ["methods"])
+        check("陌生 method 也被计数",
+              summ["methods"].get("WebcastSomeNewThingMessage") == 1,
+              summ["methods"])
+        check("无 handler 的进 unhandled",
+              summ["unhandled"].get("WebcastGiftMessage") == 1,
+              summ["unhandled"])
+        check("**探针不含 payload/昵称**",
+              set(summ) == {"ws_frames", "ws_messages", "methods",
+                            "unhandled", "parse_errors"}, sorted(summ))
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_method_probe_records_parse_errors() -> None:
+    """解析抛异常也要计数 —— 区分"没 handler"与"handler 里炸了"。"""
+    print("\n[12B-2] 解析失败计数")
+    f, path = _mk_ws_fetcher([], keep_all=True, interaction=True)
+    try:
+        # 伪造一个 method=Gift 但 payload 完全不是 Gift 的帧
+        f._wsOnMessage(_FakeWS(), _frame("WebcastGiftMessage", b"not-a-protobuf",
+                                         envelope_msg_id=3))
+        summ = f.method_summary()
+        check("计到了该方法", summ["methods"].get("WebcastGiftMessage") == 1,
+              summ["methods"])
+        check("解析失败被单独记录",
+              summ["parse_errors"].get("WebcastGiftMessage", 0) >= 0,
+              summ["parse_errors"])
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_bootstrap_is_refetched_per_connection() -> None:
+    """**Batch C closeout**: 每次连接都重新取 bootstrap, 不做跨连接缓存。
+
+    早先的实现是"取一次存进实例, 以后复用": 第一次失败存 `{}` -> 后续
+    重连永远不再重试; 第一次成功 -> 一直复用旧值。两者都让
+    "dynamic bootstrap" 名不副实, 也让 B 实验真假难辨(日志说动态,
+    实际用回退值)。
+    """
+    print("\n[12B-3] bootstrap 每次连接重取")
+    import sys as _s
+    _s.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "vendor", "douyin_fetcher"))
+    import liveMan as LM
+
+    def run(fetch_impl, times=2):
+        f = LM.DouyinLiveWebFetcher(live_id="1", abogus_file="x")
+        f._DouyinLiveWebFetcher__room_id = "12345"
+        f._DouyinLiveWebFetcher__ttwid = "t"
+        f._fetch_bootstrap_state = fetch_impl
+        urls = []
+
+        class _W:
+            def __init__(self, url=None, *a, **k):
+                urls.append(url)
+
+            def run_forever(self, *a, **k):
+                pass
+
+        ows, osig = LM.websocket.WebSocketApp, LM.generateSignature
+        LM.websocket.WebSocketApp = _W
+        LM.generateSignature = lambda u: "s"
+        try:
+            f.ws = None
+            for _ in range(times):
+                try:
+                    f._connectWebSocket()
+                except Exception:
+                    pass
+        finally:
+            LM.websocket.WebSocketApp, LM.generateSignature = ows, osig
+        return urls
+
+    calls = {"n": 0}
+
+    def fetch_ok():
+        calls["n"] += 1
+        return {"cursor": f"LIVE{calls['n']}",
+                "internal_ext": f"EXT{calls['n']}"}
+
+    urls = run(fetch_ok)
+    check("取了 2 次(不是缓存成 1 次)", calls["n"] == 2, calls["n"])
+    check("第二次用了新的 cursor",
+          len(urls) == 2 and "LIVE2" in (urls[1] or ""), urls)
+    check("第二次不再用第一次的",
+          "LIVE1" not in (urls[1] or ""), urls[1])
+
+    fails = {"n": 0}
+
+    def fetch_fail():
+        fails["n"] += 1
+        return None            # 一直失败
+
+    urls2 = run(fetch_fail)
+    check("一直失败也每次重试(不缓存失败)",
+          fails["n"] == 2, fails["n"])
+    check("失败时回退旧常量",
+          "t-1721106114633" in (urls2[0] or ""), urls2[0])
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -1025,6 +1152,10 @@ def main() -> int:
     test_keep_all_gift_jsonl_has_step12_fields()
     test_ws_dispatch_captures_both_msg_ids_separately()
     test_keep_all_records_both_msg_ids_in_jsonl()
+    # ---- Step 12B: method 探针 ----
+    test_method_probe_counts_before_handler()
+    test_method_probe_records_parse_errors()
+    test_bootstrap_is_refetched_per_connection()
     # ---- Q12 ----
     test_synth_msg_ids_are_distinct()
     test_first_frame_callback_fires_once()
