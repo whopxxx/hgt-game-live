@@ -37,7 +37,7 @@ from .puzzle import (
 )
 from .quality import (
     QUALITY_POLICY_VERSION, Quotas, ValidationResult, cross_puzzle_gate,
-    validate_blueprint, validate_spec,
+    ngrams, too_similar, validate_blueprint, validate_spec,
 )
 from .state import QAResult
 
@@ -441,34 +441,10 @@ def _looks_chinese(text: str, min_ratio: float = 0.25) -> bool:
     return (han / total) >= min_ratio
 
 
-def _ngrams(text: str, n: int = 3) -> set:
-    """把文本切成 n-gram 字符集合(只看汉字/数字, 忽略标点空白)。"""
-    body = "".join(c for c in (text or "") if "一" <= c <= "鿿" or c.isdigit())
-    if len(body) < n:
-        return {body} if body else set()
-    return {body[i:i + n] for i in range(len(body) - n + 1)}
-
-
-def _too_similar(puzzle: str, used: list,
-                 threshold: float = 0.22) -> str:
-    """新谜面是否和已出过的某条太像? 返回相似的那条, 否则 ""。
-
-    用 3-gram 的 Jaccard 相似度 —— 换个说法重讲同一道题时, 用词会高度
-    重叠, 这个指标能抓住。实测标定: 同题改写 ≈0.29, 完全不同 ≈0.00,
-    所以阈值取 0.22 落在两者中间(有很宽的余量, 不会误杀同题材新题)。
-    """
-    a = _ngrams(puzzle)
-    if not a:
-        return ""
-    for u in used or []:
-        b = _ngrams(u)
-        if not b:
-            continue
-        inter = len(a & b)
-        union = len(a | b)
-        if union and inter / union >= threshold:
-            return u
-    return ""
+# 注: `_ngrams` / `_too_similar` 已下移到 `quality.py`(纯文本工具, 不该
+# 依赖 LLM 概念), 这里用 `too_similar` / `ngrams` 导入名。llm 里原来的
+# 两份定义里, 第 2 份是**死代码** —— 它只是覆盖了第 1 份(少了大段理由
+# 注释), 谁都没用到那个差异。一并删掉。
 
 
 def _leaks_answer(comment: str, answer: str) -> bool:
@@ -515,19 +491,11 @@ _STOP2 = frozenset({
 
 def _too_similar(puzzle: str, used: list,
                  threshold: float = 0.22) -> str:
-    """新谜面是否和已出过的某条太像? 返回相似的那条, 否则 ""。"""
-    a = _ngrams(puzzle)
-    if not a:
-        return ""
-    for u in used or []:
-        b = _ngrams(u)
-        if not b:
-            continue
-        inter = len(a & b)
-        union = len(a | b)
-        if union and inter / union >= threshold:
-            return u
-    return ""
+    """薄封装, 保留老调用点(`_too_similar` 这个名字在测试里也用着)。
+
+    真正的实现在 `quality.py` —— 见上面那段注释的理由。
+    """
+    return too_similar(puzzle, used, threshold)
 
 
 # 开放疑问词: 提问者在**要信息**, 而不是给出一个可判定真假的断言。

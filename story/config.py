@@ -172,10 +172,25 @@ class Config:
     sim_loop_gap: float = 20.0            # SimSource loop 每遍之间的间隔
 
     # ---- 题池(方案 §40) ----
-    # 第一版 pool 只是"预生成好的题放哪", 不改变实时出题路径。
+    # 已通过质量链的题存下来、优先投入直播; 池子空了再现场生成。
+    #
+    # ⚠️ `pool_target_size` / `pool_min_size` 在 Q8 阶段是**惰性的** ——
+    # 没有任何代码读它们。它们的唯一消费者是 Q9 的自动补池(prefetch),
+    # 而那是有意留到下一步的。**不要**顺手把它们接进 pop_next, 那会让
+    # 池子自我补池, 把"什么时候写盘、写失败怎么办"整套并发问题提前
+    # 引进来。
     pool_enabled: bool = True
     pool_target_size: int = 5
     pool_min_size: int = 2
+    # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
+    # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
+    # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
+    pool_path: str = os.path.join("data", "pool.jsonl")
+    pool_used_path: str = os.path.join("data", "pool_used.jsonl")
+    # pop_next 做文件 I/O 时正持有出题的互斥锁(在 worker 线程里), 而
+    # 引擎那边唯一的兜底是 setting_timeout_seconds(故意很大)。给个
+    # 上界, 免得慢盘把出题拖到超时。
+    pool_op_budget_ms: int = 500
 
     # ---- Blueprint 调度(方案 §7) ----
     # **与 pool_enabled 解耦** —— 关掉题池不该顺便关掉"控制题型分布"。

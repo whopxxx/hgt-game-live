@@ -622,8 +622,44 @@ def cross_puzzle_gate(spec: PuzzleSpec, recent: Optional[list],
     return bad
 
 
-def policy_version() -> str:
-    return QUALITY_POLICY_VERSION
+# ======================================================================
+# 文本近似(3-gram Jaccard)
+# ======================================================================
+# 从 `llm.py` **下移**到这里。理由: 它是纯文本工具, 不碰任何 LLM 概念,
+# 而 `llm.py` 本来就 `from .quality import ...` —— 留在 llm 里会让
+# 任何想复用它的人(比如题池)反向依赖 llm, 从而把 urllib/logging 那套
+# 初始化一起拖进来。放这里, 依赖方向才是对的。
+def ngrams(text: str, n: int = 3) -> set:
+    """把文本切成 n-gram 字符集合(只看汉字/数字, 忽略标点空白)。"""
+    body = "".join(c for c in (text or "") if "一" <= c <= "鿿" or c.isdigit())
+    if len(body) < n:
+        return {body} if body else set()
+    return {body[i:i + n] for i in range(len(body) - n + 1)}
+
+
+def too_similar(puzzle: str, used: list,
+                threshold: float = 0.22) -> str:
+    """新谜面是否和已出过的某条太像? 返回相似的那条, 否则 ""。
+
+    用 3-gram 的 Jaccard 相似度 —— 换个说法重讲同一道题时, 用词会高度
+    重叠, 这个指标能抓住。实测标定: 同题改写 ≈0.29, 完全不同 ≈0.00,
+    所以阈值取 0.22 落在两者中间(有很宽的余量, 不会误杀同题材新题)。
+    """
+    a = ngrams(puzzle)
+    if not a:
+        return ""
+    for u in used or []:
+        b = ngrams(u)
+        if not b:
+            continue
+        inter = len(a & b)
+        union = len(a | b)
+        if union and inter / union >= threshold:
+            return u
+    return ""
+
+
+def policy_version() -> str:    return QUALITY_POLICY_VERSION
 
 
 # ======================================================================
