@@ -51,8 +51,9 @@ def main(argv=None) -> int:
     tp = tn = fp = fn = 0
     wrong = []
     for r in rows:
-        got, err = w.judge(r["puzzle"], r["answer"], r["user_text"],
-                           r.get("solve_atoms"))
+        jr = w.judge(r["puzzle"], r["answer"], r["user_text"],
+                     r.get("solve_atoms"))
+        got = jr.solved
         want = bool(r["expected_solved"])
         if got and want:
             tp += 1
@@ -60,10 +61,10 @@ def main(argv=None) -> int:
             tn += 1
         elif got and not want:
             fp += 1
-            wrong.append(("误判为猜中", r, got, err))
+            wrong.append(("误判为猜中", r, got, jr.error))
         else:
             fn += 1
-            wrong.append(("漏判(该中未中)", r, got, err))
+            wrong.append(("漏判(该中未中)", r, got, jr.error))
 
     total = len(rows)
     print("=" * 60)
