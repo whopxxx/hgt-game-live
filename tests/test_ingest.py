@@ -13,11 +13,12 @@ import os
 import queue
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from danmaku import ChatMessage           # 从 danmaku 转出(它会先把 vendor 加进路径)
+from danmaku import ChatMessage, DanmakuFetcher   # 从 danmaku 转出(它会先把 vendor 加进路径)
 from story.config import Config
 from story.ingest import CallbackFetcher, ChatEvent, SimSource, StdinSource
 
@@ -376,6 +377,160 @@ def test_first_frame_resets_per_connection() -> None:
         parent._wsOnOpen = orig_open
 
 
+def _patch_network_boundary(behavior, holder):
+    """把父类 start() 换成"连上->阻塞直到 stop()"。
+
+    返回还原函数。`holder["connects"]` 由调用方读。
+    """
+    parent = DanmakuFetcher.__mro__[1]             # DouyinLiveWebFetcher
+    orig = parent.start
+
+    def fake_start(self):
+        holder["connects"] += 1
+        if behavior == "error":
+            raise ConnectionResetError("模拟普通网络断线")
+        self._live.set()
+        self._live.wait(5.0)                       # 直到 stop() 清掉
+
+    parent.start = fake_start
+
+    def restore():
+        parent.start = orig
+    return restore
+
+
+class _CountingFetcher(DanmakuFetcher):
+    """跑**真实** `DanmakuFetcher.start()`, 只打桩网络边界。"""
+
+    def __init__(self, behavior="ok"):
+        self.out_path = os.devnull
+        self.keep_all = False
+        self._fp = None
+        self._counts = {}
+        self._terminated = threading.Event()
+        self.live_id = "test"
+        self.behavior = behavior
+        self.connects = 0
+        self._live = threading.Event()
+
+    # 复刻上游 stop(): 只关当前 socket, 让"本次连接"结束
+    def stop(self):
+        self._live.clear()
+
+
+def test_terminate_stops_reconnect() -> None:
+    """下播后**不得**再次建连 —— 这是 Hotfix A 的核心验收。
+
+    跑的是**真实** `DanmakuFetcher.start()`: 只把父类的网络连接打桩,
+    循环结构本身是生产代码那一份。
+    """
+    print("\n[13] terminate(): 下播后不再重连")
+    holder = {"connects": 0}
+    f = _CountingFetcher(behavior="ok")
+    restore = _patch_network_boundary("ok", holder)
+    try:
+        t = threading.Thread(target=f.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        check("先连上过", holder["connects"] >= 1, holder["connects"])
+        f.terminate()
+        t.join(timeout=5.0)
+        check("terminate 后线程退出", not t.is_alive())
+        n = holder["connects"]
+        time.sleep(0.5)                    # 循环若还活着, 这里必然继续涨
+        check("**不再有新的建连**", holder["connects"] == n,
+              f"{n} -> {holder['connects']}")
+    finally:
+        restore()
+
+
+def test_plain_disconnect_still_reconnects() -> None:
+    """普通网络断线**必须**仍然自动重连 —— 防 `stop()` 被误改成终止。
+
+    这条是 Hotfix A 里最重要的防回归: 原库自己在错误路径上调
+    `stop()`(`liveMan.py` 的 _connectWebSocket except 分支), 如果谁把
+    `stop()` 写成永久退出, 一次抖动就永久断流。
+    """
+    print("\n[14] 普通断线仍自动重连(防回归)")
+    holder = {"connects": 0}
+    f = _CountingFetcher(behavior="error")
+    restore = _patch_network_boundary("error", holder)
+    try:
+        t = threading.Thread(target=f.start, daemon=True)
+        t.start()
+        # 真实退避是 3s -> 6s -> 12s, 所以 2 次建连约 9 秒。
+        time.sleep(9.5)
+        check("**反复重连中**", holder["connects"] >= 2, holder["connects"])
+        f.terminate()
+        t.join(timeout=5.0)
+        check("terminate 能停住错误重试循环", not t.is_alive())
+    finally:
+        restore()
+
+
+def test_stop_is_not_terminal() -> None:
+    """`stop()` 只中止当前连接, **不**终止重连循环。"""
+    print("\n[15] stop() 与 terminate() 语义不同")
+    holder = {"connects": 0}
+    f = _CountingFetcher(behavior="ok")
+    restore = _patch_network_boundary("ok", holder)
+    try:
+        t = threading.Thread(target=f.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        before = holder["connects"]
+        check("先连上过", before >= 1, before)
+        f.stop()                           # 只关当前连接
+        # 真实退避 3s, 所以等 4 秒看它有没有再连
+        time.sleep(4.0)
+        check("**stop() 后循环仍在跑(会继续重连)**",
+              holder["connects"] > before, f"{before} -> {holder['connects']}")
+        f.terminate()
+        t.join(timeout=5.0)
+        check("terminate 收尾", not t.is_alive())
+    finally:
+        restore()
+
+
+def test_livesource_terminates_on_stream_end() -> None:
+    """端到端: 下播信号 -> LiveSource 终止 fetcher(不再重连)。
+
+    这是 2026-09-18 那次真实故障的复现路径:
+        _parseControlMsg(status=3) -> _on_control("stream_ended")
+        -> LiveSource._on_control -> 必须 terminate, 而不只是 stop
+    修好之前, 日志里会变成 "收到下播信号 -> 又连上 -> 又收到下播信号" 的循环。
+    """
+    print("\n[16] 下播 -> LiveSource 终止重连(端到端)")
+    from story.ingest import LiveSource
+
+    src = LiveSource.__new__(LiveSource)
+    src._stop = threading.Event()
+    src._on_stream_end = None
+    holder = {"connects": 0}
+
+    f = _CountingFetcher(behavior="ok")
+    src._fetcher = f
+    restore = _patch_network_boundary("ok", holder)
+    try:
+        t = threading.Thread(target=f.start, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        check("fetcher 已连上", holder["connects"] >= 1, holder["connects"])
+
+        # 模拟真实链路: 收到下播信号
+        src._on_control("stream_ended")
+
+        t.join(timeout=5.0)
+        check("**下播后抓取线程退出**", not t.is_alive())
+        n = holder["connects"]
+        time.sleep(0.5)
+        check("**下播后不再重连**", holder["connects"] == n,
+              f"{n} -> {holder['connects']}")
+        check("source 的 _stop 已置位", src._stop.is_set())
+    finally:
+        restore()
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -393,6 +548,11 @@ def main() -> int:
     test_missing_common_means_empty_id()
     test_stdin_path_works()
     test_first_frame_resets_per_connection()
+    # ---- Hotfix A: 下播终止语义 ----
+    test_terminate_stops_reconnect()
+    test_plain_disconnect_still_reconnects()
+    test_stop_is_not_terminal()
+    test_livesource_terminates_on_stream_end()
     print("\n" + "=" * 60)
     if FAIL:
         print(f"  {FAIL} 项失败")

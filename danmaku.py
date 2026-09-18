@@ -81,6 +81,10 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         self.keep_all = keep_all
         self._fp = None
         self._counts = {}
+        #: **永久终止**标志 —— 见 `terminate()`。与 `stop()` 是两件事:
+        #: `stop()` 只关当前 socket(允许重连), 这个置位后 `start()` 的
+        #: 重连循环**不再**继续。
+        self._terminated = threading.Event()
 
     # ---- 落库 ----
     def _emit(self, kind, user_id=None, user_name=None, content=None, extra=None):
@@ -162,8 +166,10 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         m = ControlMessage().parse(payload)
         if m.status == 3:
             print(">>> 直播间已结束", flush=True)
+            # 下播是**终止**: 只 `stop()` 的话重连循环下一轮又会连上,
+            # 抖音会把同一批弹幕重发 —— 见 `terminate()` 的说明。
             with _suppress_stdout():
-                self.stop()
+                self.terminate()
 
     # ---- 覆盖消息分发: 去掉噪音类型 + 让异常可见 ----
     def _wsOnMessage(self, ws, message):
@@ -224,12 +230,38 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         print(">>> WebSocket 已断开", file=sys.stderr, flush=True)
 
     # ---- 生命周期 ----
+    def terminate(self) -> None:
+        """**永久终止** —— 置位后 `start()` 的重连循环不再继续。
+
+        与 `stop()` 的区别(这个区别很关键, 不要合并):
+
+        - `stop()` 语义是"**中止本次连接**" —— 它只做 `self.ws.close()`,
+          让当前 `run_forever()` 返回, 外层重连循环随后照常重连。
+          原库自己在错误路径上就调它(`liveMan.py` 的 `_connectWebSocket`
+          except 分支), 所以**绝不能**把它改成永久退出: 否则一次普通
+          网络抖动就会让弹幕永远不再重连。
+        - `terminate()` 语义是"**结束这个抓取器**" —— 下播(status=3)、
+          watchdog 淘汰、进程正常退出时用。
+
+        `terminate()` 内部仍会调一次 `stop()`: 光置标志位只能让循环在
+        **下一轮**发现, 当前那次 `run_forever()` 还阻塞在 socket 上,
+        必须关掉它才能立刻返回。
+        """
+        self._terminated.set()
+        try:
+            self.stop()          # 关掉当前 socket, 让 run_forever 立即返回
+        except Exception:
+            pass
+
     def start(self):
         self._fp = open(self.out_path, "a", encoding="utf-8")
         delay = 3
         warned = False
         try:
-            while True:
+            # 用 `_terminated.is_set()` 而不是 `while True`: 否则下播之后
+            # `stop()` 关掉 socket -> run_forever 返回 -> 睡几秒 -> **又连**,
+            # 抖音会把同一批弹幕原样重发, 一次下播变成无限重连 + 无限重放。
+            while not self._terminated.is_set():
                 err = None
                 try:
                     super().start()
@@ -257,7 +289,10 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
                 else:
                     print(">>> 连接已关闭", flush=True)
 
-                time.sleep(delay)
+                # 退避也要可中断: 否则下播后最长还要干等 60 秒才退出,
+                # 期间日志看起来像"卡住了"。`wait()` 会被 `terminate()` 立刻唤醒。
+                if self._terminated.wait(delay):
+                    break
                 delay = min(int(delay * 1.5), 60)   # 退避, 最多 60 秒
                 if warned and delay == 60:
                     print(f">>> 已等待中, 每 60 秒重试一次...", flush=True)

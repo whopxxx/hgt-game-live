@@ -288,11 +288,15 @@ class CallbackFetcher(DanmakuFetcher):
                     self._on_control("stream_ended")
                 except Exception as e:
                     log.error("on_control 回调异常: %s", e)
-            # 实测: ws 未建立时 stop() 会抛 AttributeError, 必须 guard
+            # 下播是**终止**, 不是"关掉这次连接": 只 stop() 的话重连循环
+            # 下一轮又会连上, 抖音会把同一批弹幕原样重发(实测: 一次下播
+            # 变成每秒一次的重连 + 重复弹幕)。terminate() 会置永久标志位,
+            # 让 `DanmakuFetcher.start()` 的 while 循环真正退出。
+            # 实测: ws 未建立时关连接会抛 AttributeError, 必须 guard
             try:
-                self.stop()
+                self.terminate()
             except Exception as e:
-                log.warning("stop() 失败(忽略): %s", e)
+                log.warning("terminate() 失败(忽略): %s", e)
 
 
 # ======================================================================
@@ -345,8 +349,13 @@ class LiveSource:
         self._last_frame = time.monotonic()
 
     def _on_control(self, kind: str) -> None:
-        if kind == "stream_ended" and self._on_stream_end:
-            self._on_stream_end()
+        if kind == "stream_ended":
+            # 下播 = 本 source 的终点。**在这里就设终止位**, 不等 director 的
+            # finally: 那条路要等主循环 3 秒宽限才走完, 期间 fetcher 的
+            # 重连循环还活着, 会再连上一次并把旧弹幕重发一遍。
+            self.stop()
+            if self._on_stream_end:
+                self._on_stream_end()
 
     def _build(self) -> CallbackFetcher:
         out = os.path.abspath(self.cfg.out_path)
@@ -498,6 +507,11 @@ class LiveSource:
             except Exception:
                 pass
         try:
+            # 这里**必须**用 stop() 而不是 terminate(): 我们只是在淘汰一个
+            # 停摆的旧实例, 它的重连循环该被放行(新 fetcher 已经接管)。
+            # 若改成 terminate(), 旧实例被永久终止 —— 看着没问题, 但语义
+            # 就变成"淘汰 = 杀死", 和 `LiveSource.stop()`(整体终止)混在一
+            # 起, 以后有人复用 _force_close 去关一个还要重连的 fetcher 就会踩坑。
             f.stop()                       # 上游实现: self.ws.close()
         except Exception:
             pass
@@ -544,10 +558,18 @@ class LiveSource:
         log.info("LiveSource 已启动: %s", self.cfg.live_id)
 
     def stop(self) -> None:
+        """**终止**本 source —— 此后不再有任何重连。
+
+        注意这里用的是 `terminate()` 而不是 `stop()`: 后者只关当前 socket,
+        fetcher 的 `while True` 下一轮照样重连。下播后无限重连的根因就在
+        这个差别上。`_restart()` 里淘汰旧 fetcher 用的是 `stop()`, 那里
+        **必须**保持"允许重试"的语义, 不要跟着改。
+        """
         self._stop.set()
-        if self._fetcher is not None:
+        f = self._fetcher
+        if f is not None:
             try:
-                self._fetcher.stop()
+                f.terminate()
             except Exception:
                 pass
 
