@@ -62,6 +62,11 @@ jobs:
       - name: 离线套件 web
         run: uv run tests/test_web.py
 
+      # Step 05: 用 Step 00 冻结的真实 fixture 跑 canonical regression。
+      # **只证明当前错误存在**, 不修 —— 修在 Step 07。
+      - name: 离线套件 canonical
+        run: uv run tests/test_canonical.py
+
       - name: 离线套件 pool
         run: uv run tests/test_pool.py
 
