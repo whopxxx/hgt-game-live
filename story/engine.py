@@ -591,6 +591,17 @@ class RoundEngine:
             p["attempt"] = attempt
         return EngineAction(ActionKind.RIDDLE, p)
 
+    def request_riddle_action(self, reason: str = "riddle_deferred"
+                              ) -> EngineAction:
+        """**给外部线程**用的: 拿一个 RIDDLE 动作(自带加锁)。
+
+        director 的调度线程需要在"上一拍出题被推迟"之后补发一次请求。
+        它以前直接调 `_riddle_action_locked()`, 那是个明确带锁语义的私有
+        方法 —— 眼下只是读几个字段所以没炸, 但 API 边界不干净。
+        """
+        with self._lock:
+            return self._riddle_action_locked(reason)
+
     def _riddle_failed_locked(self, now: float, why: str) -> list[EngineAction]:
         self._setting_attempts += 1
         self.last_error = why
@@ -598,10 +609,19 @@ class RoundEngine:
             # 用兜底谜题, 保证永不开天窗
             log.warning("出题连续失败(%s), 使用兜底谜题", why)
             # 轮换兜底题 —— 总用同一道, 观众一看就知道出题挂了。
-            riddle = P.FALLBACK_RIDDLES[self._puzzle_index % len(P.FALLBACK_RIDDLES)]
-            return self.submit_riddle(riddle[0], riddle[1],
-                                      list(P.FALLBACK_HINTS),
-                                      title="海龟汤", now=now)
+            #
+            # **兜底也必须结构化**(第二轮 review P1): 它同样要经过正式
+            # Q&A, 只给 puzzle/answer 的话 facts 为空 -> 主持人退回"只看
+            # 文学谜底", Final Judge 也没有 atom gate —— 质量系统在这条
+            # 路径上等于不存在。
+            spec = P.fallback_spec(self._puzzle_index)
+            return self.submit_riddle(
+                spec.puzzle, spec.answer, list(spec.hints), title=spec.title,
+                now=now, solve_atoms=spec.solve_atoms,
+                fair_clues=spec.fair_clues, spec=spec,
+                # 注意: **不传 signature** —— 兜底题不该挤占跨题配额,
+                # 否则"出题全挂了"这一事实会污染全局分布统计。
+                signature=None)
         log.warning("出题失败(%s), 重试 %d/%d", why, self._setting_attempts,
                     self.cfg.riddle_max_attempts)
         return [self._riddle_action_locked("riddle_retry",

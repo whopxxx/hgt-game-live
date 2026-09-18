@@ -364,8 +364,12 @@ class Director:
                 else:
                     recent = payload.get("recent_signatures") or []
                     bp = self._pick_blueprint(recent)
-                    spec = self.writer.gen_spec(avoid=payload.get("avoid"),
-                                                blueprint=bp, recent=recent)
+                    spec = self.writer.gen_spec(
+                        avoid=payload.get("avoid"), blueprint=bp,
+                        recent=recent,
+                        # bp is None 时**真的**跳过 blueprint 硬校验,
+                        # 而不是退回默认 blueprint。
+                        enforce_blueprint=bp is not None)
                     # 只有**通过质量门**的 spec 才允许上直播。
                     # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
                     if spec.puzzle and not spec.error:
@@ -403,10 +407,16 @@ class Director:
 
         用固定 seed 的 Random 实例 —— 每次出题都换 seed 会让"同输入不同
         输出", 复盘时无法重现。这里用**进程级** rng, 只保证可注入、可测。
+
+        返回 None 表示**本轮不施加 blueprint 硬约束**(由调用方转成
+        `enforce_blueprint=False`)。注意这与"用默认 blueprint"完全不同:
+        早先 None 会被 `gen_spec` 里的 `blueprint or PuzzleBlueprint()`
+        悄悄变成 fixed default —— 关掉调度反而让所有题长一个样。
         """
         # 注意: 这里读的是 quality_scheduler_enabled, **不是** pool_enabled。
         # 两者职责不同: 前者管"题型分布受不受控", 后者管"要不要预生成题池"。
         if not getattr(self.cfg, "quality_scheduler_enabled", True):
+            log.info("quality_scheduler_enabled=False: 本轮不施加 blueprint")
             return None
         try:
             from story.quality import Quotas, choose_blueprint
@@ -417,8 +427,10 @@ class Director:
             _detail("blueprint 全文: %s", bp.describe())
             return bp
         except Exception as e:                       # noqa: BLE001
-            # 调度失败不能让出题链断掉 —— 退化成"模型自由发挥"
-            log.warning("blueprint 选择失败, 本题不限形状: %s", e)
+            # 调度失败不能让出题链断掉 —— 退化成"模型自由发挥"。
+            # 这里返回的 None 会被调用方转成 enforce_blueprint=False,
+            # 所以"不限形状"这次是真的(早先它其实会退回默认 blueprint)。
+            log.warning("blueprint 选择失败, 本题**真的**不限形状: %s", e)
             return None
 
     def _hint(self, payload: dict) -> None:
@@ -624,7 +636,7 @@ class Director:
                     if self.engine.phase == Phase.SETTING:
                         log.info("补发被推迟的出题请求")
                         self._run_action(
-                            self.engine._riddle_action_locked("riddle_deferred"))
+                            self.engine.request_riddle_action("riddle_deferred"))
                 self.push()
                 pushes_since += 1
                 if self.engine.should_stop():

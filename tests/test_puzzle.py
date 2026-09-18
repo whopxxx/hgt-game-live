@@ -76,7 +76,7 @@ def good_spec(**kw) -> PuzzleSpec:
                        domain="maritime", emotion_mode="neutral",
                        relation="stranger", time_shape="habitual"),
                    prompt_version="riddle-v3",
-                   quality_policy_version="quality-v2")
+                   quality_policy_version="quality-v3")
     for k, v in kw.items():
         setattr(s, k, v)
     return s
@@ -370,10 +370,6 @@ def test_blueprint_mismatch_is_rejected_not_warned():
                                         solution_shape="hidden_function_explains_behavior",
                                         domain="commerce", relation="stranger",
                                         emotion_mode="grief", time_shape="instant"),
-        "time_shape": PuzzleSignature(mechanism_family="hidden_function",
-                                      solution_shape="hidden_function_explains_behavior",
-                                      domain="commerce", relation="stranger",
-                                      emotion_mode="neutral", time_shape="years_long"),
     }
     for name, sig in cases.items():
         sp = good_spec()
@@ -382,6 +378,47 @@ def test_blueprint_mismatch_is_rejected_not_warned():
         check(f"{name} 不一致 -> error", not r.ok, r.errors)
         check(f"  错误信息点到 {name}",
               any(name in e for e in r.errors), r.errors)
+
+
+def test_time_shape_is_not_a_hard_constraint():
+    """P1(第二轮 review): `time_shape` 降为 observed metadata, 不拒稿。
+
+    原因: blueprint 里它只有一个默认值 instant, 而严格比对下"每天做某事 /
+    连续几天 / 长年观察 / 固定规矩"这类**完全合理**的题全被判死。实测 3 个
+    seed 里就有 1 个因为"长年习惯 vs time_shape=instant"多花一轮重出 ——
+    这个字段于是从"增加多样性"变成了"提高废稿率"。
+
+    现在生成器如实回传, 代码只统计(见 signature_counts 的 time: 计数)。
+    """
+    bp = PuzzleBlueprint(mechanism_family="hidden_function",
+                         solution_shape="hidden_function_explains_behavior",
+                         domain="maritime", relation="stranger",
+                         emotion_mode="neutral", time_shape="instant")
+    for ts in ("instant", "habitual", "years_long", "single_day"):
+        sp = good_spec()
+        sp.blueprint = bp
+        sp.signature = PuzzleSignature(
+            mechanism_family="hidden_function",
+            solution_shape="hidden_function_explains_behavior",
+            domain="maritime", relation="stranger",
+            emotion_mode="neutral", time_shape=ts)
+        r = validate_blueprint(sp, bp)
+        check(f"time_shape={ts} 不该被拒", r.ok, r.errors)
+
+    # 但其它维度**仍然**是硬约束 —— 降级只限 time_shape 这一个字段
+    sp = good_spec()
+    sp.blueprint = bp
+    sp.signature = PuzzleSignature(
+        mechanism_family="hidden_function",
+        solution_shape="hidden_function_explains_behavior",
+        domain="maritime", relation="stranger",
+        emotion_mode="neutral", time_shape="years_long")
+    check("降级没有波及其它维度", validate_blueprint(sp, bp).ok, "误拒")
+
+    # time_shape 仍要被统计到(配额不用它, 但分布要看得见)
+    from story.quality import signature_counts
+    c = signature_counts([sp.signature])
+    check("time_shape 进了统计", c.get("time:years_long") == 1, c)
 
 
 def test_blueprint_flags_both_directions():
@@ -689,6 +726,7 @@ def main():
         test_legacy_atoms_migrate,
         test_validate_blueprint_flags,
         test_blueprint_mismatch_is_rejected_not_warned,
+        test_time_shape_is_not_a_hard_constraint,
         test_blueprint_flags_both_directions,
         test_legacy_spec_skips_blueprint_comparison,
         test_quota_blocks_after_two_deaths,

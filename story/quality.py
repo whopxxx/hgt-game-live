@@ -31,7 +31,16 @@ from .puzzle import (
 )
 
 #: 每次改配额规则都要动这里, 并写进 archive —— 下一轮直播才能比较版本。
-QUALITY_POLICY_VERSION = "quality-v2"
+#:
+#: v3(第二轮 review):
+#:   - `time_shape` 退出 blueprint 硬比对, 降为 observed metadata
+#:     (v2 里它只有一个默认值 instant, 把大量合理题判死);
+#:   - 审稿改稿必须整套同步 facts/atoms/clues/signature, 缺一即整稿拒;
+#:   - pass 也要吸收审稿人的 observed_signature;
+#:   - 兜底题结构化为 PuzzleSpec。
+#: 所以 v2 与 v3 的 archive **不可直接比较**: v2 的 signature.time_shape
+#: 是"被强制成 instant", v3 的是"如实观察"。
+QUALITY_POLICY_VERSION = "quality-v3"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -243,9 +252,22 @@ def validate_blueprint(spec: PuzzleSpec,
             r.warn("signature 缺 mechanism_family(老 spec, 跳过逐项比对)")
         return r
 
-    # ---- 逐项严格比对(方案 review Blocker 7) ----
+    # ---- which 维度逐项严格比对(方案 review Blocker 7) ----
+    #
+    # `time_shape` **不在**这个名单里(第二轮 review P1)。
+    #
+    # 原因: blueprint 里 time_shape 只有一个默认值 instant(SHAPE_FLAGS 只给
+    # past_trauma_explains_current_ritual 派了 years_long), 而 instant 在
+    # 严格比对下会与大量完全合理的题冲突 —— "每天做某事 / 连续几天 /
+    # 长年观察 / 固定规矩"全都被判死。实测 3 个 seed 里就有 1 个因为
+    # "长年习惯 vs time_shape=instant" 而多花一轮重出。
+    #
+    # 于是这个字段从"增加多样性"变成了"提高废稿率"。降为 **observed
+    # metadata**: 生成器如实回传, 代码只统计(见 signature_counts), 不拒稿。
+    # 等将来真要做 time_shape 维度的配额, 得先有 family × time_shape 的
+    # 兼容表, 而不是拿一个默认值去卡所有题。
     for name in ("mechanism_family", "solution_shape", "domain",
-                 "relation", "emotion_mode", "time_shape"):
+                 "relation", "emotion_mode"):
         want = getattr(bp, name, "")
         got = getattr(sig, name, "")
         if got != want:
@@ -338,6 +360,8 @@ def signature_counts(recent: Optional[list],
         c[f"shape:{s.solution_shape}"] += 1
         c[f"domain:{s.domain}"] += 1
         c[f"relation:{s.relation}"] += 1
+        if s.time_shape:
+            c[f"time:{s.time_shape}"] += 1    # 只统计, 不参与配额
         if s.death:
             c["death"] += 1
         if s.past_trauma:
@@ -455,7 +479,11 @@ SHAPE_FLAGS = {
 
 
 def _shape_flags(shape: str, emotion_mode: str) -> dict:
-    """按解法形状推导 blueprint 的静态标记与时间/情绪形态。"""
+    """按解法形状推导 blueprint 的静态标记与时间/情绪形态。
+
+    `time_shape` 在这里**只是给生成器的一个提示**, 不再被 validate_blueprint
+    硬比对(第二轮 review P1)。所以即使生成器写出"每天/长年"的题也不会被拒。
+    """
     f = dict(SHAPE_FLAGS.get(shape, {}))
     f.setdefault("time_shape", "instant")
     f.setdefault("emotion_mode", emotion_mode)

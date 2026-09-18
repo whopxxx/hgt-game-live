@@ -162,10 +162,22 @@ def sig_ok():
             "long_term_profession": False, "repeated_ritual": False}
 
 
-def review_ok(**kw):
-    """审稿: pass。"""
-    d = {"decision": "pass", "observed_signature": sig_ok()}
+def review_ok(puzzle=None, **kw):
+    """审稿: pass —— **原样回传**整套字段。
+
+    P0-2 之后 `pass` 也要走 `_apply_review`, 而后者要求"改了就必须整套
+    同步"。真实审稿人 pass 时会把 puzzle/answer/atoms/clues 原样带回,
+    这里照做 —— 否则会被（正确地）判成"改了却没同步"。
+
+    `puzzle` 是**它在审的那道题**。必须与同一条 FakeClient 队列里上一发
+    出题用的谜面一致: 代码现在会把 fair_clues 的 quote 逐字对照谜面,
+    对不上就是"审稿人引用了不存在的句子", 会被正确拒掉。
+    """
+    d = riddle(puzzle=puzzle)
+    d.update({"decision": "pass", "observed_signature": sig_ok()})
     d.update(kw)
+    if "fair_clues" not in kw:
+        d["fair_clues"] = clues_for(d["puzzle"])
     return d
 
 
@@ -238,7 +250,7 @@ def test_gen_spec_returns_puzzle_spec():
     check("prompt_version 写上", spec.prompt_version == "riddle-v3",
           spec.prompt_version)
     check("quality_policy_version 写上",
-          spec.quality_policy_version == "quality-v2",
+          spec.quality_policy_version == "quality-v3",
           spec.quality_policy_version)
     back = PuzzleSpec.from_dict(spec.to_archive())
     check("archive round trip", back.puzzle == spec.puzzle
@@ -251,7 +263,7 @@ def test_hard_validator_rejects_missing_facts():
     bad["facts"] = []
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="二稿灯塔题目。为什么?")),
-                     LLMResult(tool_input=review_ok())])
+                     LLMResult(tool_input=review_ok("二稿灯塔题目。为什么?"))])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第一稿被硬校验拦下", r.puzzle and "二稿" in r.puzzle, r)
@@ -267,7 +279,7 @@ def test_hard_validator_rejects_fake_fair_clue():
                           "supports_atoms": ["a1"]}]
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="换个题目的灯塔。为什么?")),
-                     LLMResult(tool_input=review_ok())])
+                     LLMResult(tool_input=review_ok("换个题目的灯塔。为什么?"))])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("被拒后重出成功", r.puzzle and "换个题目" in r.puzzle, r)
@@ -280,7 +292,7 @@ def test_blueprint_violation_rejected():
     bad["signature"]["death"] = True
     fc = FakeClient([LLMResult(tool_input=bad),
                      LLMResult(tool_input=riddle(puzzle="另一道灯塔题。为什么?")),
-                     LLMResult(tool_input=review_ok())])
+                     LLMResult(tool_input=review_ok("另一道灯塔题。为什么?"))])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     bp = PuzzleBlueprint(mechanism_family="hidden_function",
                          solution_shape="hidden_function_explains_behavior",
@@ -357,7 +369,7 @@ def test_reviewer_no_fix_falls_back_to_regen():
         LLMResult(tool_input=riddle()),
         LLMResult(tool_input={"ok": False, "note": "不好"}),
         LLMResult(tool_input=riddle(puzzle=P2)),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(P2)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
@@ -376,7 +388,7 @@ def test_riddle_check_retries_empty_tool_use():
         LLMResult(tool_input={}, text="I'll analyze this puzzle"),
         # 第二稿
         LLMResult(tool_input=riddle(puzzle=P2)),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(P2)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
@@ -426,10 +438,10 @@ def test_no_repeat_puzzles():
     # avoid 检查在硬校验**之后**; 太像的那稿要能过校验才会走到 avoid。
     fc = FakeClient([
         LLMResult(tool_input=riddle(puzzle=b + "为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(b + "为什么?")),
         # 与 a 太像 -> 重出
         LLMResult(tool_input=riddle(puzzle=c)),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(c)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(avoid=[a], blueprint=fc.default_blueprint)
@@ -720,7 +732,7 @@ def test_reject_reasons_accumulate():
         LLMResult(tool_input={"ok": False, "note": "谜底没解释反常点"}),
         # 第 3 稿: 通过
         LLMResult(tool_input=riddle(puzzle="他每天擦那扇窗。为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("他每天擦那扇窗。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
@@ -748,7 +760,7 @@ def test_rejected_puzzle_goes_into_avoid():
             puzzle="男人在沙漠中醒来, 身边只有一个空水壶。为什么?"),
             facts=[])),
         LLMResult(tool_input=riddle(puzzle="她每天数楼梯的台阶。为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("她每天数楼梯的台阶。为什么?")),
     ])
     # 调用次数 = 出题(坏) + 重出 + 审稿 = 3
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -766,7 +778,7 @@ def test_bad_draft_does_not_consume_attempt():
         LLMResult(text="I'll create a fresh puzzle in objective third-person, avoiding..."),
         LLMResult(text="Let me think about a good puzzle."),
         LLMResult(tool_input=riddle(puzzle="他每天擦那扇窗。为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("他每天擦那扇窗。为什么?")),
     ])
     # 两次英文独白走文本分支 -> 解析不出谜面 -> 不消耗次数
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -795,7 +807,7 @@ def test_wrapped_tool_input_unwrapped():
         LLMResult(tool_input={"name": "emit_riddle",
                               "parameters": riddle(
                                   puzzle="他每天擦那扇窗。为什么?")}),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("他每天擦那扇窗。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
@@ -1034,7 +1046,7 @@ def test_rejected_by_cross_puzzle_gate_not_returned():
         LLMResult(tool_input=riddle()),
         LLMResult(tool_input=review_ok()),
         LLMResult(tool_input=riddle(puzzle="二稿灯塔。为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("二稿灯塔。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     # 最近两道都是同一 (mechanism, shape) -> 配额已满
@@ -1090,9 +1102,9 @@ def test_unfixed_format_still_rejected():
     fc = FakeClient([
         LLMResult(tool_input=riddle(puzzle=P0)),
         # 审稿"通过"了, 但谜面还是第一人称(没真改)
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(P0)),
         LLMResult(tool_input=riddle(puzzle="他每天数楼梯台阶。为什么?")),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok("他每天数楼梯台阶。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
@@ -1296,7 +1308,7 @@ def test_review_decision_rewrite_regenerates():
         LLMResult(tool_input=review_rewrite("谜底依赖题面外的私人往事")),
         # 应该**重新出题**(而不是修补上一稿)
         LLMResult(tool_input=riddle(puzzle=P2)),
-        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input=review_ok(P2)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     spec = w.gen_spec(blueprint=fc.default_blueprint)
@@ -1406,6 +1418,11 @@ def test_check_system_teaches_rewrite():
           CHECK_SYSTEM[:200])
     check("明确不要照抄 signature", "不要照抄" in CHECK_SYSTEM,
           CHECK_SYSTEM[-600:])
+    # 第二轮: 必须明说"改了就得整套给齐, 否则整稿被拒"
+    check("说明了少给一样会被整稿拒掉", "整稿拒掉" in CHECK_SYSTEM,
+          CHECK_SYSTEM[-700:])
+    check("说明了 pass 时也要填 observed_signature",
+          "pass 时也一样" in CHECK_SYSTEM, CHECK_SYSTEM[-500:])
 
 
 
@@ -1474,6 +1491,143 @@ def test_candidate_definition_documented():
 
 
 
+def test_fix_answer_without_facts_is_rejected():
+    """P0-1(第二轮): 审稿改了 answer 却不给 facts -> **整稿拒绝**。
+
+    这是上一版残留的漏洞: `_apply_review` 里写的是
+        facts = [PuzzleFact.from_dict(f) for f in (ti.get("facts") or [])]
+        if not facts:
+            facts = list(spec.facts)
+    ——**无条件**沿用旧值。注释说"谜底没变才沿用", 代码根本没做那个判断。
+
+    于是"新谜底 + 旧事实表"照样进正式 Q&A: 主持人会依据**过期事实**
+    非常自信地回答观众, 比"只看文学谜底"更危险。
+    """
+    P1 = "海角守塔人只在退潮的那几个小时亮灯。为什么?"
+    for missing in ("facts", "solve_atoms", "fair_clues",
+                    "observed_signature"):
+        gen = riddle()
+        fix = {"decision": "fix", "note": "改了核心",
+               "puzzle": P1, "answer": "换了一个完全不同的解释。",
+               "facts": gen["facts"], "solve_atoms": gen["solve_atoms"],
+               "fair_clues": clues_for(P1),
+               "observed_signature": sig_ok()}
+        del fix[missing]
+        fc = FakeClient([LLMResult(tool_input=gen),
+                         LLMResult(tool_input=fix),
+                         # 应该**重新出题**, 所以后面还得有料
+                         LLMResult(tool_input=riddle(puzzle="二稿。为什么?")),
+                         LLMResult(tool_input=review_ok("二稿。为什么?"))])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=3)
+        check(f"缺 {missing} -> 该稿被拒(没有上屏)",
+              spec.puzzle != P1, spec.puzzle)
+        names = [c["tool"]["name"] for c in fc.calls]
+        check(f"缺 {missing} -> 走的是重出而不是采用",
+              names[:2] == ["emit_riddle", "emit_review"]
+              and len(names) > 2 and names[2] == "emit_riddle", names)
+
+
+def test_fix_puzzle_change_also_requires_full_sync():
+    """P0-1: 只改**谜面**(没动 answer)也算"改了", 同样要整套同步。
+
+    判据是"谜面或谜底任一变化", 不是只看 answer —— 否则删掉一句泄底
+    的话、换了措辞, 也能带着陈旧的 facts 过关。
+    """
+    P1 = "海角守塔人只在退潮的那几个小时亮灯。为什么?"
+    gen = riddle()
+    fix = {"decision": "fix", "note": "只改了措辞",
+           "puzzle": P1, "answer": gen["answer"],
+           "facts": gen["facts"]}          # 没给 atoms/clues/signature
+    fc = FakeClient([LLMResult(tool_input=gen),
+                     LLMResult(tool_input=fix),
+                     LLMResult(tool_input=riddle(puzzle="二稿。为什么?")),
+                     LLMResult(tool_input=review_ok("二稿。为什么?"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=3)
+    check("只改谜面也要整套同步", spec.puzzle != P1, spec.puzzle)
+
+
+def test_pass_uses_reviewer_observed_signature():
+    """P0-2(第二轮): decision=pass 也要吸收审稿人的 observed_signature。
+
+    早先 pass 直接 `return spec`, 于是 blueprint 校验比的是**生成器自报**
+    的指纹 —— 模型把 emotional_motive 报成 hidden_function, 审稿人看出来了
+    并写了 observed_signature, 代码却照旧用自报的, validate_blueprint
+    于是"验过了"。那是自己验自己。
+
+    这条用例: 生成器报 hidden_function, 审稿人 pass 但观察为
+    emotional_motive -> 最终必须按**审稿人**的, 并被 blueprint 硬拒。
+    """
+    gen = riddle()
+    obs = dict(sig_ok())
+    obs.update({"mechanism_family": "emotional_motive",
+                "emotion_mode": "grief"})
+    fc = FakeClient([
+        LLMResult(tool_input=gen),
+        LLMResult(tool_input=review_ok(observed_signature=obs)),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    bp = bp_for()                     # 要 hidden_function
+    spec = w.gen_spec(blueprint=bp, max_attempts=1)
+    check("审稿人的观察覆盖了生成器自报",
+          spec.signature.mechanism_family == "emotional_motive"
+          or not spec.puzzle,
+          (spec.signature.mechanism_family, spec.puzzle))
+    check("与 blueprint 冲突 -> 该稿没上屏", not spec.puzzle, spec.puzzle)
+
+
+def test_pass_signature_accepted_when_matching():
+    """P0-2: 审稿人 pass 且观察与 blueprint 一致时, 正常放行。"""
+    gen = riddle()
+    fc = FakeClient([LLMResult(tool_input=gen),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=bp_for())
+    check("正常 pass 仍能出题", bool(spec.puzzle), spec.error)
+    check("signature 被登记", spec.signature.mechanism_family
+          == "hidden_function", spec.signature)
+
+
+def test_enforce_blueprint_false_truly_skips():
+    """P1(第二轮): `blueprint=None` 要**真的跳过**, 不是退回默认 blueprint。
+
+    早先 `bp = blueprint or PuzzleBlueprint()` -> 关掉调度反而固定到
+    information_gap/information_advantage/daily/neutral/instant ——
+    所有题长一个样, 与日志里说的"不限形状"正好相反。
+
+    这条用例: 生成器交回一个与默认 blueprint **完全不符**的题,
+    enforce_blueprint=False 时必须放行; 默认(True)时必须拒。
+    """
+    other = riddle()
+    other["signature"].update({"mechanism_family": "emotional_motive",
+                               "solution_shape": "psychological_necessity",
+                               "domain": "family", "emotion_mode": "grief"})
+
+    # 默认 -> 拒(因为默认 blueprint 是 information_gap)
+    fc1 = FakeClient([LLMResult(tool_input=dict(other))])
+    w1 = PuzzleWriter(client=fc1, runtime_cfg=fc1.runtime_cfg)
+    check("不传 blueprint 时默认按默认 blueprint 严格校验",
+          not w1.gen_spec(blueprint=fc1.default_blueprint,
+                          max_attempts=1).puzzle)
+
+    # 显式关掉 -> 放行(审稿仍然要走, 所以给两发)
+    fc2 = FakeClient([LLMResult(tool_input=dict(other)),
+                      LLMResult(tool_input=review_ok())])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    spec = w2.gen_spec(blueprint=None, enforce_blueprint=False,
+                       max_attempts=1)
+    check("enforce_blueprint=False 时真的不施加约束",
+          bool(spec.puzzle), spec.error)
+    # prompt 里不该出现"Blueprint"硬约束段
+    check("prompt 里没有 Blueprint 硬约束段",
+          "Blueprint" not in fc2.calls[0]["user"],
+          fc2.calls[0]["user"][:300])
+    check("prompt 明确说了不限形状",
+          "不限形状" in fc2.calls[0]["user"], fc2.calls[0]["user"][:200])
+
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -1514,6 +1668,12 @@ def main():
               test_candidate_safety_net,
               test_touched_fact_ids_filtered,
               test_candidate_definition_documented,
+              # ---- 第二轮 review ----
+              test_fix_answer_without_facts_is_rejected,
+              test_fix_puzzle_change_also_requires_full_sync,
+              test_pass_uses_reviewer_observed_signature,
+              test_pass_signature_accepted_when_matching,
+              test_enforce_blueprint_false_truly_skips,
               test_review_decision_pass,
               test_review_decision_rewrite_regenerates,
               test_review_decision_fix_syncs_facts,

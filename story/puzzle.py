@@ -271,7 +271,7 @@ class PuzzleBlueprint:
             f"- domain(领域): {self.domain}\n"
             f"- relation(人物关系): {self.relation}\n"
             f"- emotion_mode(情绪基调): {self.emotion_mode}\n"
-            f"- time_shape(时间形态): {self.time_shape}\n"
+            f"- time_shape(时间形态, 参考): {self.time_shape}\n"
             f"- 必须为真的标记: {', '.join(flags) if flags else '(无)'}\n"
             f"- 必须为假的标记: "
             f"{', '.join(k for k in ('death', 'past_trauma', 'long_term_profession', 'repeated_ritual') if not getattr(self, k))}"

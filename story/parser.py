@@ -543,6 +543,140 @@ FALLBACK_HINTS = ["注意他为什么要绕路。", "问题出在他路上遇到
                   "他不想被谁看见？"]
 
 
+# ----------------------------------------------------------------------
+# 兜底题的**结构化**版本(方案第二轮 review P1)。
+#
+# 为什么必须结构化: `_riddle_failed_locked` 是"连续出题失败"的最后一关,
+# 它上屏的题**同样**要经过正式 Q&A。若只给 puzzle/answer, 那么
+#   facts 为空 -> atoms 也构不出来 -> ANSWER 退回"只看文学谜底",
+#   Final Judge 也没有 atom gate —— 质量系统在兜底路径上等于不存在。
+#
+# 标记为 death=False / past_trauma=False: 这 4 道题虽然都带悲情色彩
+# (离婚/丧偶/妄想), 但**没有人死亡是谜底的核心**, 且都不依赖创伤后仪式
+# —— 报 True 会污染跨题配额。题面里出现的"去世老伴"属于背景而非机关,
+# 所以 death 也如实报 False。
+#
+# 这一组**不参与** blueprint 调度: 它是兜底, 不进 recent_signatures
+# (engine 只在 signature 非空时才登记, 而这里我们**故意**传 None)。
+# ----------------------------------------------------------------------
+def _fallback_specs():
+    """构造兜底题的 PuzzleSpec 列表(延迟导入避免循环)。"""
+    from .puzzle import FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, \
+        PuzzleSpec, SolveAtom
+
+    def mk(idx, puzzle, answer, hints, facts, atoms, clues, sig):
+        return PuzzleSpec(
+            id=f"fallback-{idx}",
+            title="经典海龟汤",
+            puzzle=puzzle, answer=answer, hints=list(hints),
+            facts=[PuzzleFact(**f) for f in facts],
+            solve_atoms=[SolveAtom(**a) for a in atoms],
+            fair_clues=[FairClue(**c) for c in clues],
+            blueprint=PuzzleBlueprint(**sig),
+            signature=PuzzleSignature(**sig),
+            prompt_version="fallback-v1",
+            quality_policy_version="fallback-v1")
+
+    # ---- ① 后门 ----
+    f0 = [dict(id="f1", text="后门巷子里住着他前妻一家", kind="core"),
+          dict(id="f2", text="他绕路是为了避开他们", kind="core"),
+          dict(id="f3", text="他不想让孩子看见自己过得不好", kind="support"),
+          dict(id="f4", text="不是因为后门更近或有别的事", kind="exclusion")]
+    a0 = [dict(id="a1", role="cause", text="前妻一家住在后门那条巷子里",
+               fact_ids=["f1"]),
+          dict(id="a2", role="mechanism",
+               text="绕路是为了避开他们, 那天走前门所以撞见了",
+               fact_ids=["f2", "f3"])]
+    c0 = [dict(quote="每天下班都从公司后门走", supports_atoms=["a1"]),
+          dict(quote="哪怕绕远路", supports_atoms=["a1"])]
+
+    # ---- ② 电梯 ----
+    f1 = [dict(id="f1", text="她有被害妄想, 怕被人跟上楼", kind="core"),
+          dict(id="f2", text="多按一层是她给自己留的观察时间", kind="core"),
+          dict(id="f3", text="她决定不再让这个病支配生活", kind="support"),
+          dict(id="f4", text="不是因为电梯坏了或走错楼层", kind="exclusion")]
+    a1 = [dict(id="a1", role="cause", text="她患有被害妄想症",
+               fact_ids=["f1"]),
+          dict(id="a2", role="mechanism",
+               text="'多按一层再走楼梯'是她自查有没有被跟踪的固定动作; "
+                    "那天她放弃了这个动作, 等于承认病好不了",
+               fact_ids=["f2", "f3"])]
+    c1 = [dict(quote="每次坐电梯都要先按一个没人的楼层", supports_atoms=["a2"]),
+          dict(quote="再走楼梯回去", supports_atoms=["a2"])]
+
+    # ---- ③ 长椅 ----
+    f2 = [dict(id="f1", text="长椅是他去世的老伴捐的", kind="core"),
+          dict(id="f2", text="椅子上的名字牌刻着老伴的名字", kind="core"),
+          dict(id="f3", text="他每天来是为了陪她", kind="support"),
+          dict(id="f4", text="撕牌子不是因为管理处赶他走", kind="exclusion")]
+    a2 = [dict(id="a1", role="cause", text="长椅是他为去世老伴捐的纪念",
+               fact_ids=["f1"]),
+          dict(id="a2", role="mechanism",
+               text="管理处要翻修换掉旧名牌, 连这点念想都留不住, "
+                    "所以他撕了牌子、不再来",
+               fact_ids=["f2", "f3"])]
+    c2 = [dict(quote="每天都去公园同一张长椅", supports_atoms=["a1"]),
+          dict(quote="从不跟人说话", supports_atoms=["a1"])]
+
+    # ---- ④ 调钟 ----
+    f3 = [dict(id="f1", text="妻子生前有严重迟延症, 两人为此吵了半辈子",
+               kind="core"),
+          dict(id="f2", text="妻子车祸去世是因为赶时间闯红灯", kind="core"),
+          dict(id="f3", text="调快十分钟是他给自己的缓冲与赎罪", kind="support"),
+          dict(id="f4", text="不是因为钟不准或他在开玩笑", kind="exclusion")]
+    a3 = [dict(id="a1", role="cause",
+               text="妻子因为赶时间闯红灯出车祸去世",
+               fact_ids=["f2"]),
+          dict(id="a2", role="mechanism",
+               text="把钟调快十分钟 = 永远提前出门, 是对'害她赶时间'的赎罪",
+               fact_ids=["f1", "f3"])]
+    c3 = [dict(quote="把家里的钟全调快十分钟", supports_atoms=["a2"]),
+          dict(quote="他跪下来求他们别动", supports_atoms=["a2"])]
+
+    sig0 = dict(mechanism_family="information_gap",
+                solution_shape="information_advantage", domain="workplace",
+                emotion_mode="guilt", relation="family",
+                time_shape="habitual")
+    sig1 = dict(mechanism_family="psychological_compulsion",
+                solution_shape="psychological_necessity",
+                domain="daily", emotion_mode="grief", relation="self",
+                time_shape="habitual")
+    sig2 = dict(mechanism_family="emotional_motive",
+                solution_shape="past_trauma_explains_current_ritual",
+                domain="daily", emotion_mode="memorial", relation="family",
+                time_shape="years_long", past_trauma=True,
+                repeated_ritual=True)
+    sig3 = dict(mechanism_family="emotional_motive",
+                solution_shape="psychological_necessity", domain="family",
+                emotion_mode="guilt", relation="family",
+                time_shape="years_long", past_trauma=True)
+
+    return [
+        mk(0, FALLBACK_RIDDLES[0][0], FALLBACK_RIDDLES[0][1], FALLBACK_HINTS,
+           f0, a0, c0, sig0),
+        mk(1, FALLBACK_RIDDLES[1][0], FALLBACK_RIDDLES[1][1],
+           ["注意她的那个多余动作。", "这个动作是给谁看的？",
+            "她在防什么？"], f1, a1, c1, sig1),
+        mk(2, FALLBACK_RIDDLES[2][0], FALLBACK_RIDDLES[2][1],
+           ["那张椅子上有什么？", "他为什么每天都来？",
+            "牌子上刻着什么？"], f2, a2, c2, sig2),
+        mk(3, FALLBACK_RIDDLES[3][0], FALLBACK_RIDDLES[3][1],
+           ["十分钟意味着什么？", "他妻子是怎么走的？",
+            "他在为什么道歉？"], f3, a3, c3, sig3),
+    ]
+
+
+_FALLBACK_SPECS_CACHE = None
+
+
+def fallback_spec(index: int):
+    """按序号取一道兜底 PuzzleSpec(轮换用)。"""
+    global _FALLBACK_SPECS_CACHE
+    if _FALLBACK_SPECS_CACHE is None:
+        _FALLBACK_SPECS_CACHE = _fallback_specs()
+    return _FALLBACK_SPECS_CACHE[index % len(_FALLBACK_SPECS_CACHE)]
+
+
 # ======================================================================
 # 小工具: 提问归一化(供引擎去重与注入清洗)
 # ======================================================================

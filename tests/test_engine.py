@@ -812,6 +812,98 @@ def test_retry_payload_is_a_copy():
           act.payload["recent_signatures"])
 
 
+def test_fallback_riddle_is_structured():
+    """P1(第二轮): 兜底谜题也必须是完整 PuzzleSpec。
+
+    早先 `submit_riddle(riddle[0], riddle[1], FALLBACK_HINTS)` 没有
+    facts/atoms/clues —— 正式 Q&A 于是 facts 为空 -> 主持人退回"只看
+    文学谜底", Final Judge 也没有 atom gate。质量系统在这条路径上
+    等于不存在, 而它恰好是"出题连挂 3 次"时**唯一**会上屏的题。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=2), clock=clk)
+    eng.start()
+    # 连续失败到耗尽
+    eng.submit_riddle(None, error="网关抖动")
+    acts = eng.submit_riddle(None, error="还是抖动")
+    check("最终进 QA", eng.phase == Phase.QA, eng.phase)
+    check("兜底题有谜面", bool(eng._puzzle), eng._puzzle)
+    sp = eng._spec
+    check("兜底题**有 spec**(核心断言)", sp is not None, sp)
+    check("兜底题**有 facts**", sp is not None and len(sp.facts) >= 4, sp)
+    check("兜底题有 solve_atoms", len(eng._solve_atoms) >= 2, eng._solve_atoms)
+    check("兜底题有 fair_clues", len(eng._fair_clues) >= 1, eng._fair_clues)
+    check("兜底题有 signature",
+          sp is not None and bool(sp.signature.mechanism_family), sp)
+
+
+def test_fallback_specs_all_valid():
+    """P1: 4 道兜底题都要过**同一套**硬校验(不能是手写的法外之地)。"""
+    from story import parser as P
+    from story.quality import validate_spec
+    for i in range(4):
+        sp = P.fallback_spec(i)
+        vr = validate_spec(sp)
+        check(f"兜底题 {i} 过硬校验", vr.ok, vr.why())
+        check(f"兜底题 {i} 没有待修项", not vr.fixable, vr.must_fix())
+
+
+def test_fallback_does_not_pollute_quota():
+    """P1: 兜底题**不该**进 recent_signatures。
+
+    出题全挂是**系统故障**, 不是一个内容分布事实。把它登记进去会让
+    下一题的 blueprint 选择基于"刚播过一道 emotional_motive"这种假前提,
+    而且连挂几次就会把配额顶死。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=2), clock=clk)
+    eng.start()
+    eng.submit_riddle(None, error="挂了")
+    eng.submit_riddle(None, error="又挂了")
+    check("兜底题没有登记指纹", len(eng._recent_signatures) == 0,
+          eng._recent_signatures)
+
+
+def test_fallback_rotates():
+    """P1: 兜底题要轮换 —— 总用同一道, 观众一看就知道出题挂了。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=1), clock=clk)
+    eng.start()
+    eng.submit_riddle(None, error="挂了")
+    p1 = eng._puzzle
+    # 揭晓 -> 下一题 -> 再挂
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底")
+    clk.advance(31.0)
+    eng.tick(clk.t)
+    eng.submit_riddle(None, error="又挂了")
+    check("第二道兜底题与第一道不同", eng._puzzle != p1,
+          (p1[:20], eng._puzzle[:20]))
+
+
+def test_request_riddle_action_is_public_and_matches():
+    """小修: director 不该直接调 engine 的 `_xxx_locked()`。
+
+    新增的 `request_riddle_action()` 是公开入口, 结果必须与内部版本一致。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle("第一题。为什么?", "底", ["a", "b", "c"],
+                      signature={"mechanism_family": "hidden_function",
+                                 "solution_shape": "s", "domain": "maritime"})
+    pub = eng.request_riddle_action("riddle_deferred")
+    check("返回 RIDDLE 动作", pub.kind == ActionKind.RIDDLE, pub.kind)
+    check("reason 正确", pub.payload.get("reason") == "riddle_deferred",
+          pub.payload)
+    check("带 avoid", "avoid" in pub.payload, pub.payload)
+    check("带 recent_signatures", "recent_signatures" in pub.payload,
+          pub.payload)
+    inner = eng._riddle_action_locked("riddle_deferred")
+    check("公开版与内部版结果一致",
+          pub.payload == inner.payload, (pub.payload, inner.payload))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -833,6 +925,12 @@ def main():
              test_touched_facts_accumulate_and_reset,
              test_candidate_count_and_reset_on_new_puzzle,
              test_answer_action_carries_facts,
+             # ---- 第二轮 review ----
+             test_fallback_riddle_is_structured,
+             test_fallback_specs_all_valid,
+             test_fallback_does_not_pollute_quota,
+             test_fallback_rotates,
+             test_request_riddle_action_is_public_and_matches,
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,
              test_first_and_retry_riddle_actions_match,

@@ -33,10 +33,11 @@ from .puzzle import (
     DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, SOLUTION_SHAPES,
     TIME_SHAPES,
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec, SolveAtom,
+    quote_in_puzzle,
 )
 from .quality import (
-    QUALITY_POLICY_VERSION, Quotas, cross_puzzle_gate, validate_blueprint,
-    validate_spec,
+    QUALITY_POLICY_VERSION, Quotas, ValidationResult, cross_puzzle_gate,
+    validate_blueprint, validate_spec,
 )
 from .state import QAResult
 
@@ -1295,7 +1296,16 @@ facts / solve_atoms / fair_clues / observed_signature 是**一套**。
 - `observed_signature` 必须**如实重新判断** —— 你把题改成了什么形状
   就写什么。**不要照抄原稿**, 那是给跨题配额用的, 报假的会污染全局分布。
 
+⚠ **只要谜面或谜底有任何一个字变了, 上面四样就必须全部给出。**
+少给一样, 代码会**整稿拒掉**(不会退回旧值替你补) —— 因为"新谜底 +
+旧事实表"会让主持人非常自信地说错话。宁可重出一稿。
+
 没动核心就原样回传它们(含 id 与 fact_ids)。
+
+**pass 时也一样**: 照样要把 `observed_signature` 填成你**读完之后**
+的判断。如果你发现生成器自报的形状与题目实际形状不符(比如它说
+hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 ——
+代码会用**你的**判断去验 blueprint, 而不是生成器自报的。
 
 **只看这一道题。** 不要去评判"最近连续几题都是……" —— 你**看不到**
 别的题, 全局分布由代码层控制。凭猜测去改只会改错。
@@ -1383,7 +1393,8 @@ class PuzzleWriter:
                  blueprint: Optional[PuzzleBlueprint] = None,
                  recent: Optional[list] = None,
                  check: bool = True, max_attempts: int = 4,
-                 budget_s: float = 90.0) -> PuzzleSpec:
+                 budget_s: float = 90.0,
+                 enforce_blueprint: Optional[bool] = None) -> PuzzleSpec:
         """出一个谜题, 返回**结构化 `PuzzleSpec`**(方案 §13)。
 
         与老 `gen_riddle` 的区别: 模型现在要交出 facts / signature,
@@ -1400,6 +1411,10 @@ class PuzzleWriter:
 
         `recent` 是最近的 signature 列表, 用于跨题配额。
 
+        `enforce_blueprint=False` 时**真正跳过** blueprint 相关的一切
+        (prompt 里的硬约束段、validate_blueprint、跨题门里的 blueprint 比对),
+        而不是退回一个默认 blueprint。
+
         为什么硬校验要放在 reviewer **之前**: 结构性错误(atoms 引用了不
         存在的 fact)reviewer 改不好, 它只会"改"出一个更不一致的版本。
         先毙掉能省一次调用, 也避免把坏结构喂给 reviewer 当"原稿"。
@@ -1411,6 +1426,13 @@ class PuzzleWriter:
         bad: list = []
         attempts = 0
         guard = 0
+        # P1(第二轮 review): `blueprint=None` **不再**暗含"用默认 blueprint"。
+        # 早先 `blueprint or PuzzleBlueprint()` 会把"没给"变成"固定成
+        # information_gap / information_advantage / daily / neutral / instant"
+        # —— 于是关掉调度反而让所有题长一个样, 与日志里说的"不限形状"相反。
+        # 现在"不施加"是一个**显式**开关: enforce_blueprint=False。
+        if enforce_blueprint is None:
+            enforce_blueprint = blueprint is not None
         bp = blueprint or PuzzleBlueprint()
 
         while attempts < (max_attempts if check else 1) and guard < 8:
@@ -1421,7 +1443,8 @@ class PuzzleWriter:
                 break
             reject_why = "\n".join(f"- {w}" for w in seen_why)
             spec = self._gen_spec_once(avoid, avoid_reason=reject_why,
-                                       bad_puzzles=bad, blueprint=bp)
+                                       bad_puzzles=bad, blueprint=bp,
+                                       enforce_blueprint=enforce_blueprint)
             if not spec.puzzle:
                 log.info("出题第 %d 轮没出稿(不计数): %s", guard, spec.error)
                 last = spec
@@ -1450,7 +1473,9 @@ class PuzzleWriter:
                 last.error = f"硬校验不合格: {vr.why()}"
                 continue
             # ---- ② blueprint 是否被真正执行 ----
-            vb = validate_blueprint(spec, bp)
+            # enforce_blueprint=False -> 显式跳过(不是"退回默认 blueprint")
+            vb = (validate_blueprint(spec, bp) if enforce_blueprint
+                  else ValidationResult())
             if not vb.ok:
                 log.info("出题第 %d 稿违反 blueprint: %s", attempts, vb.why()[:120])
                 _remember(seen_why, "违反 blueprint: " + vb.why()[:120])
@@ -1478,7 +1503,8 @@ class PuzzleWriter:
             # 这一遍必须**完全干净**: 上一轮 fixable 的问题若还在, 说明
             # 审稿人没改掉, 不能再放行(否则第一人称会一路溜到直播上)。
             vr2 = validate_spec(spec)
-            vb2 = validate_blueprint(spec, bp)
+            vb2 = (validate_blueprint(spec, bp) if enforce_blueprint
+                   else ValidationResult())
             if not vr2.ok or not vb2.ok or vr2.fixable:
                 why2 = "; ".join(vr2.errors + vr2.fixable + vb2.errors)
                 log.info("出题第 %d 稿改稿后仍不合格: %s", attempts, why2[:120])
@@ -1495,7 +1521,8 @@ class PuzzleWriter:
             rcfg = self._cfg()
             xbad = cross_puzzle_gate(
                 spec, recent,
-                Quotas.from_config(rcfg) if rcfg is not None else None, bp)
+                Quotas.from_config(rcfg) if rcfg is not None else None,
+                bp if enforce_blueprint else None)
             if xbad:
                 log.info("出题第 %d 稿不过跨题门: %s", attempts, xbad[:120])
                 _remember(seen_why, "跨题重复: " + "; ".join(xbad)[:120])
@@ -1581,13 +1608,20 @@ class PuzzleWriter:
     # ------------------------------------------------------------------
     def _gen_spec_once(self, avoid: Optional[list] = None,
                        avoid_reason: str = "", bad_puzzles: Optional[list] = None,
-                       blueprint: Optional[PuzzleBlueprint] = None) -> PuzzleSpec:
+                       blueprint: Optional[PuzzleBlueprint] = None,
+                       enforce_blueprint: bool = True) -> PuzzleSpec:
         """生成一稿 `PuzzleSpec`(不做校验)。"""
         bp = blueprint or PuzzleBlueprint()
         user = "请出一道新的海龟汤谜题。\n\n"
-        # blueprint 是**代码决定的硬约束**, 必须原样执行(方案 §12)
-        user += ("【本题的 Blueprint —— 代码层已经决定, 你不能修改它, "
-                 "只能按照它设计谜题】\n" + bp.describe() + "\n")
+        if enforce_blueprint:
+            # blueprint 是**代码决定的硬约束**, 必须原样执行(方案 §12)
+            user += ("【本题的 Blueprint —— 代码层已经决定, 你不能修改它, "
+                     "只能按照它设计谜题】\n" + bp.describe() + "\n")
+        else:
+            # 关掉调度: 不塞硬约束段, 也不在事后比对。生成器自由发挥,
+            # signature 仍然照实回传, 代码拿它做统计。
+            user += ("【本题不限形状】自己挑一个最有意思的诡计与解法, "
+                     "但 signature 仍要**如实**回传。\n")
         # 被毙掉的稿子也得算"出过的题"。否则模型只从驳回理由里看到几个
         # 关键词, 会顺着那个题材再写一个 —— 实测连续 4 稿全是沙漠水壶。
         tried: list = list(avoid or []) + list(bad_puzzles or [])
@@ -1704,10 +1738,18 @@ class PuzzleWriter:
                                        "review_temperature"))
         ti = _unwrap_tool_input(res.tool_input)
         if not isinstance(ti, dict) or not ti.get("decision"):
-            # 老网关可能仍回 ok=bool —— 兼容一下, 别让整条链断掉
+            # 老网关可能仍回 ok=bool —— 兼容一下, 别让整条链断掉。
+            # 但 **空 tool_input 不算通过**: 网关抖动时 tool_use 块在而
+            # input 为空, 那必须当成"没审" -> 重出, 否则质检形同虚设。
             if isinstance(ti, dict) and "ok" in ti:
                 ti = dict(ti)
                 ti["decision"] = "pass" if ti.get("ok") else "fix"
+                # 老格式没有 pass/fix/rewrite 的概念: ok=False 就是
+                # "改不好" -> 退化成 rewrite, 明确交回生成器重出。
+                # (下面 `fix` 分支会因为没有 puzzle 而走 rewrite, 这里
+                # 说清楚, 免得被当成 bug 反复"修"。)
+                if not ti.get("ok") and not ti.get("puzzle"):
+                    return None, str(ti.get("note", "") or "审稿未通过"), True
             else:
                 return None, res.error or "审稿拿到空/无效 tool_input", True
 
@@ -1729,8 +1771,17 @@ class PuzzleWriter:
                 new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
                 if not new_p or new_p == spec.puzzle:
                     return None, f"审稿称 pass 但未处理已知问题: {hard}", True
-                return self._apply_review(spec, ti, bp, new_p), note, False
-            return spec, note, False
+            else:
+                new_p = spec.puzzle
+            # P0-2: pass **也必须**吸收审稿人的 observed_signature。
+            # 早先这里 `return spec` —— 于是 blueprint 校验比的是**生成器
+            # 自报**的指纹。模型把 emotional_motive 报成 hidden_function,
+            # 审稿人看出来了并写了 observed_signature, 但代码照旧用自报的,
+            # validate_blueprint 于是"验过了"。那是自己验自己。
+            merged, err = self._apply_review(spec, ti, bp, new_p)
+            if merged is None:
+                return None, err or "", True
+            return merged, note, False
 
         # ---- fix: 必须有改后的谜面 ----
         new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
@@ -1738,43 +1789,104 @@ class PuzzleWriter:
             return None, note or "审稿未给出改稿", True
         if hard and new_p == spec.puzzle:
             return None, f"审稿未处理已知问题: {hard}", True
-        return self._apply_review(spec, ti, bp, new_p), note or "审稿已修改", False
+        merged, err = self._apply_review(spec, ti, bp, new_p)
+        if merged is None:
+            return None, err or "", True
+        return merged, note or "审稿已修改", False
 
     @staticmethod
     def _apply_review(spec: PuzzleSpec, ti: dict,
-                      bp: PuzzleBlueprint, new_puzzle: str) -> PuzzleSpec:
-        """把审稿返回合并进 spec。**facts/atoms/clues/signature 一起同步**。
+                      bp: PuzzleBlueprint, new_puzzle: str
+                      ) -> tuple[Optional[PuzzleSpec], str]:
+        """把审稿返回合并进 spec。返回 `(新 spec 或 None, 拒绝原因)`。
 
-        这是 Blocker 5/6 的修复点: 以前只接 puzzle/answer/atoms/clues,
-        facts 与 signature 一律沿用原稿 —— 于是审稿人改了核心机制之后,
-        Q&A 还在用旧事实表, 配额还在记旧指纹。
+        这是 Blocker 5/6 + 第二轮 P0-1 的修复点。
+
+        **改了就整套重出**(方案 §17): facts / solve_atoms / fair_clues /
+        observed_signature 是一套。审稿人改了谜面 **或** 谜底, 就必须把这
+        四样一起给出; 少一样就**整稿拒绝**, 而不是悄悄沿用旧值。
+
+        早先是 `if not facts: facts = list(spec.facts)` —— 无条件沿用。
+        于是"新谜底 + 旧事实表"照样进正式 Q&A: 主持人会依据**过期事实**
+        非常自信地回答观众, 比"只看文学谜底"更危险。
+        注释写着"谜底没变才沿用", 代码却根本没做那个判断。
+
+        所以现在:
+          - **没改** -> 原样回传即可, 缺什么补什么(零风险)。
+          - **改了** -> 四样必须齐全, 缺一即拒(交回生成器重出)。
         """
-        new_answer = str(ti.get("answer", "") or "").strip() or spec.answer
+        new_answer = str(ti.get("answer", "") or "").strip()
+        new_puzzle = (new_puzzle or "").strip()
 
-        # ---- facts: 给了就用, 没给且**谜底没变**才沿用 ----
+        # ---- 到底改没改? 谜面或谜底任一变化都算 ----
+        changed = (new_puzzle != (spec.puzzle or "").strip()
+                   or new_answer != (spec.answer or "").strip())
+        if not new_answer:
+            new_answer = spec.answer
+
+        # 拒稿时也要能看出是哪一项没同步 —— 生成器会照着重出。
+        bad: list = []
+
+        # ---- facts: 它是**正式 Q&A 的判定依据**, 最不能过期 ----
         facts = [PuzzleFact.from_dict(f) for f in (ti.get("facts") or [])]
         if not facts:
-            facts = list(spec.facts)
+            if changed:
+                bad.append("facts")
+            else:
+                facts = list(spec.facts)
 
-        # ---- atoms: 同上 ----
+        # ---- atoms: 同上; fact_ids 必须指向**新**的 fact id ----
         atoms = [SolveAtom.from_dict(a, i)
                  for i, a in enumerate(ti.get("solve_atoms") or [])]
         if not atoms:
-            atoms = list(spec.solve_atoms)
+            if changed:
+                bad.append("solve_atoms")
+            else:
+                atoms = list(spec.solve_atoms)
 
-        # ---- clues: 同上 ----
+        # ---- clues: quote 必须逐字出自**改后**的谜面(下面还有一道硬检查) ----
         clues = [FairClue.from_dict(c) for c in _norm_clues(ti.get("fair_clues"))]
         if not clues:
-            clues = list(spec.fair_clues)
+            if changed:
+                bad.append("fair_clues")
+            else:
+                clues = list(spec.fair_clues)
 
         # ---- signature: 审稿人的 observed_signature 优先 ----
         # 它读过改后的题, 比原稿的指纹更可信 —— 而配额就靠这个。
         obs = ti.get("observed_signature")
-        if isinstance(obs, dict) and (obs.get("mechanism_family")
-                                      or obs.get("solution_shape")):
+        has_obs = (isinstance(obs, dict)
+                   and bool(obs.get("mechanism_family") or obs.get("solution_shape")))
+        if has_obs:
             sig = PuzzleSignature.from_dict(obs)
+        elif changed:
+            bad.append("observed_signature")
+            sig = spec.signature
         else:
             sig = spec.signature
+
+        if bad:
+            return None, ("审稿改了谜面/谜底, 但没有同步 " + " / ".join(bad)
+                          + " —— facts/atoms/clues/signature 是一套, "
+                            "不能只改谜底")
+
+        # ---- clues 必须逐字出自**改后**的谜面 ----
+        # 代码侧的确定性检查, 不花 LLM 调用。早先这一步只在别处对**生成器**
+        # 做, 审稿人改完谜面后没人再看 —— 于是 clues 可能指向已经删掉的句子。
+        if clues and _is_v2(spec):
+            for c in clues:
+                if not quote_in_puzzle(c.quote, new_puzzle):
+                    return None, (f"审稿给的 fair_clue {c.quote[:20]!r} "
+                                  f"不在改后的谜面里")
+
+        # ---- 改完之后 facts/atoms 还得对得上 ----
+        if changed:
+            ids = {f.id for f in facts}
+            for a in atoms:
+                for fid in (a.fact_ids or []):
+                    if fid not in ids:
+                        return None, (f"审稿给的 solve_atom({a.id}) 引用了"
+                                      f"不存在的 fact {fid!r}")
 
         return PuzzleSpec(
             id=spec.id, title=spec.title, puzzle=new_puzzle, answer=new_answer,
@@ -1784,7 +1896,7 @@ class PuzzleWriter:
             blueprint=bp, signature=sig,
             prompt_version=spec.prompt_version,
             quality_policy_version=spec.quality_policy_version,
-            usage=spec.usage, model=spec.model)
+            usage=spec.usage, model=spec.model), ""
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
