@@ -80,187 +80,69 @@ window.addEventListener("load", async () => {
   }, o))});
 
   try {
-    // ⓪ 弹幕: 服务端每次推"最近 N 条"窗口, 前端必须只放没见过的
-    //    (否则每次推送整个窗口重放一遍 = "弹幕乱飞")
-    let dmNodes = () => document.querySelectorAll("#danmaku .dm").length;
-    send({danmaku: [
-      {seq: 1, user_name: "甲", content: "一", is_command: false},
-      {seq: 2, user_name: "乙", content: "二", is_command: false},
-    ]});
-    const n2 = dmNodes();
-    // 再推同一个窗口(模拟 4Hz 重复推送) -> 不应新增
-    send({danmaku: [
-      {seq: 1, user_name: "甲", content: "一", is_command: false},
-      {seq: 2, user_name: "乙", content: "二", is_command: false},
-    ]});
-    check(dmNodes() === n2, "重复推同一窗口不应重放弹幕 (got " + dmNodes() + ")");
-    // 窗口滑动 + 新的一条 -> 只新增那一条
-    send({danmaku: [
-      {seq: 2, user_name: "乙", content: "二", is_command: false},
-      {seq: 3, user_name: "丙", content: "三", is_command: false},
-    ]});
-    check(dmNodes() === n2 + 1, "只应新增第 3 条, 实际新增 "
-          + (dmNodes() - n2));
-
-    // ⓪b 弹幕轨道占用(P1 + P2)
+    // ⓪ 飘屏弹幕已移除(UI cleanup)
     //
-    // 历史 bug 链条:
-    //   P1  `batchSlots` 只增不减(靠 1.2s 批次时钟归零, 而那时钟被 4Hz 的
-    //       重复窗口一直刷新 -> 永不归零) + 固定时长 => 同一轨道越播越快。
-    //   P2  即使修好 P1 的时钟, `batchSlots` 仍是"累计到过这里的弹幕总宽度",
-    //       没有物理含义 —— 只要一直有人说话就无限上涨, 表现为出生偏移
-    //       越来越大(越来越晚出现)。
+    // 飘屏弹幕整个删掉了 —— 它的速度/轨道状态机(P1/P2 那一整套)也一并
+    // 删除, 不再保留"display:none 但继续维护"的代码。
     //
-    // 现在的模型: 每条轨道只保留**尚未释放的尾部占用** `tailPx`, 在下一条
-    // 弹幕到来时按 `DM_SPEED × Δt` **lazy 释放**。所以间歇流量下轨道会自然
-    // 空出来; 持续超过 5 条轨道吞吐能力时仍会排队(物理限制, 不是 bug)。
+    // 这三条保护的是**删除后的契约**, 而不是被删掉的功能:
+    //   A. DOM 里不存在 #danmaku
+    //   B. 服务端仍然下发 danmaku 字段时, 前端**明确忽略**且不报错
+    //      (允许后端暂时保留该字段, 不必和这次前端删除绑在一起)
+    //   C. 底部 260px 已被回收 —— #content 底边与 #stage 底边重合
+    check(!document.getElementById("danmaku"),
+          "A: DOM 中不应再有 #danmaku");
+    // B. 服务端**仍然**下发 danmaku 时, 前端必须明确忽略, 且不得报错。
     //
-    // 测试纪律:
-    //   - 跑**真实** pushDanmaku / renderDanmaku, 只控制时钟与输入;
-    //   - 绝不在测试里重写占用公式;
-    //   - 每个不变量先 `window.__dmReset()` 归零 —— 否则上一个断言留下的
-    //     占用会污染下一个, 而 `dmSeq` 跨断言增长使轨道无法对齐。
+    // 只断言"没有 .dm 节点"是**不够**的: 一个还在尝试渲染、只是找不到
+    // 容器的实现也会通过(它 `getElementById("danmaku")` 拿到 null 就
+    // 静默放弃)。所以这里改断言**数据路径**:
+    //  - 页面不能抛错(errors 里不能多出东西)
+    //  - 带 danmaku 的 snapshot 之后, 其它区域必须**照常工作**
+    //    (说明 danmaku 字段被安全忽略, 而不是把 onState 打断了)
+    // ⚠️ 不能靠"没抛错"来判断 —— `app.js` 里 onState 整个被
+    //     `try { onState(...) } catch (e) {}` 包着, 任何渲染异常都被
+    //     静默吞掉。所以这里改断言**副作用**: pushDanmaku 在 onState 里
+    //     排在 renderStats 之后、renderDebug/layout 之前, 一个还会炸的
+    //     实现会把后面的渲染**截断**。
+    //     用一个"只有它才会更新"的可见信号来验证 onState 跑到了最后:
+    //     layout() 会按谜面长度调 #puzzle 的字号, 而 renderStats 更新统计。
+    // 关键: 要验的是 onState **跑完了**, 而不是"stats 有没有更新"。
+    // `renderStats` 排在 pushDanmaku **之前**, 所以哪怕 pushDanmaku 炸了,
+    // 它照样更新 —— 用 stats 当探针会得到假绿(我第一版就是这么错的)。
     //
-    // 曾经踩过的坑(前几版探针因此**反向验证抓不到 bug**):
-    //   ① 重复推送的间隔必须 < 1.2s(真实 4Hz ≈ 250ms);
-    //   ② 必须落在**同一轨道** —— 状态按轨道存, 而 `(dmSeq++) % LANES` 轮换;
-    //   ③ 无头 Chrome 的 `--virtual-time-budget` 下量不出真实速度, 必须打
-    //      **受控时钟**。
+    // pushDanmaku 之后只剩 `renderDebug` 和 `layout()`。layout() 会设置
+    // `#bottom.style.top`(按谜面高度算), 这是**唯一**能被外部观察、
+    // 且必然发生在 pushDanmaku 之后的副作用。
+    const bottom = document.getElementById("bottom");
+    const topBefore = bottom.style.top;
+    // 换一道**很长**的谜面, 保证 layout() 会算出不同的 top(否则值不变,
+    // 无法区分"没执行"和"执行了但结果一样")
+    const longPuzzle = "这是一道很长的谜面。".repeat(12);
+    send({puzzle: longPuzzle, puzzle_index: 99,
+          stats: {questions: 7, answered: 5, solved: 1, dropped: 0,
+                  viewers_seen: 3},
+          danmaku: [{seq: 1, user_name: "甲", content: "一", is_command: false},
+                    {seq: 2, user_name: "乙", content: "二", is_command: true}]});
+    check(document.querySelectorAll(".dm").length === 0,
+          "B1: 不应再生成 .dm 节点 (got "
+          + document.querySelectorAll(".dm").length + ")");
+    check(bottom.style.top !== topBefore,
+          "B2: 带 danmaku 的 snapshot 之后 onState 必须跑完 —— "
+          + "layout() 是最后一步, 它没执行说明中途被截断 "
+          + "(#bottom.top " + topBefore + " -> " + bottom.style.top + ")");
     {
-      const dmEl = document.getElementById("danmaku");
-      const LANES_JS = 5;        // 与 app.js 的 LANES 一致
-      const SPEED_JS = 130;      // 与 app.js 的 DM_SPEED 一致(仅用于算等待量)
-      const WIDTH_EST = 224;     // 文本宽度估计(仅用于算等待量)
-      const GAP_EST = 60;        // 与 app.js 的 DM_GAP_PX 一致
-      const nowOrig = performance.now;
-      let fakeT = 100000;
-      performance.now = () => fakeT;
-
-      const reset = () => {
-        dmEl.innerHTML = "";
-        window.__dmReset();
-      };
-      let seq = 0;
-      // 放一条弹幕; at 给出该条的到达时刻
-      const pushOne = (at, label) => {
-        fakeT = at;
-        send({danmaku: [{seq: ++seq, user_name: "甲",
-                         content: label || "同样的内容", is_command: false}]});
-        const nodes = dmEl.querySelectorAll(".dm");
-        const n = nodes[nodes.length - 1];
-        return n ? {left: parseFloat(n.style.left),
-                    lane: Math.round((parseFloat(n.style.top) - 4) / 44),
-                    dist: parseFloat(n.dataset.dmDist),
-                    dur: parseFloat(n.dataset.dmDur)}
-                 : null;
-      };
-      // 重复推**同一个**窗口(无新 seq) —— 真实 4Hz 形态
-      const pushStale = (at) => {
-        fakeT = at;
-        send({danmaku: [{seq: seq, user_name: "甲", content: "同样的内容",
-                         is_command: false}]});
-      };
-
-      try {
-        // ============ 不变量 A: 无新 seq 的 snapshot 对状态零影响 ======
-        reset();
-        const a1 = pushOne(100000);
-        for (let t = 250; t <= 3000; t += 250) pushStale(100000 + t);
-        // 绕一圈回到同一轨道
-        let a2 = null;
-        for (let i = 0; i < LANES_JS; i++) {
-          const x = pushOne(103250 + i);
-          if (x && x.lane === a1.lane) a2 = x;
-        }
-        check(a2 && a2.left === 1080,
-              "**A: 无新 seq 的 snapshot 不得改变轨道占用** (同轨道 left="
-              + (a2 ? a2.left : "null") + ", 期望 1080)");
-
-        // ============ 不变量 B: 时间真的会释放占用 =====================
-        // B1: 时间几乎没走 -> 后一条被推开
-        reset();
-        const b1 = pushOne(200000);
-        let b2 = null;
-        for (let i = 1; i <= LANES_JS; i++) {
-          const x = pushOne(200000 + i);
-          if (x && x.lane === b1.lane) b2 = x;
-        }
-        check(b2 && b2.left > 1080,
-              "B1: 紧跟的同轨道弹幕应被推开 (left="
-              + (b2 ? b2.left : "null") + ")");
-
-        // B2: 等足够久 -> 占用完全释放, 回到 1080
-        reset();
-        const c1 = pushOne(300000);
-        let c2 = null;
-        for (let i = 1; i <= LANES_JS; i++) {
-          const x = pushOne(300000 + i);
-          if (x && x.lane === c1.lane) c2 = x;
-        }
-        // 需要释放的是 c2 **放完之后**该轨道的全部尾部占用:
-        //   c2 的起点偏移 + c2 自身宽度 + 间距
-        // 早先只按 `c2.left - 1080`(起点偏移)算, 漏了 c2 自己的宽度+间距,
-        // 等待时间算短了 -> 断言误报。轨道占用的定义看 app.js 的 laneState。
-        const occupied = c2 ? (c2.left - 1080) + WIDTH_EST + GAP_EST : 0;
-        const waitMs = occupied / SPEED_JS * 1000 + 500;   // 留余量
-        let c3 = null;
-        for (let i = 0; i < LANES_JS; i++) {
-          const x = pushOne(300000 + waitMs + i);
-          if (x && x.lane === c1.lane) c3 = x;
-        }
-        check(c3 && c3.left === 1080,
-              "**B2: 等足够久后占用应完全释放**(重新从 1080 出生) (left="
-              + (c3 ? c3.left : "null") + ", 等待 " + waitMs.toFixed(0)
-              + "ms, 需释放 " + occupied.toFixed(0) + "px)");
-
-        // ============ 不变量 C: 速度恒定, 与出生偏移无关 ===============
-        reset();
-        const burst = [];
-        for (let i = 0; i < 10; i++) burst.push(pushOne(400000 + i));
-        const byLane = {};
-        burst.forEach((b) => {
-          if (b) (byLane[b.lane] = byLane[b.lane] || []).push(b);
-        });
-        const pairLane = Object.keys(byLane).find((k) => byLane[k].length >= 2);
-        if (pairLane === undefined) {
-          check(false, "C: 没拿到同轨道相邻两条");
-        } else {
-          const x = byLane[pairLane][0], y = byLane[pairLane][1];
-          const sx = x.dist / x.dur, sy = y.dist / y.dur;
-          check(Math.abs(sy / sx - 1) < 0.02,
-                "**C: 速度应与出生偏移无关** (第1条 " + sx.toFixed(1)
-                + " px/s @位移" + x.dist.toFixed(0) + ", 第2条 "
-                + sy.toFixed(1) + " px/s @位移" + y.dist.toFixed(0) + ")");
-          check(y.dist > x.dist + 1,
-                "C: 同轨道相邻两条位移应不同(否则上一条是空的) ("
-                + x.dist.toFixed(0) + " -> " + y.dist.toFixed(0) + ")");
-        }
-
-        // ============ 不变量 D: 长期低负载不产生递增的出生延迟 =========
-        //
-        // 核心 P2 回归。**必须低于轨道容量**: 每条弹幕占用 width+gap,
-        // 走完需 (width+gap)/SPEED; 5 条轨道轮转间隔 = 5 × 发送间隔。
-        // 只有 轮转间隔 > 释放时间 时, 才不该累积。
-        //   发送间隔 500ms -> 轮转 2.5s > 释放 ~2.2s  ✓ 低于容量
-        //   (早先写 400ms -> 轮转 2.0s < 2.2s, 那是**超载**, 增长合理,
-        //    断言会误报 —— 这个坑记下来。)
-        reset();
-        let t = 500000;
-        const offsets = [];
-        for (let round = 0; round < 80; round++) {
-          const x = pushOne(t);
-          if (x) offsets.push(x.left - 1080);
-          t += 500;
-        }
-        const early = Math.max.apply(null, offsets.slice(0, 10));
-        const late = Math.max.apply(null, offsets.slice(-10));
-        check(late <= early + 1,
-              "**D: 长期低负载不应让出生偏移越来越大** (前10条最大 "
-              + early + "px -> 后10条最大 " + late + "px)");
-      } finally {
-        performance.now = nowOrig;
-      }
+      const content = document.getElementById("content");
+      const stage = document.getElementById("stage");
+      const cr = content.getBoundingClientRect();
+      const sr = stage.getBoundingClientRect();
+      // 非 debug 模式下 #content 应铺满舞台到底边(允许 1px 取整误差)
+      check(Math.abs(cr.bottom - sr.bottom) <= 1,
+            "C: #content 底边应与 #stage 底边重合(260px 已回收) (content="
+            + cr.bottom.toFixed(1) + ", stage=" + sr.bottom.toFixed(1) + ")");
     }
+
+
     // ① 谜面 + 问答流追加
     send({qa_log: mkQa(3), qa_total: 3});
     check(document.querySelectorAll(".qa-row").length === 3, "应渲染 3 行问答");

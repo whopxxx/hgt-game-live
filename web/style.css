@@ -29,7 +29,7 @@ html, body {
 
 /* 内容区: 调试面板打开时整体右移, 避免遮挡 */
 #content {
-  position: absolute; inset: 0 0 260px;
+  position: absolute; inset: 0;
   transition: right .25s, width .25s;
 }
 #stage.debug-on #content {
@@ -250,23 +250,6 @@ html, body {
   text-align: center;
 }
 #stats b { color: #d4af6e; font-weight: 600; }
-
-/* ================= 弹幕流 ================= */
-#danmaku {
-  position: absolute;
-  left: 0; right: 0; bottom: 0; height: 240px;   /* 固定在舞台底部区域内 */
-  overflow: hidden; pointer-events: none;
-  mask-image: linear-gradient(to right, transparent, #000 4%, #000 96%, transparent);
-  -webkit-mask-image: linear-gradient(to right, transparent, #000 4%, #000 96%, transparent);
-}
-.dm {
-  position: absolute; white-space: nowrap;
-  font-size: 32px; color: #b9b3a6;
-  text-shadow: 0 1px 10px rgba(0,0,0,.95);
-  will-change: transform;
-}
-.dm.cmd { color: #f0d9a8; font-weight: 600; }
-.dm.cmd::before { content: "▲ "; font-size: 20px; opacity: .7; }
 
 /* ================= 调试面板 ================= */
 #debug {

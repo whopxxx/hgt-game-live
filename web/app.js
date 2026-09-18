@@ -3,7 +3,7 @@
  * 上半部: #puzzle  谜面大字(固定) + #reveal 揭晓覆盖层
  * 下半部: #qa      问答流, 持续向上滚动
  *
- * 复用旧版的: WS 管道 / fit() 舞台缩放 / 弹幕轨道 / 自动滚动兜底 / layout()
+ * 复用旧版的: WS 管道 / fit() 舞台缩放 / 自动滚动兜底 / layout()
  */
 
 (function () {
@@ -22,7 +22,6 @@
     qa: $("qa"), qaBody: $("qa-body"),
     thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
     stats: $("stats"), toast: $("toast"),
-    danmaku: $("danmaku"),
     debug: $("debug"), debugBody: $("debug-body"), conn: $("conn"),
   };
 
@@ -310,146 +309,16 @@
     el.stats.innerHTML = parts.join("　·　");
   }
 
-  // ================= 弹幕 =================
-  const LANES = 5, LANE_H = 44;
-  let dmSeq = 0;                     // 轨道轮换序号
-  // 同一轨道上前后两条之间的最小间距(px), 避免"追尾"看起来像叠在一起。
-  const DM_GAP_PX = 60;
-  // 弹幕的**恒定**移动速度(px/s)。原来用固定时长(9~12s) + 变化的位移,
-  // 位移一涨速度就跟着涨 —— 见 renderDanmaku 里的说明。
-  //
-  // 130 是**校正回原基准观感**的值, 不是新的视觉调参。
-  // 推导: 原来的时长是 9~12 秒, 而位移 = STAGE_W(1080) + offsetWidth。
-  //   文本宽 200px -> (1080+200)/130 ≈ 9.8s
-  //   文本宽 300px ->               ≈ 10.6s
-  //   文本宽 400px ->               ≈ 11.4s
-  // 正好落回原来的 9~12 秒区间。
-  // (早先取 110 时**漏算了 offsetWidth**, 实际会变成 11.6~13.5 秒, 偏慢。)
-  const DM_SPEED = 130;
-
-  //: 每条轨道"尚未释放的尾部占用"(px)。
-  //
-  // 取代了早先的 `batchSlots`(一个只增不减的累计像素计数器) + `lastDmAt`
-  // + 1200ms 批次时钟。那套东西的问题:
-  //   ① 只有"距上一条 > 1.2 秒"才会清零, 而服务端窗口一直在推, 时钟
-  //      永远被刷新 -> 状态**从不释放**, 单调上涨;
-  //   ② 它记的是"到过这里的弹幕总宽度", 不是"现在还剩多少没走" ——
-  //      没有任何物理含义。
-  //
-  // 新模型: 轨道上只保留**当前还未让开屏幕右侧的那一段**。前面的弹幕
-  // 以 DM_SPEED 向左移动, 所以占用按时间**自然衰减**。
-  //
-  // 关键: 释放是 **lazy** 的 —— 不靠任何定时器, 而是在下一条弹幕进来时
-  // 按 `DM_SPEED × Δt` 一次性扣掉。所以低流量时轨道会自然空出来。
-  const laneState = Array.from({length: LANES}, () => ({
-    tailPx: 0,      // 尚未释放的尾部占用
-    updatedAt: 0,   // 上次更新该轨道状态的时刻
-  }));
-
-  // 服务端每次推的是**最近 N 条的窗口**(4Hz)。必须只渲染"没见过的"
-  // —— 用服务端给的**单调递增 seq** 判断。
-  //
-  // 早先按"人+内容、相邻 2 条内算重复"判重: 每次推送整个窗口时序号全在涨,
-  // 于是 40 条旧弹幕**全部重新飞一遍** —— 就是"发一条消息后弹幕乱飞"的根因。
-  let lastDmSeq = 0;
-
-  // 测试专用: 把轨道占用与 seq 水位复位。
-  //
-  // 离线用例需要"从干净状态开始"才能断言绝对位移(例如"等久了应回到
-  // 1080"), 否则每个断言都被上一个断言留下的占用污染 —— 而
-  // `dmSeq` 是跨断言持续增长的, 测试无法靠"数到第几条"来对齐轨道。
-  //
-  // **只被 tests/test_web.py 调用**, 生产路径没有任何地方使用它。
-  window.__dmReset = function () {
-    dmSeq = 0;
-    lastDmSeq = 0;
-    for (let i = 0; i < LANES; i++) {
-      laneState[i].tailPx = 0;
-      laneState[i].updatedAt = 0;
-    }
-  };
-
-  function pushDanmaku(list) {
-    if (!list || !list.length) return;
-
-    // 先挑出**真正没见过的** seq, 并推进水位。
-    // 服务端 seq 由引擎在锁内 `+1` 生成、窗口按序切 `[-40:]`, 所以它是
-    // **连续且升序**的 —— `seq > lastDmSeq` 就等价于"没见过", 不会漏。
-    let top = lastDmSeq;
-    const fresh = [];
-    for (let i = 0; i < list.length; i++) {
-      const seq = list[i].seq || 0;
-      if (seq > top) top = seq;
-      if (seq > lastDmSeq) fresh.push(list[i]);
-    }
-    lastDmSeq = top;
-
-    // **没有新弹幕就什么都不做** —— 不碰任何轨道状态。
-    //
-    // 这是 P1/P2 共同的核心不变量: 服务端在房间有人说过话之后, 每个
-    // snapshot 都带最近 40 条(约 4Hz), 所以"重复窗口"必须对状态**零影响**。
-    // 早先无条件刷新 `lastDmAt` 正是"越播越快"的根因: 时钟被反复推后,
-    // 批次永不归零 -> 累计量单调上涨。
-    if (!fresh.length) return;
-
-    for (let i = 0; i < fresh.length; i++) renderDanmaku(fresh[i]);
-  }
-
-  function renderDanmaku(d) {
-    const node = document.createElement("div");
-    node.className = "dm" + (d.is_command ? " cmd" : "");
-    node.textContent = d.user_name + "：" + d.content;
-    const lane = (dmSeq++) % LANES;
-    const st = laneState[lane];
-    node.style.top = lane * LANE_H + 4 + "px";
-
-    // ---- 轨道占用: 先按经过的时间释放, 再决定这一条的出生偏移 ----
-    //
-    // lazy 释放: 不跑定时器, 用"距上次更新过了多久"一次性扣减。
-    // 前面的弹幕以 DM_SPEED 左移, 走过的距离就是让开的空间。
-    const now = performance.now();
-    if (st.updatedAt) {
-      const moved = DM_SPEED * (now - st.updatedAt) / 1000;
-      st.tailPx = Math.max(0, st.tailPx - moved);
-    }
-    const offset = st.tailPx;
-    node.style.left = (STAGE_W + offset) + "px";
-    el.danmaku.appendChild(node);
-
-    // ---- 固定**速度**, 不是固定时长 ----
-    //
-    // 曾经是 `dur = 9 + random*3`(固定时长), 而位移里含出生偏移 ——
-    // 于是偏移一涨, 同样的 9~12 秒要跑更远的路, 弹幕越飞越快。
-    // 改成按距离算时长, 速度才与偏移无关。
-    const width = node.offsetWidth;
-    const distance = STAGE_W + offset + width;
-    const dur = distance / DM_SPEED;
-    // 测试探针: 把这一条的位移/时长暴露出来, 供离线用例断言
-    // "速度与出生偏移无关"。**只读导出**, 不影响渲染逻辑。
-    node.dataset.dmDist = distance;
-    node.dataset.dmDur = dur;
-
-    // 这一条成为轨道的新尾部: 它自己的宽度 + 与后一条的最小间距。
-    st.tailPx = offset + width + DM_GAP_PX;
-    st.updatedAt = now;
-
-    const t0 = performance.now();
-    (function step(t) {
-      const p = (t - t0) / (dur * 1000);
-      if (p >= 1) { node.remove(); return; }
-      // 终点与 distance 一致: 整条走出屏幕左侧
-      node.style.transform = "translateX(" + (-distance * p) + "px)";
-      requestAnimationFrame(step);
-    })(performance.now());
-  }
-
   // ================= 布局 =================
   // 上半(谜面)与下半(问答)的高度分配。谜面越长给越高, 但保底下半部空间。
   const TOP_MIN = 620, TOP_MAX = 1000, BOTTOM_MIN = 620;
   let lastTopH = -1;
   function layout() {
-    const stageH = 1920, danmakuH = 240;
-    const avail = stageH - danmakuH;                 // 1680
+    // 整个舞台都可用 —— 飘屏弹幕已移除, 不再为它预留底部 240px。
+    // 多出来的高度主要回给下半部 QA 区(上半部有 TOP_MAX=1000 封顶,
+    // 不会被无限撑大)。
+    const stageH = 1920;
+    const avail = stageH;
 
     // 谜面过长时按内容自动缩小字号(而不是溢出压到问答流上)。
     // 58px 是基准; 内容越高缩得越小, 下限 30px。
@@ -527,7 +396,6 @@
     renderHint(s);
     renderPrompt(s);
     renderStats(s);
-    pushDanmaku(s.danmaku);
     renderDebug(s);
     layout();
   }
