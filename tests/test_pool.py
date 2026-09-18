@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1056,12 +1057,18 @@ def test_disk_old_policy_cannot_bypass():
 def test_mixed_current_and_old():
     """[9e] 混合池: 只交付 current 那道, 旧题保持未 used。
 
-    不依赖 shuffle 顺序 —— 每种组合各断言一次, 并且**跑的轮数够多**,
-    因为 `pop_next` 会打散候选; 只跑一轮的话"恰好先抽到好题"会让
-    错误实现蒙混过关。
+    `pop_next` 会 shuffle 候选, 所以**跑多轮**是必要的 —— 只跑一轮的
+    话, 一个"碰巧先抽到好题"的错误实现会蒙混过关。
+
+    ⚠️ 但多轮**不能**把每轮断言直接推进全局 `FAIL`: 真出问题时那会
+    打印 8×N 行重复 FAIL、且 `FAIL[0]` 一次加 8×N。正确做法是每轮把
+    该轮结果收集起来, **只在有轮次失败时记一次**, 并把首个失败轮的
+    细节打出来。
     """
     print("\n[9e] mixed current + old")
-    for _ in range(8):
+    rounds = 8
+    bad: list = []          # 每轮: (轮号, 失败说明列表)
+    for i in range(rounds):
         with tmpdir() as d:
             cfg = mkcfg(d)
             cur = good_spec()
@@ -1072,34 +1079,57 @@ def test_mixed_current_and_old():
             old.quality_policy_version = "quality-v2"
             _raw_pool(cfg.pool_path, old, cur)
             pool = PuzzlePool.open(cfg)
-            check("pending == 2", pool.pending_count() == 2, pool.pending_count())
-            check("stock == 1", pool.stock_count() == 1, pool.stock_count())
+            fails: list = []
+            # ⚠️ 顺序要紧: 库存类断言必须在 `pop_next` **之前** ——
+            # 一旦交付, current 那道就进了 used, pending/stock 都会减 1。
+            if pool.pending_count() != 2:
+                fails.append("交付前 pending=%r 应为 2" % pool.pending_count())
+            if pool.stock_count() != 1:
+                fails.append("交付前 stock=%r 应为 1" % pool.stock_count())
             got = pool.pop_next(recent_signatures=[])
-            check("交付的是 current policy 那道",
-                  got is not None and got.puzzle == cur.puzzle,
-                  "got=%r" % (got.puzzle[:20] if got else None))
-            check("旧题仍未标 used",
-                  spec_key(old) not in pool._used)
-            check("used 只有 1 条", pool.used_count() == 1, pool.used_count())
-            check("旧题还在盘上的候选集里",
-                  pool.pending_count() == 1, pool.pending_count())
+            if got is None or got.puzzle != cur.puzzle:
+                fails.append("交付的应是 current 那道, got=%r"
+                             % (got.puzzle[:20] if got else None))
+            if spec_key(old) in pool._used:
+                fails.append("旧题被标了 used")
+            if pool.used_count() != 1:
+                fails.append("used_count=%r 应为 1" % pool.used_count())
+            if pool.pending_count() != 1:
+                fails.append("交付后 pending=%r 应为 1(current 已用, 旧题还在)"
+                             % pool.pending_count())
+            if fails:
+                bad.append((i, fails))
+    check("%d 轮全部正确(只交付 current, 旧题保持未 used)" % rounds,
+          not bad, bad[0] if bad else "")
+    check("旧题在**任何一轮**都没被标 used",
+          all("旧题被标了 used" not in f for _i, f in bad),
+          [f for _i, f in bad][:1])
 
 
 def test_policy_bump_auto_quarantines_old_stock():
-    """[9f] policy bump 模拟: 当前常量一变, 旧 spec 自动失去 live 资格。
+    """[9f] policy bump 语义: 门只认**当前常量**, 换个版本就整批失效。
 
-    **不真改常量**(那会污染其他测试与生产语义), 而是构造一道
-    "版本 != 当前常量"的题来等价模拟 bump 之后的局面:
-    bump 后现存 v3 就是"!= 当前"的那一类。
+    ⚠️ 这条**不能**声称"模拟了一次真实 bump" —— 真 bump 是改
+    `QUALITY_POLICY_VERSION` 这个模块常量, 而那会污染同进程的其他测试
+    与生产语义, 所以本测试**不真改它**。
 
-    同时验证 Step 04 的关键推论: bump 之后 stock 归零 -> 补池看得见
-    "没库存" -> 会去补新题; 而新 policy 的题照常进得来。
+    它实际验证的是 bump 所**依赖的那条机制**, 两个方向都验:
+
+      (a) 一道版本 != 当前常量的题 -> 门拒绝。
+          这正是 bump 之后"所有旧 v3 题"所处的状态, 所以它证明
+          "bump 会让旧库存失去 live 资格"。
+      (b) 一道版本 == 当前常量的题 -> 门放行、照常入池。
+          这证明"新版本的题补得进来", 即 bump 后补池不会被自己的门
+          卡死(否则会出现"旧的全隔离、新的也进不来"的死锁)。
+
+    (a) + (b) 合起来才是 Step 04 需要的完整推论。真实 bump 本身由
+    Step 04 的 commit 改动常量来落地, 不在这里伪造。
     """
-    print("\n[9f] policy bump 模拟")
+    print("\n[9f] policy bump 机制(两个方向)")
     from story.quality import QUALITY_POLICY_VERSION
     with tmpdir() as d:
         cfg = mkcfg(d)
-        # 盘上是"当前版本"的 3 道(模拟 bump 前的正常库存)
+        # 盘上是"当前版本"的 3 道(即 bump 前的正常库存)
         _raw_pool(cfg.pool_path,
                   good_spec(),
                   good_spec(puzzle="第二道完全不同的题。为什么?",
@@ -1111,56 +1141,113 @@ def test_policy_bump_auto_quarantines_old_stock():
                             fair_clues=[FairClue(quote="第三道完全不同的题",
                                                  supports_atoms=["a1"])]))
         pool = PuzzlePool.open(cfg)
-        check("bump 前: stock == 3", pool.stock_count() == 3, pool.stock_count())
+        check("当前版本: stock == 3", pool.stock_count() == 3, pool.stock_count())
 
-        # ---- 模拟 bump: 构造一道"属于下一版"的题, 并把上面三道看成旧版 ----
+        # ---- (a) 版本 != 当前常量 -> 拒绝(== bump 后旧题的状态) ----
         nxt = good_spec(puzzle="第四道完全不同的题。为什么?",
                         answer="第四个谜底。",
                         fair_clues=[FairClue(quote="第四道完全不同的题",
                                              supports_atoms=["a1"])])
         nxt.quality_policy_version = "quality-v4"
-        check("bump 后: 新版本 != 当前 -> 入池被拒(这正说明门在看常量)",
-              pool.add(nxt) is False)
+        check("(a) 版本 != 当前 -> 入池被拒", pool.add(nxt) is False)
         ok, why = PuzzlePool._validate_pool_spec(nxt)
-        check("理由里 current 仍是当前常量",
-              QUALITY_POLICY_VERSION in why, why)
-        check("当前版本的题照常入池",
+        check("(a) 理由里同时有 spec 版本与 current 版本",
+              "quality-v4" in why and QUALITY_POLICY_VERSION in why, why)
+        # 这条是 (a) 的**真正含义**: 现在盘上那 3 道是"当前版本",
+        # 一旦常量上调, 它们就变成 (a) 那一类 -> stock 归零。
+        check("(a) 3 道旧库存此刻仍算库存(因为现在它们还是当前版本)",
+              pool.stock_count() == 3, pool.stock_count())
+
+        # ---- (b) 版本 == 当前常量 -> 放行(== bump 后新题的状态) ----
+        check("(b) 当前版本的题照常入池",
               pool.add(good_spec(puzzle="第五道完全不同的题。为什么?",
                                  answer="第五个谜底。",
                                  fair_clues=[FairClue(
                                      quote="第五道完全不同的题",
                                      supports_atoms=["a1"])])) is True)
-        check("入池后 stock 变成 4", pool.stock_count() == 4,
+        check("(b) 入池后 stock 变成 4", pool.stock_count() == 4,
               pool.stock_count())
 
 
-def test_gate_has_no_online_review():
-    """[9g] 硬边界: 准入门是**纯确定性代码路径**。
+def test_gate_is_deterministic_pure_code():
+    """[9g] 硬边界: 准入门是**纯确定性代码路径**, 不碰在线重审。
 
-    policy 不兼容的题被隔离时必须**不**调用 LLM / PuzzleWriter /
-    Reviewer / gen_spec —— 题池 pop 不能变成在线重审。
+    为什么这条断言的是"代码事实"而不是"挂桩行为": `_validate_pool_spec`
+    是 `@staticmethod` 纯函数, 只读 spec 字段 + 调 `validate_spec` /
+    `validate_blueprint` / `cross_puzzle_gate`。没有任何 I/O、没有
+    LLM client、没有 writer。
+
+    本测试用**三层可验证的证据**钉住它:
+
+      ① 静态: `pool` 模块命名空间里根本没有那些入口的名字。
+      ② 依赖: 准入门里确实**只**用到了已知的纯校验函数 —— 把
+         `story.quality` 里那几个函数换成会记录调用的替身, 跑一遍
+         隔离判定, 断言"被调用的全是它们", 别的什么都没发生。
+      ③ 行为: 隔离判定对一个旧 policy 题返回 False, 且**不抛**
+         (真的去联网/调模型就不可能毫秒级返回)。
     """
-    print("\n[9g] 准入门不碰在线重审")
+    print("\n[9g] 准入门是纯确定性代码路径")
     import story.pool as _sp
     for name in ("PuzzleWriter", "gen_spec", "review_spec", "_review_spec"):
-        check("pool 模块里没有引用 %s" % name,
+        check("(1) pool 模块里没有引用 %s" % name,
               not hasattr(_sp, name))
-    # 行为验证: 隔离一道旧题, 全程没有任何网络/模型入口可被触发。
-    with tmpdir() as d:
-        cfg = mkcfg(d)
-        pool = PuzzlePool.open(cfg)
-        # 把 add/pop 可能用到的外部入口全部换成"一调就炸"
-        import story.quality as _q
-        real = _q.validate_spec
 
-        def _boom(*a, **k):
-            raise AssertionError("不该在校验之外调用别的东西")
-        old = good_spec()
-        old.quality_policy_version = "quality-v2"
+    # ---- (2) 依赖替身: 记录准入门到底调了什么 ----
+    import story.quality as _q
+    called: list = []
+    real_validate_spec = _q.validate_spec
+    real_cross = _q.cross_puzzle_gate
+    real_vb = _q.validate_blueprint
+
+    def spy_validate_spec(spec):
+        called.append("validate_spec")
+        return real_validate_spec(spec)
+
+    def spy_cross(*a, **k):
+        called.append("cross_puzzle_gate")
+        return real_cross(*a, **k)
+
+    def spy_vb(*a, **k):
+        called.append("validate_blueprint")
+        return real_vb(*a, **k)
+
+    old = good_spec()
+    old.quality_policy_version = "quality-v2"
+    try:
+        _q.validate_spec = spy_validate_spec
+        _q.cross_puzzle_gate = spy_cross
+        _q.validate_blueprint = spy_vb
+        _sp.validate_spec = spy_validate_spec
+        _sp.cross_puzzle_gate = spy_cross
+        _sp.validate_blueprint = spy_vb
+        t0 = time.monotonic()
         ok, _why = PuzzlePool._validate_pool_spec(old)
-        check("隔离判定返回 False", ok is False)
-        check("validate_spec 未被绕过后仍可正常调用(回归)",
-              real(good_spec()).ok is True)
+        dt = time.monotonic() - t0
+    finally:
+        _q.validate_spec = real_validate_spec
+        _q.cross_puzzle_gate = real_cross
+        _q.validate_blueprint = real_vb
+        _sp.validate_spec = real_validate_spec
+        _sp.cross_puzzle_gate = real_cross
+        _sp.validate_blueprint = real_vb
+
+    check("(3) 隔离判定返回 False", ok is False)
+    check("(2) policy 不兼容时**在校验之前**就短路, 一个校验都没调",
+          called == [], called)
+    check("(3) 毫秒级返回(没有 I/O)", dt < 0.5, "%.4fs" % dt)
+
+    # 对照: 版本合法的题会走到校验, 说明替身确实能记录到调用
+    called.clear()
+    try:
+        _q.validate_spec = spy_validate_spec
+        _sp.validate_spec = spy_validate_spec
+        ok2, _why2 = PuzzlePool._validate_pool_spec(good_spec())
+    finally:
+        _q.validate_spec = real_validate_spec
+        _sp.validate_spec = real_validate_spec
+    check("(2 对照) 版本合法时确实调用了 validate_spec",
+          "validate_spec" in called, called)
+    check("(对照) 合法题放行", ok2 is True)
 
 
 def test_quarantine_is_not_deletion():
@@ -1240,7 +1327,7 @@ def main():
         test_disk_old_policy_cannot_bypass,
         test_mixed_current_and_old,
         test_policy_bump_auto_quarantines_old_stock,
-        test_gate_has_no_online_review,
+        test_gate_is_deterministic_pure_code,
         test_quarantine_is_not_deletion,
     ]
     for t in tests:
