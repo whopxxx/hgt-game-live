@@ -584,6 +584,89 @@ def test_hints_not_leaked_into_puzzle():
           _strip_puzzle_tail(keep))
 
 
+def test_reviewer_keeps_solve_atoms():
+    print("[审稿: 改稿后 solve_atoms / fair_clues 不能丢]")
+    # 实测踩过的最隐蔽的坑: 审稿人改稿后重建 RiddleResult 时只复制了
+    # puzzle/answer/hints, atoms 被丢掉 —— 于是只要经过一次审稿, engine
+    # 拿到的 _solve_atoms 就是空数组, judge 悄悄退回"凭感觉判"。
+    # 新机制**看起来生效, 其实没有**。
+    ATOMS = ["退潮时礁石露出水面", "亮灯是标出礁石位置"]
+    CLUES = ["谜面写了'只在退潮亮灯'"]
+    fc = FakeClient([
+        # 出题: 带 atoms
+        LLMResult(tool_input={"puzzle": "守塔人只在退潮亮灯。为什么?",
+                              "answer": "礁石露出水面, 亮灯标位置。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": CLUES}),
+        # 审稿: 改了谜面, **原样带回 atoms**
+        LLMResult(tool_input={"ok": False, "note": "补个具体地点",
+                              "puzzle": "守塔人在海角灯塔, 只在退潮时亮灯。为什么?",
+                              "answer": "礁石露出水面, 亮灯标位置。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": CLUES}),
+        # 再审: 通过
+        LLMResult(tool_input={"ok": True}),
+    ])
+    w = PuzzleWriter(client=fc)
+    r = w.gen_riddle()
+    check("改稿被采用", r.puzzle and "海角" in r.puzzle, r)
+    check("solve_atoms 经过审稿后仍在", r.solve_atoms == ATOMS, r.solve_atoms)
+    check("fair_clues 经过审稿后仍在", r.fair_clues == CLUES, r.fair_clues)
+    # 审稿请求里应该把现有 atoms 一并送过去了
+    check("审稿请求带上了现有 atoms",
+          "退潮时礁石露出水面" in fc.calls[1]["user"], fc.calls[1]["user"][-200:])
+
+
+def test_reviewer_can_replace_atoms_when_answer_changes():
+    print("[审稿: 改了谜底就必须重出 atoms]")
+    NEW_ATOMS = ["他打嗝", "惊吓能止嗝"]
+    fc = FakeClient([
+        LLMResult(tool_input={"puzzle": "他要一杯水, 酒保却掏枪。为什么?",
+                              "answer": "旧答案(错的)。", "hints": ["a", "b", "c"],
+                              "solve_atoms": ["旧1", "旧2"],
+                              "fair_clues": ["旧线索"]}),
+        # 审稿改了谜底, 同时给出**新的** atoms
+        LLMResult(tool_input={"ok": False, "note": "谜底不对, 换成打嗝",
+                              "puzzle": "他要一杯水, 酒保却掏枪。为什么?",
+                              "answer": "他打嗝, 酒保掏枪吓他止嗝。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": NEW_ATOMS,
+                              "fair_clues": ["他说了声谢谢"]}),
+        LLMResult(tool_input={"ok": True}),
+    ])
+    w = PuzzleWriter(client=fc)
+    r = w.gen_riddle()
+    check("用了审稿人新给的 atoms", r.solve_atoms == NEW_ATOMS, r.solve_atoms)
+    check("用了审稿人新给的 clues", r.fair_clues == ["他说了声谢谢"],
+          r.fair_clues)
+
+
+def test_main_regression_no_atoms_lost():
+    print("[回归: reviewer 修 2 轮后 atoms 仍不为空]")
+    # 这是 reviewer 特别要求的端到端测试: 生成带 atoms -> 审稿改题(两轮)
+    # -> 最终 RiddleResult 仍有 atoms。
+    ATOMS = ["A1", "A2"]
+    fc = FakeClient([
+        LLMResult(tool_input={"puzzle": "一稿。为什么?", "answer": "一稿底。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": ["线索1"]}),
+        LLMResult(tool_input={"ok": False, "note": "改1",
+                              "puzzle": "二稿。为什么?", "answer": "二稿底。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": ["线索1"]}),
+        LLMResult(tool_input={"ok": False, "note": "改2",
+                              "puzzle": "三稿。为什么?", "answer": "三稿底。",
+                              "hints": ["a", "b", "c"],
+                              "solve_atoms": ATOMS, "fair_clues": ["线索1"]}),
+        LLMResult(tool_input={"ok": True}),
+    ])
+    w = PuzzleWriter(client=fc)
+    r = w.gen_riddle()
+    check("两轮修改后仍有谜题", bool(r.puzzle), r)
+    check("两轮修改后 atoms 非空", r.solve_atoms == ATOMS, r.solve_atoms)
+    check("两轮修改后 clues 非空", r.fair_clues == ["线索1"], r.fair_clues)
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -591,6 +674,9 @@ def main():
               test_first_person_story_rejected,
               test_no_repeat_puzzles,
               test_riddle_check_retries_empty_tool_use, test_english_riddle_rejected_on_text_path,
+              test_reviewer_keeps_solve_atoms,
+              test_reviewer_can_replace_atoms_when_answer_changes,
+              test_main_regression_no_atoms_lost,
               test_reject_reasons_accumulate, test_rejected_puzzle_goes_into_avoid,
               test_bad_draft_does_not_consume_attempt,
               test_wrapped_tool_input_unwrapped, test_hints_not_leaked_into_puzzle,

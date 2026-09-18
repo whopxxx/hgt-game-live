@@ -143,6 +143,27 @@ def _unwrap_tool_input(ti) -> dict:
     return ti
 
 
+def _merge_fix(base: "RiddleResult", fixed: "RiddleResult") -> "RiddleResult":
+    """把审稿人的改稿合并回原稿。
+
+    **必须保住 solve_atoms / fair_clues** —— 这是实测踩过的最隐蔽的坑:
+    原来这里重建 RiddleResult 时只复制 puzzle/answer/hints, atoms 被丢掉,
+    于是只要题目经过一次审稿修改, engine 拿到的 _solve_atoms 就是空数组,
+    judge 悄悄退回"看文学谜底凭感觉判" —— 新机制**看起来生效, 其实没有**。
+
+    规则:
+      - 审稿人给了新 atoms/clues -> 用它(它改了 answer 就有义务重出);
+      - 没给 -> 沿用原稿的。
+    """
+    return RiddleResult(
+        puzzle=fixed.puzzle,
+        answer=fixed.answer or base.answer,
+        hints=fixed.hints or base.hints,
+        title=base.title, usage=base.usage, model=base.model,
+        solve_atoms=list(fixed.solve_atoms or base.solve_atoms),
+        fair_clues=list(fixed.fair_clues or base.fair_clues))
+
+
 def _remember(store: list, why: str) -> None:
     """把一条拒绝原因记进 store(去重 + 保留顺序 + 限制条数)。
 
@@ -739,10 +760,28 @@ _TOOL_CHECK = {
                        "description": "修好的谜底。合格时原样回传"},
             "hints": {"type": "array", "items": {"type": "string"},
                       "description": "修好的 3 条提示。合格时原样回传"},
+            "solve_atoms": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {"type": "string"},
+                "description": (
+                    "玩家必须说中的 2-4 条原子事实, **按角色顺序**排列: "
+                    "第 1 条是 cause(反常的起因), 第 2 条是 mechanism"
+                    "(这个起因如何导致那个反常行为), 其余是 support。"
+                    "只要改动了 answer 或核心机制, 必须**重新生成**这组; "
+                    "没动就原样回传。"),
+            },
+            "fair_clues": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string"},
+                "description": (
+                    "谜面原文里已经写着、回看能指向谜底的具体事实。"
+                    "修改后**必须至少保留一条**; 不许为了'避免泄底'而"
+                    "把可回溯的线索全删光。"),
+            },
             "note": {"type": "string",
                      "description": "改了什么、为什么(合格则留空)"},
         },
-        "required": ["ok"],
+        "required": ["ok", "solve_atoms", "fair_clues"],
     },
 }
 
@@ -892,29 +931,26 @@ class PuzzleWriter:
                 hard = ""
             ok, why, fixed = self._check_riddle(
                 r.puzzle, r.answer or "", r.hints, tries=1,
-                must_fix=hard)
+                must_fix=hard, solve_atoms=r.solve_atoms,
+                fair_clues=r.fair_clues)
             if not ok and fixed:
                 # **审稿人改好了** -> 用改稿继续, 不丢掉这一稿。
                 # 这正是"不是毙掉, 就是让他改"。
                 log.info("审稿已修改(第 %d 稿): %s", attempts, why[:60])
                 _detail("改稿谜面=%s\n      改稿谜底=%s",
                         _clip(fixed.puzzle, 300), _clip(fixed.answer, 300))
-                r = RiddleResult(puzzle=fixed.puzzle,
-                                 answer=fixed.answer or r.answer,
-                                 hints=fixed.hints or r.hints,
-                                 title=r.title, usage=r.usage, model=r.model)
+                r = _merge_fix(r, fixed)
                 ok2, why2, fixed2 = self._check_riddle(
-                    r.puzzle, r.answer or "", r.hints, tries=1)
+                    r.puzzle, r.answer or "", r.hints, tries=1,
+                    solve_atoms=r.solve_atoms, fair_clues=r.fair_clues)
                 if ok2:
                     ok, why = True, why2
                 elif fixed2:
                     # 又改了一版, 再收一次(最多来回两次, 防止无休止)
-                    r = RiddleResult(puzzle=fixed2.puzzle,
-                                     answer=fixed2.answer or r.answer,
-                                     hints=fixed2.hints or r.hints,
-                                     title=r.title, usage=r.usage, model=r.model)
+                    r = _merge_fix(r, fixed2)
                     ok, why, _ = self._check_riddle(
-                        r.puzzle, r.answer or "", r.hints, tries=1)
+                        r.puzzle, r.answer or "", r.hints, tries=1,
+                        solve_atoms=r.solve_atoms, fair_clues=r.fair_clues)
             if ok and avoid:
                 dup = _too_similar(r.puzzle, avoid)
                 if dup:
@@ -934,7 +970,9 @@ class PuzzleWriter:
         return last
 
     def _check_riddle(self, puzzle: str, answer: str, hints: Optional[list] = None,
-                      tries: int = 1, must_fix: str = ""
+                      tries: int = 1, must_fix: str = "",
+                      solve_atoms: Optional[list] = None,
+                      fair_clues: Optional[list] = None
                       ) -> tuple[bool, str, Optional[RiddleResult]]:
         """审稿: 合格就通过; 不合格**由审稿人直接改好**。
 
@@ -946,16 +984,37 @@ class PuzzleWriter:
           - 原稿往往只有一处毛病(实测: "谜面把核心线索写出来了"),
             改一句就能救, 整题重写是浪费。
 
+        `solve_atoms` / `fair_clues` 会一起送给审稿人, 并要求它**原样带回**
+        (改了谜底就必须重出)。这两样如果在这一步丢了, judge 就退回凭感觉判,
+        整条新链路白做 —— 实测踩过。
+
         注意**空 tool_input**: 网关的强制工具调用偶发返回空 input。那种
         必须当成"**审稿没做成**"(ok=False 且没有改稿), 让上层重出。
         """
+        atoms = [str(a).strip() for a in (solve_atoms or []) if str(a).strip()]
+        clues = [str(c).strip() for c in (fair_clues or []) if str(c).strip()]
         user = (f"【谜面】{puzzle}\n"
                 f"【谜底】{answer or '(空)'}\n"
                 f"【提示】{' / '.join(hints or []) or '(空)'}")
+        if atoms:
+            user += ("\n【现有 solve_atoms(改了谜底就重出, 否则原样带回)】\n"
+                     + "\n".join(f"{i}. {a}" for i, a in enumerate(atoms)))
+        if clues:
+            user += ("\n【现有 fair_clues(必须至少保留一条)】\n"
+                     + "\n".join(f"- {c}" for c in clues))
         if must_fix:
             # 代码已经确定的毛病(第一人称 / 没问句), 直接点名让它改,
             # 不必再花一次调用去"发现"。
             user += f"\n\n【已知问题, 必须改掉】{must_fix}"
+
+        def _pick(ti: dict) -> tuple:
+            """从审稿返回里取 atoms/clues, 空则沿用原稿。"""
+            a = [str(x).strip() for x in (ti.get("solve_atoms") or [])
+                 if str(x).strip()][:4]
+            c = [str(x).strip() for x in (ti.get("fair_clues") or [])
+                 if str(x).strip()][:4]
+            return (a or atoms), (c or clues)
+
         for _ in range(max(1, tries)):
             try:
                 res = self.client.messages(CHECK_SYSTEM, user, max_tokens=3000,
@@ -975,22 +1034,25 @@ class PuzzleWriter:
             # 而且代码会再验一遍(见 gen_riddle)。
             if ti.get("ok") and must_fix:
                 if new_p and new_p != puzzle:
+                    a, c = _pick(ti)
                     return False, note or "已按要求改写", RiddleResult(
                         puzzle=new_p,
                         answer=str(ti.get("answer", "") or "").strip() or None,
                         hints=[str(h).strip() for h in (ti.get("hints") or [])
-                               if str(h).strip()][:3])
+                               if str(h).strip()][:3],
+                        solve_atoms=a, fair_clues=c)
                 return False, f"审稿未处理已知问题: {must_fix}", None
             # 不合格 -> 取改好的稿子(审稿人应该给了)
             if not new_p or not _looks_chinese(new_p):
                 # 没给改稿 / 改成英文 -> 这次审稿白做了, 让上层重出
                 return False, note or "审稿未给出改稿", None
+            a, c = _pick(ti)
             fixed = RiddleResult(
                 puzzle=new_p,
                 answer=str(ti.get("answer", "") or "").strip() or None,
                 hints=[str(h).strip() for h in (ti.get("hints") or [])
                        if str(h).strip()][:3],
-                title=None)
+                title=None, solve_atoms=a, fair_clues=c)
             return False, note or "审稿已修改", fixed
         # 拿不到有效结果 -> 视为未通过(让上层重出或走兜底)
         return False, "审稿未拿到有效结果(网关抖动)", None
