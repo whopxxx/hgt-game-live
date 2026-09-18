@@ -477,6 +477,8 @@ class Director:
                 #
                 # `pop_next` 契约上不抛、坏了也返回 None, 所以这里不需要
                 # 额外的 try —— 它的失败模式就是"回落"。
+                # Step 06: 这一发是为第几题要的。原样带给引擎做身份校验。
+                expect_round = payload.get("expect_round")
                 spec = None
                 source = "live_generate"
                 if self.pool is not None:
@@ -488,12 +490,13 @@ class Director:
 
                 if spec is not None:
                     # 池子里来的: 结构已经齐了, 直接上屏。
-                    self._submit_spec(spec, source)
+                    self._submit_spec(spec, source, expect_round=expect_round)
                 elif self.cfg.no_llm or not self.writer:
                     res_p, res_a = self._fake_riddle()
                     self._dispatch(self.engine.submit_riddle(
                         res_p, res_a, list(P.FALLBACK_HINTS),
-                        title="海龟汤", model="no-llm", source=source))
+                        title="海龟汤", model="no-llm", source=source,
+                        expect_round=expect_round))
                 else:
                     bp = self._pick_blueprint(recent)
                     spec = self.writer.gen_spec(
@@ -505,7 +508,8 @@ class Director:
                     # 只有**通过质量门**的 spec 才允许上直播。
                     # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
                     if spec.puzzle and not spec.error:
-                        self._submit_spec(spec, source)
+                        self._submit_spec(spec, source,
+                                          expect_round=expect_round)
                         if not spec.answer:
                             log.info("本题未解析出谜底, 揭晓时将重新生成")
                     else:
@@ -521,19 +525,24 @@ class Director:
             # ---- 锁已释放, 现在提交失败结果(它会触发下一拍 retry) ----
             if failure is not None:
                 try:
-                    self._dispatch(self.engine.submit_riddle(None, error=failure))
+                    self._dispatch(self.engine.submit_riddle(
+                        None, error=failure, expect_round=expect_round))
                 except Exception as e:                # noqa: BLE001
                     log.exception("提交出题失败结果时出错: %s", e)
             self.push()
 
         threading.Thread(target=work, daemon=True, name="riddle").start()
 
-    def _submit_spec(self, spec, source: str) -> None:
+    def _submit_spec(self, spec, source: str,
+                     expect_round=None) -> None:
         """把一道**已通过质量门**的 spec 提交给引擎上屏。
 
         池子来的题与现场生成的题走这里同一段代码 —— 免得两条路各写
         一遍 `submit_riddle(...)` 参数, 然后其中一条漏传字段(第四轮
         的 P0 就是"两条路参数不一致"造成的)。
+
+        `expect_round`: 这发是**为第几题**生成的。由 worker 从 RIDDLE
+        payload 原样带回, 引擎据此丢弃迟到交付(Step 06 的 stale gate)。
         """
         r = _spec_to_riddle(spec)
         self._dispatch(self.engine.submit_riddle(
@@ -541,7 +550,7 @@ class Director:
             error=r.error, usage=r.usage, model=r.model,
             solve_atoms=r.solve_atoms, fair_clues=r.fair_clues,
             signature=spec.signature.to_dict(),
-            spec=spec, source=source))
+            spec=spec, source=source, expect_round=expect_round))
 
     def _pick_blueprint(self, recent: list, rng=None):
         """选下一条 blueprint(方案 §11 的 weighted-LRU)。

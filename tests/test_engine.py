@@ -2221,6 +2221,105 @@ def test_ack_action_is_pure_broadcast():
         check(f"不含 {bad.value}", bad not in kinds(acts), kinds(acts))
 
 
+def _to_next_setting(eng, clk):
+    """把引擎从第 N 题的 QA 推到第 N+1 题的 SETTING。"""
+    eng._enter_revealing_locked(0.0, "giveup", "")
+    clk.advance(30.0)
+    eng.tick(clk.t)
+    if eng.phase != Phase.SETTING:
+        eng.phase = Phase.SETTING
+    return eng.round_index
+
+
+# ======================================================================
+# Step 06 — spec identity / stale worker gate
+# ======================================================================
+def test_riddle_action_carries_expect_round():
+    """RIDDLE 动作必须带上"这一发是为第几题要的"。"""
+    print("\n[S06-1] RIDDLE 动作带 expect_round")
+    eng, clk = boot(mkcfg())
+    _to_next_setting(eng, clk)
+    act = eng._riddle_action_locked("riddle")
+    check("payload 里有 expect_round", "expect_round" in act.payload, act.payload)
+    check("expect_round == 当前 round_index",
+          act.payload["expect_round"] == eng.round_index,
+          (act.payload.get("expect_round"), eng.round_index))
+
+
+def test_stale_worker_return_is_discarded():
+    """**核心**: 上一题的 worker 迟到 -> 不得写进下一题。
+
+    故障链(修之前真实存在):
+        第 N 题 worker 发出(慢)
+        引擎超时/异常 -> 回到 SETTING 重试
+        第 N+1 题 worker 很快返回 -> 上屏, 进入 QA
+        第 N 题 worker 终于返回 -> 若此刻 phase 又是 SETTING(下一题
+        已在出题), 旧交付会被当成**新题的**, 于是谜面错、题号却递增。
+    """
+    print("\n[S06-2] 迟到交付被丢弃")
+    eng, clk = boot(mkcfg())
+    _to_next_setting(eng, clk)
+    cur = eng.round_index
+    # 一个"上一题"的迟到交付: expect_round 是更早的题号
+    stale = cur - 1
+    before = eng._puzzle
+    acts = eng.submit_riddle("一道迟到的旧谜面。为什么?", "旧谜底。",
+                             ["h1", "h2", "h3"], title="旧的",
+                             expect_round=stale)
+    check("迟到交付被丢弃(无动作)", acts == [], acts)
+    check("阶段没变", eng.phase == Phase.SETTING, eng.phase)
+    check("题号没被推进", eng.round_index == cur, (eng.round_index, cur))
+    check("当前题面没被旧内容覆盖", eng._puzzle == before, eng._puzzle)
+
+
+def test_matching_round_is_accepted():
+    """回归: 题号匹配的正常交付照常接受(别把门关过头)。"""
+    print("\n[S06-3] 题号匹配 -> 正常接受")
+    eng, clk = boot(mkcfg())
+    _to_next_setting(eng, clk)
+    cur = eng.round_index
+    acts = eng.submit_riddle("一道正常的新谜面。为什么?", "新谜底。",
+                             ["h1", "h2", "h3"], title="新的",
+                             expect_round=cur)
+    check("被接受", bool(acts), acts)
+    check("进入了 QA", eng.phase == Phase.QA, eng.phase)
+    check("题号推进", eng.round_index == cur + 1, (eng.round_index, cur))
+
+
+def test_expect_round_none_keeps_legacy_behavior():
+    """`expect_round=None`(老调用方/测试)不做身份校验 —— 兼容保留。"""
+    print("\n[S06-4] expect_round=None 保持旧行为")
+    eng, clk = boot(mkcfg())
+    _to_next_setting(eng, clk)
+    acts = eng.submit_riddle("一道不带题号的谜面。为什么?", "谜底。",
+                             ["h1", "h2", "h3"], title="无题号")
+    check("照常被接受", bool(acts), acts)
+    check("进入 QA", eng.phase == Phase.QA, eng.phase)
+
+
+def test_stale_return_cannot_advance_archive_identity():
+    """迟到交付被丢弃后, **指纹/来源/题号**都不能被它改掉。
+
+    这是"跨题 stale 写入"的实际危害面: 若旧交付被接受, archive 会记下
+    「第 N+1 题」的题号 + 「第 N 题」的谜面/来源。
+    """
+    print("\n[S06-5] 迟到交付不改指纹/来源")
+    eng, clk = boot(mkcfg())
+    _to_next_setting(eng, clk)
+    cur = eng.round_index
+    sig_before = list(eng._recent_signatures)
+    src_before = eng._spec_source
+    eng.submit_riddle("迟到的旧谜面。为什么?", "旧谜底。", ["h1", "h2", "h3"],
+                      title="旧的", source="pool",
+                      signature={"mechanism_family": "hidden_function",
+                                 "solution_shape": "hidden_function_explains_behavior"},
+                      expect_round=cur - 1)
+    check("指纹没被写入", list(eng._recent_signatures) == sig_before,
+          eng._recent_signatures)
+    check("来源没被改", eng._spec_source == src_before,
+          (eng._spec_source, src_before))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -2287,6 +2386,12 @@ def main():
              test_director_hint_exception_clears_pending,
              test_director_hint_success_still_works,
              # ---- Q7 ----
+             # ---- Step 06: spec identity / stale worker gate ----
+             test_riddle_action_carries_expect_round,
+             test_stale_worker_return_is_discarded,
+             test_matching_round_is_accepted,
+             test_expect_round_none_keeps_legacy_behavior,
+             test_stale_return_cannot_advance_archive_identity,
              test_archive_writes_full_schema,
              test_archive_metrics_survive_missing_spec,
              test_archive_fallback_does_not_inherit_previous_metrics,

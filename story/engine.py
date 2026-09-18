@@ -628,11 +628,38 @@ class RoundEngine:
                       fair_clues: Optional[list] = None,
                       signature: Optional[dict] = None,
                       spec: Optional[PuzzleSpec] = None,
-                      source: str = "live_generate"
+                      source: str = "live_generate",
+                      expect_round: Optional[int] = None
                       ) -> list[EngineAction]:
+        """交付一道题。
+
+        ## `expect_round`: 挡住"上一题的 worker 迟到"
+
+        `if self.phase != Phase.SETTING` 只挡住"此刻不在等题"。它**挡不住**
+        这一种真实情形:
+
+            第 N 题   worker 发出 (gen_spec, 10–40s)
+            ...超时/异常, 引擎回到 SETTING 重试
+            第 N+1 题 worker 发出并很快返回 -> 上屏, 进入 QA
+            第 N 题   worker **终于**返回 -> 此刻 phase 已经是
+                      SETTING(下一题)或 QA
+
+        若正好落在下一题的 SETTING 窗口里, 旧的返回会被当成**新题的**
+        交付 —— 谜面是旧的、`_puzzle_index` 却递增, 于是配额/archive/
+        used ledger 全部记错题。这是"跨题 stale 写入"。
+
+        `expect_round` 让调用方声明"我这一发是为第几题出的"。与当前
+        `round_index` 不符即丢弃。默认 None = 不做该检查(老调用方/测试
+        兼容), 但**生产路径必须传**。
+        """
         now = self._now(now)
         with self._lock:
             if self._stopped:
+                return []
+            # ---- 身份校验(stale worker gate) ----
+            if expect_round is not None and expect_round != self.round_index:
+                log.info("丢弃迟到交付: 该发是为第 %s 题出的, 当前第 %d 题",
+                         expect_round, self.round_index)
                 return []
             self._touch_meta(usage, model, error)
             if self.phase != Phase.SETTING:
@@ -921,6 +948,14 @@ class RoundEngine:
         """
         p = {"reason": reason}
         p.update(self._generation_inputs_locked())
+        # `expect_round`: 这一发是**为第几题**要的。worker 交付时必须
+        # 原样带回, `submit_riddle` 会拿它与当前 `round_index` 比对 ——
+        # 不符即丢弃。见 `submit_riddle` 的 `expect_round` 说明。
+        #
+        # 在**动作生成时**取值(而不是 worker 返回时): 那才是"这一发属于
+        # 哪一题"的真实时刻。`_enter_setting_locked` 已经把 round_index
+        # 推进到"正在要的这一题", 所以这里读到的就是目标题号。
+        p["expect_round"] = self.round_index
         if attempt:
             p["attempt"] = attempt
         return EngineAction(ActionKind.RIDDLE, p)
