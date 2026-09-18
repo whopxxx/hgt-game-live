@@ -366,7 +366,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--playtest", dest="playtest_enabled",
                     action="store_true",
                     help="后台补池时先用 AI 玩家试玩一遍, 只有猜得中才入池"
-                         "(默认关闭)。会让补池变慢很多: 每道题多 2N 次调用")
+                         "(默认关闭)。会让补池变慢很多: 每道题多约 2N~3N 次"
+                         "调用(N=轮数)。每轮是 Player + answer, 而 answer "
+                         "一旦把该句判为 solution_candidate 还会再调一次 "
+                         "Final Judge, 所以单轮最坏 3 次")
     ap.add_argument("--playtest-max-turns", type=int, default=10,
                     help="AI 试玩最多几轮, 默认 10")
 
