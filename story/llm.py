@@ -366,6 +366,12 @@ def _hint_leaks(hint: str, focus: Optional[dict]) -> str:
         return ""
     targets = list(focus.get("forbidden_core_terms") or [])
     targets += list(focus.get("focus_fact_texts") or [])
+    # `focus_atom` 也要查(第三轮 review): prompt 里把整条 solve atom 原样
+    # 交给了模型, 而 atom 本身往往就等于答案("灯是在标礁石, 而不是给船
+    # 引路")。若模型几乎照搬 atom, 但用词与 fact 的前 6 字不同, 只查
+    # fact 文本就会漏掉。
+    if focus.get("focus_atom"):
+        targets.append(focus["focus_atom"])
     hn = normalize_for_match(hint)
     for t in targets:
         tn = normalize_for_match(t)
@@ -1482,6 +1488,10 @@ class PuzzleWriter:
         m = {"generation_attempts": 0, "review_calls": 0, "rewrite_count": 0}
         m["review_issues"] = []
         m["review_decision"] = ""
+        # 审稿**累计**耗时(第三轮 review): 一题可能审多次, 所以是 total。
+        # 复盘时用 total / review_calls 自己算均值 —— 只存"最后一次"
+        # 会把"审了 5 次"的题算得和"审了 1 次"一样快。
+        m["review_latency_ms_total"] = 0
         # P1(第二轮 review): `blueprint=None` **不再**暗含"用默认 blueprint"。
         # 早先 `blueprint or PuzzleBlueprint()` 会把"没给"变成"固定成
         # information_gap / information_advantage / daily / neutral / instant"
@@ -1544,8 +1554,10 @@ class PuzzleWriter:
             # ---- ③ reviewer(需要语义理解的才交给它) ----
             # 格式问题(人称/问句/meta)作为 must_fix 点名让它改 ——
             # 这三样都是"改一句话", 重出整题是浪费。
+            _tr = _t.monotonic()
             reviewed, why, need_rewrite = self._review_spec(
                 spec, bp, must_fix=vr.must_fix())
+            m["review_latency_ms_total"] += int((_t.monotonic() - _tr) * 1000)
             m["review_calls"] += 1
             m["review_decision"] = (self._last_review_decision or "").lower()
             if self._last_review_issues:
@@ -1607,6 +1619,11 @@ class PuzzleWriter:
             m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
             m["ok"] = True
             spec.metrics = dict(m)
+            # 显式 provenance(第三轮 review): 不从 blueprint 的**值**推断
+            # "这题有没有真的被分配 blueprint" —— 调度器完全可能合法地
+            # 选中 information_gap + information_advantage, 那种题是**有**
+            # blueprint 的。值推断两个方向都会错。
+            spec.blueprint_specified = bool(enforce_blueprint)
             return spec
 
         # ---- 重试耗尽: **绝不能**把被拒的稿子当结果返回 ----
@@ -1972,6 +1989,11 @@ class PuzzleWriter:
             blueprint=bp, signature=sig,
             prompt_version=spec.prompt_version,
             quality_policy_version=spec.quality_policy_version,
+            # provenance 与 metrics 都要**原样带过**。审稿只改内容,
+            # 不改"这题是怎么来的" —— 早先这里重建 spec 时漏掉它们,
+            # 于是过审的题 provenance 全变 False(和 P0-5 同一类错)。
+            blueprint_specified=spec.blueprint_specified,
+            metrics=dict(spec.metrics or {}),
             usage=spec.usage, model=spec.model), ""
 
     # ------------------------------------------------------------------
@@ -2227,6 +2249,7 @@ class PuzzleWriter:
         自动退回旧行为 —— 不能因为升级提示系统就让兜底题没有提示。
         """
         given = [g for g in (given or []) if g]
+        last_safe: Optional[str] = None      # 见过的最干净的提示(不含泄底)
         # ---- 代码侧挑方向(方案 §33) ----
         if focus is None and spec is not None:
             try:
@@ -2276,18 +2299,30 @@ class PuzzleWriter:
             if not h:
                 return None, res.error
             # ---- 泄漏检查: 提示里不能出现 core hidden fact 的原话 ----
+            # **泄底与重复的容忍策略必须分开**(第三轮 review):
+            #   - 重复: 三次都重复 -> 挑一条认了, 总比没有提示强。
+            #   - 泄底: 三次都泄底 -> **绝不能认**。那等于"泄漏检测形同
+            #     虚设", 只要模型坚持三次就能把答案说出来。
             leak = _hint_leaks(h, focus)
             if leak:
                 log.info("提示泄漏了 fact, 重出(第 %d 次): %r ~ %r",
                          attempt + 1, h[:30], leak[:30])
                 given = given + [h]
                 continue
-            # 跟已给过的**完全相同或高度相似** -> 让模型重来
+            # 到这里说明**这条提示是干净的** —— 记下来当兜底候选。
+            last_safe = h
             if not _hint_repeated(h, given):
                 return h, res.error
             log.info("提示与已给过的重复, 重出(第 %d 次): %r", attempt + 1, h[:30])
             given = given + [h]        # 明确告诉它"这条也不行"
-        return h, None                 # 三次都不过 -> 认了, 总比没有强
+        # ---- 三次用完 ----
+        if last_safe:
+            # 只是重复(或有别的瑕疵), 但**没泄底** -> 可以用。
+            return last_safe, None
+        # 三次全部泄底 -> 宁可不给提示, 也不能把答案说出去。
+        # engine 见到 None 就不会把这条上屏(提示额度也不该被消耗)。
+        log.warning("连续 %d 条提示都存在泄底风险, 放弃本次提示", attempt + 1)
+        return None, "连续生成的提示都存在泄底风险"
 
     # ------------------------------------------------------------------
     def reveal(self, puzzle: str, answer: str, reason: str,

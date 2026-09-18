@@ -164,9 +164,6 @@ class Director:
         # 出题 worker 因锁被占而推迟时的标志 —— 下一拍 tick 补发。
         # 出题是直播的命脉, 不能因为"当时正忙"就静默丢掉。
         self._deferred_riddle = False
-        # 当前这一题的 spec —— archive metrics 要读它的 .metrics
-        # (方案 §35 的 generation_attempts / review_decision 等)。
-        self._current_spec = None
         # 逐条秒回: 独立的 ANSWER 并发池(与 qa_max_inflight 对齐)
         self._answer_pool: ThreadPoolExecutor | None = None
         if not cfg.no_llm:
@@ -360,7 +357,6 @@ class Director:
             failure: Optional[str] = None
             try:
                 if self.cfg.no_llm or not self.writer:
-                    self._current_spec = None
                     res_p, res_a = self._fake_riddle()
                     self._dispatch(self.engine.submit_riddle(
                         res_p, res_a, list(P.FALLBACK_HINTS),
@@ -377,7 +373,6 @@ class Director:
                     # 只有**通过质量门**的 spec 才允许上直播。
                     # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
                     if spec.puzzle and not spec.error:
-                        self._current_spec = spec
                         r = _spec_to_riddle(spec)
                         self._dispatch(self.engine.submit_riddle(
                             r.puzzle, r.answer, r.hints, r.title,
@@ -516,7 +511,17 @@ class Director:
             blueprint_specified=spec_d.get("blueprint_specified"),
             signature_present=spec_d.get("signature_present"),
             # ---- metrics(方案 §35) ----
-            metrics=self._round_metrics(snap),
+            # **必须把本题的 spec 传进去**(第三轮 review): 早先
+            # `_round_metrics` 自己去读 `self._current_spec`, 而那是
+            # Director 侧的状态。真实路径会串题:
+            #   第 10 题生成成功 -> _current_spec = 第10题
+            #   第 11 题连续生成失败 -> Engine 内部走结构化兜底,
+            #                        Director 的 _current_spec **没被更新**
+            #   揭晓第 11 题 -> payload 是第11题兜底 spec, 但指标读到的
+            #                  还是第10题的 -> 兜底题被记成
+            #                  generated=true / attempts=2, 全错。
+            # 现在只相信 REVEAL payload 里那个 spec。
+            metrics=self._round_metrics(snap, spec),
             ts=time.time(), model=model)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.cfg.puzzle_out_path)),
@@ -531,7 +536,7 @@ class Director:
             self.engine.stop("谜题落盘失败，请检查磁盘与输出路径")
             self._stop.set()
 
-    def _round_metrics(self, snap) -> dict:
+    def _round_metrics(self, snap, spec=None) -> dict:
         """这一题的运行指标(方案 §35)。
 
         目标是把"下一轮直播该看什么"直接算好落盘, 而不是事后翻日志:
@@ -566,9 +571,9 @@ class Director:
             "solved": bool(snap.solved),
         }
         # ---- 生成/审稿指标(方案 §35) ----
-        # 落在 spec.metrics 上(gen_spec 填的)。兜底题没有 spec -> 就没有
-        # 这一段, 那本身也是有用信息: 一眼看出这题不是生成的。
-        gen = dict(getattr(self._current_spec, "metrics", None) or {})
+        # 只看**传入的本题 spec**。绝不回退到 Director 的 _current_spec ——
+        # 那是"最近一次生成成功"的题, 兜底题时会指向上一题。
+        gen = dict(getattr(spec, "metrics", None) or {})
         out.update({
             "generation_attempts": gen.get("generation_attempts", 0),
             "generation_latency_ms": gen.get("generation_latency_ms", 0),
@@ -576,6 +581,7 @@ class Director:
             "review_decision": gen.get("review_decision", ""),
             "review_issues": gen.get("review_issues", []),
             "rewrite_count": gen.get("rewrite_count", 0),
+            "review_latency_ms_total": gen.get("review_latency_ms_total", 0),
             "generated": bool(gen),
         })
         return out

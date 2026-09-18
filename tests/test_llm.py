@@ -1742,6 +1742,125 @@ def test_review_issues_recorded():
 
 
 
+def test_hint_never_returns_leaking_hint_when_exhausted():
+    """Q6 blocker(第三轮 review): 三次全泄底时**绝不返回**泄底提示。
+
+    早先的收尾是 `return h, None` —— 它分不清"三次只是重复"和
+    "三次全部泄底"。于是模型只要坚持三次把答案说出来, 第三条照上屏,
+    泄漏检测形同虚设。
+
+    重复可以认(挑一条最不重复的, 总比没提示强); **泄底不能认**。
+    """
+    from story.puzzle import PuzzleSpec
+    sp = PuzzleSpec.from_dict(riddle())
+    leak = "灯的真正作用是标示礁石位置。"
+    # 三次全部泄底
+    fc = FakeClient([LLMResult(tool_input={"hint": leak}),
+                     LLMResult(tool_input={"hint": leak + "。"}),
+                     LLMResult(tool_input={"hint": leak + "！"})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    h, err = w.hint("谜面", "谜底", 1, [], spec=sp)
+    check("三次全泄底 -> 不给提示", h is None, h)
+    check("给出原因", bool(err) and "泄底" in err, err)
+    check("三次都试过了", len(fc.calls) == 3, len(fc.calls))
+
+
+def test_hint_uses_last_safe_when_only_repeated():
+    """Q6 final: 只是**重复**(没泄底)时, 三次耗尽可以认一条干净的。
+
+    这是刻意的区分: 重复的代价只是"观众觉得提示没用", 而泄底的代价
+    是"整道题废掉"。两者不能用同一条兜底策略。
+    """
+    from story.puzzle import PuzzleSpec
+    sp = PuzzleSpec.from_dict(riddle())
+    same = "再想想灯是用来做什么的。"
+    fc = FakeClient([LLMResult(tool_input={"hint": same}),
+                     LLMResult(tool_input={"hint": same}),
+                     LLMResult(tool_input={"hint": same})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    # 把它当成"已经给过"的 -> 每次都被判重复
+    h, err = w.hint("谜面", "谜底", 2, [same], spec=sp)
+    check("重复三次仍给出一条(干净的)", h == same, (h, err))
+    check("没有报泄底", not err or "泄底" not in err, err)
+
+
+def test_hint_leak_check_includes_focus_atom():
+    """Q6 final: `focus_atom` 也要查 —— prompt 里把整条 atom 给了模型。
+
+    atom 本身往往就等于答案("灯是在标礁石, 而不是给船引路")。
+    只查 fact 文本的话, 模型照搬 atom 而用词与 fact 前 6 字不同就会漏。
+    """
+    from story.llm import _hint_leaks
+    focus = {"focus_atom": "灯是在标礁石, 而不是给船引路",
+             "forbidden_core_terms": [],
+             "focus_fact_texts": []}
+    check("照搬 atom -> 拦",
+          _hint_leaks("灯是在标礁石, 而不是给船引路。", focus) != "", "应拦住")
+    check("正常引导仍不拦",
+          _hint_leaks("想想他为什么挑那个时间开灯。", focus) == "",
+          _hint_leaks("想想他为什么挑那个时间开灯。", focus))
+
+
+def test_gen_spec_records_review_latency_total():
+    """Q7(第三轮 review): 审稿耗时是累计值, 不是最后一次。"""
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_rewrite("不行")),
+                     LLMResult(tool_input=riddle(puzzle="二稿。为什么?")),
+                     LLMResult(tool_input=review_ok("二稿。为什么?"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    m = spec.metrics
+    check("有 review_latency_ms_total",
+          isinstance(m.get("review_latency_ms_total"), int), m)
+    check("两次审稿都计入了(值 >= 0)",
+          m.get("review_latency_ms_total") >= 0, m)
+    check("review_calls=2 可算均值", m.get("review_calls") == 2, m)
+
+
+def test_blueprint_specified_is_explicit_not_inferred():
+    """Q7(第三轮 review): provenance 必须显式, 不能从 blueprint 值推断。
+
+    调度器**完全可能合法地**选中 information_gap + information_advantage
+    —— 那种题是有 blueprint 的。靠"值等于默认值就判 False"会把它误标,
+    统计污染只是换了个方向。
+    """
+    from story.puzzle import PuzzleBlueprint, PuzzleSpec
+    # 一个 domain/relation 都是真实调度结果、但 family/shape 恰好是默认值的题
+    bp = PuzzleBlueprint(mechanism_family="information_gap",
+                         solution_shape="information_advantage",
+                         domain="aviation", relation="colleague")
+    gen = riddle()
+    gen["signature"].update({"mechanism_family": "information_gap",
+                             "solution_shape": "information_advantage",
+                             "domain": "aviation", "relation": "colleague"})
+    gen["blueprint"] = bp.to_dict()
+    # 审稿人的观察必须与 blueprint 一致, 否则会被正确拒掉(那是另一条测试)
+    obs = dict(gen["signature"])
+    fc = FakeClient([LLMResult(tool_input=gen),
+                     LLMResult(tool_input=review_ok(observed_signature=obs))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=bp)
+    check("恰好是默认值但确实是调度出来的 -> True",
+          spec.blueprint_specified is True, spec.blueprint_specified)
+    check("archive 如实落盘",
+          spec.to_archive().get("blueprint_specified") is True,
+          spec.to_archive().get("blueprint_specified"))
+
+    # 自由生成(不施加 blueprint) -> False
+    fc2 = FakeClient([LLMResult(tool_input=riddle()),
+                      LLMResult(tool_input=review_ok())])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    spec2 = w2.gen_spec(blueprint=None, enforce_blueprint=False)
+    check("自由生成 -> False", spec2.blueprint_specified is False,
+          spec2.blueprint_specified)
+
+    # round-trip 不能丢
+    sp = PuzzleSpec.from_dict(spec.to_archive())
+    check("round-trip 保住 provenance",
+          sp.blueprint_specified is True, sp.blueprint_specified)
+
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -1783,6 +1902,11 @@ def main():
               test_touched_fact_ids_filtered,
               test_candidate_definition_documented,
               # ---- Q6 / Q7 ----
+              test_hint_never_returns_leaking_hint_when_exhausted,
+              test_hint_uses_last_safe_when_only_repeated,
+              test_hint_leak_check_includes_focus_atom,
+              test_gen_spec_records_review_latency_total,
+              test_blueprint_specified_is_explicit_not_inferred,
               test_hint_is_fact_aware,
               test_hint_without_spec_still_works,
               test_hint_rejects_leaked_fact,

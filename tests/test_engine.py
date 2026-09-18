@@ -999,7 +999,7 @@ def test_archive_writes_full_schema():
     sp.metrics = {"generation_attempts": 2, "generation_latency_ms": 4123,
                   "review_calls": 1, "review_decision": "fix",
                   "review_issues": ["第一人称"], "rewrite_count": 0, "ok": True}
-    d._current_spec = sp
+    sp.blueprint_specified = True
     d.engine.submit_riddle(sp.puzzle, sp.answer, ["h"], spec=sp)
     d._archive_reveal({"puzzle": sp.puzzle, "answer": sp.answer,
                        "reason": "giveup", "winner": "",
@@ -1056,8 +1056,10 @@ def test_archive_metrics_survive_missing_spec():
 
     d = Director(cfg)
     d.engine.start()
-    d._current_spec = None                 # 兜底题: 没有 spec
     d.engine.submit_riddle("兜底谜面。为什么?", "兜底谜底。", ["h"])
+    # spec=None 是"真的什么 spec 都没有"的极端情况(老 archive / 手工调用),
+    # 现在真实兜底路径传的是结构化 spec —— 那条路见下面
+    # test_archive_fallback_does_not_inherit_previous_metrics。
     d._archive_reveal({"puzzle": "兜底谜面。为什么?", "answer": "兜底谜底。",
                        "reason": "giveup", "winner": "", "spec": None}, "揭晓")
     rec = json.loads(io.open(out, encoding="utf-8").read().strip())
@@ -1066,6 +1068,117 @@ def test_archive_metrics_survive_missing_spec():
     check("generated=False 标出这是兜底题", m.get("generated") is False, m)
     check("生成指标缺省为 0", m.get("generation_attempts") == 0, m)
     check("问答指标仍然有", "question_count" in m, sorted(m))
+
+
+def test_archive_fallback_does_not_inherit_previous_metrics():
+    """Q7 blocker(第三轮 review): 兜底题不能继承上一题的生成指标。
+
+    真实路径:
+        第 10 题生成成功 -> _current_spec(旧实现) = 第10题
+        第 11 题连续生成失败 -> Engine 内部走**结构化兜底**,
+                              Director 侧的"最近一次生成"没被更新
+        揭晓第 11 题 -> payload 是第11题兜底 spec, 但指标若去读
+                       Director 侧的状态, 读到的还是第10题的
+        于是第 11 题被记成 generated=true / attempts=2 —— 全错。
+
+    现在 archive 只相信 REVEAL payload 里的 spec, 所以这里必须
+    落成 generated=false / generation_attempts=0。
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_arch_test3.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    # 第 10 题: 生成成功, 指标非空
+    good = PuzzleSpec.from_dict({"puzzle": "第十题。为什么?", "answer": "底",
+                                 "facts": [{"id": "f1", "text": "事实一",
+                                            "kind": "core"}],
+                                 "solve_atoms": [
+                                     {"id": "a1", "role": "cause", "text": "c",
+                                      "fact_ids": ["f1"]},
+                                     {"id": "a2", "role": "mechanism",
+                                      "text": "m", "fact_ids": ["f1"]}],
+                                 "fair_clues": [{"quote": "第十题",
+                                                 "supports_atoms": ["a1"]}]})
+    good.metrics = {"generation_attempts": 2, "generation_latency_ms": 900,
+                    "review_calls": 1, "review_decision": "fix",
+                    "review_issues": [], "rewrite_count": 0, "ok": True}
+    good.blueprint_specified = True
+    d._archive_reveal({"puzzle": good.puzzle, "answer": good.answer,
+                       "reason": "giveup", "winner": "", "spec": good}, "揭晓")
+
+    # 第 11 题: 走**结构化兜底**(Engine 内部造的, 没有任何生成指标)
+    fallback = PuzzleSpec.from_dict({
+        "puzzle": "兜底题。为什么?", "answer": "兜底底",
+        "facts": [{"id": "f1", "text": "退潮礁石露出", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "c",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "m",
+                         "fact_ids": ["f1"]}],
+        "fair_clues": [{"quote": "兜底题", "supports_atoms": ["a1"]}]})
+    d._archive_reveal({"puzzle": fallback.puzzle, "answer": fallback.answer,
+                       "reason": "giveup", "winner": "", "spec": fallback},
+                      "揭晓")
+
+    rows = [json.loads(x) for x in
+            io.open(out, encoding="utf-8").read().strip().splitlines()]
+    check("落了两题", len(rows) == 2, len(rows))
+    m10, m11 = rows[0]["metrics"], rows[1]["metrics"]
+    check("第 10 题有生成指标", m10.get("generation_attempts") == 2, m10)
+    check("第 11 题**没有**继承第 10 题的指标(核心断言)",
+          m11.get("generation_attempts") == 0, m11)
+    check("第 11 题 generated=False", m11.get("generated") is False, m11)
+    check("第 11 题没继承 review_decision",
+          m11.get("review_decision") == "", m11)
+    check("第 11 题没继承 rewrite_count",
+          m11.get("rewrite_count") == 0, m11)
+    check("第 10 题标了 blueprint_specified",
+          rows[0].get("blueprint_specified") is True, rows[0])
+    check("第 11 题 blueprint_specified=False",
+          rows[1].get("blueprint_specified") is False, rows[1])
+
+
+def test_archive_records_review_latency_total():
+    """Q7(第三轮 review): 审稿耗时是**累计**值, 不是"最后一次"。"""
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_arch_test4.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    sp = PuzzleSpec.from_dict({
+        "puzzle": "题。为什么?", "answer": "底",
+        "facts": [{"id": "f1", "text": "事实一事实", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "c",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "m",
+                         "fact_ids": ["f1"]}],
+        "fair_clues": [{"quote": "题。为什么?", "supports_atoms": ["a1"]}]})
+    sp.metrics = {"review_calls": 3, "review_latency_ms_total": 4200}
+    d._archive_reveal({"puzzle": sp.puzzle, "answer": sp.answer,
+                       "reason": "giveup", "winner": "", "spec": sp}, "揭晓")
+    m = json.loads(io.open(out, encoding="utf-8").read().strip())["metrics"]
+    check("有 review_latency_ms_total", m.get("review_latency_ms_total") == 4200, m)
+    check("有 review_calls 可算均值", m.get("review_calls") == 3, m)
 
 
 def main():
@@ -1100,6 +1213,8 @@ def main():
              # ---- Q7 ----
              test_archive_writes_full_schema,
              test_archive_metrics_survive_missing_spec,
+             test_archive_fallback_does_not_inherit_previous_metrics,
+             test_archive_records_review_latency_total,
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,
              test_first_and_retry_riddle_actions_match,

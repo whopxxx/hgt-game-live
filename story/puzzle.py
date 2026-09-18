@@ -368,6 +368,12 @@ class PuzzleSpec:
     # 数字天然属于"这一题是怎么来的"。由 gen_spec 填, director 落盘。
     # 默认空字典 -> 老调用方/兜底题不必关心它。
     metrics: dict = field(default_factory=dict)
+    #: 这道题的 blueprint 是**真的被分配过**(调度器选的), 还是只是
+    #: dataclass 默认值? 由 gen_spec 显式写, **绝不从值推断** ——
+    #: `information_gap + information_advantage` 是合法调度结果,
+    #: 光看值分不出它和"没分配"的区别, 两个方向都会算错分布。
+    #: 兜底题 / 自由生成 / 老数据 = False。
+    blueprint_specified: bool = False
 
     # ------------------------------------------------------------------
     # 便捷访问 —— engine / llm 需要"原子事实的文本列表"这类视图
@@ -401,6 +407,7 @@ class PuzzleSpec:
             "signature": self.signature.to_dict(),
             "prompt_version": self.prompt_version,
             "quality_policy_version": self.quality_policy_version,
+            "blueprint_specified": bool(self.blueprint_specified),
         }
 
     def to_archive(self) -> dict[str, Any]:
@@ -414,7 +421,7 @@ class PuzzleSpec:
         """
         d = self.to_dict()
         d["spec_version"] = 2
-        d["blueprint_specified"] = _bp_is_specified(self.blueprint)
+        d["blueprint_specified"] = bool(self.blueprint_specified)
         d["signature_present"] = bool(
             self.signature and (self.signature.mechanism_family
                                 or self.signature.solution_shape))
@@ -439,6 +446,7 @@ class PuzzleSpec:
             signature=PuzzleSignature.from_dict(d.get("signature")),
             prompt_version=str(d.get("prompt_version", "") or ""),
             quality_policy_version=str(d.get("quality_policy_version", "") or ""),
+            blueprint_specified=bool(d.get("blueprint_specified", False)),
         )
         return spec
 
@@ -503,20 +511,6 @@ class PuzzleSpec:
 def _pick(v: Any, allowed: tuple, default: str) -> str:
     s = str(v or "").strip().lower()
     return s if s in allowed else default
-
-
-#: `PuzzleBlueprint()` 的默认值 —— 用来判断"这份 blueprint 是真分配的
-#: 还是没给所以落到默认了"。两者必须能区分, 否则 archive 的分布统计
-#: 会把所有兜底题/老数据都算成 information_gap。
-_DEFAULT_BLUEPRINT_KEY = ("information_gap", "information_advantage")
-
-
-def _bp_is_specified(bp: Any) -> bool:
-    """这份 blueprint 是真的被分配过, 还是只是 dataclass 默认值?"""
-    if bp is None:
-        return False
-    return (getattr(bp, "mechanism_family", ""),
-            getattr(bp, "solution_shape", "")) != _DEFAULT_BLUEPRINT_KEY
 
 
 def _pos_role(idx: int) -> str:
