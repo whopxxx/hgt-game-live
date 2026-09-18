@@ -164,6 +164,9 @@ class Director:
         # 出题 worker 因锁被占而推迟时的标志 —— 下一拍 tick 补发。
         # 出题是直播的命脉, 不能因为"当时正忙"就静默丢掉。
         self._deferred_riddle = False
+        # 当前这一题的 spec —— archive metrics 要读它的 .metrics
+        # (方案 §35 的 generation_attempts / review_decision 等)。
+        self._current_spec = None
         # 逐条秒回: 独立的 ANSWER 并发池(与 qa_max_inflight 对齐)
         self._answer_pool: ThreadPoolExecutor | None = None
         if not cfg.no_llm:
@@ -357,6 +360,7 @@ class Director:
             failure: Optional[str] = None
             try:
                 if self.cfg.no_llm or not self.writer:
+                    self._current_spec = None
                     res_p, res_a = self._fake_riddle()
                     self._dispatch(self.engine.submit_riddle(
                         res_p, res_a, list(P.FALLBACK_HINTS),
@@ -373,6 +377,7 @@ class Director:
                     # 只有**通过质量门**的 spec 才允许上直播。
                     # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
                     if spec.puzzle and not spec.error:
+                        self._current_spec = spec
                         r = _spec_to_riddle(spec)
                         self._dispatch(self.engine.submit_riddle(
                             r.puzzle, r.answer, r.hints, r.title,
@@ -441,7 +446,10 @@ class Director:
                 else:
                     text, err = self.writer.hint(
                         payload.get("puzzle", ""), payload.get("answer", ""),
-                        payload.get("level", 1), payload.get("given"))
+                        payload.get("level", 1), payload.get("given"),
+                        spec=payload.get("spec"),
+                        touched_fact_ids=set(payload.get("touched_fact_ids")
+                                             or ()))
                 if text:
                     self._dispatch(self.engine.submit_hint(text))
                 self.push()
@@ -502,6 +510,11 @@ class Director:
             hints=spec_d.get("hints", []),
             blueprint=spec_d.get("blueprint", {}),
             signature=spec_d.get("signature", {}),
+            # 这两个布尔是给**分析**用的: blueprint 的默认值长得和"真的
+            # 分配了 information_gap"一模一样, 不标出来, 兜底题与老数据
+            # 会被算进调度分布, 统计全错。
+            blueprint_specified=spec_d.get("blueprint_specified"),
+            signature_present=spec_d.get("signature_present"),
             # ---- metrics(方案 §35) ----
             metrics=self._round_metrics(snap),
             ts=time.time(), model=model)
@@ -534,7 +547,7 @@ class Director:
         # 后者在 no-llm / 竞态下可能和 answered 对不上(实测见到 0 vs 1),
         # 而 metrics 的用途就是"下一轮直接拿来算", 自相矛盾的数字比没有更糟。
         asked = max(int(snap.stat_questions or 0), answered)
-        return {
+        out = {
             "question_count": asked,
             "answered_count": answered,
             "dropped_count": max(int(snap.stat_dropped or 0),
@@ -552,6 +565,20 @@ class Director:
             "duration_ms": snap.puzzle_elapsed_ms,
             "solved": bool(snap.solved),
         }
+        # ---- 生成/审稿指标(方案 §35) ----
+        # 落在 spec.metrics 上(gen_spec 填的)。兜底题没有 spec -> 就没有
+        # 这一段, 那本身也是有用信息: 一眼看出这题不是生成的。
+        gen = dict(getattr(self._current_spec, "metrics", None) or {})
+        out.update({
+            "generation_attempts": gen.get("generation_attempts", 0),
+            "generation_latency_ms": gen.get("generation_latency_ms", 0),
+            "review_calls": gen.get("review_calls", 0),
+            "review_decision": gen.get("review_decision", ""),
+            "review_issues": gen.get("review_issues", []),
+            "rewrite_count": gen.get("rewrite_count", 0),
+            "generated": bool(gen),
+        })
+        return out
 
     # ---- 离线(--no-llm)用的固定内容 ----
     _FAKE_RIDDLES = (

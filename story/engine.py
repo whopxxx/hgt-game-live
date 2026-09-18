@@ -309,7 +309,9 @@ class RoundEngine:
                     return [EngineAction(ActionKind.HINT, {
                         "level": self._hints_given,
                         "puzzle": self._puzzle, "answer": self._answer,
-                        "given": list(self._hints_shown)})]
+                        "given": list(self._hints_shown),
+                        "spec": self._spec,
+                        "touched_fact_ids": sorted(self._touched_fact_ids)})]
                 return []
 
             if self.phase != Phase.QA:
@@ -701,7 +703,13 @@ class RoundEngine:
             acts.append(EngineAction(ActionKind.HINT, {
                 "level": self._hints_given,
                 "puzzle": self._puzzle, "answer": self._answer,
-                "given": list(self._hints_shown)}))
+                "given": list(self._hints_shown),
+                # ---- Q6(方案 §31/§32): fact-aware hint 的三样输入 ----
+                # `spec` 让 worker 能算出该点拨哪个方向;
+                # `touched` 是"玩家群体问过哪些方向" —— 已问过的不该再提示;
+                # 两者都**只读**地拷出去, worker 不碰引擎状态。
+                "spec": self._spec,
+                "touched_fact_ids": sorted(self._touched_fact_ids)}))
             return acts
 
         if acts:

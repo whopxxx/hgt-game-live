@@ -904,6 +904,170 @@ def test_request_riddle_action_is_public_and_matches():
           pub.payload == inner.payload, (pub.payload, inner.payload))
 
 
+def test_hint_payload_carries_spec_and_touched():
+    """Q6(方案 §31/§32): HINT 动作要带上 spec 与 touched_fact_ids。
+
+    没有这两样, worker 就只能"看着谜面随便点拨" —— 而"哪个方向还没被
+    探索过"这件事模型看不到(touched 集合在引擎里), 只能由代码告诉它。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=10.0), clock=clk)
+    eng.start()
+    from story.puzzle import PuzzleSpec
+    sp = PuzzleSpec.from_dict({
+        "puzzle": "灯塔守塔人只在退潮时亮灯。为什么?",
+        "answer": "退潮礁石露出。",
+        "facts": [{"id": "f1", "text": "退潮礁石露出", "kind": "core"},
+                  {"id": "f2", "text": "灯是标礁石", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "退潮",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "标礁石",
+                         "fact_ids": ["f2"]}],
+        "fair_clues": [{"quote": "只在退潮时亮灯", "supports_atoms": ["a1"]}],
+        "signature": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+    })
+    eng.submit_riddle(sp.puzzle, sp.answer, sp.hints, spec=sp)
+    # 模拟观众问过 f1 这个方向
+    eng._touched_fact_ids.add("f1")
+    acts = eng.tick(clk.t + 11.0)
+    hints = [a for a in acts if a.kind == ActionKind.HINT]
+    check("产出了 HINT", len(hints) == 1, acts)
+    pl = hints[0].payload
+    check("HINT 带 spec", pl.get("spec") is sp, pl.get("spec"))
+    check("HINT 带 touched_fact_ids",
+          pl.get("touched_fact_ids") == ["f1"], pl)
+    check("仍然是列表不是 set(要能进 payload)",
+          isinstance(pl.get("touched_fact_ids"), list), pl)
+
+
+def test_hint_payload_touched_is_a_copy():
+    """Q6: touched 必须是**拷贝** —— 否则 worker 读的时候引擎在改它。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=10.0), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    eng._touched_fact_ids.add("f1")
+    acts = eng.tick(clk.t + 11.0)
+    pl = [a for a in acts if a.kind == ActionKind.HINT][0].payload
+    eng._touched_fact_ids.add("f2")
+    check("touched 是拷贝", pl["touched_fact_ids"] == ["f1"],
+          pl["touched_fact_ids"])
+
+
+def test_archive_writes_full_schema():
+    """Q7(方案 §34/§35): archive 必须写出完整 schema + 生成指标。
+
+    以前只存 puzzle/answer —— 赛后复盘"这题为什么判错"时,
+    facts/atoms/clues/blueprint 全都没有, 只能去翻日志。
+    另外 §35 的过程指标(几稿出成 / 审稿打了什么)也必须落盘,
+    否则"出题质量在变好还是变坏"根本无从判断。
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_arch_test.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    sp = PuzzleSpec.from_dict({
+        "puzzle": "灯塔题。为什么?", "answer": "礁石。",
+        "facts": [{"id": "f1", "text": "退潮礁石露出", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "退潮",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "标礁石",
+                         "fact_ids": ["f1"]}],
+        "fair_clues": [{"quote": "只在退潮时亮灯", "supports_atoms": ["a1"]}],
+        "signature": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+        "blueprint": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+    })
+    sp.prompt_version = "riddle-v3"
+    sp.quality_policy_version = "quality-v3"
+    sp.metrics = {"generation_attempts": 2, "generation_latency_ms": 4123,
+                  "review_calls": 1, "review_decision": "fix",
+                  "review_issues": ["第一人称"], "rewrite_count": 0, "ok": True}
+    d._current_spec = sp
+    d.engine.submit_riddle(sp.puzzle, sp.answer, ["h"], spec=sp)
+    d._archive_reveal({"puzzle": sp.puzzle, "answer": sp.answer,
+                       "reason": "giveup", "winner": "",
+                       "solve_atoms": [], "fair_clues": [], "spec": sp}, "揭晓")
+
+    rec = json.loads(io.open(out, encoding="utf-8").read().strip())
+    # ---- §34 的字段 ----
+    for k in ("spec_version", "prompt_version", "quality_policy_version",
+              "blueprint", "signature", "puzzle", "answer", "facts",
+              "solve_atoms", "fair_clues", "hints", "qa", "winner",
+              "reason", "metrics"):
+        check(f"archive 有 {k}", k in rec, sorted(rec))
+    check("spec_version=2", rec.get("spec_version") == 2, rec.get("spec_version"))
+    check("prompt_version 落盘", rec.get("prompt_version") == "riddle-v3", rec)
+    check("policy_version 落盘",
+          rec.get("quality_policy_version") == "quality-v3", rec)
+    check("facts 落盘", len(rec.get("facts") or []) == 1, rec.get("facts"))
+    check("blueprint 落盘",
+          rec.get("blueprint", {}).get("mechanism_family") == "hidden_function",
+          rec.get("blueprint"))
+    check("标出 blueprint 是真分配的", rec.get("blueprint_specified") is True, rec)
+    check("标出 signature 存在", rec.get("signature_present") is True, rec)
+
+    # ---- §35 的指标 ----
+    m = rec.get("metrics", {})
+    check("metrics.generation_attempts", m.get("generation_attempts") == 2, m)
+    check("metrics.generation_latency_ms", m.get("generation_latency_ms") == 4123, m)
+    check("metrics.review_calls", m.get("review_calls") == 1, m)
+    check("metrics.review_decision", m.get("review_decision") == "fix", m)
+    check("metrics.review_issues", m.get("review_issues") == ["第一人称"], m)
+    check("metrics.generated=True", m.get("generated") is True, m)
+    for k in ("hint_calls", "question_count", "answered_count",
+              "duration_ms", "judge_calls", "answer_calls",
+              "solution_candidate_count", "unavailable_count"):
+        check(f"metrics 有 {k}", k in m, sorted(m))
+
+
+def test_archive_metrics_survive_missing_spec():
+    """Q7: 兜底题(没有 spec)落盘时不能炸 —— 指标段整体缺省即可。
+
+    "没有生成指标"本身就是有用信息: 一眼看出这题不是生成出来的。
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_arch_test2.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    d._current_spec = None                 # 兜底题: 没有 spec
+    d.engine.submit_riddle("兜底谜面。为什么?", "兜底谜底。", ["h"])
+    d._archive_reveal({"puzzle": "兜底谜面。为什么?", "answer": "兜底谜底。",
+                       "reason": "giveup", "winner": "", "spec": None}, "揭晓")
+    rec = json.loads(io.open(out, encoding="utf-8").read().strip())
+    m = rec.get("metrics", {})
+    check("没有 spec 也能落盘", bool(rec.get("puzzle")), rec.get("puzzle"))
+    check("generated=False 标出这是兜底题", m.get("generated") is False, m)
+    check("生成指标缺省为 0", m.get("generation_attempts") == 0, m)
+    check("问答指标仍然有", "question_count" in m, sorted(m))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -931,6 +1095,11 @@ def main():
              test_fallback_does_not_pollute_quota,
              test_fallback_rotates,
              test_request_riddle_action_is_public_and_matches,
+             test_hint_payload_carries_spec_and_touched,
+             test_hint_payload_touched_is_a_copy,
+             # ---- Q7 ----
+             test_archive_writes_full_schema,
+             test_archive_metrics_survive_missing_spec,
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,
              test_first_and_retry_riddle_actions_match,

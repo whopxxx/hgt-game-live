@@ -45,7 +45,12 @@ def main(argv=None) -> int:
     report_only = "--report" in argv
 
     cfg = Config()
-    w = PuzzleWriter(client=AnthropicMessagesClient(cfg.llm))
+    # **必须**把 runtime_cfg 传进去: 否则 judge_temperature 不生效,
+    # 这个套件就在用网关默认温度跑。实测同一份代码两次跑会一次误判
+    # (false positive)一次漏判(false negative) —— 温度没钉住的金标准
+    # 是测不出回归的, 只会让人以为是模型"手气不好"。
+    w = PuzzleWriter(client=AnthropicMessagesClient(cfg.llm),
+                     runtime_cfg=cfg)
     rows = load_golden()
 
     tp = tn = fp = fn = 0

@@ -363,6 +363,11 @@ class PuzzleSpec:
     usage: Optional[dict] = None
     model: Optional[str] = None
     error: Optional[str] = None
+    # ---- 生成/审稿过程指标(方案 §35) ----
+    # 放在 spec 上而不是另开一条通道: archive 是**按题**写的, 而这些
+    # 数字天然属于"这一题是怎么来的"。由 gen_spec 填, director 落盘。
+    # 默认空字典 -> 老调用方/兜底题不必关心它。
+    metrics: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # 便捷访问 —— engine / llm 需要"原子事实的文本列表"这类视图
@@ -399,9 +404,20 @@ class PuzzleSpec:
         }
 
     def to_archive(self) -> dict[str, Any]:
-        """落盘用(方案 §34)。含 spec_version, 便于以后迁移。"""
+        """落盘用(方案 §34)。含 spec_version, 便于以后迁移。
+
+        `blueprint_specified`: 这道题**有没有**真的被分配 blueprint。
+        为什么需要这个布尔: `PuzzleBlueprint()` 的默认值长得和"真的
+        分配了 information_gap"一模一样, 落盘后无法区分。分析时若把
+        默认值当成真实调度结果, 分布统计就全错了(兜底题/老数据都会
+        混进来)。所以显式记一个标记。
+        """
         d = self.to_dict()
         d["spec_version"] = 2
+        d["blueprint_specified"] = _bp_is_specified(self.blueprint)
+        d["signature_present"] = bool(
+            self.signature and (self.signature.mechanism_family
+                                or self.signature.solution_shape))
         return d
 
     @classmethod
@@ -487,6 +503,20 @@ class PuzzleSpec:
 def _pick(v: Any, allowed: tuple, default: str) -> str:
     s = str(v or "").strip().lower()
     return s if s in allowed else default
+
+
+#: `PuzzleBlueprint()` 的默认值 —— 用来判断"这份 blueprint 是真分配的
+#: 还是没给所以落到默认了"。两者必须能区分, 否则 archive 的分布统计
+#: 会把所有兜底题/老数据都算成 information_gap。
+_DEFAULT_BLUEPRINT_KEY = ("information_gap", "information_advantage")
+
+
+def _bp_is_specified(bp: Any) -> bool:
+    """这份 blueprint 是真的被分配过, 还是只是 dataclass 默认值?"""
+    if bp is None:
+        return False
+    return (getattr(bp, "mechanism_family", ""),
+            getattr(bp, "solution_shape", "")) != _DEFAULT_BLUEPRINT_KEY
 
 
 def _pos_role(idx: int) -> str:

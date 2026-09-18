@@ -1628,6 +1628,120 @@ def test_enforce_blueprint_false_truly_skips():
 
 
 
+def test_hint_is_fact_aware():
+    """Q6(方案 §31): 提示必须拿到 facts/atoms/touched, 而不是只看谜面。"""
+    from story.puzzle import PuzzleSpec
+    sp = PuzzleSpec.from_dict(riddle())
+    fc = FakeClient([LLMResult(tool_input={"hint": "想想他为什么挑那个时间。"})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    h, err = w.hint("谜面", "谜底", 1, [], spec=sp, touched_fact_ids={"f1"})
+    check("给出了提示", bool(h), (h, err))
+    user = fc.calls[0]["user"]
+    check("prompt 有'要点拨的方向'", "要点拨的方向" in user, user[:400])
+    check("prompt 有禁止说出段", "禁止说出" in user, user[:600])
+    check("prompt 带了 touched 信息", "已经问过的方向" in user, user[:800])
+    check("用了 hint_temperature",
+          fc.calls[0]["temperature"] == 0.5, fc.calls[0]["temperature"])
+
+
+def test_hint_without_spec_still_works():
+    """Q6: 没有 spec 的兜底题也必须有提示 —— 升级不能把这条路堵死。"""
+    fc = FakeClient([LLMResult(tool_input={"hint": "注意顺序。"})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    h, err = w.hint("谜面", "谜底", 1, [])
+    check("无 spec 仍给出提示", bool(h), (h, err))
+    check("无 spec 时 prompt 不含方向段",
+          "要点拨的方向" not in fc.calls[0]["user"], fc.calls[0]["user"][:300])
+
+
+def test_hint_rejects_leaked_fact():
+    """Q6: 提示直接说出 core hidden fact -> 重出, 不让它上屏。"""
+    from story.puzzle import PuzzleSpec
+    sp = PuzzleSpec.from_dict(riddle())
+    leak = "灯的真正作用是标示礁石位置的位置。"
+    fc = FakeClient([
+        LLMResult(tool_input={"hint": leak}),
+        LLMResult(tool_input={"hint": "想想他为什么挑退潮那会儿。"}),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    h, err = w.hint("谜面", "谜底", 1, [], spec=sp)
+    check("泄漏的那条被换掉", h != leak, h)
+    check("重出过一次", len(fc.calls) == 2, len(fc.calls))
+    check("最终给的是干净的那条", "退潮" in (h or ""), h)
+
+
+def test_hint_leak_checker_does_not_overblock():
+    """Q6: 泄漏检查要**保守** —— 共享几个汉字不该拦。
+
+    过度拦截会让提示被迫说得极含糊(观众更懵)。直播里一条稍微具体
+    的提示, 远比一条没用的提示好。
+    """
+    from story.llm import _hint_leaks
+    focus = {"forbidden_core_terms": ["退潮时危险礁石会露出或接近水面"],
+             "focus_fact_texts": ["灯的真正作用是标示危险礁石的位置"]}
+    check("正常引导语不拦",
+          _hint_leaks("想想他为什么挑那个时间开灯。", focus) == "",
+          _hint_leaks("想想他为什么挑那个时间开灯。", focus))
+    check("用了同一个词但不泄底 -> 不拦",
+          _hint_leaks("注意'灯'这个字出现了几次。", focus) == "",
+          _hint_leaks("注意'灯'这个字出现了几次。", focus))
+    check("照搬 fact 原话 -> 拦",
+          _hint_leaks("因为退潮时危险礁石会露出或接近水面。", focus) != "",
+          "应拦住")
+
+
+def test_gen_spec_records_metrics():
+    """Q7(方案 §35): gen_spec 要把出题/审稿过程指标挂在 spec 上。"""
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_rewrite("骨架不行")),
+                     LLMResult(tool_input=riddle(puzzle="二稿。为什么?")),
+                     LLMResult(tool_input=review_ok("二稿。为什么?"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    m = spec.metrics
+    check("有 generation_attempts", m.get("generation_attempts") == 2, m)
+    # 注意: FakeClient 是瞬时的, 所以这里是 0 —— 断言的是**字段存在且是
+    # 非负整数**, 不是"大于 0"。真实调用时它才是正数。
+    check("有 generation_latency_ms",
+          isinstance(m.get("generation_latency_ms"), int)
+          and m["generation_latency_ms"] >= 0, m)
+    check("有 review_calls", m.get("review_calls") == 2, m)
+    check("有 review_decision", m.get("review_decision") == "pass", m)
+    check("记了 rewrite 次数", m.get("rewrite_count") == 1, m)
+    check("标了 ok", m.get("ok") is True, m)
+
+
+def test_gen_spec_failure_also_records_metrics():
+    """Q7: 失败路径也要有指标 —— 否则"出了几稿才放弃"查不出来。"""
+    bad = dict(riddle(), facts=[])
+    fc = FakeClient([LLMResult(tool_input=dict(bad)),
+                     LLMResult(tool_input=dict(bad, puzzle="二稿。为什么?"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=2)
+    check("失败时也有 metrics", bool(spec.metrics), spec.metrics)
+    check("失败标了 ok=False", spec.metrics.get("ok") is False, spec.metrics)
+    check("失败也记了耗时",
+          spec.metrics.get("generation_latency_ms", 0) >= 0, spec.metrics)
+
+
+def test_review_issues_recorded():
+    """Q7: 审稿提了什么问题也要落盘 —— 复盘时这是最有价值的一栏。"""
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_fix(
+            "海角守塔人只在退潮的那几个小时亮灯。为什么?",
+            issues=["谜面是第一人称", "结尾缺问句"])),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("review_issues 被记录",
+          spec.metrics.get("review_issues") == ["谜面是第一人称", "结尾缺问句"],
+          spec.metrics)
+    check("review_decision 是 fix",
+          spec.metrics.get("review_decision") == "fix", spec.metrics)
+
+
+
 def main():
     for t in (test_riddle_tool, test_reviewer_fixes_in_place,
               test_hard_rule_asks_reviewer_to_fix,
@@ -1668,6 +1782,14 @@ def main():
               test_candidate_safety_net,
               test_touched_fact_ids_filtered,
               test_candidate_definition_documented,
+              # ---- Q6 / Q7 ----
+              test_hint_is_fact_aware,
+              test_hint_without_spec_still_works,
+              test_hint_rejects_leaked_fact,
+              test_hint_leak_checker_does_not_overblock,
+              test_gen_spec_records_metrics,
+              test_gen_spec_failure_also_records_metrics,
+              test_review_issues_recorded,
               # ---- 第二轮 review ----
               test_fix_answer_without_facts_is_rejected,
               test_fix_puzzle_change_also_requires_full_sync,

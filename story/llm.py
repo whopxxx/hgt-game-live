@@ -33,7 +33,7 @@ from .puzzle import (
     DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, SOLUTION_SHAPES,
     TIME_SHAPES,
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec, SolveAtom,
-    quote_in_puzzle,
+    normalize_for_match, quote_in_puzzle,
 )
 from .quality import (
     QUALITY_POLICY_VERSION, Quotas, ValidationResult, cross_puzzle_gate,
@@ -351,6 +351,45 @@ def _has_closing_question(puzzle: str) -> bool:
     if not puzzle:
         return False
     return re.search(r"[?？][\"'”’」』）)】\s]*$", puzzle.strip()) is not None
+
+
+def _hint_leaks(hint: str, focus: Optional[dict]) -> str:
+    """提示里是否出现了"说出来就等于泄底"的内容? 返回命中的那条。
+
+    刻意做得**保守**: 只在提示几乎照搬了 fact 原话时才判泄漏。
+    过度拦截会让提示被迫说得极其含糊(观众更懵), 而这是直播,
+    一条稍微具体点的提示远比一条没用的提示好。
+    所以判据是"fact 文本的**主要片段**出现在提示里" —— 而不是
+    共享几个汉字就拦。
+    """
+    if not focus:
+        return ""
+    targets = list(focus.get("forbidden_core_terms") or [])
+    targets += list(focus.get("focus_fact_texts") or [])
+    hn = normalize_for_match(hint)
+    for t in targets:
+        tn = normalize_for_match(t)
+        if len(tn) < 4:
+            continue
+        # 取 fact 的核心片段(去掉"灯的/是为了"这类虚词后仍够长)
+        core = _content_core(tn)
+        if core and core in hn:
+            return t
+    return ""
+
+
+def _content_core(s: str, keep: int = 6) -> str:
+    """从归一化文本里取一段"有信息量"的核心片段。
+
+    取不到就返回整串(够长的话) —— 宁可不拦, 不可错拦。
+    """
+    if len(s) <= keep:
+        return s
+    # 跳过开头的虚词(的/是/在/了/和/与)再截
+    i = 0
+    while i < len(s) - keep and s[i] in "的是在了和与就才也都很":
+        i += 1
+    return s[i:i + keep]
 
 
 def _hint_repeated(hint: str, given: list) -> bool:
@@ -841,11 +880,21 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
 「是」「不是」时写剧情相关的短句: "方向不对" / "好眼力" / "再想想" """
 
 
-HINT_SYSTEM = """你在主持中文「海龟汤」推理直播。观众卡住了, 给一条方向性提示。
+HINT_SYSTEM = """你在主持中文「海龟汤」推理直播。观众卡住了, 给一条**方向性**提示。
 
-- 一个方向的点拨, 一句话, 30 字以内。
-- 不含谜底, 不复述核心真相。
-- 与已给过的提示不同。
+代码已经替你挑好了这条提示该点拨哪个方向(见用户消息里的【本次要点拨的方向】)。
+你的任务是把那个方向**翻译成一句给观众看的话**, 而不是把那件事说出来。
+
+严格做到:
+- 一句话, 30 字以内, 一个方向。
+- **绝不直接说出**【禁止说出】里列出的任何内容 —— 那些是谜底本身,
+  说出来这题就没了。
+- 把观众往那个方向**引**, 让他们自己去想。例如:
+    ✓ "想想他为什么偏偏挑这个时间开灯。"
+    ✓ "注意顺序 —— 是先看到什么, 才做了什么？"
+    ✗ "灯是在照礁石。"        (把答案说出来了)
+    ✗ "因为退潮时礁石会露出来。"(把答案说出来了)
+- 与已给过的提示不同, 也不要把同一句话说第二遍。
 直接输出这一句提示。"""
 
 
@@ -1426,6 +1475,13 @@ class PuzzleWriter:
         bad: list = []
         attempts = 0
         guard = 0
+        # ---- 方案 §35 的过程指标 ----
+        # 这些数字必须**按题**归档: 下一轮复盘要能直接算
+        # "一题平均花几稿 / 审稿打回率 / 出题慢在哪一段",
+        # 而不是去日志里刨。
+        m = {"generation_attempts": 0, "review_calls": 0, "rewrite_count": 0}
+        m["review_issues"] = []
+        m["review_decision"] = ""
         # P1(第二轮 review): `blueprint=None` **不再**暗含"用默认 blueprint"。
         # 早先 `blueprint or PuzzleBlueprint()` 会把"没给"变成"固定成
         # information_gap / information_advantage / daily / neutral / instant"
@@ -1452,6 +1508,7 @@ class PuzzleWriter:
                     _remember(seen_why, spec.error)
                 continue
             attempts += 1
+            m["generation_attempts"] = attempts
             _detail("出题第 %d 稿(%.1fs):\n      谜面=%s\n      谜底=%s\n"
                     "      facts=%s\n      atoms=%s",
                     attempts, _t.monotonic() - t0,
@@ -1489,10 +1546,15 @@ class PuzzleWriter:
             # 这三样都是"改一句话", 重出整题是浪费。
             reviewed, why, need_rewrite = self._review_spec(
                 spec, bp, must_fix=vr.must_fix())
+            m["review_calls"] += 1
+            m["review_decision"] = (self._last_review_decision or "").lower()
+            if self._last_review_issues:
+                m["review_issues"] = list(self._last_review_issues)
             if reviewed is None:
                 # 审稿人说 rewrite(或没给出可用结果) -> 换骨架重出。
                 # **不修补** —— 这才是"结构性烂题"的出口(方案 §18)。
                 log.info("出题第 %d 稿被要求重出: %s", attempts, why[:100])
+                m["rewrite_count"] += 1
                 _remember(seen_why, "推倒重出: " + why[:120])
                 bad.append(spec.puzzle)
                 last = spec
@@ -1542,6 +1604,9 @@ class PuzzleWriter:
                     continue
             log.info("出题成功(第 %d 稿, 用时 %.1fs): %s",
                      attempts, _t.monotonic() - t0, spec.puzzle[:40])
+            m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+            m["ok"] = True
+            spec.metrics = dict(m)
             return spec
 
         # ---- 重试耗尽: **绝不能**把被拒的稿子当结果返回 ----
@@ -1556,12 +1621,18 @@ class PuzzleWriter:
         err = (last.error if last is not None else None) or "没有生成合格谜题"
         log.warning("出题失败(%d 稿均未通过), 交回引擎走兜底: %s",
                     attempts, err[:120])
+        m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+        m["ok"] = False
         return PuzzleSpec(
-            error=err,
+            error=err, metrics=dict(m),
             usage=getattr(last, "usage", None),
             model=getattr(last, "model", None))
 
     # ------------------------------------------------------------------
+    #: 上一次 `_review_spec` 的决定与 issues(给 gen_spec 统计用)
+    _last_review_decision: str = ""
+    _last_review_issues: Optional[list] = None
+
     def _cfg(self) -> Optional[Any]:
         """取**运行时 Config**(temperature / quota 都在这上面)。
 
@@ -1756,6 +1827,11 @@ class PuzzleWriter:
         decision = str(ti.get("decision", "")).strip().lower()
         note = str(ti.get("note", "") or "")
         issues = [str(x).strip() for x in (ti.get("issues") or []) if str(x).strip()]
+        # 侧信道: gen_spec 要按题统计"审稿打了什么决定 / 提了什么问题"。
+        # 用实例属性而不是返回值 —— 返回值已经被 (spec, why, rewrite)
+        # 占满了, 再加一个会逼着所有调用点跟着改。
+        self._last_review_decision = decision
+        self._last_review_issues = issues
 
         # ---- rewrite: 不修补, 交回生成器 ----
         if decision == "rewrite":
@@ -2127,24 +2203,71 @@ class PuzzleWriter:
 
     # ------------------------------------------------------------------
     def hint(self, puzzle: str, answer: str, level: int,
-             given: Optional[list] = None) -> tuple[Optional[str], Optional[str]]:
+             given: Optional[list] = None,
+             spec: Optional[PuzzleSpec] = None,
+             touched_fact_ids: Optional[set] = None,
+             focus: Optional[dict] = None
+             ) -> tuple[Optional[str], Optional[str]]:
         """生成一条提示。**保证不与已给过的重复**。
 
         `given` 必须是**实际展示过**的提示(engine 维护), 不是出题时
         附带的模板提示 —— 传错会导致第二条和第一条说一样的话(实测踩过)。
+
+        Q6(方案 §31/§33): 提示不再是"看着谜面随便点拨", 而是
+        **fact-aware** 的 —— 代码先用 `quality.hint_focus()` 挑出
+        "哪个 required atom 还欠点拨、它依赖哪些还没被碰过的 fact",
+        再把那个方向交给模型翻译成一句人话。
+
+        为什么必须这样: 观众卡住时最需要的是"往哪想", 而"哪个方向
+        还没被探索过"这件事模型**看不到**(touched 集合在引擎里)。
+        旧实现只给谜面+谜底, 于是提示常常是"再审一遍谜面"这种废话,
+        或者干脆换个说法把谜底说出来。
+
+        传了 `spec` 就走 fact-aware 路径; 没传(老调用/无 spec 的兜底题)
+        自动退回旧行为 —— 不能因为升级提示系统就让兜底题没有提示。
         """
         given = [g for g in (given or []) if g]
+        # ---- 代码侧挑方向(方案 §33) ----
+        if focus is None and spec is not None:
+            try:
+                from .quality import hint_focus
+                focus = hint_focus(spec, touched_fact_ids or set())
+            except Exception as e:                       # noqa: BLE001
+                log.warning("hint_focus 失败, 退回普通提示: %s", e)
+                focus = None
+
         for attempt in range(3):
             g = "\n".join(f"- {x}" for x in given) if given else "(暂无)"
             user = (
                 f"【谜面】{puzzle}\n"
                 f"【谜底(绝不能说出口)】{answer or '(未记录)'}\n"
-                f"【已经给观众看过的提示 —— 绝对不要重复】\n{g}\n\n"
+            )
+            if focus:
+                focus_txt = "\n".join(f"- {t}" for t in
+                                       (focus.get("focus_fact_texts") or []))
+                forbid = "\n".join(f"- {t}" for t in
+                                    (focus.get("forbidden_core_terms") or []))
+                user += (
+                    f"\n【本次要点拨的方向(不要直接说出来)】\n"
+                    f"{focus.get('focus_atom', '')}\n"
+                )
+                if focus_txt:
+                    user += (f"\n【这个方向依赖的具体事实(只能引导, "
+                             f"**不能念出来**)】\n{focus_txt}\n")
+                if forbid:
+                    user += f"\n【禁止说出 —— 说了这题就没了】\n{forbid}\n"
+                if focus.get("known_or_touched"):
+                    user += (f"\n【观众已经问过的方向(不要重复引导)】"
+                             f"{', '.join(focus['known_or_touched'])}\n")
+            user += (
+                f"\n【已经给观众看过的提示 —— 绝对不要重复】\n{g}\n\n"
                 f"这是第 {level} 条提示, 请给一个"
                 f"{'更具体、换个角度' if level > 1 else '方向性'}的点拨。"
             )
             res = self.client.messages(HINT_SYSTEM, user, max_tokens=1200,
-                                       tool=_TOOL_HINT)
+                                       tool=_TOOL_HINT,
+                                       temperature=self._temperature(
+                                           "hint_temperature"))
             h = None
             if res.tool_input:
                 h = str(_unwrap_tool_input(res.tool_input).get("hint", "") or "").strip()[:60]
@@ -2152,12 +2275,19 @@ class PuzzleWriter:
                 h = res.text.strip().strip("【】").split("\n", 1)[0].strip()[:60]
             if not h:
                 return None, res.error
+            # ---- 泄漏检查: 提示里不能出现 core hidden fact 的原话 ----
+            leak = _hint_leaks(h, focus)
+            if leak:
+                log.info("提示泄漏了 fact, 重出(第 %d 次): %r ~ %r",
+                         attempt + 1, h[:30], leak[:30])
+                given = given + [h]
+                continue
             # 跟已给过的**完全相同或高度相似** -> 让模型重来
             if not _hint_repeated(h, given):
                 return h, res.error
             log.info("提示与已给过的重复, 重出(第 %d 次): %r", attempt + 1, h[:30])
             given = given + [h]        # 明确告诉它"这条也不行"
-        return h, None                 # 三次都重复 -> 认了, 总比没有强
+        return h, None                 # 三次都不过 -> 认了, 总比没有强
 
     # ------------------------------------------------------------------
     def reveal(self, puzzle: str, answer: str, reason: str,
