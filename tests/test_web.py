@@ -4,13 +4,59 @@
 """
 import html
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CHROME = Path("C:/Program Files/Google/Chrome/Application/chrome.exe")
+
+
+def _find_chrome() -> str | None:
+    """找一个可用的 Chrome/Chromium。
+
+    早先这里写死 `C:/Program Files/...`(Windows 路径), 于是 CI(Ubuntu)
+    上必然找不到 —— 而且报出来的是 subprocess 的 FileNotFoundError,
+    看着像测试逻辑坏了, 其实是环境假设错了。
+
+    顺序: 环境变量 -> 各平台常见安装位置 -> PATH。
+    """
+    env = os.environ.get("HGT_CHROME") or os.environ.get("CHROME_PATH")
+    if env and Path(env).exists():
+        return env
+    cands = [
+        # Windows
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        # Linux (CI / 服务器)
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    for c in cands:
+        if c and Path(c).exists():
+            return c
+    for name in ("google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+CHROME = _find_chrome()
+
+_NEED_MSG = ("没找到 Chrome/Chromium —— 这个套件验证的是真实浏览器布局。\n"
+             "  装一个, 或用 HGT_CHROME=/path/to/chrome 指定。")
 
 CHECK = r'''
 window.socket = null;
@@ -251,11 +297,23 @@ window.addEventListener("load", async () => {
 
 
 def main():
+    if not CHROME:
+        # 找不到浏览器时**默认失败**, 不静默跳过 —— 静默跳过会让这个
+        # 套件在 CI 上"一直绿", 而它验的正是真实布局, 恰恰是最该跑的。
+        # 确实想跳过(比如本地没装)就显式设 HGT_SKIP_WEB=1。
+        print("\n" + _NEED_MSG)
+        if os.environ.get("HGT_SKIP_WEB") == "1":
+            print("HGT_SKIP_WEB=1 -> 跳过")
+            return
+        sys.exit(1)
+    print(f"(使用浏览器: {CHROME})")
     source = (ROOT / "web/index.html").read_text(encoding="utf-8")
     source = source.replace('href="/style.css"', 'href="' + (ROOT / "web/style.css").as_uri() + '"')
     source = source.replace('<script src="/app.js"></script>',
                             "<script>" + CHECK + "</script><script src=\"" +
                             (ROOT / "web/app.js").as_uri() + '\"></script>')
+    # data/ 在干净 checkout 上可能不存在(它只靠两个 .md 撑着)。
+    (ROOT / "data").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=ROOT / "data") as tmp:
         page = Path(tmp) / "test.html"
         page.write_text(source, encoding="utf-8")
