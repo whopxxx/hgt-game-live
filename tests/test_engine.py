@@ -2445,6 +2445,45 @@ def test_runtime_spec_key_is_stable_and_distinguishes():
     check("不抛异常(空输入)", isinstance(runtime_spec_key(), str))
 
 
+def test_runtime_spec_key_covers_structure():
+    """RF-6: key 必须覆盖**完整** canonical 结构, 不只是 id+text。
+
+    早先每项只取 `id + text`, 于是 atom 的 role/fact_ids/required、
+    fact 的 kind/visibility/hintable 全被漏掉; 更明显的是 `FairClue`
+    **根本没有 text 字段**(它只有 quote + supports_atoms), 所以不同的
+    线索内容几乎没进哈希 —— 两条 quote 与指向都不同的 clue 会算出同一个
+    key, 身份判断直接失效。
+    """
+    print("\n[S06g] runtime_spec_key 覆盖结构字段")
+    import copy
+    from story.puzzle import runtime_spec_key as k
+    f = [{"id": "f1", "text": "t", "kind": "core",
+          "visibility": "hidden", "hintable": True}]
+    a = [{"id": "a1", "role": "cause", "text": "x",
+          "fact_ids": ["f1"], "required": True}]
+    c = [{"quote": "谜面原句", "supports_atoms": ["a1"]}]
+    base = k("p", "a", f, a, c)
+    check("同输入稳定", base == k("p", "a", f, a, c))
+
+    def mutated(which, **change):
+        f2, a2, c2 = copy.deepcopy(f), copy.deepcopy(a), copy.deepcopy(c)
+        {"fact": f2, "atom": a2, "clue": c2}[which][0].update(change)
+        return k("p", "a", f2, a2, c2)
+
+    # 结构字段逐个验 —— 每一个都必须改变 key
+    for label, which, change in (
+            ("atom.role", "atom", {"role": "mechanism"}),
+            ("atom.fact_ids", "atom", {"fact_ids": ["f9"]}),
+            ("atom.required", "atom", {"required": False}),
+            ("fact.kind", "fact", {"kind": "support"}),
+            ("fact.visibility", "fact", {"visibility": "public"}),
+            ("fact.hintable", "fact", {"hintable": False}),
+            ("clue.quote", "clue", {"quote": "另一句"}),
+            ("clue.supports_atoms", "clue", {"supports_atoms": ["a9"]})):
+        check(f"改 {label} -> key 变化",
+              mutated(which, **change) != base, label)
+
+
 def test_engine_tracks_current_spec_key():
     """Engine 接受题后必须记住它的运行时身份。"""
     print("\n[S06c] Engine 记录 current_spec_key")
@@ -2599,6 +2638,7 @@ def main():
              test_expect_round_none_keeps_legacy_behavior,
              test_stale_return_cannot_advance_archive_identity,
              test_runtime_spec_key_is_stable_and_distinguishes,
+             test_runtime_spec_key_covers_structure,
              test_engine_tracks_current_spec_key,
              test_async_payloads_carry_identity,
              test_stale_qa_callback_is_discarded,

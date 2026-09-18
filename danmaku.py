@@ -109,10 +109,10 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
               else f"[{kind}] {user_name}", flush=True)
 
     # ---- Step 11: 业务钩子(基类 no-op, 由 CallbackFetcher 覆盖) ----
-    def _on_like(self, msg):
+    def _on_like(self, msg, envelope_msg_id=0):
         """一条点赞。基类什么都不做 —— 只落库的用法不受影响。"""
 
-    def _on_gift(self, msg):
+    def _on_gift(self, msg, envelope_msg_id=0):
         """一个礼物。基类什么都不做。"""
 
     # ---- 覆盖消息解析 ----
@@ -120,33 +120,59 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         m = ChatMessage().parse(payload)
         self._emit("chat", m.user.id, m.user.nick_name, m.content)
 
-    def _parseGiftMsg(self, payload):
-        # Step 11: 同 `_parseLikeMsg` —— 业务与落库解耦。
+    def _parseGiftMsg(self, payload, envelope_msg_id=0):
+        # Step 11 review-fix: 同 `_parseLikeMsg` —— 两个开关正交。
         if not (self.keep_all or self.interaction_enabled):
             return
         m = GiftMessage().parse(payload)
         if self.keep_all:
+            # ---- RF-4: 落库字段必须够 Step 12 回答协议问题 ----
+            # 原来只落 gift_id/name/combo/repeat/total —— 就算现在去跑一场
+            # 真实直播, 拿回来的 JSONL 仍答不出"哪个字段是稳定绝对值""重连
+            # 会不会 replay""group/trace 在一次 combo 内是否稳定"。
+            # `group_count` 只做**观察**保留, 不赋任何业务语义。
             self._emit("gift", m.user.id, m.user.nick_name,
                        f"{m.gift.name}x{m.combo_count}",
                        {"gift_name": m.gift.name,
                         "gift_id": str(getattr(m, "gift_id", "") or ""),
-                        "combo_count": m.combo_count,
+                        "combo_count": getattr(m, "combo_count", 0),
                         "repeat_count": getattr(m, "repeat_count", 0),
-                        "total_count": getattr(m, "total_count", 0)})
-        self._on_gift(m)
+                        "total_count": getattr(m, "total_count", 0),
+                        "repeat_end": getattr(m, "repeat_end", 0),
+                        "group_count": getattr(m, "group_count", 0),
+                        "group_id": str(getattr(m, "group_id", "") or ""),
+                        "log_id": str(getattr(m, "log_id", "") or ""),
+                        "trace_id": str(getattr(m, "trace_id", "") or ""),
+                        # Step 12: 两个 msg_id **分开记**, 不猜关系。
+                        # `envelope_msg_id` 来自外层 Message(字段 3),
+                        # `common_msg_id` 来自 GiftMessage.common.msg_id。
+                        # 到底哪个才是稳定幂等键 —— 真实样本说了算。
+                        "envelope_msg_id": str(envelope_msg_id or ""),
+                        "common_msg_id": str(getattr(
+                            getattr(m, "common", None), "msg_id", 0) or "")})
+        if self.interaction_enabled:
+            self._on_gift(m, envelope_msg_id=envelope_msg_id)
 
-    def _parseLikeMsg(self, payload):
-        # Step 11: 业务开关与落库开关**分开**。想收礼物不该被迫开全量落库。
+    def _parseLikeMsg(self, payload, envelope_msg_id=0):
+        # Step 11 review-fix: 两个开关**真正正交**。
+        #   keep_all             -> 只决定**落库**
+        #   interaction_enabled  -> 只决定**业务回调**
+        # 谁都不蕴含谁。早先写成"落库时顺便无条件调 _on_like", 于是
+        # keep_all=True + interaction_enabled=False 的诊断用法会**顺手
+        # 启动业务通路** —— 那不是这个配置想要的。
         if not (self.keep_all or self.interaction_enabled):
             return
         m = LikeMessage().parse(payload)
-        # 落库仍只在 keep_all 时做(那是存储策略, 归 keep_all 管)。
         if self.keep_all:
+            # Step 12: envelope 与 common 的 msg_id **分开记**, 先不猜关系。
             self._emit("like", m.user.id, m.user.nick_name, None,
                        {"count": m.count, "total": m.total,
-                        "msg_id": str(getattr(getattr(m, "common", None),
-                                              "msg_id", 0) or "")})
-        self._on_like(m)
+                        "envelope_msg_id": str(envelope_msg_id or ""),
+                        "common_msg_id": str(
+                            getattr(getattr(m, "common", None),
+                                    "msg_id", 0) or "")})
+        if self.interaction_enabled:
+            self._on_like(m, envelope_msg_id=envelope_msg_id)
 
     def _parseMemberMsg(self, payload):
         if not self.keep_all:
@@ -210,14 +236,34 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
             ).SerializeToString()
             ws.send(ack, websocket.ABNF.OPCODE_BINARY)
 
+        # ---- 真实分发层(Step 11 review-fix) ----
+        #
+        # ⚠️ 这里曾是**假绿**的来源: Like/Gift 的注册条件原来只看
+        # `keep_all`, 于是默认配置(interaction_enabled=True,
+        # keep_all=False)下真实 WS 帧里的礼物/点赞**根本进不了 handlers**,
+        # 直接被 `continue` 丢掉。而当时的测试是**直接调**
+        # `_parseLikeMsg/_parseGiftMsg()` —— 绕过了这一层, 所以全绿。
+        #
+        # 三条纪律:
+        #   Chat / Control    永远注册(直播命脉)
+        #   Gift / Like       keep_all(要落库) **或** interaction_enabled
+        #                     (要进业务链) —— 两个开关各自成立即可
+        #   Member/Social/Emoji  仍然只在 keep_all 时注册(纯诊断类型)
+        #
+        #: 只有 Like/Gift 需要 envelope msg_id(它们要做协议观察)。
+        #: 用**实例方法对象**比对而不是名字 —— 名字重命名时不会静默失配。
+        _ENVELOPE_AWARE = {self._parseLikeMsg, self._parseGiftMsg}
         handlers = {
             "WebcastChatMessage": self._parseChatMsg,
             "WebcastControlMessage": self._parseControlMsg,
         }
-        if self.keep_all:
+        if self.keep_all or self.interaction_enabled:
             handlers.update({
                 "WebcastGiftMessage": self._parseGiftMsg,
                 "WebcastLikeMessage": self._parseLikeMsg,
+            })
+        if self.keep_all:
+            handlers.update({
                 "WebcastMemberMessage": self._parseMemberMsg,
                 "WebcastSocialMessage": self._parseSocialMsg,
                 "WebcastEmojiChatMessage": self._parseEmojiChatMsg,
@@ -228,7 +274,23 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
             if fn is None:
                 continue  # 排行榜/统计/心跳等一律忽略
             try:
-                fn(msg.payload)
+                # ---- envelope msg_id 必须传下去(Step 12 capture readiness) ----
+                #
+                # 外层 `Message`(proto 字段 3)有它**自己**的 `msg_id`, 与
+                # 内层 `GiftMessage.common.msg_id` 是**两个不同的东西**。
+                # 早先这里只传 `msg.payload`, envelope 的 id 被直接丢掉,
+                # 而 `_gift_event()` 只读内层 common.msg_id —— 于是 Step 12
+                # 想观察"哪个才是稳定幂等键"时, 手里压根没有 envelope 那一半。
+                #
+                # Like/Gift 的解析器接受这个可选参数并存下来; 其余 handler
+                # (chat/control/member/...) 的签名没变, 所以按需传。
+                #
+                # ⚠️ 现在**不判断**哪个才是幂等主键, 也**不假设**两者相等。
+                # 那是 Step 12 用真实连续消息观察出来的事 —— 先如实采下来。
+                if fn in _ENVELOPE_AWARE:
+                    fn(msg.payload, envelope_msg_id=getattr(msg, "msg_id", 0) or 0)
+                else:
+                    fn(msg.payload)
             except Exception as e:
                 # 不再静默吞异常, 便于排障
                 print(f"!!! 解析 {msg.method} 失败: {type(e).__name__}: {e}",

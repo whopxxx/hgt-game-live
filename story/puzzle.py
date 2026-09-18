@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -751,22 +752,47 @@ def runtime_spec_key(puzzle: str = "", answer: str = "",
 
     不抛异常: 任何输入都返回一个字符串(空题也有确定的 key)。
     """
-    def _items(xs) -> str:
-        out = []
-        for x in (xs or []):
-            if isinstance(x, dict):
-                out.append(str(x.get("id", "") or "") + ""
-                           + str(x.get("text", "") or ""))
-            else:
-                out.append(str(getattr(x, "id", "") or "") + ""
-                           + str(getattr(x, "text", "") or ""))
-        return "".join(out)
+    def _canon(item) -> dict:
+        """把 fact / atom / clue 归一成**完整**的规范字典。
 
-    raw = "".join([
-        str(puzzle or ""),
-        str(answer or ""),
-        _items(facts),
-        _items(solve_atoms),
-        _items(fair_clues),
-    ])
+        ⚠️ 早先的实现每项只取 `id + text` —— 那会漏掉:
+          - atom 的 `role` / `fact_ids` / `required`;
+          - fact 的 `kind` / `visibility` / `hintable`;
+          - **`FairClue` 根本没有 `text` 字段**(它只有 quote +
+            supports_atoms), 所以不同线索的内容几乎没进哈希 —— 两条
+            quote/指向都不同的 clue 会算出同一个 key。
+        这些字段都是"这一题的世界"的一部分, 漏掉就等于身份判错。
+        """
+        if item is None:
+            return {}
+        if isinstance(item, dict):
+            d = dict(item)
+        elif hasattr(item, "to_dict"):
+            d = dict(item.to_dict())
+        else:
+            # 裸字符串(老格式 atoms): 归一成一个确定的形状, 不要
+            # 让它在下面按 getattr 静默变成空字典。
+            return {"_raw": str(item)}
+        # 只保留可 JSON 序列化的基本类型; 其余转成字符串, 保证稳定。
+        out = {}
+        for k in sorted(d):
+            v = d[k]
+            if isinstance(v, (list, tuple)):
+                out[k] = [str(x) for x in v]
+            elif isinstance(v, (str, int, float, bool)) or v is None:
+                out[k] = v
+            else:
+                out[k] = str(v)
+        return out
+
+    def _canon_list(xs) -> list:
+        return [_canon(x) for x in (xs or [])]
+
+    raw = json.dumps({
+        "puzzle": str(puzzle or ""),
+        "answer": str(answer or ""),
+        "facts": _canon_list(facts),
+        "solve_atoms": _canon_list(solve_atoms),
+        "fair_clues": _canon_list(fair_clues),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:RUNTIME_KEY_LEN]

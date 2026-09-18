@@ -600,7 +600,11 @@ def test_gift_reaches_business_chain_without_keep_all() -> None:
         m.repeat_count = 2
         m.total_count = 5
         m.group_id = 88
-        m.log_id = "trace-abc"
+        # RF-3: proto 里 logId(16) 与 traceId(35) 是**两个**字段。
+        # 早先测试只设 log_id 并断言 trace_id 等于它 —— 那是在锁死一个
+        # 错误的映射。两个都设, 分别断言。
+        m.log_id = "log-abc"
+        m.trace_id = "trace-xyz"
         m.user.id = 9
         m.user.nick_name = "乙"
         m.common.msg_id = 1001
@@ -611,7 +615,9 @@ def test_gift_reaches_business_chain_without_keep_all() -> None:
             for field, want in (("kind", "gift"), ("gift_id", "12345"),
                                 ("gift_name", "玫瑰"), ("combo_count", 2),
                                 ("repeat_count", 2), ("total_count", 5),
-                                ("group_id", "88"), ("trace_id", "trace-abc"),
+                                ("group_id", "88"),
+                                ("trace_id", "trace-xyz"),
+                                ("log_id", "log-abc"),
                                 ("message_id", "1001")):
                 check(f"{field} 原样带过", getattr(ev, field) == want,
                       (field, getattr(ev, field), want))
@@ -705,6 +711,292 @@ def test_livesource_routes_interaction_to_inbox() -> None:
           not isinstance(got, ChatEvent), type(got))
 
 
+# ======================================================================
+# Step 11 review-fix — 真实 WS 分发层回归
+# ======================================================================
+def _mk_ws_fetcher(events, *, keep_all, interaction, chat_events=None):
+    """造一个能跑 `_wsOnMessage` 的半成品 fetcher。"""
+    import collections, tempfile
+    f = CallbackFetcher.__new__(CallbackFetcher)
+    f._on_chat = lambda e: (chat_events.append(e) if chat_events is not None
+                            else None)
+    f._on_control = None
+    f._on_interaction = events.append if interaction else None
+    f.keep_all = keep_all
+    f.interaction_enabled = interaction
+    f._expired = False
+    f._counts = collections.Counter()
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                      encoding="utf-8")
+    f.out_path = tmp.name
+    tmp.close()
+    f._fp = open(tmp.name, "a", encoding="utf-8")
+    return f, tmp.name
+
+
+class _FakeWS:
+    """`_wsOnMessage` 只在 need_ack 时调 `ws.send`。这里不需要 ACK。"""
+    def send(self, *a, **k):
+        pass
+
+
+def _frame(method, payload_bytes, envelope_msg_id=0):
+    """把一条内层消息包成真实 WS 帧(gzip + PushFrame + Response)。"""
+    import gzip
+    from vendor.douyin_fetcher.protobuf.douyin import (  # noqa: F401
+        Message, PushFrame, Response)
+    import sys as _sys, os as _os
+    _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                      "..", "vendor", "douyin_fetcher"))
+    from protobuf.douyin import Message as M, PushFrame as P, Response as R
+    resp = R()
+    msg = M()
+    msg.method = method
+    msg.payload = payload_bytes
+    msg.msg_id = envelope_msg_id      # 外层 envelope id(proto 字段 3)
+    resp.messages_list.append(msg)
+    pkg = P()
+    pkg.payload = gzip.compress(bytes(resp))
+    return pkg.SerializeToString()
+
+
+def test_ws_dispatch_gift_reaches_chain_without_keep_all() -> None:
+    """**核心回归**: 真实 WS 帧里的 Gift 必须进业务链。
+
+    修之前 `_wsOnMessage` 只在 `keep_all` 时注册 Gift/Like handler, 于是
+    默认配置(interaction_enabled=True, keep_all=False)下礼物帧被
+    `continue` 丢掉。原测试**直接调** `_parseGiftMsg`, 绕过了这一层 ——
+    所以全绿。这条走真实分发路径。
+    """
+    print("\n[11h] 真实 WS 帧: keep_all=False 也能收 Gift")
+    from danmaku import GiftMessage
+    events = []
+    f, path = _mk_ws_fetcher(events, keep_all=False, interaction=True)
+    try:
+        gm = GiftMessage()
+        gm.gift_id = 42
+        gm.gift.name = "玫瑰"
+        gm.combo_count = 1
+        frame = _frame("WebcastGiftMessage", gm.SerializeToString())
+        f._wsOnMessage(_FakeWS(), frame)
+        check("**帧里的 Gift 进了业务链**", len(events) == 1, events)
+        if events:
+            check("kind=gift", events[0].kind == "gift", events[0].kind)
+            check("gift_id 正确", events[0].gift_id == "42", events[0].gift_id)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_ws_dispatch_like_reaches_chain_without_keep_all() -> None:
+    """Like 同理 —— 走真实分发层。"""
+    print("\n[11i] 真实 WS 帧: keep_all=False 也能收 Like")
+    from danmaku import LikeMessage
+    events = []
+    f, path = _mk_ws_fetcher(events, keep_all=False, interaction=True)
+    try:
+        lm = LikeMessage()
+        lm.count = 5
+        lm.total = 100
+        frame = _frame("WebcastLikeMessage", lm.SerializeToString())
+        f._wsOnMessage(_FakeWS(), frame)
+        check("**帧里的 Like 进了业务链**", len(events) == 1, events)
+        if events:
+            check("total 正确", events[0].total == 100, events[0].total)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_ws_dispatch_keep_all_only_logs_not_business() -> None:
+    """**正交性**: keep_all=True + interaction_enabled=False
+    -> 只落库, **不进**业务回调。
+
+    ⚠️ 这条测试必须**直接**验证 `_parseGiftMsg` 不会调业务回调 ——
+    不能只靠 `_wsOnMessage`。原因: 当 `interaction_enabled=False` 时
+    `_on_interaction` 是 None, 而 `_on_gift` 在 None 时**自己会早退**,
+    于是"落库时无条件调 `_on_gift`"这种 bug 会被那层早退掩盖 ——
+    测试假绿(第一版就是这么写的, mutation 没抓到)。
+    所以这里直接把 `_on_interaction` 挂上一个**会记录**的回调, 再用
+    `interaction_enabled=False` 跑, 才能真的证明开关生效。
+    """
+    print("\n[11j] keep_all=True + interaction=False 只落库")
+    from danmaku import GiftMessage
+    events = []
+    f, path = _mk_ws_fetcher(events, keep_all=True, interaction=False)
+    try:
+        # 故意挂一个**会记录**的回调 —— 这样"被误调"才看得见。
+        f._on_interaction = events.append
+        gm = GiftMessage()
+        gm.gift_id = 7
+        gm.gift.name = "x"
+        f._parseGiftMsg(gm.SerializeToString())
+        check("**业务回调没被调用**(尽管回调是挂着的)",
+              len(events) == 0, events)
+        check("但落了库", f._counts.get("gift", 0) == 1, f._counts)
+        # 反过来: interaction_enabled=True 时必须调到
+        events2 = []
+        f2, path2 = _mk_ws_fetcher(events2, keep_all=True, interaction=True)
+        try:
+            gm2 = GiftMessage()
+            gm2.gift_id = 8
+            gm2.gift.name = "y"
+            f2._parseGiftMsg(gm2.SerializeToString())
+            check("interaction=True 时业务回调被调用",
+                  len(events2) == 1, events2)
+            check("同时也落了库", f2._counts.get("gift", 0) == 1, f2._counts)
+        finally:
+            f2._fp.close()
+            os.unlink(path2)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_ws_dispatch_diagnostics_still_keep_all_only() -> None:
+    """Member/Social/Emoji 仍然只在 keep_all 时注册(纯诊断类型)。"""
+    print("\n[11k] 诊断类型仍只在 keep_all 时注册")
+    from danmaku import MemberMessage
+    # interaction=True 但 keep_all=False -> member **不该**被处理
+    events = []
+    f, path = _mk_ws_fetcher(events, keep_all=False, interaction=True)
+    try:
+        mm = MemberMessage(); mm.user.id = 1; mm.user.nick_name = "甲"
+        f._wsOnMessage(_FakeWS(), _frame("WebcastMemberMessage",
+                                         mm.SerializeToString()))
+        check("keep_all=False 时 member 不落库",
+              f._counts.get("member", 0) == 0, f._counts)
+    finally:
+        f._fp.close()
+        os.unlink(path)
+    # keep_all=True -> 落库
+    f2, path2 = _mk_ws_fetcher([], keep_all=True, interaction=True)
+    try:
+        mm = MemberMessage(); mm.user.id = 1; mm.user.nick_name = "甲"
+        f2._wsOnMessage(_FakeWS(), _frame("WebcastMemberMessage",
+                                          mm.SerializeToString()))
+        check("keep_all=True 时 member 落库",
+              f2._counts.get("member", 0) == 1, f2._counts)
+    finally:
+        f2._fp.close()
+        os.unlink(path2)
+
+
+def test_ws_dispatch_chat_always_registered() -> None:
+    """Chat 是直播命脉 —— 任何开关组合下都必须注册。"""
+    print("\n[11l] Chat 永远注册")
+    for keep_all, interaction in ((False, False), (False, True),
+                                  (True, False), (True, True)):
+        chats = []
+        f, path = _mk_ws_fetcher([], keep_all=keep_all,
+                                 interaction=interaction, chat_events=chats)
+        try:
+            from danmaku import ChatMessage
+            cm = ChatMessage(); cm.content = "#问"; cm.user.id = 1
+            cm.user.nick_name = "甲"
+            f._wsOnMessage(_FakeWS(), _frame("WebcastChatMessage",
+                                             cm.SerializeToString()))
+            check(f"chat 收到(keep_all={keep_all}, interaction={interaction})",
+                  len(chats) == 1, chats)
+        finally:
+            f._fp.close()
+            os.unlink(path)
+
+
+def test_ws_dispatch_captures_both_msg_ids_separately() -> None:
+    """RF-7: envelope 与 common 的 msg_id 必须**分开**采下来。
+
+    外层 `Message.msg_id`(proto 字段 3)与内层
+    `GiftMessage.common.msg_id` 是两个不同的字段。`_wsOnMessage` 原来
+    只传 `msg.payload`, envelope 的 id 直接被丢掉 —— 于是 Step 12 想
+    观察"哪个才是稳定幂等键"时, 手里压根没有 envelope 那一半。
+
+    ⚠️ 这条**不假设**两者相等, 也**不判断**哪个是主键 —— 只证明两个值
+    都被如实带到了业务事件上, 且互不覆盖。
+    """
+    print("\n[11n] 两个 msg_id 分开采集")
+    from danmaku import GiftMessage
+    events = []
+    f, path = _mk_ws_fetcher(events, keep_all=False, interaction=True)
+    try:
+        gm = GiftMessage()
+        gm.gift_id = 11
+        gm.gift.name = "花"
+        gm.common.msg_id = 1001          # 内层 common
+        frame = _frame("WebcastGiftMessage", gm.SerializeToString(),
+                       envelope_msg_id=2002)   # 外层 envelope
+        f._wsOnMessage(_FakeWS(), frame)
+        check("事件收到", len(events) == 1, events)
+        if events:
+            ev = events[0]
+            check("common_msg_id 正确", ev.message_id == "1001", ev.message_id)
+            check("envelope_msg_id 正确",
+                  ev.envelope_msg_id == "2002", ev.envelope_msg_id)
+            check("两者**不同**(没有被互相覆盖)",
+                  ev.message_id != ev.envelope_msg_id,
+                  (ev.message_id, ev.envelope_msg_id))
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_keep_all_records_both_msg_ids_in_jsonl() -> None:
+    """落库侧也要两个都记 —— 真实采样靠它回答 Step 12 的差问题。"""
+    print("\n[11o] JSONL 里两个 msg_id 都在")
+    from danmaku import GiftMessage
+    f, path = _mk_ws_fetcher([], keep_all=True, interaction=False)
+    try:
+        gm = GiftMessage()
+        gm.gift_id = 5
+        gm.gift.name = "x"
+        gm.common.msg_id = 777
+        f._parseGiftMsg(gm.SerializeToString(), envelope_msg_id=888)
+        f._fp.flush()
+        rec = json.loads(open(path, encoding="utf-8").read().strip())
+        check("common_msg_id 落库", rec.get("common_msg_id") == "777", rec)
+        check("envelope_msg_id 落库", rec.get("envelope_msg_id") == "888", rec)
+        check("旧的笼统 msg_id 不再冒充其中一个",
+              "msg_id" not in rec, sorted(rec))
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
+def test_keep_all_gift_jsonl_has_step12_fields() -> None:
+    """RF-4: 落库字段必须够 Step 12 回答协议问题。"""
+    print("\n[11m] keep_all gift JSONL 含 Step 12 所需字段")
+    from danmaku import GiftMessage
+    f, path = _mk_ws_fetcher([], keep_all=True, interaction=True)
+    try:
+        gm = GiftMessage()
+        gm.gift_id = 3
+        gm.gift.name = "花"
+        gm.combo_count = 2
+        gm.repeat_count = 2
+        gm.total_count = 9
+        gm.repeat_end = 1
+        gm.group_count = 4
+        gm.group_id = 77
+        gm.log_id = "L1"
+        gm.trace_id = "T1"
+        gm.common.msg_id = 555
+        f._parseGiftMsg(gm.SerializeToString())
+        f._fp.flush()
+        rec = json.loads(open(path, encoding="utf-8").read().strip())
+        for key, want in (("gift_id", "3"), ("gift_name", "花"),
+                          ("combo_count", 2), ("repeat_count", 2),
+                          ("total_count", 9), ("repeat_end", 1),
+                          ("group_count", 4), ("group_id", "77"),
+                          ("log_id", "L1"), ("trace_id", "T1"),
+                          # Step 12: 两个 msg_id **分开**落, 不猜关系。
+                          ("common_msg_id", "555"),
+                          ("envelope_msg_id", "")):
+            check(f"落了 {key}", rec.get(key) == want, (key, rec.get(key), want))
+    finally:
+        f._fp.close()
+        os.unlink(path)
+
+
 def main() -> int:
     print("=" * 60)
     print("  弹幕接入层 离线自测")
@@ -724,6 +1016,15 @@ def main() -> int:
     test_expired_fetcher_drops_interaction()
     test_engine_submit_interaction_is_noop_stub()
     test_livesource_routes_interaction_to_inbox()
+    # ---- Step 11 review-fix: 真实 WS 分发层 ----
+    test_ws_dispatch_gift_reaches_chain_without_keep_all()
+    test_ws_dispatch_like_reaches_chain_without_keep_all()
+    test_ws_dispatch_keep_all_only_logs_not_business()
+    test_ws_dispatch_diagnostics_still_keep_all_only()
+    test_ws_dispatch_chat_always_registered()
+    test_keep_all_gift_jsonl_has_step12_fields()
+    test_ws_dispatch_captures_both_msg_ids_separately()
+    test_keep_all_records_both_msg_ids_in_jsonl()
     # ---- Q12 ----
     test_synth_msg_ids_are_distinct()
     test_first_frame_callback_fires_once()

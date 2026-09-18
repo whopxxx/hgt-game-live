@@ -129,14 +129,15 @@ class InteractionEvent:
     """
 
     __slots__ = ("kind", "user_id", "user_name", "ts", "message_id",
-                 "count", "total", "gift_id", "gift_name",
+                 "envelope_msg_id", "count", "total", "gift_id", "gift_name",
                  "combo_count", "repeat_count", "total_count",
-                 "repeat_end", "group_id", "trace_id")
+                 "repeat_end", "group_id", "trace_id", "log_id")
 
     def __init__(self, kind, user_id=None, user_name=None, ts=0.0,
-                 message_id="", count=0, total=0, gift_id="", gift_name="",
+                 message_id="", envelope_msg_id="", count=0, total=0,
+                 gift_id="", gift_name="",
                  combo_count=0, repeat_count=0, total_count=0,
-                 repeat_end=0, group_id="", trace_id=""):
+                 repeat_end=0, group_id="", trace_id="", log_id=""):
         self.kind = kind              # "like" / "gift"
         self.user_id = user_id
         self.user_name = user_name
@@ -144,6 +145,12 @@ class InteractionEvent:
         #: 平台消息唯一 ID(`common.msg_id`)。空串 = 没有 ID。
         #: **不要**用 0 当缺失标记(见 ChatEvent 的同一说明)。
         self.message_id = message_id
+        #: 外层 `Message.msg_id`(proto 字段 3)。与 `message_id` 是
+        #: **两个不同的字段**, 分开记录。
+        #:
+        #: ⚠️ 现在**不判断**哪个才是幂等主键, 也**不假设**两者相等 ——
+        #: 那是 Step 12 用真实连续消息观察出来的结论。先如实采下来。
+        self.envelope_msg_id = envelope_msg_id
         # ---- like ----
         self.count = count
         self.total = total
@@ -155,7 +162,11 @@ class InteractionEvent:
         self.total_count = total_count
         self.repeat_end = repeat_end
         self.group_id = group_id
+        #: `GiftMessage.trace_id`(proto 字段 35)。
+        #: ⚠️ **不是** `log_id` —— 两个是不同字段(16 / 35), 别互相冒充。
         self.trace_id = trace_id
+        #: `GiftMessage.log_id`(proto 字段 16)。单独保留, 供 Step 12 观察。
+        self.log_id = log_id
 
 
 class DanmakuSource(Protocol):
@@ -277,7 +288,7 @@ class CallbackFetcher(DanmakuFetcher):
         self._first_frame_seen = False
         return super()._wsOnOpen(ws)
 
-    def _on_like(self, m):
+    def _on_like(self, m, envelope_msg_id=0):
         """一条点赞 -> InteractionEvent。
 
         **代际检查与 chat 一致**: 被 watchdog 作废的旧连接不该再往业务层
@@ -288,23 +299,23 @@ class CallbackFetcher(DanmakuFetcher):
         if self._on_interaction is None:
             return
         try:
-            self._on_interaction(self._like_event(m))
+            self._on_interaction(self._like_event(m, envelope_msg_id))
         except Exception as e:                  # noqa: BLE001
             log.error("on_interaction(like) 回调异常: %s", e)
 
-    def _on_gift(self, m):
+    def _on_gift(self, m, envelope_msg_id=0):
         """一个礼物 -> InteractionEvent。"""
         if getattr(self, "_expired", False):
             return
         if self._on_interaction is None:
             return
         try:
-            self._on_interaction(self._gift_event(m))
+            self._on_interaction(self._gift_event(m, envelope_msg_id))
         except Exception as e:                  # noqa: BLE001
             log.error("on_interaction(gift) 回调异常: %s", e)
 
     # ---- 协议 -> 事件(纯映射, 不做业务换算) ----
-    def _like_event(self, m) -> "InteractionEvent":
+    def _like_event(self, m, envelope_msg_id=0) -> "InteractionEvent":
         raw_mid = getattr(getattr(m, "common", None), "msg_id", 0) or 0
         return InteractionEvent(
             kind="like",
@@ -312,10 +323,11 @@ class CallbackFetcher(DanmakuFetcher):
             user_name=getattr(getattr(m, "user", None), "nick_name", None),
             ts=time.monotonic(),
             message_id=str(raw_mid) if raw_mid else "",
+            envelope_msg_id=str(envelope_msg_id) if envelope_msg_id else "",
             count=int(getattr(m, "count", 0) or 0),
             total=int(getattr(m, "total", 0) or 0))
 
-    def _gift_event(self, m) -> "InteractionEvent":
+    def _gift_event(self, m, envelope_msg_id=0) -> "InteractionEvent":
         raw_mid = getattr(getattr(m, "common", None), "msg_id", 0) or 0
         u = getattr(m, "user", None)
         g = getattr(m, "gift", None)
@@ -325,6 +337,7 @@ class CallbackFetcher(DanmakuFetcher):
             user_name=getattr(u, "nick_name", None),
             ts=time.monotonic(),
             message_id=str(raw_mid) if raw_mid else "",
+            envelope_msg_id=str(envelope_msg_id) if envelope_msg_id else "",
             gift_id=str(getattr(m, "gift_id", "") or ""),
             gift_name=str(getattr(g, "name", "") or ""),
             combo_count=int(getattr(m, "combo_count", 0) or 0),
@@ -332,7 +345,12 @@ class CallbackFetcher(DanmakuFetcher):
             total_count=int(getattr(m, "total_count", 0) or 0),
             repeat_end=int(getattr(m, "repeat_end", 0) or 0),
             group_id=str(getattr(m, "group_id", "") or ""),
-            trace_id=str(getattr(m, "log_id", "") or ""))
+            # RF-3: trace_id 必须来自 `m.trace_id`(字段 35)。原来错把
+            # `m.log_id`(字段 16)塞进来 —— 那是**另一个字段**, 真正的
+            # trace_id 被丢掉。Step 12 恰恰要观察 trace/group 在一次
+            # combo 内是否稳定, 带错字段进去等于白采。
+            trace_id=str(getattr(m, "trace_id", "") or ""),
+            log_id=str(getattr(m, "log_id", "") or ""))
 
     def _parseChatMsg(self, payload):
         # 代际检查: 这个回调可能来自**已经被废弃的旧连接** —— 旧线程卡在
