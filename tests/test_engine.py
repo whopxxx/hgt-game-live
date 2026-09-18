@@ -630,6 +630,123 @@ def test_reveal_payload_carries_atoms():
           p.get("fair_clues"))
 
 
+def test_signature_recorded_and_passed_on():
+    """Q4: 出题后记下指纹, 下一题的 RIDDLE 动作里带上最近指纹。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    sig = {"mechanism_family": "hidden_function",
+           "solution_shape": "hidden_function_explains_behavior",
+           "domain": "maritime", "death": False}
+    eng.submit_riddle("灯塔只在退潮亮灯。为什么?", "因为礁石。", ["a", "b", "c"],
+                      title="灯塔", solve_atoms=[{"role": "cause", "text": "x"},
+                                                 {"role": "mechanism", "text": "y"}],
+                      fair_clues=["只在退潮亮灯"], signature=sig)
+    check("指纹记进了引擎", len(eng._recent_signatures) == 1,
+          eng._recent_signatures)
+    # 走到下一题 -> RIDDLE 动作里要带上最近指纹
+    clk.advance(1)
+    acts = eng.submit_qa([])
+    clk.advance(1)
+    eng.tick(clk.t)
+    # 直接构造: 揭晓 -> 展示 30s -> 下一题
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底")
+    clk.advance(enc := 31.0)
+    acts = eng.tick(clk.t)
+    rid = [a for a in acts if a.kind == ActionKind.RIDDLE]
+    check("产生了 RIDDLE 动作", len(rid) == 1, acts)
+    rs = rid[0].payload.get("recent_signatures")
+    check("RIDDLE 带上 recent_signatures", rs and len(rs) == 1, rs)
+    check("signature 是结构化对象", rs and rs[0].get("mechanism_family")
+          == "hidden_function", rs)
+
+
+def test_signature_window_bounded():
+    """Q4: 指纹列表按 quality_recent_window 截断。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(quality_recent_window=3), clock=clk)
+    for i in range(6):
+        eng.start() if eng.phase == Phase.IDLE else None
+        if eng.phase != Phase.SETTING:
+            eng.phase = Phase.SETTING
+        eng.submit_riddle(f"第{i}题。为什么?", "底", ["a", "b", "c"],
+                          signature={"mechanism_family": f"m{i}",
+                                     "solution_shape": "s", "domain": "daily"})
+        eng.phase = Phase.SETTING      # 强制回到 SETTING 再交一题
+    check("指纹只留最近 3 条", len(eng._recent_signatures) == 3,
+          [x.mechanism_family for x in eng._recent_signatures])
+    check("留的是最新的 3 条",
+          [x.mechanism_family for x in eng._recent_signatures] == ["m3", "m4", "m5"],
+          [x.mechanism_family for x in eng._recent_signatures])
+
+
+def test_touched_facts_accumulate_and_reset():
+    """Q5: touched_fact_ids 要累加, 每题开始清空。"""
+    eng, clk = boot(mkcfg())
+    check("开局 touched 为空", eng._touched_fact_ids == set(),
+          eng._touched_fact_ids)
+    say(eng, clk, "u1", "甲", "#礁石吗")
+    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
+    qid = ans[0].payload["qid"]
+    eng.submit_qa([QAResult(qid=qid, verdict="是", touched_fact_ids=["f1"],
+                            solution_candidate=False)])
+    check("f1 记进 touched", eng._touched_fact_ids == {"f1"},
+          eng._touched_fact_ids)
+    say(eng, clk, "u2", "乙", "#涨潮呢")
+    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
+    eng.submit_qa([QAResult(qid=ans[0].payload["qid"], verdict="是",
+                            touched_fact_ids=["f2", "f3"])])
+    check("touched 累加", eng._touched_fact_ids == {"f1", "f2", "f3"},
+          eng._touched_fact_ids)
+    # 落盘记录里也要有
+    arch = eng.snapshot().qa_archive
+    check("archive 带 touched_fact_ids",
+          arch[0].get("touched_fact_ids") == ["f1"], arch[0])
+    check("archive 带 solution_candidate",
+          arch[0].get("solution_candidate") is False, arch[0])
+    # 上屏记录**不该**带这些内部字段
+    check("上屏不含 touched", "touched_fact_ids" not in eng.snapshot().qa_log[0],
+          eng.snapshot().qa_log[0])
+
+
+def test_candidate_count_and_reset_on_new_puzzle():
+    """Q5: candidate 计数, 以及开新题时清空。"""
+    eng, clk = boot(mkcfg())
+    say(eng, clk, "u1", "甲", "#完整解释")
+    ans = [a for a in eng.tick(clk.t) if a.kind == ActionKind.ANSWER]
+    eng.submit_qa([QAResult(qid=ans[0].payload["qid"], verdict="是",
+                            solution_candidate=True, touched_fact_ids=["f1"])])
+    check("candidate 计数 +1", eng._candidate_count == 1, eng._candidate_count)
+    # 开新题 -> 清空
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底")
+    clk.advance(31.0)
+    eng.tick(clk.t)
+    eng.submit_riddle("新题。为什么?", "新底", ["a", "b", "c"])
+    check("新题清空 touched", eng._touched_fact_ids == set(),
+          eng._touched_fact_ids)
+    check("新题清空 candidate 计数", eng._candidate_count == 0,
+          eng._candidate_count)
+
+
+def test_answer_action_carries_facts():
+    """Q5: ANSWER 动作要把 facts 传给 worker。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    from story.puzzle import PuzzleFact, PuzzleSpec
+    spec = PuzzleSpec(puzzle="灯塔只在退潮亮灯。为什么?", answer="因为礁石。",
+                      facts=[PuzzleFact(id="f1", text="退潮礁石露出", kind="core")])
+    eng.submit_riddle("灯塔只在退潮亮灯。为什么?", "因为礁石。", ["a", "b", "c"],
+                      spec=spec)
+    ans = [a for a in say(eng, clk, "u1", "甲", "#礁石吗")
+           if a.kind == ActionKind.ANSWER]
+    check("ANSWER 带 facts", ans[0].payload.get("facts") == [
+        {"id": "f1", "text": "退潮礁石露出", "kind": "core",
+         "visibility": "hidden", "hintable": True}], ans[0].payload.get("facts"))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,

@@ -28,6 +28,7 @@ from typing import Any, Callable, Optional
 
 from .config import Config
 from . import parser as P
+from .puzzle import PuzzleSignature, PuzzleSpec
 from .state import (CMD_PREFIX, HINT_TOKENS, NEXT_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
@@ -74,6 +75,18 @@ class RoundEngine:
         self._hint_pool: list[str] = []      # AI 出题时附带的提示(备用)
         # 出题时定下的原子事实 —— 传给裁判, 让"说中了几条"有据可依
         self._solve_atoms: list = []
+        # 公平线索(quote + supports_atoms) —— 一路带到 archive
+        self._fair_clues: list = []
+        # 最近 N 题的**可比较指纹**, 用于跨题配额与结构去重(方案 §10)。
+        # 刻意不放进 Snapshot: 它是内部数据, 前端不需要也不该看到。
+        self._recent_signatures: list = []
+        # 观众群体**碰到过**哪些 fact(方案 §32)。判断提示方向时用。
+        # 刻意叫 touched 不叫 discovered —— 问过 ≠ 确认为真。
+        self._touched_fact_ids: set = set()
+        self._candidate_count = 0        # 被标为"完整解释尝试"的提问数
+        # 当前这题的完整 spec(方案 §49 的收拢方向; 现阶段与上面几个
+        # 平铺字段并存, 供 archive 用)
+        self._spec: Optional[PuzzleSpec] = None
         self._hints_shown: list[str] = []    # **实际展示过**的提示文本
         self._hints_given = 0
         self._hint_text = ""
@@ -343,7 +356,9 @@ class RoundEngine:
                       error: Optional[str] = None, usage: Optional[dict] = None,
                       model: Optional[str] = None, now: Optional[float] = None,
                       solve_atoms: Optional[list] = None,
-                      fair_clues: Optional[list] = None
+                      fair_clues: Optional[list] = None,
+                      signature: Optional[dict] = None,
+                      spec: Optional[PuzzleSpec] = None
                       ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
@@ -362,7 +377,14 @@ class RoundEngine:
             self._hint_pool = list(hints or [])
             self._solve_atoms = list(solve_atoms or [])
             self._fair_clues = list(fair_clues or [])
+            self._spec = spec
+            # 记下这题的指纹 —— 下一题的 blueprint 选择与跨题配额要用
+            # (方案 §10)。只留最近 window 条, 不放进 Snapshot。
+            if signature:
+                self._remember_signature_locked(signature)
             self._hints_shown = []
+            self._touched_fact_ids = set()
+            self._candidate_count = 0
             self._puzzle_index += 1
             self.round_index = self._puzzle_index
             self._puzzle_started = now
@@ -422,8 +444,16 @@ class RoundEngine:
                             status=r.status,
                             is_guess=r.is_guess, cause_hit=r.cause_hit,
                             mechanism_hit=r.mechanism_hit,
-                            matched_atoms=r.matched_atoms)
+                            matched_atoms=r.matched_atoms,
+                            touched_fact_ids=list(r.touched_fact_ids or []),
+                            solution_candidate=r.solution_candidate)
                 self._append_qa_locked(rec)
+                # 累加"观众已经探索过哪些方向"(方案 §32)。
+                # **touched ≠ discovered**: 只表示问过这个方向, 不代表已确认为真。
+                for fid in (r.touched_fact_ids or []):
+                    self._touched_fact_ids.add(fid)
+                if r.solution_candidate:
+                    self._candidate_count += 1
                 self._answered_total += 1
                 # 「未判定」是系统故障, 不是对观众猜测的评价 ——
                 # 不进"是/不是/无关"统计, 否则复盘时会把它算成一次
@@ -598,6 +628,8 @@ class RoundEngine:
                 "puzzle": self._puzzle, "answer": self._answer,
                 "solve_atoms": list(self._solve_atoms),
                 "fair_clues": list(self._fair_clues),
+                "facts": ([f.to_dict() for f in self._spec.facts]
+                          if self._spec else []),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
             }))
@@ -679,7 +711,8 @@ class RoundEngine:
         self._puzzle = ""
         self._answer = ""
         self._solve_atoms = []
-        self._fair_clues: list = []
+        self._fair_clues = []
+        self._spec = None
         self._title = ""
         self._pending.clear()
         self._inflight.clear()
@@ -690,9 +723,27 @@ class RoundEngine:
         acts = [EngineAction(ActionKind.BROADCAST, {
             "notice": self._notice, "phase_changed": True,
             "new_puzzle": True})]
+        # 把最近的指纹交给 director —— blueprint 选择与跨题配额都在**代码层**
+        # 决定(方案 §7/§10): 先选好硬约束再让模型照着设计, 而不是写一句
+        # "换个完全不同的题材"然后指望它理解什么叫"不同"。
         acts.append(EngineAction(ActionKind.RIDDLE, {
-            "reason": reason, "avoid": list(self._used_titles[-8:])}))
+            "reason": reason, "avoid": list(self._used_titles[-8:]),
+            "recent_signatures": list(self._recent_signatures)}))
         return acts
+
+    def _remember_signature_locked(self, signature) -> None:
+        """记下这题的指纹, 只留最近 quality_recent_window 条。"""
+        if not signature:
+            return
+        sig = (signature if isinstance(signature, PuzzleSignature)
+               else PuzzleSignature.from_dict(signature))
+        self._recent_signatures.append(sig)
+        keep = max(1, int(getattr(self.cfg, "quality_recent_window", 10)))
+        if len(self._recent_signatures) > keep:
+            self._recent_signatures = self._recent_signatures[-keep:]
+        _detail("记下第 %d 题指纹: %s/%s (最近 %d 条)",
+                self._puzzle_index, sig.mechanism_family, sig.solution_shape,
+                len(self._recent_signatures))
 
     def _enter_revealing_locked(self, now: float, reason: str,
                                 winner: str) -> list[EngineAction]:
@@ -724,6 +775,9 @@ class RoundEngine:
             # 对照不了。实测踩过: 结构齐了, 数据没流过去。
             "solve_atoms": list(self._solve_atoms),
             "fair_clues": list(self._fair_clues),
+            # 完整 spec 也带上 —— archive 要按方案 §34 落盘结构化定义
+            # (facts/hints/blueprint/signature), 不只是谜面谜底两段文本。
+            "spec": self._spec,
             "transcript": self._transcript_locked(),
         })]
 

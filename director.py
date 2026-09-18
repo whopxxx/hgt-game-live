@@ -27,6 +27,7 @@ import logging
 import json
 import os
 import queue
+import random
 import subprocess
 import sys
 import threading
@@ -41,7 +42,8 @@ from story.engine import RoundEngine                # noqa: E402
 from story.ingest import (ChatEvent, LiveSource,    # noqa: E402
                           SimSource, StdinSource)
 from story import parser as P                       # noqa: E402
-from story.llm import AnthropicMessagesClient, PuzzleWriter  # noqa: E402
+from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
+                       _spec_to_riddle)
 from story.server import RenderServer, StateHub     # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
 
@@ -151,6 +153,9 @@ class Director:
         self.segment_counter = 0
         self.session_id = uuid.uuid4().hex
         self._archive_failed = False
+        # blueprint 调度用的随机源。**不要用全局 random** —— 出题在 worker
+        # 线程里跑, 用模块级 random 会和其他代码互相干扰, 复盘也无法重现。
+        self._rng = random.Random()
         # 逐条秒回: 独立的 ANSWER 并发池(与 qa_max_inflight 对齐)
         self._answer_pool: ThreadPoolExecutor | None = None
         if not cfg.no_llm:
@@ -291,7 +296,8 @@ class Director:
                 payload["puzzle"], payload.get("answer", ""),
                 payload.get("transcript", []), qid,
                 payload.get("user_name", ""), payload.get("text", ""),
-                solve_atoms=payload.get("solve_atoms"))
+                solve_atoms=payload.get("solve_atoms"),
+                facts=payload.get("facts"))
             log.info("答 %r -> %.1fs %s", payload.get("text", "")[:16],
                      time.time() - t0,
                      (results[0].verdict if results else f"失败: {err}"))
@@ -326,13 +332,28 @@ class Director:
                         res_p, res_a, list(P.FALLBACK_HINTS),
                         title="海龟汤", model="no-llm"))
                 else:
-                    r = self.writer.gen_riddle(avoid=payload.get("avoid"))
-                    if r.error and not r.puzzle:
-                        log.warning("出题失败: %s", r.error)
-                    self._dispatch(self.engine.submit_riddle(
-                        r.puzzle, r.answer, r.hints, r.title,
-                        error=r.error, usage=r.usage, model=r.model,
-                        solve_atoms=r.solve_atoms, fair_clues=r.fair_clues))
+                    # blueprint 由**代码层**选(方案 §7/§12): 先定好
+                    # mechanism_family/solution_shape/domain 等硬约束
+                    # 再让模型照着设计, 而不是让它自己理解"什么叫不同"。
+                    recent = payload.get("recent_signatures") or []
+                    bp = self._pick_blueprint(recent)
+                    # 走 spec 路径: 拿到完整结构化定义(含 facts), 再转成
+                    # engine 认的 RiddleResult 形态 —— 这样 archive 能按
+                    # 方案 §34 落盘, 而 runtime 不必改接口。
+                    spec = self.writer.gen_spec(avoid=payload.get("avoid"),
+                                                blueprint=bp, recent=recent)
+                    r = _spec_to_riddle(spec) if spec.puzzle else None
+                    if r is None:
+                        log.warning("出题失败: %s", spec.error)
+                        self._dispatch(self.engine.submit_riddle(
+                            None, error=spec.error))
+                    else:
+                        self._dispatch(self.engine.submit_riddle(
+                            r.puzzle, r.answer, r.hints, r.title,
+                            error=r.error, usage=r.usage, model=r.model,
+                            solve_atoms=r.solve_atoms, fair_clues=r.fair_clues,
+                            signature=spec.signature.to_dict(),
+                            spec=spec))
                     if r.puzzle and not r.answer:
                         log.info("本题未解析出谜底, 揭晓时将重新生成")
                 self.push()
@@ -346,6 +367,27 @@ class Director:
         t = threading.Thread(target=work, daemon=True, name="riddle")
         t.start()
         return t
+
+    def _pick_blueprint(self, recent: list):
+        """选下一条 blueprint(方案 §11 的 weighted-LRU)。
+
+        用固定 seed 的 Random 实例 —— 每次出题都换 seed 会让"同输入不同
+        输出", 复盘时无法重现。这里用**进程级** rng, 只保证可注入、可测。
+        """
+        if not getattr(self.cfg, "pool_enabled", True):
+            return None
+        try:
+            from story.quality import Quotas, choose_blueprint
+            quotas = Quotas.from_config(self.cfg)
+            bp = choose_blueprint(recent, self._rng, quotas)
+            log.info("本题 blueprint: %s / %s / %s",
+                     bp.mechanism_family, bp.solution_shape, bp.domain)
+            _detail("blueprint 全文: %s", bp.describe())
+            return bp
+        except Exception as e:                       # noqa: BLE001
+            # 调度失败不能让出题链断掉 —— 退化成"模型自由发挥"
+            log.warning("blueprint 选择失败, 本题不限形状: %s", e)
+            return None
 
     def _hint(self, payload: dict) -> None:
         def work():
@@ -385,21 +427,40 @@ class Director:
         threading.Thread(target=work, daemon=True, name="reveal").start()
 
     def _archive_reveal(self, payload: dict, text: str) -> None:
-        """把一题的谜面/谜底/问答落盘。失败即停引擎(沿用旧语义)。"""
+        """把一题的谜面/谜底/问答落盘。失败即停引擎(沿用旧语义)。
+
+        落盘结构按方案 §34/§35: 不只存 puzzle/answer, 而是**完整 spec**
+        (facts/atoms/clues/hints) + blueprint/signature + 一整套 metrics。
+        下一轮分析要能直接算, 不必再去日志里刨。
+        """
         snap = self.engine.snapshot()
         model = getattr(getattr(self.writer, "client", None), "cfg", None)
         model = getattr(model, "model", "no-llm") if model else "no-llm"
-        record = dict(session=self.session_id, puzzle_index=snap.puzzle_index,
-                      puzzle=payload.get("puzzle", ""),
-                      answer=payload.get("answer", ""),
-                      reason=payload.get("reason", ""),
-                      winner=payload.get("winner", ""),
-                      reveal=text, qa=list(snap.qa_archive),
-                      # 出题时定下的原子事实与公平线索 —— 赛后复盘
-                      # "为什么这条没判中"时必须能对照它们。
-                      solve_atoms=payload.get("solve_atoms", []),
-                      fair_clues=payload.get("fair_clues", []),
-                      ts=time.time(), model=model)
+        spec = payload.get("spec")
+        spec_d = spec.to_archive() if spec is not None else {}
+        record = dict(
+            session=self.session_id, puzzle_index=snap.puzzle_index,
+            # ---- 版本(方案 §55): 没有它就分不清成绩属于哪一版 ----
+            spec_version=2,
+            prompt_version=spec_d.get("prompt_version", ""),
+            quality_policy_version=spec_d.get("quality_policy_version", ""),
+            puzzle=payload.get("puzzle", ""),
+            answer=payload.get("answer", ""),
+            reason=payload.get("reason", ""),
+            winner=payload.get("winner", ""),
+            reveal=text, qa=list(snap.qa_archive),
+            # 出题时定下的原子事实与公平线索 —— 赛后复盘
+            # "为什么这条没判中"时必须能对照它们。
+            solve_atoms=payload.get("solve_atoms", []),
+            fair_clues=payload.get("fair_clues", []),
+            # ---- 完整的结构化定义(方案 §34) ----
+            facts=spec_d.get("facts", []),
+            hints=spec_d.get("hints", []),
+            blueprint=spec_d.get("blueprint", {}),
+            signature=spec_d.get("signature", {}),
+            # ---- metrics(方案 §35) ----
+            metrics=self._round_metrics(snap),
+            ts=time.time(), model=model)
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.cfg.puzzle_out_path)),
                         exist_ok=True)
@@ -412,6 +473,41 @@ class Director:
             self._archive_failed = True
             self.engine.stop("谜题落盘失败，请检查磁盘与输出路径")
             self._stop.set()
+
+    def _round_metrics(self, snap) -> dict:
+        """这一题的运行指标(方案 §35)。
+
+        目标是把"下一轮直播该看什么"直接算好落盘, 而不是事后翻日志:
+        最有价值的是 `judge_calls / answer_calls` 与 `solution_candidate_count`
+        —— 它们直接回答"candidate 闸门有没有真的省下调用"。
+        """
+        qa = list(snap.qa_archive or [])
+        answered = len(qa)
+        candidates = sum(1 for r in qa if r.get("solution_candidate"))
+        judges = sum(1 for r in qa if r.get("is_guess") is not None)
+        unavailable = sum(1 for r in qa if r.get("status") == "unavailable")
+        # question_count 用**落盘记录里的提问数**而不是 stat_questions:
+        # 后者在 no-llm / 竞态下可能和 answered 对不上(实测见到 0 vs 1),
+        # 而 metrics 的用途就是"下一轮直接拿来算", 自相矛盾的数字比没有更糟。
+        asked = max(int(snap.stat_questions or 0), answered)
+        return {
+            "question_count": asked,
+            "answered_count": answered,
+            "dropped_count": max(int(snap.stat_dropped or 0),
+                                 max(0, asked - answered)),
+            "solution_candidate_count": candidates,
+            # 裁判调用次数 ≈ 有覆盖结果的记录数(只有 candidate 才会填这些)
+            "judge_calls": judges,
+            "answer_calls": answered,
+            "judge_call_rate": (round(judges / answered, 3) if answered else 0.0),
+            "candidate_rate": (round(candidates / answered, 3) if answered else 0.0),
+            "hint_calls": snap.hint_count,
+            "unavailable_count": unavailable,
+            "llm_failures": unavailable,
+            "viewers_seen": snap.stat_viewers_seen,
+            "duration_ms": snap.puzzle_elapsed_ms,
+            "solved": bool(snap.solved),
+        }
 
     # ---- 离线(--no-llm)用的固定内容 ----
     _FAKE_RIDDLES = (

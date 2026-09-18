@@ -213,18 +213,44 @@ def test_hints_must_be_three_and_short():
 
 
 def test_puzzle_format_checks():
-    print("[validate_spec: 谜面格式(问句/第三人称/无 meta)]")
-    s = good_spec()
-    s.puzzle = "他每天晚上都亮灯, 从不间断。"
-    check("没有问句 -> 拒", not validate_spec(s).ok)
-    s2 = good_spec()
-    s2.puzzle = "我每天晚上都亮灯, 从不间断。为什么?"
+    """谜面格式问题归 `fixable` —— 由审稿人就地改, 不是直接毙。
+
+    这三样(人称/问句/meta)都是"改一句话"的事。早先当成结构性错误直接拒,
+    结果是审稿人根本没机会改它, 一道只差一个人称的好题被丢掉 ——
+    而且 gen_spec 会一直重出直到次数耗尽。
+    """
+    print("[validate_spec: 谜面格式问题 -> fixable, 不是 error]")
+    def with_puzzle(text, quote):
+        """换谜面时同步换 clue —— 否则会先被"quote 不在谜面里"拦下,
+        测不到格式那一档。"""
+        sp = good_spec()
+        sp.puzzle = text
+        sp.fair_clues = [FairClue(quote=quote, supports_atoms=["a1"])]
+        return sp
+
+    s = with_puzzle("他每天晚上都亮灯, 从不断, 也从不说为什么。",
+                    "他每天晚上都亮灯")
+    r = validate_spec(s)
+    check("没有问句: 结构仍算过", r.ok, r.errors)
+    check("没有问句: 记进 fixable", any("问句" in f for f in r.fixable), r.fixable)
+
+    s2 = with_puzzle("我每天晚上都亮灯, 从不间断。为什么?", "我每天晚上都亮灯")
     r2 = validate_spec(s2)
-    check("第一人称 -> 拒", not r2.ok, r2.errors)
-    s3 = good_spec()
-    s3.puzzle = PUZZLE + " 【谜底】其实是礁石。"
+    check("第一人称: 结构仍算过", r2.ok, r2.errors)
+    check("第一人称: 记进 fixable",
+          any("第一人称" in f for f in r2.fixable), r2.fixable)
+
+    s3 = with_puzzle(PUZZLE + " 【谜底】其实是礁石。", "只在退潮的那几个小时亮")
     r3 = validate_spec(s3)
-    check("meta 污染 -> 拒", not r3.ok, r3.errors)
+    check("meta 污染: 结构仍算过", r3.ok, r3.errors)
+    check("meta 污染: 记进 fixable",
+          any("元文本" in f for f in r3.fixable), r3.fixable)
+
+    # 结构性错误**仍然**是 error(区分必须真的生效)
+    s4 = good_spec()
+    s4.facts = []
+    r4 = validate_spec(s4)
+    check("引用缺失的 fact 仍是 error", not r4.ok, r4.errors)
     # 低层 helper
     check("has_closing_question 正例", has_closing_question("他为什么走了?"))
     check("has_closing_question 反例", not has_closing_question("他走了。"))

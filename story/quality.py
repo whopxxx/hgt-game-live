@@ -44,24 +44,41 @@ RECENT_WINDOW = 10
 class ValidationResult:
     """硬校验结果。
 
-    `hard` 为 True 表示**结构性问题** —— 必须重出, reviewer 改不了
-    (例如 atoms 引用了不存在的 fact)。这类问题交给 reviewer 只会浪费
-    一次调用, 而且它很可能"改"出一个更不一致的版本。
+    分两档, 因为它们的**处置方式完全不同**:
+
+    `errors` —— 结构性问题, 必须重出。reviewer 改不好
+        (例如 atoms 引用了不存在的 fact), 交给它只会浪费一次调用,
+        而且它很可能"改"出一个更不一致的版本。
+
+    `fixable` —— **格式问题, 审稿人能就地改好**。
+        第一人称叙述 -> 改成第三人称; 结尾没有问句 -> 补一个;
+        谜面混进 meta 文本 -> 删掉。这三样都是"改一句话"的事,
+        整题重出是浪费(实测: 一稿只差一个人称就被丢掉)。
+        这些会被**转成 `must_fix` 交给审稿人**, 而不是直接毙。
     """
 
     ok: bool = True
-    errors: list = field(default_factory=list)   # 必须修
+    errors: list = field(default_factory=list)    # 必须重出
+    fixable: list = field(default_factory=list)   # 交给审稿人改
     warnings: list = field(default_factory=list)
 
     def fail(self, msg: str) -> None:
         self.ok = False
         self.errors.append(msg)
 
+    def can_fix(self, msg: str) -> None:
+        """记一条"审稿人能改"的问题 —— 不算硬失败。"""
+        self.fixable.append(msg)
+
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
 
     def why(self) -> str:
         return "; ".join(self.errors)
+
+    def must_fix(self) -> str:
+        """转成给审稿人的"已知问题"文本。"""
+        return "; ".join(self.fixable)
 
 
 # ======================================================================
@@ -83,13 +100,15 @@ def validate_spec(spec: PuzzleSpec,
         r.fail("谜底为空")
 
     # ---- 谜面格式 ----
+    # 注意: 这三样归 `can_fix` 而不是 `fail` —— 审稿人改一句话就能救,
+    # 整题重出会把一道好题丢掉(实测: 只差一个人称)。
     if spec.puzzle:
         if not has_closing_question(spec.puzzle):
-            r.fail("谜面结尾不是问句")
+            r.can_fix("谜面结尾不是问句, 末尾补一句'为什么?'")
         if is_first_person(spec.puzzle):
-            r.fail("谜面是第一人称叙事(应为第三人称客观事实)")
+            r.can_fix("谜面是第一人称叙事, 改成第三人称客观事实")
         if has_meta_text(spec.puzzle):
-            r.fail("谜面混进了【谜底】/【提示】之类的元文本")
+            r.can_fix("谜面混进了【谜底】/【提示】之类的元文本, 删掉它们")
 
     # ---- facts ----
     facts = spec.facts or []

@@ -93,6 +93,13 @@ class QAResult:
     cause_hit: Optional[bool] = None
     mechanism_hit: Optional[bool] = None
     matched_atoms: Optional[list] = None
+    # ---- Q5: 这一层就带出来的覆盖信息 ----
+    # touched_fact_ids: 提问**碰到了**哪些 fact(不等于确认为真)。
+    #   用来告诉提示系统"哪些方向观众已经探索过"(方案 §32/§33)。
+    # solution_candidate: 粉丝是否在**尝试完整解释谜底**。只有 true 才调
+    #   Final Judge —— 这是把 judge_calls/answer_calls 降下来的闸门。
+    touched_fact_ids: Optional[list] = None
+    solution_candidate: Optional[bool] = None
 
 
 @dataclass
@@ -117,6 +124,8 @@ class QARec:
     cause_hit: Optional[bool] = None
     mechanism_hit: Optional[bool] = None
     matched_atoms: Optional[list] = None
+    touched_fact_ids: Optional[list] = None
+    solution_candidate: Optional[bool] = None
 
     def to_json(self) -> dict[str, Any]:
         # 上屏用: 只给前端展示需要的字段(不暴露内部判定细节)
@@ -138,6 +147,8 @@ class QARec:
             "cause_hit": self.cause_hit,
             "mechanism_hit": self.mechanism_hit,
             "matched_atoms": self.matched_atoms,
+            "touched_fact_ids": self.touched_fact_ids,
+            "solution_candidate": self.solution_candidate,
         })
         return d
 
