@@ -543,6 +543,37 @@ def test_qa_archive_includes_hint_and_restate():
           len(eng._qa_archive))
 
 
+def test_qa_archive_stays_sorted_past_ui_cap():
+    """**Batch B closeout**: 超过 UI 上限后 archive 仍按 qid 有序。
+
+    原来有个"快路径/慢路径"分支: 120 条以内按 qid 插入, 超了就变成
+    直接 append。并发回答在 120 条之后会乱序 —— 而且是"跑久了才出现"
+    的那种, 最难排查。
+    """
+    print("\n[S09b] archive 超过 UI 上限后仍有序")
+    eng, _clk = boot(mkcfg(qa_max_records=500, qa_max_chars=99999))
+    N = 160                      # 明确超过 120 的 UI 截断线
+    for i in range(N):
+        eng.submit_danmaku(f"u{i}", f"观众{i}", f"#第{i}个问题")
+        eng.tick()
+        eng.submit_qa([QAResult(qid=i + 1, verdict="是")])
+    qids = [r.qid for r in eng._qa_archive]
+    check(f"archive 有全部 {N} 条", len(qids) == N, len(qids))
+    check("**严格递增**(无乱序)",
+          qids == sorted(qids), qids[:14])
+
+
+def test_qa_archive_out_of_order_arrival_stays_sorted():
+    """乱序到达(并发回答)也要插到正确位置。"""
+    print("\n[S09c] 乱序到达仍有序")
+    eng, _clk = boot(mkcfg())
+    for qid in (3, 1, 4, 2):
+        eng._append_qa_locked(QARec(qid=qid, user_name="u", text=f"q{qid}",
+                                    verdict="是", comment="", kind="qa"))
+    qids = [r.qid for r in eng._qa_archive]
+    check("按 qid 排序", qids == [1, 2, 3, 4], qids)
+
+
 def test_transcript_bounded():
     print("[长跑: transcript 有界]")
     eng, clk = boot(mkcfg(qa_max_records=10, qa_max_chars=300))
@@ -2394,6 +2425,101 @@ def test_stale_return_cannot_advance_archive_identity():
           (eng._spec_source, src_before))
 
 
+def test_runtime_spec_key_is_stable_and_distinguishes():
+    """Batch B closeout: 运行时身份要稳定, 且能区分不同题目。"""
+    print("\n[S06b] runtime_spec_key 基本性质")
+    from story.puzzle import runtime_spec_key
+    f = [{"id": "f1", "text": "事实一"}]
+    a = [{"id": "a1", "text": "原因"}]
+    k1 = runtime_spec_key("谜面", "谜底", f, a, [])
+    k2 = runtime_spec_key("谜面", "谜底", f, a, [])
+    check("同输入 -> 同 key", k1 == k2, (k1, k2))
+    check("换谜面 -> 不同 key",
+          runtime_spec_key("别的谜面", "谜底", f, a, []) != k1)
+    check("换谜底 -> 不同 key",
+          runtime_spec_key("谜面", "别的谜底", f, a, []) != k1)
+    check("换 facts -> 不同 key",
+          runtime_spec_key("谜面", "谜底", [{"id": "f9", "text": "x"}], a, []) != k1)
+    check("换 atoms -> 不同 key",
+          runtime_spec_key("谜面", "谜底", f, [{"id": "a9", "text": "y"}], []) != k1)
+    check("不抛异常(空输入)", isinstance(runtime_spec_key(), str))
+
+
+def test_engine_tracks_current_spec_key():
+    """Engine 接受题后必须记住它的运行时身份。"""
+    print("\n[S06c] Engine 记录 current_spec_key")
+    eng, _clk = boot(mkcfg())
+    check("接受题后有 key", bool(eng._current_spec_key), eng._current_spec_key)
+    k1 = eng._current_spec_key
+    # 开新题 -> 清空, 直到新题被接受
+    eng._enter_setting_locked(0.0, "riddle")
+    check("开新题时清空", eng._current_spec_key == "", eng._current_spec_key)
+    eng.submit_riddle("另一道完全不同的题。为什么?", "另一个谜底。",
+                      ["h1", "h2", "h3"], title="另一题",
+                      expect_round=eng.round_index)
+    check("新题接受后又有 key", bool(eng._current_spec_key))
+    check("两道题的 key 不同", eng._current_spec_key != k1,
+          (eng._current_spec_key, k1))
+
+
+def test_async_payloads_carry_identity():
+    """ANSWER / HINT / REVEAL 三种 payload 都要带 round + spec_key。"""
+    print("\n[S06d] 异步 payload 带身份")
+    eng, _clk = boot(mkcfg())
+    # ANSWER
+    eng.submit_danmaku("u1", "观众1", "#这是问题吗")
+    acts = eng.tick()
+    ans = [a for a in acts if a.kind == ActionKind.ANSWER]
+    check("有 ANSWER 动作", bool(ans), [a.kind for a in acts])
+    if ans:
+        p = ans[0].payload
+        check("ANSWER 带 expect_round",
+              p.get("expect_round") == eng.round_index, p.get("expect_round"))
+        check("ANSWER 带 expect_spec_key",
+              p.get("expect_spec_key") == eng._current_spec_key,
+              p.get("expect_spec_key"))
+    # HINT: 走 _hint_action 的路径需要时间推进; 直接查 builder
+    acts2 = eng._enter_revealing_locked(0.0, "giveup", "")
+    rev = [a for a in acts2 if a.kind == ActionKind.REVEAL]
+    check("有 REVEAL 动作", bool(rev), [a.kind for a in acts2])
+    if rev:
+        p = rev[0].payload
+        check("REVEAL 带 expect_round",
+              p.get("expect_round") == eng.round_index, p.get("expect_round"))
+        check("REVEAL 带 expect_spec_key",
+              p.get("expect_spec_key") == eng._current_spec_key,
+              p.get("expect_spec_key"))
+
+
+def test_stale_qa_callback_is_discarded():
+    """**核心**: 别的题(或别的稿)回来的 QA 回调 -> 整包丢弃。"""
+    print("\n[S06e] 跨题 QA 回调被丢弃")
+    eng, _clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "观众1", "#问题")
+    eng.tick()
+    # 用一个**不匹配**的 spec_key 回包
+    acts = eng.submit_qa([QAResult(qid=1, verdict="是")],
+                         expect_round=eng.round_index,
+                         expect_spec_key="deadbeefdeadbeef")
+    check("不匹配 -> 无动作", acts == [], acts)
+    check("在途没被消费", 1 in eng._inflight, list(eng._inflight))
+    # 匹配的照常
+    acts2 = eng.submit_qa([QAResult(qid=1, verdict="是")],
+                          expect_round=eng.round_index,
+                          expect_spec_key=eng._current_spec_key)
+    check("匹配 -> 正常处理", bool(acts2), acts2)
+
+
+def test_stale_reveal_callback_is_discarded():
+    """揭晓回调也要挡 —— 否则上一题的揭晓文案会揭到新题上。"""
+    print("\n[S06f] 跨题 REVEAL 回调被丢弃")
+    eng, _clk = boot(mkcfg())
+    eng._enter_revealing_locked(0.0, "giveup", "")
+    acts = eng.submit_reveal("这是上一题的揭晓文案", expect_round=99)
+    check("round 不符 -> 丢弃", acts == [], acts)
+    check("阶段没变", eng.phase == Phase.REVEALING, eng.phase)
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -2408,6 +2534,8 @@ def main():
              test_qa_archive_keeps_everything_beyond_ui_tail,
              test_qa_archive_resets_between_puzzles,
              test_qa_archive_includes_hint_and_restate,
+             test_qa_archive_stays_sorted_past_ui_cap,
+             test_qa_archive_out_of_order_arrival_stays_sorted,
              test_history_trim, test_transcript_bounded,
              test_stop_and_stream_end, test_clock_jump, test_snapshot_keys,
              test_hint_order_and_dedup, test_commands_are_not_swallowed,
@@ -2470,6 +2598,16 @@ def main():
              test_matching_round_is_accepted,
              test_expect_round_none_keeps_legacy_behavior,
              test_stale_return_cannot_advance_archive_identity,
+             test_runtime_spec_key_is_stable_and_distinguishes,
+             test_engine_tracks_current_spec_key,
+             test_async_payloads_carry_identity,
+             test_stale_qa_callback_is_discarded,
+             test_stale_reveal_callback_is_discarded,
+             test_runtime_spec_key_is_stable_and_distinguishes,
+             test_engine_tracks_current_spec_key,
+             test_async_payloads_carry_identity,
+             test_stale_qa_callback_is_discarded,
+             test_stale_reveal_callback_is_discarded,
              test_archive_writes_full_schema,
              test_archive_metrics_survive_missing_spec,
              test_archive_fallback_does_not_inherit_previous_metrics,

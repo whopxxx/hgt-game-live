@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -708,3 +709,64 @@ def is_first_person(puzzle: str) -> bool:
     s = re.sub(r"[「『“\"'][^」』”\"']*[」』”\"']", "", puzzle)
     s = re.sub(r"[（(][^）)]*[）)]", "", s)
     return bool(_FIRST_PERSON.search(s))
+
+
+# ======================================================================
+# 运行时 spec 身份(Batch B closeout / Step 06 冻结的 spec_key)
+# ======================================================================
+#: 运行时身份用的哈希长度。与 `pool.KEY_LEN` 相同纯属巧合 —— 两者是
+#: **不同的身份**, 见下面 `runtime_spec_key` 的说明。
+RUNTIME_KEY_LEN = 16
+
+
+def runtime_spec_key(puzzle: str = "", answer: str = "",
+                     facts: Optional[list] = None,
+                     solve_atoms: Optional[list] = None,
+                     fair_clues: Optional[list] = None) -> str:
+    """一道题在**运行时**的规范身份(内容哈希)。
+
+    任务书 Step 06 冻结的身份是 `round_index + spec_key +
+    quality_policy_version` 三者合用: `round_index` 是**时序**身份(第几
+    题), 这个是**内容**身份(这一题的世界是什么)。两者互补 —— 只有
+    round 时, "同一题被重出一稿"与"换了一题"分不开; 只有内容时,
+    两道内容相同的题会被误判成同一题。
+
+    ## 为什么**不**复用 `story.pool.spec_key()`
+
+    那个是**持久化 used 账本**的 key: 它的哈希输入(含 title/id)一旦改动,
+    盘上老记录算出来的 key 就变了 —— 等于所有播过的题集体复活。这是
+    绝不能碰的东西。
+
+    而运行时身份要的是"这一题的**世界**是什么", 所以输入固定为:
+        puzzle / answer / facts / solve_atoms / fair_clues
+    刻意**不含** title 与 id(它们不是世界的一部分), 也**不含**
+    signature / metrics / 时间戳(那些是观察与元信息, 换个说法不该改变
+    "这是同一道题"的判断)。
+
+    ## 用途
+
+    Engine 接受一道题时保存它; 这道题相关的异步回调(ANSWER / HINT /
+    REVEAL)带上 `expect_spec_key`, 回调在**写状态之前**复核 —— 迟到/
+    串题的结果一律丢弃。Step 14 的 Detective reservation 也依赖它。
+
+    不抛异常: 任何输入都返回一个字符串(空题也有确定的 key)。
+    """
+    def _items(xs) -> str:
+        out = []
+        for x in (xs or []):
+            if isinstance(x, dict):
+                out.append(str(x.get("id", "") or "") + ""
+                           + str(x.get("text", "") or ""))
+            else:
+                out.append(str(getattr(x, "id", "") or "") + ""
+                           + str(getattr(x, "text", "") or ""))
+        return "".join(out)
+
+    raw = "".join([
+        str(puzzle or ""),
+        str(answer or ""),
+        _items(facts),
+        _items(solve_atoms),
+        _items(fair_clues),
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:RUNTIME_KEY_LEN]

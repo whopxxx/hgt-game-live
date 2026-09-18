@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 
 from .config import Config
 from . import parser as P
-from .puzzle import PuzzleSignature, PuzzleSpec
+from .puzzle import PuzzleSignature, PuzzleSpec, runtime_spec_key
 from .state import (CMD_PREFIX, HINT_TOKENS, NEXT_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
@@ -161,6 +161,14 @@ class RoundEngine:
         #: Step 09: 本题**完整**的问答存档(append-only, 永不截断)。
         #: `qa_log` 是 UI 尾窗, `qa_archive` 是分析用的全量。
         self._qa_archive: list[QARec] = []
+        #: Batch B closeout: 当前这道题的**运行时内容身份**
+        #: (`puzzle.runtime_spec_key`)。接受题时算好, 之后与本题相关的
+        #: 异步回调都带 `expect_spec_key`, 回调写状态前复核。
+        #:
+        #: `round_index` 是时序身份(第几题), 这个是内容身份(这一题的
+        #: 世界是什么)。只有 round 时, "同一题重出一稿"与"换了一题"
+        #: 分不开; 只有内容时, 两道内容相同的题会被误判成同一道。
+        self._current_spec_key = ""
         self._qa_total = 0
         self._verdict_counts: dict[str, int] = {}
         self._last_ask: dict[tuple[str, str], float] = {}   # 去重
@@ -689,6 +697,14 @@ class RoundEngine:
             self._solve_atoms = [_atom_dict(a) for a in (solve_atoms or [])]
             self._fair_clues = [_clue_dict(c) for c in (fair_clues or [])]
             self._spec = spec
+            # 运行时内容身份(Batch B closeout)。从**交付的题本身**算,
+            # 而不是从 spec 对象 —— 兜底题 / 老调用方没有 spec 时也要有。
+            self._current_spec_key = runtime_spec_key(
+                puzzle=puzzle, answer=answer or "",
+                facts=[f.to_dict() if hasattr(f, "to_dict") else f
+                       for f in (getattr(spec, "facts", None) or [])],
+                solve_atoms=self._solve_atoms,
+                fair_clues=self._fair_clues)
             # 这道题**从哪来**(Q8 provenance)。三种取值:
             #   "pool"          题池里挑出来的
             #   "live_generate" 现场生成(含 no-llm 假题)
@@ -750,11 +766,18 @@ class RoundEngine:
 
     def submit_qa(self, answers: Optional[list[QAResult]] = None,
                   error: Optional[str] = None, usage: Optional[dict] = None,
-                  model: Optional[str] = None, now: Optional[float] = None
+                  model: Optional[str] = None, now: Optional[float] = None,
+                  expect_round: Optional[int] = None,
+                  expect_spec_key: Optional[str] = None
                   ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
             if self._stopped:
+                return []
+            # Batch B closeout: 这道题已经被换掉 -> 整个回包作废。
+            # 注意这不是"忽略某一条", 而是**整包丢弃**: 一个回包里的
+            # 裁决都属于同一个 worker, 它算的是同一道题。
+            if not self._identity_ok(expect_round, expect_spec_key):
                 return []
             self._touch_meta(usage, model, error)
             acts: list[EngineAction] = []
@@ -808,11 +831,15 @@ class RoundEngine:
             return acts
 
     def submit_hint(self, text: Optional[str] = None,
-                    error: Optional[str] = None, now: Optional[float] = None
+                    error: Optional[str] = None, now: Optional[float] = None,
+                    expect_round: Optional[int] = None,
+                    expect_spec_key: Optional[str] = None
                     ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
             if self._stopped or self.phase != Phase.QA:
+                return []
+            if not self._identity_ok(expect_round, expect_spec_key):
                 return []
             self._hint_pending = False          # 在途结束(成功或失败)
             # ---- 失败: 槽位**不消耗**, 退避后再试同一格 ----
@@ -863,11 +890,15 @@ class RoundEngine:
                 "hint": self._hint_text, "phase_changed": True})]
 
     def submit_reveal(self, text: Optional[str] = None,
-                      error: Optional[str] = None, now: Optional[float] = None
+                      error: Optional[str] = None, now: Optional[float] = None,
+                      expect_round: Optional[int] = None,
+                      expect_spec_key: Optional[str] = None
                       ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
             if self._stopped or self.phase != Phase.REVEALING:
+                return []
+            if not self._identity_ok(expect_round, expect_spec_key):
                 return []
             self._reveal_deadline = None
             self._reveal_timeout = None
@@ -974,6 +1005,33 @@ class RoundEngine:
         """
         with self._lock:
             return self._riddle_action_locked(reason)
+
+    def _identity_ok(self, expect_round: Optional[int],
+                     expect_spec_key: Optional[str]) -> bool:
+        """这道异步回调**还属于当前这道题**吗?(Batch B closeout)
+
+        两个维度互补, 两个都要查:
+
+            round_index   时序身份 —— 挡住"上一题的回调落到下一题"
+            spec_key      内容身份 —— 挡住"同一题重出了一稿, 旧稿的回调
+                          却带着同样的 round 回来"
+
+        只查 round 时, "重出一稿"这种情况会漏(round 没变, 但题已经换了);
+        只查 spec_key 时, "同一道题被连续出两次"会被误判成同一个。
+
+        两个参数都可选(None = 不查该维度), 老调用方/测试因此不受影响;
+        但**生产路径一定都传**(payload 里两个都有)。
+        """
+        if expect_round is not None and expect_round != self.round_index:
+            log.info("丢弃跨题回调: 该发属于第 %s 题, 当前第 %d 题",
+                     expect_round, self.round_index)
+            return False
+        if (expect_spec_key is not None and self._current_spec_key
+                and expect_spec_key != self._current_spec_key):
+            log.info("丢弃跨稿回调: 该发属于另一稿(round=%d)",
+                     self.round_index)
+            return False
+        return True
 
     def snapshot_generation_inputs(self) -> dict[str, Any]:
         """给**外部生成线程**用的一致快照: `{"avoid", "recent_signatures"}`。
@@ -1096,6 +1154,10 @@ class RoundEngine:
             self._inflight_at[q.qid] = now
             acts.append(EngineAction(ActionKind.ANSWER, {
                 "qid": q.qid, "user_name": q.user_name, "text": q.text,
+                # Batch B closeout: 这一发属于**哪一道题**。worker 原样
+                # 带回, submit_qa 写状态前复核 —— 迟到/串题的结果丢弃。
+                "expect_round": self.round_index,
+                "expect_spec_key": self._current_spec_key,
                 "puzzle": self._puzzle, "answer": self._answer,
                 "solve_atoms": list(self._solve_atoms),
                 "fair_clues": list(self._fair_clues),
@@ -1146,6 +1208,8 @@ class RoundEngine:
             self._hint_pending = True
             acts.append(EngineAction(ActionKind.HINT, {
                 "level": self._hints_given + 1,
+                "expect_round": self.round_index,
+                "expect_spec_key": self._current_spec_key,
                 "puzzle": self._puzzle, "answer": self._answer,
                 "given": list(self._hints_shown),
                 # ---- Q6(方案 §31/§32): fact-aware hint 的三样输入 ----
@@ -1206,6 +1270,9 @@ class RoundEngine:
         self._solve_atoms = []
         self._fair_clues = []
         self._spec = None
+        # 运行时身份也一起清空(Batch B closeout): 新题还没被接受, 此刻
+        # 任何带**上一题** key 的回调都必须被挡下 —— 那正是要防范的窗口。
+        self._current_spec_key = ""
         # 来源也一起重置: 否则上一题是池子来的, 这一题还没回调时
         # REVEAL payload 就可能带着**上一题的**来源(串题)。
         self._spec_source = "live_generate"
@@ -1262,6 +1329,8 @@ class RoundEngine:
         return [EngineAction(ActionKind.REVEAL, {
             "reason": reason,
             "winner": winner if reason == "solved" else "",
+            "expect_round": self.round_index,
+            "expect_spec_key": self._current_spec_key,
             "puzzle": self._puzzle, "answer": self._answer,
             # 出题时定下的原子事实与公平线索 —— **必须一路带到 archive**。
             # director._archive_reveal() 早就读这两个字段了, 但 payload 一直
@@ -1314,21 +1383,23 @@ class RoundEngine:
             #
             # 与 `_qa_log` 保持同一顺序(问答按 qid 插到正确位置), 这样
             # 两份记录逐条对得上, 排查时不会互相矛盾。
-            if len(self._qa_archive) == len(self._qa_log) - 1:
-                # 快路径: 上一拍刚同步过, 直接把新记录按同样规则插进去
-                pos_a = len(self._qa_archive)
-                for i in range(len(self._qa_archive) - 1, -1, -1):
-                    if (self._qa_archive[i].qid >= 0
-                            and self._qa_archive[i].qid > rec.qid):
-                        pos_a = i
-                    elif self._qa_archive[i].qid >= 0:
-                        break
-                self._qa_archive.insert(pos_a, rec)
-            else:
-                # 慢路径(理论上不该走到): 直接追加, 保证不漏记。
-                # **宁可顺序略有偏差, 也不能丢记录** —— 顺序可以事后按
-                # qid 重排, 丢掉的记录无法恢复。
-                self._qa_archive.append(rec)
+            #
+            # ⚠️ Batch B closeout: 这里原来有个"快路径/慢路径"分支 ——
+            # 120 条以内按 qid 插入, 超了就退化成长度检查失败后直接
+            # append。于是**并发回答**在超过 120 条之后会乱序(qid 8 可能
+            # 排在 qid 7 前面), 而且乱序是"运行久了才出现"的那种, 最难查。
+            #
+            # 现在**始终**按同一规则插入: 与 `_qa_log` 完全一致的算法,
+            # 独立作用在 `_qa_archive` 上。代价是一次 O(n) 反向扫描, 而这
+            # 个列表只在一道题内增长(几百条量级), 完全可以接受。
+            pos_a = len(self._qa_archive)
+            for i in range(len(self._qa_archive) - 1, -1, -1):
+                if (self._qa_archive[i].qid >= 0
+                        and self._qa_archive[i].qid > rec.qid):
+                    pos_a = i
+                elif self._qa_archive[i].qid >= 0:
+                    break
+            self._qa_archive.insert(pos_a, rec)
             # 「未判定」**不进 transcript**: 它不是对这条提问的判断, 只是
             # 系统这次没答上。喂回模型会让它以为"未判定"是一种合法裁决,
             # 久而久之开始拿它敷衍。

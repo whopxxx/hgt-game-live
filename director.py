@@ -399,7 +399,9 @@ class Director:
             # --no-llm: 用固定裁决, 但仍要回填, 否则提问会一直挂着
             verdict = self._fake_verdict(payload.get("text", ""))
             self._dispatch(self.engine.submit_qa(
-                [QAResult(qid=payload["qid"], verdict=verdict)]))
+                [QAResult(qid=payload["qid"], verdict=verdict)],
+                expect_round=payload.get("expect_round"),
+                expect_spec_key=payload.get("expect_spec_key")))
             self.push()
             return
         pool.submit(self._answer_work, payload)
@@ -431,13 +433,17 @@ class Director:
                                     status="unavailable")]
             self._dispatch(self.engine.submit_qa(
                 results, error=err,
-                model=getattr(self.writer.client.cfg, "model", None)))
+                model=getattr(self.writer.client.cfg, "model", None),
+                expect_round=payload.get("expect_round"),
+                expect_spec_key=payload.get("expect_spec_key")))
         except Exception as e:
             log.exception("回答异常: %s", e)
             self._dispatch(self.engine.submit_qa(
                 [QAResult(qid=qid, verdict=P.UNAVAILABLE,
                           comment="刚才网络抖了一下，再发一次吧",
-                          status="unavailable")], error=str(e)))
+                          status="unavailable")], error=str(e),
+                expect_round=payload.get("expect_round"),
+                expect_spec_key=payload.get("expect_spec_key")))
         self.push()
 
     # ---- RIDDLE / HINT / REVEAL: 单 worker(低频) ----
@@ -621,16 +627,23 @@ class Director:
                 # 永远挂着 True -> 本题后续提示**永久不再派发**。
                 # 失败也要回调, 由 Engine 清 pending + 设退避。
                 if text:
-                    self._dispatch(self.engine.submit_hint(text))
+                    self._dispatch(self.engine.submit_hint(
+                        text, expect_round=payload.get("expect_round"),
+                        expect_spec_key=payload.get("expect_spec_key")))
                 else:
                     self._dispatch(self.engine.submit_hint(
-                        None, error=err or "提示生成失败"))
+                        None, error=err or "提示生成失败",
+                        expect_round=payload.get("expect_round"),
+                        expect_spec_key=payload.get("expect_spec_key")))
                 self.push()
             except Exception as e:
                 log.exception("提示异常: %s", e)
                 # 异常同样要清 pending, 否则提示链在这里静默死掉。
                 try:
-                    self._dispatch(self.engine.submit_hint(None, error=str(e)))
+                    self._dispatch(self.engine.submit_hint(
+                        None, error=str(e),
+                        expect_round=payload.get("expect_round"),
+                        expect_spec_key=payload.get("expect_spec_key")))
                     self.push()
                 except Exception:
                     log.exception("提示失败回调也异常")
@@ -668,11 +681,16 @@ class Director:
                     except Exception:               # noqa: BLE001
                         # 题池只是加速器, 记不上不能影响揭晓。
                         log.exception("题池 mark_used 异常(忽略)")
-                self._dispatch(self.engine.submit_reveal(text))
+                self._dispatch(self.engine.submit_reveal(
+                    text, expect_round=payload.get("expect_round"),
+                    expect_spec_key=payload.get("expect_spec_key")))
                 self.push()
             except Exception as e:
                 log.exception("揭晓异常: %s", e)
-                self.engine.submit_reveal(None, error=str(e))
+                self.engine.submit_reveal(
+                    None, error=str(e),
+                    expect_round=payload.get("expect_round"),
+                    expect_spec_key=payload.get("expect_spec_key"))
                 self.push()
 
         threading.Thread(target=work, daemon=True, name="reveal").start()
@@ -761,7 +779,13 @@ class Director:
         最有价值的是 `judge_calls / answer_calls` 与 `solution_candidate_count`
         —— 它们直接回答"candidate 闸门有没有真的省下调用"。
         """
-        qa = list(snap.qa_archive or [])
+        # ⚠️ Batch B closeout: `qa_archive` 里**也含** hint / nudge 这些
+        # 系统记录(kind != "qa"), 直接 len() 会把系统提示算成人类问答 ——
+        # `answered_count` / `answer_calls` / `judge_call_rate` 全部虚高,
+        # 而这几项正是用来判断"candidate 闸门省了多少调用"的, 虚高就等于
+        # 结论反向。所以先按 kind 过滤。
+        qa = [r for r in (snap.qa_archive or [])
+              if (r.get("kind") or "qa") == "qa"]
         answered = len(qa)
         candidates = sum(1 for r in qa if r.get("solution_candidate"))
         judges = sum(1 for r in qa if r.get("is_guess") is not None)

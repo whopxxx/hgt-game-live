@@ -1027,6 +1027,71 @@ def test_s08_index_is_not_stable_across_reorder():
           w2.judge("谜面", "谜底", "x", after).solved)
 
 
+def test_bco_legacy_index_normalized_to_id_on_output():
+    """**Batch B closeout**: 老序号输入必须**立即归一成 id** 再写出去。
+
+    只做"读得懂"是不够的: 若结果里仍保留整数 0/1, `JudgeResult ->
+    QAResult -> archive` 就继续产出老格式, 迁移永远收不了口, 新直播也
+    一直在写混合类型数据。
+    """
+    print("\n[BCO-2] 老序号输出归一成 id")
+    ATOMS = [{"id": "a1", "role": "cause", "text": "原因"},
+             {"id": "a2", "role": "mechanism", "text": "机制"}]
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": [0, 1]})])          # 老格式输入
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "x", ATOMS)
+    check("结果里是 id 而不是序号",
+          jr.matched_atoms == ["a1", "a2"], jr.matched_atoms)
+    check("全部是字符串", all(isinstance(x, str) for x in jr.matched_atoms),
+          jr.matched_atoms)
+
+
+def test_bco_legacy_index_kept_only_when_atoms_lack_ids():
+    """只有在 legacy atoms **本身没有 id** 时才保留序号(不得已)。"""
+    print("\n[BCO-3] 无 id 的 legacy atoms 才保留序号")
+    ATOMS = [{"role": "cause", "text": "原因"},
+             {"role": "mechanism", "text": "机制"}]      # 没有 id
+    fc = FakeClient([LLMResult(tool_input={
+        "is_guess": True, "cause_hit": True, "mechanism_hit": True,
+        "matched_atoms": [0, 1]})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "x", ATOMS)
+    check("保留序号(没有 id 可归一)", jr.matched_atoms == [0, 1],
+          jr.matched_atoms)
+    check("仍能通关", jr.solved is True, jr)
+
+
+def test_bco_judge_text_fallback_cannot_solve():
+    """**Batch B closeout**: 没有结构化 `emit_judgement` -> **不得通关**。
+
+    老兜底: 没有 tool_input 但 `res.text` 非空时, 只要文本里有"是"就
+    `solved=True`。那条路绕过了 canonical facts、matched atom id、以及
+    cause+mechanism 的代码一致性门 —— 等于把通关权又还给了自由文本。
+    """
+    print("\n[BCO-4] Judge 自由文本兜底不得通关")
+    for txt in ("是", "是的，猜中了", "对"):
+        fc = FakeClient([LLMResult(text=txt)])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        jr = w.judge("谜面", "谜底", "退潮礁石露出",
+                     [{"id": "a1", "role": "cause", "text": "退潮礁石露出"},
+                      {"id": "a2", "role": "mechanism", "text": "灯标礁石"}])
+        check(f"文本 {txt!r} -> 不通关", jr.solved is False,
+              f"solved={jr.solved}")
+        check(f"文本 {txt!r} -> 标记为技术失败", jr.failed is True, jr)
+
+
+def test_bco_empty_tool_input_still_fails_closed():
+    """回归: 空 tool_input 一直就是技术失败(别被上面的改动带坏)。"""
+    print("\n[BCO-5] 空 tool_input 仍是技术失败")
+    fc = FakeClient([LLMResult(tool_input={})])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    jr = w.judge("谜面", "谜底", "x", [{"id": "a1", "role": "cause", "text": "c"}])
+    check("不通关", jr.solved is False, jr)
+    check("标记技术失败", jr.failed is True, jr)
+
+
 def test_judge_technical_failure_not_downgraded_to_irrelevant():
     print("[Q5: 裁判技术失败不能伪装成'无关', 也不抹掉第一层裁决]")
     # 第一层判"是" + candidate=true, 但裁判调用技术失败。
@@ -1400,6 +1465,36 @@ def test_closeout_incomplete_obs_never_lands_in_signature():
     check("没有采用那半套观察值",
           spec.signature.reveal_mode != "meaning_flip",
           spec.signature.reveal_mode)
+
+
+def test_closeout_absent_observed_signature_on_pass_is_rejected():
+    """**Batch B closeout**: 整个 `observed_signature` 缺失 + pass -> 拒。
+
+    这是第二层防线上的一个洞: 判据曾经是
+    `obs_missing and (changed or has_obs)`, 于是"整个 key 都没回 + 谜面
+    谜底也没改"会落到 `else`, 直接沿用 `spec.signature` —— 又变回了
+    **相信生成器自报值**(P0-2 修掉的那个"自己验自己")。
+
+    危害: v4 两条 observed 配额(reveal / procedural)完全依赖这个值。
+    Reviewer 只要不提 observed_signature, 代码就会拿生成器自报的指纹
+    登记进最近窗口, 配额统计被污染且**看不出来**。
+    """
+    print("\n[BCO-1] 整个 observed_signature 缺失 + pass -> 拒")
+    r = riddle()
+    r.pop("observed_signature", None)     # 整个 key 都没回
+    r["decision"] = "pass"
+    # 谜面谜底**不改**(这正是老判据漏掉的那种组合)
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=r),
+                     LLMResult(tool_input=riddle(puzzle="补出的一稿。为什么?")),
+                     LLMResult(tool_input=review_ok("补出的一稿。为什么?"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.gen_spec(blueprint=fc.default_blueprint)
+    gen_reqs = [c["user"] for c in fc.calls
+                if c["tool"] and c["tool"]["name"] == "emit_riddle"]
+    check("第 1 稿被拒并把原因带回下一稿",
+          len(gen_reqs) >= 2 and "observed_signature 缺字段" in gen_reqs[-1],
+          gen_reqs[-1][-200:] if gen_reqs else "(无第 2 稿)")
 
 
 def test_closeout_complete_observed_signature_is_accepted():
@@ -2418,6 +2513,11 @@ def main():
               test_s08_legacy_index_still_readable,
               test_s08_unknown_atom_id_is_dropped,
               test_s08_index_is_not_stable_across_reorder,
+              # ---- Batch B closeout ----
+              test_bco_legacy_index_normalized_to_id_on_output,
+              test_bco_legacy_index_kept_only_when_atoms_lack_ids,
+              test_bco_judge_text_fallback_cannot_solve,
+              test_bco_empty_tool_input_still_fails_closed,
               test_judge_technical_failure_not_downgraded_to_irrelevant,
               test_reviewer_keeps_solve_atoms,
               test_reviewer_can_replace_atoms_when_answer_changes,
@@ -2498,7 +2598,8 @@ def main():
               test_closeout_observed_signature_schema_is_complete,
               test_closeout_incomplete_observed_signature_is_rejected,
               test_closeout_incomplete_obs_never_lands_in_signature,
-              test_closeout_complete_observed_signature_is_accepted):
+              test_closeout_complete_observed_signature_is_accepted,
+              test_closeout_absent_observed_signature_on_pass_is_rejected):
         t()
     print()
     if FAIL[0]:

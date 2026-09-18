@@ -2148,20 +2148,27 @@ class PuzzleWriter:
         else:
             obs_missing = list(_OBSERVED_SIGNATURE_FIELDS)
 
-        has_obs = (isinstance(obs, dict)
-                   and bool(obs.get("mechanism_family")
-                            or obs.get("solution_shape")))
-        if has_obs and not obs_missing:
-            sig = PuzzleSignature.from_dict(obs)
-        elif obs_missing and (changed or has_obs):
-            # 审稿给了(不全的)观察值, 或者它改了稿 —— 两种都不接受半套。
+        # ---- v4: `pass` / `fix` 一律要求**完整**的 observed_signature ----
+        #
+        # ⚠️ 这里曾经有个洞: 判据写成 `obs_missing and (changed or has_obs)`,
+        # 于是"整个 observed_signature 都没回 + 谜面谜底也没改"会落到
+        # `else` 分支, 直接沿用 `spec.signature` —— 那又变回了**相信
+        # 生成器自报值**(P0-2 修掉的那个"自己验自己")。
+        #
+        # nested schema 要求完整字段, 但那只是第一层: 模型完全可能整个
+        # key 都不给(工具 schema 由它遵守, 不能把正确性押在它身上)。
+        # 所以代码这一层直接判: 只要 observed_signature 不是 dict、或缺少
+        # 任意一个契约字段, **就是不合格答复**, 与改没改稿、有没有给值
+        # 无关。
+        #
+        # 为什么 pass 也不例外: pass 的语义是"原样通过", 但它**仍然**要
+        # 交出"我读完之后认为这道题是什么形状"这个观察结果 —— 配额靠它,
+        # 不是靠生成器的自报值。
+        sig = spec.signature
+        if obs_missing:
             bad.append("observed_signature 缺字段(" + ", ".join(obs_missing) + ")")
-            sig = spec.signature
-        elif changed:
-            bad.append("observed_signature")
-            sig = spec.signature
         else:
-            sig = spec.signature
+            sig = PuzzleSignature.from_dict(obs)
 
         if bad:
             return None, ("审稿改了谜面/谜底, 但没有同步 " + " / ".join(bad)
@@ -2444,6 +2451,12 @@ class PuzzleWriter:
             #
             # 兼容: 老 archive 与老 fixture 里存的是整数序号, 仍按
             # **当前位置**解析; 解析不出 id 的整数一律丢弃(不猜)。
+            #
+            # ⚠️ Batch B closeout: 兼容**只作用于输入**。只要当前的 atom
+            # 有稳定 id, 就必须**立刻归一成 id** 再往下传 —— 否则
+            # `JudgeResult -> QAResult -> archive` 会继续写整数序号,
+            # 于是"迁移"永远收不了口, 新直播也一直在产出混合类型数据。
+            # 只有 legacy atoms 本身没有 id 时, 才不得已保留序号。
             roles, id_to_role = {}, {}
             for i, a in enumerate(atoms):
                 if isinstance(a, dict):
@@ -2454,6 +2467,15 @@ class PuzzleWriter:
                         roles[aid] = a.get("role")
                 else:
                     roles[i] = None
+
+            def _norm_hit(i: int):
+                """序号 -> 该位置 atom 的稳定 id; 没有 id 才退回序号。"""
+                if not (0 <= i < len(atoms)):
+                    return None
+                a = atoms[i]
+                aid = str(a.get("id", "") or "") if isinstance(a, dict) else ""
+                return aid or i
+
             raw_hits = list(ti.get("matched_atoms") or [])
             hit = []
             hit_roles = set()
@@ -2464,15 +2486,17 @@ class PuzzleWriter:
                         hit.append(key)
                         hit_roles.add(id_to_role[key])
                     elif key.isdigit() and int(key) < len(atoms):
-                        # 老格式的数字字符串: 当序号用
-                        i = int(key)
-                        hit.append(i)
-                        hit_roles.add(roles.get(i))
+                        # 老格式的数字字符串: 当序号用 -> 立即归一成 id
+                        n = _norm_hit(int(key))
+                        if n is not None:
+                            hit.append(n)
+                            hit_roles.add(roles.get(int(key)))
                 elif isinstance(x, (int, float)) and not isinstance(x, bool):
-                    # 老格式: 整数序号
+                    # 老格式: 整数序号 -> 立即归一成 id
                     i = int(x)
-                    if 0 <= i < len(atoms):
-                        hit.append(i)
+                    n = _norm_hit(i)
+                    if n is not None:
+                        hit.append(n)
                         hit_roles.add(roles.get(i))
             solved = is_guess and cause and mech
             # ---- 代码层一致性校验: 说中机制就必须真的命中 mechanism atom ----
@@ -2490,12 +2514,23 @@ class PuzzleWriter:
                     text[:40], "猜中" if solved else "未中",
                     is_guess, cause, mech, hit)
             return jr
-        if res.text:
-            t = res.text.strip()[:6]
-            ok = ("是" in t and "否" not in t and "不是" not in t)
-            return JudgeResult(solved=ok, is_guess=ok, cause_hit=ok,
-                               mechanism_hit=ok, error=res.error)
-        # 既没有 tool_input 也没有 text —— 这是**技术失败**, 不是"判否"。
+        # ---- Batch B closeout: 无结构化结果 -> **fail closed**, 不得通关 ----
+        #
+        # 这里原来有一条自由文本兜底: 没有 `tool_input` 但 `res.text` 非空
+        # 时, 只要文本前几个字里有"是"就构造 `solved=True / cause_hit=True
+        # / mechanism_hit=True`。
+        #
+        # 那条路绕过了**全部**三层:
+        #   ① Step 07 的 canonical facts(根本没进 prompt),
+        #   ② Step 08 的 matched atom id(压根没有 atom 命中),
+        #   ③ cause + mechanism 的代码层一致性门(直接被跳过)。
+        # 而"通关权在代码"现在已经冻结 —— 换句话说, 那条路径把通关权
+        # 又还给了模型的自由文本, 与冻结的设计直接冲突。
+        #
+        # 现在: 拿不到有效的 `emit_judgement` 结构就是**技术失败**。
+        # 上层仍然保留第一层"是/不是/无关"的裁决(那是 Answer 阶段的产物),
+        # 但**绝不能因此揭晓** —— 通关必须由结构化的 cause+mechanism 命中
+        # 推出。
         return JudgeResult(failed=True, error=res.error or "裁判无有效返回")
 
     # ------------------------------------------------------------------
