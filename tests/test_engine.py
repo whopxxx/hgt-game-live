@@ -11,7 +11,7 @@ from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
 from story.llm import RIDDLE_PROMPT_VERSION  # noqa: E402
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
-from story.state import ActionKind, Phase, QAResult  # noqa: E402
+from story.state import ActionKind, Phase, QARec, QAResult  # noqa: E402
 
 
 class FakeClock:
@@ -467,6 +467,80 @@ def test_history_trim():
     check("qa_total 持续增长", eng.snapshot().qa_total == 200, eng.snapshot().qa_total)
     tr = eng._transcript_locked()
     check("统计行存在", any("问答统计" in ln for ln in tr), tr[-1:])
+
+
+# ======================================================================
+# Step 09 — 完整 QA archive
+# ======================================================================
+def test_qa_archive_keeps_everything_beyond_ui_tail():
+    """**核心**: >120 条 QA 时, archive 完整, UI 仍只取尾窗。
+
+    修之前 snapshot 的 `qa_archive` 是从 `_qa_log` 现算的, 而后者在
+    120 条处被截断 —— 于是"归档"同样只留 120 条, 超出的静默消失。
+    一场直播几百条问答时, 后面全部丢失, 而且**看不出来**(字段还在,
+    只是短了)。
+    """
+    print("\n[S09-1] >120 QA: archive 完整 / UI 只取尾窗")
+    eng, _clk = boot(mkcfg(qa_max_records=500, qa_max_chars=99999))
+    N = 200
+    for i in range(N):
+        eng.submit_danmaku(f"u{i}", f"观众{i}", f"#第{i}个问题")
+        eng.tick()
+        eng.submit_qa([QAResult(qid=i + 1, verdict="是", comment="c")])
+    snap = eng.snapshot()
+    check(f"archive 有全部 {N} 条",
+          len(snap.qa_archive) == N, len(snap.qa_archive))
+    check("qa_total == N", snap.qa_total == N, snap.qa_total)
+    # UI 尾窗仍然是有界的
+    check("UI qa_log 仍只取尾窗(<=40)", len(snap.qa_log) <= 40,
+          len(snap.qa_log))
+    # 内部上屏窗口也仍被截到 120
+    check("_qa_log 被截到 120", len(eng._qa_log) == 120, len(eng._qa_log))
+    check("_qa_archive **没有**被截",
+          len(eng._qa_archive) == N, len(eng._qa_archive))
+    # archive 必须真的含**最早的**那几条 —— 这是"完整"的定义
+    qids = [r.get("qid") for r in snap.qa_archive]
+    check("archive 含第 1 条(qid=1)", 1 in qids, qids[:5])
+    check("archive 含最后一条", N in qids, qids[-5:])
+    check("archive 的 qid 无缺失",
+          set(qids) == set(range(1, N + 1)),
+          sorted(set(range(1, N + 1)) - set(qids))[:10])
+
+
+def test_qa_archive_resets_between_puzzles():
+    """archive 是**每道题**的存档 -> 开新题时清空(与 _qa_log 同步)。"""
+    print("\n[S09-2] 新题清空 archive")
+    eng, clk = boot(mkcfg())
+    for i in range(5):
+        eng.submit_danmaku(f"u{i}", f"观众{i}", f"#问题{i}")
+        eng.tick()
+        eng.submit_qa([QAResult(qid=i + 1, verdict="是")])
+    check("archive 有 5 条", len(eng._qa_archive) == 5, len(eng._qa_archive))
+    # 走完这一题
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    clk.advance(30.0)
+    eng.tick(clk.t)
+    if eng.phase != Phase.SETTING:
+        eng.phase = Phase.SETTING
+    eng.submit_riddle("下一道题。为什么?", "下一个谜底。", ["h1", "h2", "h3"],
+                      title="下一题", expect_round=eng.round_index)
+    check("新题开始时 archive 已清空",
+          len(eng._qa_archive) == 0, len(eng._qa_archive))
+    check("_qa_log 也清空了", len(eng._qa_log) == 0, len(eng._qa_log))
+
+
+def test_qa_archive_includes_hint_and_restate():
+    """archive 记的是"这道题发生过的全部", 提示/重述(qid<0)也在内。"""
+    print("\n[S09-3] archive 含提示/重述记录")
+    eng, _clk = boot(mkcfg())
+    eng.submit_danmaku("u1", "观众1", "#问题")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="是")])
+    n_before = len(eng._qa_archive)
+    eng._append_qa_locked(QARec(qid=-1, user_name="", text="",
+                                verdict="", comment="", kind="hint"))
+    check("提示也进 archive", len(eng._qa_archive) == n_before + 1,
+          len(eng._qa_archive))
 
 
 def test_transcript_bounded():
@@ -2330,6 +2404,10 @@ def main():
              test_timeline_countdown_fields,
              test_no_question_cap,
              test_restate_on_idle, test_hints_not_reset_by_chat,
+             # ---- Step 09: 完整 QA archive ----
+             test_qa_archive_keeps_everything_beyond_ui_tail,
+             test_qa_archive_resets_between_puzzles,
+             test_qa_archive_includes_hint_and_restate,
              test_history_trim, test_transcript_bounded,
              test_stop_and_stream_end, test_clock_jump, test_snapshot_keys,
              test_hint_order_and_dedup, test_commands_are_not_swallowed,

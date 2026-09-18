@@ -157,7 +157,10 @@ class RoundEngine:
         self._inflight: dict[int, PendingQ] = {}
         self._inflight_at: dict[int, float] = {}
         self._history: list[QARec] = []      # 喂回 LLM
-        self._qa_log: list[QARec] = []       # 上屏
+        self._qa_log: list[QARec] = []       # 上屏(尾窗, 会截断)
+        #: Step 09: 本题**完整**的问答存档(append-only, 永不截断)。
+        #: `qa_log` 是 UI 尾窗, `qa_archive` 是分析用的全量。
+        self._qa_archive: list[QARec] = []
         self._qa_total = 0
         self._verdict_counts: dict[str, int] = {}
         self._last_ask: dict[tuple[str, str], float] = {}   # 去重
@@ -728,6 +731,7 @@ class RoundEngine:
             self._inflight_at.clear()
             self._history.clear()
             self._qa_log.clear()
+            self._qa_archive.clear()
             self._qa_total = 0
             self._verdict_counts.clear()
             self._last_ask.clear()
@@ -1296,6 +1300,35 @@ class RoundEngine:
                 elif self._qa_log[i].qid >= 0:
                     break
             self._qa_log.insert(pos, rec)
+            # ---- Step 09: 整题 append-only 的完整存档 ----
+            #
+            # `_qa_log` 是**上屏窗口**(见下面 120 条截断), 而 `_qa_archive`
+            # 是这道题的**全部**记录。两者职责必须分开:
+            #   - `_qa_log`    -> UI 尾窗, 可以截断(前端只渲染尾部);
+            #   - `_qa_archive`-> 分析/复盘/落盘, **一条都不能丢**。
+            #
+            # 修之前 snapshot 里的 `qa_archive` 是从 `_qa_log` 现算的 ——
+            # 于是"归档"同样只留 120 条, 超出的静默消失。一场直播几百条
+            # 问答时, 后面全部丢失, 而且是**看不出来**的丢(字段还在,
+            # 只是短了)。
+            #
+            # 与 `_qa_log` 保持同一顺序(问答按 qid 插到正确位置), 这样
+            # 两份记录逐条对得上, 排查时不会互相矛盾。
+            if len(self._qa_archive) == len(self._qa_log) - 1:
+                # 快路径: 上一拍刚同步过, 直接把新记录按同样规则插进去
+                pos_a = len(self._qa_archive)
+                for i in range(len(self._qa_archive) - 1, -1, -1):
+                    if (self._qa_archive[i].qid >= 0
+                            and self._qa_archive[i].qid > rec.qid):
+                        pos_a = i
+                    elif self._qa_archive[i].qid >= 0:
+                        break
+                self._qa_archive.insert(pos_a, rec)
+            else:
+                # 慢路径(理论上不该走到): 直接追加, 保证不漏记。
+                # **宁可顺序略有偏差, 也不能丢记录** —— 顺序可以事后按
+                # qid 重排, 丢掉的记录无法恢复。
+                self._qa_archive.append(rec)
             # 「未判定」**不进 transcript**: 它不是对这条提问的判断, 只是
             # 系统这次没答上。喂回模型会让它以为"未判定"是一种合法裁决,
             # 久而久之开始拿它敷衍。
@@ -1304,6 +1337,9 @@ class RoundEngine:
                 self._trim_history_locked()
         else:
             self._qa_log.append(rec)
+            self._qa_archive.append(rec)
+        # ⚠️ 只截 `_qa_log`(上屏窗口)。`_qa_archive` **永不截断** ——
+        # 它命名成 archive 就该是 archive。
         if len(self._qa_log) > 120:
             self._qa_log = self._qa_log[-120:]
 
@@ -1375,7 +1411,7 @@ class RoundEngine:
                 solved=self._solved,
                 solved_by=self._solved_by,
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
-                qa_archive=[r.to_archive() for r in self._qa_log],
+                qa_archive=[r.to_archive() for r in self._qa_archive],
                 qa_total=self._qa_total,
                 pending_count=len(self._pending) + len(self._inflight),
                 hint_count=self._hints_given,
