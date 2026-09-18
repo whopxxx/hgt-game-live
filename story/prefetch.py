@@ -71,6 +71,13 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
+from .playtest import (
+    INTERRUPTED as OUTCOME_INTERRUPTED,
+    PASS as OUTCOME_PASS,
+    UNAVAILABLE as OUTCOME_UNAVAILABLE,
+    UNSOLVED as OUTCOME_UNSOLVED,
+)
+
 log = logging.getLogger("story.prefetch")
 
 #: `_future` 的占位标记: "已经决定要提交, 但还没拿到 Future"。
@@ -88,7 +95,8 @@ class PoolPrefetcher:
     def __init__(self, cfg: Any, pool: Any, writer: Any, probe: Callable,
                  probe_inputs: Callable, pick_blueprint: Callable,
                  rng: Optional[random.Random] = None,
-                 executor: Any = None, clock: Callable = time.monotonic):
+                 executor: Any = None, clock: Callable = time.monotonic,
+                 playtester: Any = None):
         self.cfg = cfg
         self.pool = pool
         self.writer = writer
@@ -96,6 +104,11 @@ class PoolPrefetcher:
         self._probe_inputs = probe_inputs
         self._pick_blueprint = pick_blueprint
         self._clock = clock
+        #: AI 试玩(Q10)。None = 不试玩(默认)。由 Director 在
+        #: `playtest_enabled` 时注入 —— 这里**不自己 new**, 因为
+        #: Playtester 需要 host_writer(本模块的 writer)和
+        #: should_continue(本模块的压力探针), 装配权在调用方。
+        self._playtester = playtester
 
         self._min_size = max(0, int(getattr(cfg, "pool_min_size", 2) or 0))
         self._target_size = max(0, int(getattr(cfg, "pool_target_size", 5) or 0))
@@ -120,8 +133,19 @@ class PoolPrefetcher:
         self._retry_at = 0.0               # 退避到期时刻(monotonic)
         self._pending_result = None        # worker 的终局结果, 由 tick 取走
         self._last_fail = ""
-        self.gen_count = 0
-        self.fail_count = 0
+        # ---- 计数(全部由 tick 线程单写) ----
+        # 拆得比"一个 fail_count"细, 因为后续排查时**故障发生在哪个
+        # 阶段**是最有价值的信息: 生成失败是出题质量问题, add 失败是
+        # 存储/校验边界问题, 异常是代码 bug, 试玩没过是收敛性问题。
+        # 合并成一个数字就再也拆不开了。
+        self.added_count = 0               # 最终成功写进 Pool 的题数
+        self.generation_fail_count = 0     # gen_spec 明确失败
+        self.add_fail_count = 0            # 生成/试玩都过了, 但 pool.add 失败
+        self.exception_count = 0           # worker 非预期异常
+        self.playtest_pass_count = 0
+        self.playtest_unsolved_count = 0
+        self.playtest_unavailable_count = 0
+        self.playtest_interrupted_count = 0
         self.skip_count = 0
 
     # ------------------------------------------------------------------
@@ -177,18 +201,8 @@ class PoolPrefetcher:
             # ---- ② 应用 worker 的终局结果 ----
             res, self._pending_result = self._pending_result, None
             if res is not None:
-                kind, detail = res
-                if kind == "ok":
-                    self._retry_at = 0.0        # 成功清退避
-                    self.gen_count += 1
-                    self._last_fail = ""
-                    log.info("补池成功: 库存 -> %d", self._stock())
-                else:
-                    self._retry_at = now + self._backoff_s
-                    self.fail_count += 1
-                    self._last_fail = detail or kind
-                    log.warning("补池失败(%s), 退避 %.0fs: %s",
-                                kind, self._backoff_s, detail)
+                kind, detail, extra = res
+                self._apply_result(kind, detail, extra, now)
 
             # ---- ③ 退避 ----
             if now < self._retry_at:
@@ -245,6 +259,57 @@ class PoolPrefetcher:
             if self._future is _PENDING:
                 self._future = fut
 
+    def _apply_result(self, kind: str, detail: str, extra: dict,
+                      now: float) -> None:
+        """把 worker 的终局结果记进计数/退避。
+
+        两条**正交**的账, 不要互相吞:
+          - **试玩结果**: `playtest_*_count` **无条件**按 status 自增。
+            所以 INTERRUPTED 虽然不退避(让路), 仍然计一次 interrupted ——
+            否则区分不了"试玩系统经常坏"和"直播太忙总被打断"。
+          - **入池结果**: `added` / `add_fail` 记最终有没有落进池子。
+            试玩 PASS 之后 `pool.add()` 失败, 前面那次 `playtest_pass_count`
+            **照样保留** —— 否则以后会误以为 Player 没通过。
+        """
+        pt = (extra or {}).get("playtest")
+
+        # ---- ① 试玩结果(无条件计, 与后面 add 成败无关) ----
+        if pt == OUTCOME_PASS:
+            self.playtest_pass_count += 1
+        elif pt == OUTCOME_UNSOLVED:
+            self.playtest_unsolved_count += 1
+        elif pt == OUTCOME_UNAVAILABLE:
+            self.playtest_unavailable_count += 1
+        elif pt == OUTCOME_INTERRUPTED:
+            self.playtest_interrupted_count += 1
+
+        # ---- ② 入池结果 ----
+        if kind == "ok":
+            self.added_count += 1
+        elif kind == "gen_fail":
+            self.generation_fail_count += 1
+        elif kind == "add_fail":
+            self.add_fail_count += 1
+        elif kind == "exc":
+            self.exception_count += 1
+
+        # ---- ③ 退避 ----
+        # 成功入池清退避; 其余一律按 `OUTCOME_POLICY` 决定。
+        # `interrupted` 只让路, 不退避 —— 否则运维数据会把"直播活跃"
+        # 误读成"试玩大量失败"。
+        if kind == "ok":
+            self._retry_at = 0.0
+            self._last_fail = ""
+            log.info("补池成功: 库存 -> %d", self._stock())
+            return
+        if (extra or {}).get("interrupted"):
+            log.info("补池让路(直播变忙), 不计失败不退避: %s", detail)
+            return
+        self._retry_at = now + self._backoff_s
+        self._last_fail = detail or kind
+        log.warning("补池失败(%s), 退避 %.0fs: %s",
+                    kind, self._backoff_s, detail)
+
     # ------------------------------------------------------------------
     def _ledger_ok(self) -> bool:
         try:
@@ -297,24 +362,30 @@ class PoolPrefetcher:
 
     # ------------------------------------------------------------------
     def _generate_one(self, inputs: dict) -> None:
-        """executor 线程。**唯一职责: 生成一道并 add 进池。**
+        """executor 线程。**唯一职责: 生成一道, (可选)试玩, add 进池。**
 
         唯一的写口是结尾那个 `_pending_result` —— 绝不碰 latch/退避/
         计数器(那些是 tick 线程的单写者变量)。
         """
-        kind, detail = "exc", ""
+        kind, detail, extra = "exc", "", {}
         try:
-            kind, detail = self._generate_one_inner(inputs)
+            kind, detail, extra = self._generate_one_inner(inputs)
         except Exception as e:                  # noqa: BLE001
             log.exception("补池生成异常: %s", e)
-            kind, detail = "exc", str(e)
+            kind, detail, extra = "exc", str(e), {}
         finally:
             with self._lock:
-                self._pending_result = (kind, detail)
+                self._pending_result = (kind, detail, extra)
 
     def _generate_one_inner(self, inputs: dict) -> tuple:
+        """返回 `(kind, detail, extra)`。
+
+        `extra` 目前只带一个 key: `playtest`(试玩 status)或 `interrupted`。
+        tick 线程靠它做**正交**统计 —— 见 `_apply_result`。
+        """
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
+        extra: dict = {}
         bp = self._pick_blueprint(recent, rng=self._rng)
         spec = self.writer.gen_spec(
             avoid=avoid, blueprint=bp, recent=recent,
@@ -324,7 +395,28 @@ class PoolPrefetcher:
         if spec is None or not getattr(spec, "puzzle", "") or spec.error:
             return ("gen_fail",
                     (spec.error if spec is not None else "spec=None")
-                    or "空谜面")
+                    or "空谜面", {})
+
+        # ---- Q10: AI 试玩(默认关闭, 开着才跑) ----
+        if self._playtest_enabled():
+            pt, why = self._playtest(spec)
+            if pt is not None:
+                # 试玩结论落进 metrics —— Q8 的序列化链天然保存它。
+                try:
+                    spec.metrics["playtest"] = pt.to_metrics()
+                except Exception:               # noqa: BLE001
+                    log.exception("试玩 metrics 写入失败(忽略)")
+                if not pt.passed:
+                    # 契约: 不 PASS 就不入池。丢弃 candidate。
+                    # **不**留内存副本、**不**直接上屏(同 add 失败)。
+                    kind = ("playtest_interrupted"
+                            if pt.status == OUTCOME_INTERRUPTED
+                            else "playtest_fail")
+                    return (kind, f"试玩未通过({pt.status}{'/' + pt.reason if pt.reason else ''})",
+                            {"playtest": pt.status,
+                             "interrupted": pt.status == OUTCOME_INTERRUPTED})
+                extra = {"playtest": pt.status}
+
         if not self.pool.add(spec, source="prefetch"):
             # 契约: add 失败 == 这次生成**丢弃**。
             #
@@ -332,8 +424,30 @@ class PoolPrefetcher:
             # 会同时存在两类库存(盘上可恢复 vs 内存一次性), 而内存题
             # 没有 used 行 —— 崩溃后既不在盘上也不在 used 里, Q8 验收点 4
             # ("pop 过的题重启不复活")立刻无法推理。
-            return ("add_fail", "pool.add 返回 False")
-        return ("ok", "")
+            #
+            # `extra` 里那次 `playtest=PASS` **照样带回 tick 线程计数** ——
+            # 试玩统计与入池统计正交, add 失败不能把 PASS 吞掉。
+            return ("add_fail", "pool.add 返回 False", extra)
+        return ("ok", "", extra)
+
+    # ------------------------------------------------------------------
+    def _playtest_enabled(self) -> bool:
+        if self._playtester is None:
+            return False
+        return bool(getattr(self.cfg, "playtest_enabled", False))
+
+    def _playtest(self, spec: Any) -> tuple:
+        """跑一次试玩。返回 `(PlaytestResult | None, why)`。
+
+        **绝不让试玩异常冒泡** —— 它跑在 worker 线程里, 抛出去会变成
+        `exc`, 那会把"试玩坏"记成"代码 bug", 混淆两类账。
+        """
+        try:
+            r = self._playtester.run(spec)
+            return r, ""
+        except Exception as e:                  # noqa: BLE001
+            log.exception("试玩异常: %s", e)
+            return None, str(e)
 
     # ------------------------------------------------------------------
     def shutdown(self) -> None:
@@ -362,6 +476,12 @@ class PoolPrefetcher:
 
     # ------------------------------------------------------------------
     def stats(self) -> dict:
+        """补池计数。**分阶段 + 试玩拆开**, 不做成一个宽泛的 "失败数"。
+
+        一个总的 `fail_count` 在这里是有害的: 生成失败/入池失败/代码异常/
+        试玩没过是四类完全不同的故障, 合并之后"试玩失败率 40%"这句话
+        既不知道是题不收敛、是网关抖了, 还是直播太忙。
+        """
         with self._lock:
             f = self._future
             return {
@@ -369,8 +489,19 @@ class PoolPrefetcher:
                 # `_PENDING` 也算在途(已决定提交、还没拿到 Future)。
                 "in_flight": f is not None,
                 "backoff_until": self._retry_at,
-                "gen": self.gen_count,
-                "fail": self.fail_count,
+
+                "added": self.added_count,
+                "generation_fail": self.generation_fail_count,
+                "add_fail": self.add_fail_count,
+                "exception": self.exception_count,
                 "skip": self.skip_count,
+
+                "playtest": {
+                    "pass": self.playtest_pass_count,
+                    "unsolved": self.playtest_unsolved_count,
+                    "unavailable": self.playtest_unavailable_count,
+                    "interrupted": self.playtest_interrupted_count,
+                },
+
                 "last_fail": self._last_fail,
             }

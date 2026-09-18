@@ -602,7 +602,8 @@ def test_gen_failure_sets_backoff():
         check("第一次尝试了", len(w.calls) == 1, len(w.calls))
         pf.on_tick()                    # 这一拍才**应用**上一拍的结果
         check("**设了退避**", pf._retry_at > 0, pf._retry_at)
-        check("失败计数 +1", pf.fail_count == 1, pf.fail_count)
+        check("生成失败计数 +1", pf.generation_fail_count == 1,
+              pf.generation_fail_count)
         pf.on_tick()
         pf.on_tick()
         check("**退避期内不重试**", len(w.calls) == 1, len(w.calls))
@@ -879,7 +880,8 @@ def test_on_tick_never_raises():
         check("**生成炸了也不抛**", ok2)
         pf2.on_tick()                   # 应用上一拍的结果
         check("异常也计入退避", pf2._retry_at > 0, pf2._retry_at)
-        check("异常也计入失败数", pf2.fail_count == 1, pf2.fail_count)
+        check("异常计入 exception_count", pf2.exception_count == 1,
+              pf2.exception_count)
 
 
 

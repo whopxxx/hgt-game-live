@@ -225,12 +225,56 @@ class Director:
             # `client` 仍然共用 —— 它是纯传输层, 无可变业务状态。
             pf_writer = (PuzzleWriter(client=self.client, runtime_cfg=cfg)
                          if self.client is not None else None)
+
+            # ---- Q10: AI 试玩(默认关闭) ----
+            # 装配权在这里, 不在 PoolPrefetcher 里 —— 因为 Playtester 需要
+            # (a) host_writer = 上面那个 pf_writer, (b) should_continue =
+            # 引擎的压力探针, 两者都是本层的协作者。
+            #
+            # `should_continue` 复用 `_low_pressure_for_playtest`: 试玩比
+            # 单次 gen_spec 长得多(2N 次 LLM 调用), 所以它每步之前都要
+            # 重查一次"房间还空着吗"。一旦不空, 立刻以 interrupted 让路。
+            playtester = None
+            if (getattr(cfg, "playtest_enabled", False)
+                    and pf_writer is not None):
+                from story.playtest import Playtester
+                playtester = Playtester(
+                    player_client=self.client,
+                    host_writer=pf_writer,
+                    should_continue=self._playtest_should_continue,
+                    max_turns=getattr(cfg, "playtest_max_turns", 10))
+
             self._prefetcher = PoolPrefetcher(
                 cfg=cfg, pool=self.pool, writer=pf_writer,
                 probe=self.engine.pressure,
                 probe_inputs=self.engine.snapshot_generation_inputs,
                 pick_blueprint=self._pick_blueprint,
-                rng=pf_rng)
+                rng=pf_rng, playtester=playtester)
+
+    # ------------------------------------------------------------------
+    def _playtest_should_continue(self) -> bool:
+        """试玩让路谓词: 房间还空着才继续。
+
+        用 `engine.pressure()` 而不是另起一个探针 —— 补池启动试玩时用的
+        就是它, 复用同一个判定边界, 免得"能开始试玩"和"能继续试玩"两套
+        标准漂移。试玩**开跑**的条件已经由 prefetcher 的 `_low_pressure()`
+        保证, 这里只负责"跑着跑着房间忙了就让路"。
+        """
+        try:
+            p = self.engine.pressure()
+        except Exception:                       # noqa: BLE001
+            log.exception("试玩压力探针异常, 当作中断")
+            return False
+        if not p or p.get("stopped"):
+            return False
+        from story.state import Phase
+        if p.get("phase") != Phase.QA:
+            return False
+        if p.get("pending") or p.get("inflight"):
+            return False
+        if p.get("hint_inflight") or p.get("reveal_inflight"):
+            return False
+        return True
 
     # ------------------------------------------------------------------
     def _build_source(self):
@@ -886,6 +930,11 @@ class Director:
             else:
                 print(f"  补池        : 低水位 {cfg.pool_min_size} -> "
                       f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
+                if getattr(cfg, "playtest_enabled", False):
+                    print(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "
+                          f"猜不中不入池; Player temperature=0)")
+                else:
+                    print("  试玩        : 关(--playtest 开启)")
             print(f"                {os.path.abspath(st['path'])}")
         if cfg.no_llm:
             print("  LLM         : 已禁用(--no-llm), 使用固定文案")

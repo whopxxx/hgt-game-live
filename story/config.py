@@ -220,7 +220,9 @@ class Config:
     quota_trauma_ritual: int = 1          # "创伤 + 长年怪规矩"上限(实测坍缩最重)
 
     # ---- AI 试玩(方案 §40/§42): 直播热路径里**默认关闭** ----
+    # 只在后台 prefetch candidate 上跑, `_riddle` 永远不试玩。
     playtest_enabled: bool = False
+    playtest_max_turns: int = 10          # 试玩轮数上限(Player<->Host 往返)
 
     # ---- 采样温度(方案 §30) ----
     # 裁决/裁判必须确定性(temperature=0), 出题才需要发散。
@@ -361,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_false",
                     help="不后台补池(只用已有/手工灌的题; 默认开启)。"
                          "网关故障时用它停掉后台生成, 池子里的存量题照常播")
+    ap.add_argument("--playtest", dest="playtest_enabled",
+                    action="store_true",
+                    help="后台补池时先用 AI 玩家试玩一遍, 只有猜得中才入池"
+                         "(默认关闭)。会让补池变慢很多: 每道题多 2N 次调用")
+    ap.add_argument("--playtest-max-turns", type=int, default=10,
+                    help="AI 试玩最多几轮, 默认 10")
 
     ap.add_argument("--max-question-len", type=int, default=60,
                     help="单条提问最大长度, 默认 60")
@@ -412,6 +420,8 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         # 只加 flag 不在这里接上 = 又一个 dead config(参数形同虚设,
         # 而 --help 里明明写着)。加 flag 和接线必须同一处完成。
         pool_prefetch_enabled=a.pool_prefetch_enabled,
+        playtest_enabled=a.playtest_enabled,
+        playtest_max_turns=a.playtest_max_turns,
         max_question_len=a.max_question_len,
         host=a.host,
         port=a.port,

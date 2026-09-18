@@ -29,6 +29,7 @@ from story.puzzle import (  # noqa: E402
     FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
     SolveAtom,
 )
+from story.state import Phase  # noqa: E402
 
 FAIL = [0]
 
@@ -44,11 +45,13 @@ def check(name, cond, extra=""):
 # ======================================================================
 # 假件
 # ======================================================================
-def mk_spec() -> PuzzleSpec:
-    """一道内部自洽的题。谜底/facts/atoms 都是**唯一的哨兵串**,
-    便于断言"它们一个字都没漏进 Player prompt"。
+def mk_spec(**kw) -> PuzzleSpec:
+    """一道内部自洽、**能过池准入门**的题。
+
+    谜底/facts/atoms/hints 都是**唯一的哨兵串**, 便于断言"它们一个字
+    都没漏进 Player prompt"。
     """
-    return PuzzleSpec(
+    s = PuzzleSpec(
         id="", title="灯塔",
         puzzle="守塔人只在退潮时亮灯，涨潮后反而熄灯。为什么？",
         answer="SENTINEL_ANSWER 退潮礁石露出，亮灯是标示礁石。",
@@ -57,15 +60,26 @@ def mk_spec() -> PuzzleSpec:
                        kind="core"),
             PuzzleFact(id="f2", text="SENTINEL_FACT2 灯是标示礁石",
                        kind="core"),
+            PuzzleFact(id="f3", text="涨潮后礁石被淹没，亮灯反而误导船只",
+                       kind="support", hintable=False),
+            PuzzleFact(id="f4", text="他的行为不是为了纪念死者",
+                       kind="exclusion", hintable=False),
         ],
         solve_atoms=[
-            SolveAtom(id="a1", role="cause", text="SENTINEL_ATOM 礁石需标示",
+            SolveAtom(id="a1", role="cause",
+                      text="SENTINEL_ATOM 退潮使礁石成为需标示的目标",
                       fact_ids=["f1"]),
+            SolveAtom(id="a2", role="mechanism",
+                      text="SENTINEL_ATOM2 灯是在标礁石, 不是引路",
+                      fact_ids=["f2", "f3"]),
         ],
         fair_clues=[
             FairClue(quote="只在退潮时亮灯", supports_atoms=["a1"]),
+            FairClue(quote="涨潮后反而熄灯", supports_atoms=["a2"]),
         ],
-        hints=["SENTINEL_HINT 想潮水"],
+        hints=["SENTINEL_HINT 注意灯的开关时机",
+               "SENTINEL_HINT2 想想潮水变化",
+               "SENTINEL_HINT3 灯在给谁传递信息?"],
         blueprint=PuzzleBlueprint(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
@@ -79,6 +93,9 @@ def mk_spec() -> PuzzleSpec:
         metrics={"ok": True},
         blueprint_specified=True,
     )
+    for k, v in kw.items():
+        setattr(s, k, v)
+    return s
 
 
 class _FakePlayerClient:
@@ -582,6 +599,337 @@ def test_metrics_carries_reason():
           r.to_metrics().get("reason") == "give_up", r.to_metrics())
 
 
+def test_prefetch_playtest_disabled_by_default():
+    """Q10c: 默认关 —— Q9 的调用次数/库存行为完全不变。"""
+    print("\n[G1] playtest 默认关, prefetch 行为不变")
+    import os as _os
+    import tempfile
+    from story.config import Config
+    from story.pool import PuzzlePool
+    from story.prefetch import PoolPrefetcher
+    from story.playtest import Playtester
+
+    class _W:
+        def __init__(self):
+            self.calls = 0
+            self._n = 0
+
+        def gen_spec(self, **kw):
+            self.calls += 1
+            self._n += 1
+            return _spec_for_prefetch(self._n)
+
+    class _Ex:
+        def submit(self, fn, *a, **kw):
+            from concurrent.futures import Future
+            f = Future()
+            f.set_result(fn(*a, **kw))
+            return f
+
+        def shutdown(self, **kw):
+            pass
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
+                     pool_path=_os.path.join(d, "p.jsonl"),
+                     pool_used_path=_os.path.join(d, "u.jsonl"),
+                     pool_min_size=2, pool_target_size=5)
+        pool = PuzzlePool.open(cfg)
+        w = _W()
+        # 默认: 不注入 playtester
+        pf = PoolPrefetcher(
+            cfg=cfg, pool=pool, writer=w,
+            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
+                           "hint_inflight": False, "reveal_inflight": False,
+                           "stopped": False},
+            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+            pick_blueprint=lambda recent, rng=None: None,
+            executor=_Ex())
+        check("**默认没有 playtester**", pf._playtester is None)
+        pf.on_tick()
+        pf.on_tick()
+        # 只断言"确实在生成"且"没有试玩计数", 不断言具体次数。
+        # (而且结果要**下一拍**才被应用, 所以 added_count 会滞后于 calls。)
+        check("确实在生成", w.calls >= 1, w.calls)
+        check("**零试玩计数**",
+              pf.playtest_pass_count == 0 and pf.playtest_unsolved_count == 0
+              and pf.playtest_unavailable_count == 0
+              and pf.playtest_interrupted_count == 0)
+        check("入池计数非零(至少应用了一次结果)",
+              pf.added_count >= 1, pf.added_count)
+
+
+def test_prefetch_playtest_pass_and_fail_paths():
+    """Q10c: PASS 才入池; unsolved/unavailable/interrupted 都不入池。"""
+    print("\n[G2] 试玩四种结局 -> 入池/退避")
+    from story.playtest import (INTERRUPTED, PASS, UNAVAILABLE, UNSOLVED,
+                                PlaytestResult)
+
+    class _PT:
+        def __init__(self, status):
+            self.status = status
+
+        def run(self, spec):
+            r = PlaytestResult(status=self.status)
+            if self.status == UNSOLVED:
+                r.reason = "max_turns"
+            return r
+
+    rows = [
+        (PASS, True, False, "pass"),
+        (UNSOLVED, False, True, "unsolved"),
+        (UNAVAILABLE, False, True, "unavailable"),
+        (INTERRUPTED, False, False, "interrupted"),
+    ]
+    for status, should_add, should_backoff, key in rows:
+        pf, w, clk, d = _mkpf_with_pt(_PT(status))
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()                    # 应用结果
+        added = pf.added_count
+        check(f"**{status}: 入池={should_add}**", (added == 1) == should_add,
+              added)
+        check(f"{status}: 退避={should_backoff}",
+              (pf._retry_at > 0) == should_backoff, pf._retry_at)
+        check(f"{status}: 计数 playtest_{key}=1",
+              pf.stats()["playtest"][key.split("_")[-1]
+                                     if key != "pass" else "pass"] == 1,
+              pf.stats()["playtest"])
+
+
+def test_playtest_pass_then_add_fail_keeps_both_counts():
+    """**正交性**: 试玩 PASS 后 add 失败 —— PASS 统计不能被吞。"""
+    print("\n[G3] PASS + add 失败: 两个计数都在")
+    from story.playtest import PASS, PlaytestResult
+
+    class _PT:
+        def run(self, spec):
+            return PlaytestResult(status=PASS)
+
+    pf, w, clk, d = _mkpf_with_pt(_PT())
+    # 让 pool.add 一定失败: 池子对象换成拒绝 add 的替身
+    class _RejectPool:
+        ledger_trustworthy = True
+
+        def stock_count(self, limit=None):
+            return 0
+
+        def add(self, spec, source=None):
+            return False
+
+    pf.pool = _RejectPool()
+    pf.on_tick()
+    pf.on_tick()
+    st = pf.stats()
+    check("**playtest pass 计了**", st["playtest"]["pass"] == 1,
+          st["playtest"])
+    check("**add_fail 计了**", st["add_fail"] == 1, st)
+    check("added 为 0", st["added"] == 0, st["added"])
+
+
+def test_interrupted_counts_but_does_not_backoff():
+    """INTERRUPTED: 计一次 interrupted, 但**不**退避。"""
+    print("\n[G4] interrupted 计数但不退避")
+    from story.playtest import INTERRUPTED, PlaytestResult
+
+    class _PT:
+        def run(self, spec):
+            return PlaytestResult(status=INTERRUPTED)
+
+    pf, w, clk, d = _mkpf_with_pt(_PT())
+    fill(pf.pool, 1)
+    pf.on_tick()
+    pf.on_tick()
+    st = pf.stats()
+    check("**playtest interrupted=1**", st["playtest"]["interrupted"] == 1, st)
+    check("**不退避**", pf._retry_at == 0, pf._retry_at)
+    check("**refill latch 仍 active**", pf._refill_active is True)
+    check("没入池", st["added"] == 0, st["added"])
+
+
+def test_stats_shape_is_staged():
+    """stats() 分阶段, 不再有一个宽泛的 fail。"""
+    print("\n[G5] stats() 形状分阶段")
+    pf, w, clk, d = _mkpf_with_pt(None)
+    st = pf.stats()
+    for k in ("added", "generation_fail", "add_fail", "exception", "skip"):
+        check(f"有 {k}", k in st, list(st))
+    check("**没有旧的 'gen'**", "gen" not in st, list(st))
+    check("**没有旧的宽泛 'fail'**", "fail" not in st, list(st))
+    check("playtest 是嵌套 dict", isinstance(st["playtest"], dict), st)
+    check("playtest 四键",
+          set(st["playtest"]) == {"pass", "unsolved", "unavailable",
+                                  "interrupted"}, st["playtest"])
+
+
+def test_playtest_off_by_flag():
+    """`playtest_enabled=False` 时即使注入了 playtester 也不跑。"""
+    print("\n[G6] playtest_enabled=False 时不跑试玩")
+    from story.playtest import PASS, PlaytestResult
+    calls = []
+
+    class _PT:
+        def run(self, spec):
+            calls.append(1)
+            return PlaytestResult(status=PASS)
+
+    pf, w, clk, d = _mkpf_with_pt(_PT(), playtest_enabled=False)
+    fill(pf.pool, 1)
+    pf.on_tick()
+    pf.on_tick()
+    check("**试玩零调用**", len(calls) == 0, len(calls))
+    check("照常入池", pf.added_count == 1, pf.added_count)
+
+
+def test_playtest_disabled_director_no_playtester():
+    """Director 默认不建 playtester。"""
+    print("\n[G7] Director 默认没有 playtester")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        dr = Director(cfg)
+        check("**默认 playtester 为 None**",
+              dr._prefetcher is not None
+              and dr._prefetcher._playtester is None)
+        dr._prefetcher.shutdown()
+
+
+def test_playtest_enabled_director_builds_playtester():
+    """Director 在 playtest_enabled 时注入 playtester, host 是 pf writer。"""
+    print("\n[G8] Director 开启时建 playtester, host=pf writer")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, playtest_enabled=True)
+        dr = Director(cfg)
+        pf = dr._prefetcher
+        check("**建了 playtester**", pf is not None and pf._playtester is not None)
+        if pf and pf._playtester:
+            check("**host 是 prefetch 的 writer(不是 live 的)**",
+                  pf._playtester.host is pf.writer)
+            check("host 不是 live writer", pf._playtester.host is not dr.writer)
+            check("Player 用同一 client",
+                  pf._playtester.client is dr.client)
+        if pf:
+            pf.shutdown()
+
+
+def test_prefetch_module_does_not_touch_engine_writes():
+    """AST: prefetch 仍然不碰 Pool/Engine 的写口(Q9 不变量, Q10 也不能破)。"""
+    print("\n[G9] prefetch.py 不碰写口(Q9 不变量)")
+    import ast
+    src = Path(__file__).resolve().parents[1] / "story" / "prefetch.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+    for bad in ("pop_next", "mark_used", "remember_avoid", "submit_riddle",
+                "load"):
+        check(f"**不出现 {bad}**", bad not in names, bad)
+
+
+def _spec_for_prefetch(i: int):
+    """第 i 道**能过 _validate_pool_spec** 的题。
+
+    不能随便造 —— 池的准入门要求: solve_atoms 2~4 条且必须含
+    mechanism, hints 恰好 3 条, 且 **fair_clue 的 quote 必须出现在谜面
+    正文里**。所以这里直接复用 `mk_spec()` 的完整自洽骨架, 只换 title
+    和签名以外的东西 —— 换谜面正文就得连 clues 一起换, 没必要。
+    """
+    s = mk_spec()
+    s.title = f"题{i}"
+    return s
+
+
+def _mkpf_with_pt(playtester, **cfgkw):
+    """建一个带假 playtester 的 PoolPrefetcher(同步 executor)。"""
+    import os as _os
+    import tempfile
+    from concurrent.futures import Future
+    from story.config import Config
+    from story.pool import PuzzlePool
+    from story.prefetch import PoolPrefetcher
+
+    class _W:
+        def __init__(self):
+            self._n = 0
+
+        def gen_spec(self, **kw):
+            self._n += 1
+            return _spec_for_prefetch(self._n)
+
+    class _Ex:
+        def submit(self, fn, *a, **kw):
+            f = Future()
+            try:
+                f.set_result(fn(*a, **kw))
+            except BaseException as e:          # noqa: BLE001
+                f.set_exception(e)
+            return f
+
+        def shutdown(self, **kw):
+            pass
+
+    class _Clk:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+    d = tempfile.mkdtemp()
+    cfgkw.setdefault("pool_min_size", 2)
+    cfgkw.setdefault("pool_target_size", 5)
+    # 注入了 playtester 就得同时把开关打开 —— 两者缺一都不会跑试玩。
+    # G6 专门测这道双闸门。
+    if playtester is not None:
+        cfgkw.setdefault("playtest_enabled", True)
+    cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
+                 pool_path=_os.path.join(d, "p.jsonl"),
+                 pool_used_path=_os.path.join(d, "u.jsonl"), **cfgkw)
+    pool = PuzzlePool.open(cfg)
+    pf = PoolPrefetcher(
+        cfg=cfg, pool=pool, writer=_W(),
+        probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
+                       "hint_inflight": False, "reveal_inflight": False,
+                       "stopped": False},
+        probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+        pick_blueprint=lambda recent, rng=None: None,
+        clock=_Clk(), executor=_Ex(), playtester=playtester)
+    return pf, pf.writer, pf._clock, d
+
+
+def fill(pool, n):
+    for i in range(n):
+        pool.add(_spec_for_prefetch(100 + i))
+
+
+class tmpdir:
+    """临时目录。Windows 上 Director 的后台线程可能还攥着句柄, 删目录时
+    报 PermissionError —— 那是清理期噪音, 断言都已经跑完了。"""
+
+    def __enter__(self):
+        self._d = tempfile.TemporaryDirectory()
+        return self._d.name
+
+    def __exit__(self, *a):
+        try:
+            self._d.cleanup()
+        except (PermissionError, OSError):
+            pass
+
+
+def mkcfg(tmp, **kw):
+    """给 Director 用的 Config。"""
+    kw.setdefault("pool_enabled", True)
+    kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
+    kw.setdefault("pool_used_path", os.path.join(tmp, "used.jsonl"))
+    kw.setdefault("no_llm", True)
+    return Config(sim_path="x", **kw)
+
+
 def main():
     tests = [
         # A. 隔离
@@ -622,6 +970,16 @@ def main():
         test_policy_unknown_status_is_conservative,
         test_run_only_returns_known_status,
         test_metrics_carries_reason,
+        # G. Q10c: prefetch 接线
+        test_prefetch_playtest_disabled_by_default,
+        test_prefetch_playtest_pass_and_fail_paths,
+        test_playtest_pass_then_add_fail_keeps_both_counts,
+        test_interrupted_counts_but_does_not_backoff,
+        test_stats_shape_is_staged,
+        test_playtest_off_by_flag,
+        test_playtest_disabled_director_no_playtester,
+        test_playtest_enabled_director_builds_playtester,
+        test_prefetch_module_does_not_touch_engine_writes,
     ]
     for t in tests:
         t()
