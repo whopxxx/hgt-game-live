@@ -76,6 +76,10 @@ jobs:
       - name: 离线套件 playtest
         run: uv run tests/test_playtest.py
 
+      # Step 10: PublicPlayerCore 的**结构性**隔离(签名反射 + 属性检查)。
+      - name: 离线套件 public_player
+        run: uv run tests/test_public_player.py
+
       # 单元测试覆盖不到的**装配**问题(线程/端口/信号/落盘接线)。
       # director 是常驻进程, 没有"跑完就退出"的模式, 所以用 timeout 兜底:
       # 正常情况一定是被 timeout 杀掉的(退出码 124), 那时看日志判定。

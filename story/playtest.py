@@ -66,6 +66,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from . import parser as P
+from .public_player import (
+    MOVE_ASK, MOVE_GIVE_UP, MOVE_SOLVE, MOVES,            # noqa: F401
+    PUBLIC_PLAYER_SYSTEM, PUBLIC_PLAYER_TOOL,
+    PublicPlayerCore, build_prompt as _public_prompt,
+    sanitize_transcript as _sanitize, unwrap_tool_input,
+)
 
 log = logging.getLogger("story.playtest")
 
@@ -94,47 +100,18 @@ OUTCOME_POLICY = {
 #: Player 每轮的动作类型。**只用于日志与策略**, 不决定是否调裁判 ——
 #: ask 与 solve 的文本都走同一条生产 `answer()`。否则会出现"玩家其实
 #: 已经猜全了, 但因为 action 写成 ask 所以系统故意不判"的假环境。
-MOVE_ASK = "ask"
-MOVE_SOLVE = "solve"
-MOVE_GIVE_UP = "give_up"
-_MOVES = (MOVE_ASK, MOVE_SOLVE, MOVE_GIVE_UP)
+#:
+#: Step 10: 定义移到 `public_player`(公共层), 这里保留同名别名 ——
+#: 既有的 `from story.playtest import MOVE_ASK` 调用点不受影响。
+_MOVES = MOVES
 
-#: 强制工具调用。Player 没有别的输出通道。
-_PLAYER_TOOL = {
-    "name": "emit_playtest_move",
-    "description": "给出你的下一步。一次只说一句话。",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "kind": {
-                "type": "string",
-                "enum": list(_MOVES),
-                "description": (
-                    "ask  = 问一个能缩小范围的问题\n"
-                    "solve = 给出完整因果解释(认为已经能解释全部反常)\n"
-                    "give_up = 确实无法继续"),
-            },
-            "text": {
-                "type": "string",
-                "description": "下一句要说的话。问句或完整解释。",
-            },
-        },
-        "required": ["kind", "text"],
-    },
-}
+#: 强制工具调用。Step 10: 定义移到 `public_player`(公共层),
+#: 这里保留同名别名供既有调用点使用。
+_PLAYER_TOOL = PUBLIC_PLAYER_TOOL
 
 #: Player 的系统提示。**刻意只描述任务, 不含任何本题信息。**
-_PLAYER_SYSTEM = """你在玩一个情境推理谜题。你会看到谜面和主持人此前公开回答过的
-问答记录。你不知道谜底。
-
-规则:
-- 一次只问一个最有信息量的问题, 用来排除可能性。
-- 主持人只会回答 是 / 不是 / 无关, 偶尔附一句点评。
-- 当你觉得已经能解释谜面里那个反常现象时, 用 kind=solve 给出**完整的
-  因果解释**(把"发生了什么"和"为什么会这样"连起来), 而不是继续问细节。
-- 只有在确实推不动时才用 kind=give_up。
-
-只输出一句下一轮要说的话。不要复述已经问过的内容。"""
+#: Step 10: 定义移到 `public_player`(公共层), 保留同名别名。
+_PLAYER_SYSTEM = PUBLIC_PLAYER_SYSTEM
 
 
 # ======================================================================
@@ -215,6 +192,10 @@ class Playtester:
                  clock: Callable[[], float] = time.monotonic):
         self.client = player_client
         self.host = host_writer
+        # Step 10: 玩家侧走公共层。`PublicPlayerCore` **不持有**
+        # PuzzleWriter / PuzzleSpec, API 也不收隐藏区字段 —— 隔离是
+        # 构造性的。这里传的就是原来那个 player_client, 行为零变化。
+        self.player = PublicPlayerCore(player_client)
         self._should_continue = should_continue or (lambda: True)
         self._max_turns = max(1, int(max_turns))
         self._clock = clock
@@ -298,35 +279,19 @@ class Playtester:
                     transcript: list) -> Optional[tuple]:
         """一次 Player 调用。返回 `(kind, text)` 或 None(技术失败)。
 
-        `temperature=0.0`: 试玩结果**决定一道已生成好的题能不能入池**,
-        所以它必须可复现。同一份 spec 今天 pass 明天 unsolved(只因为
-        采样抖动)会让质量闸门没法 debug。
+        Step 10: 实现搬到 `PublicPlayerCore.ask()` —— 净化、prompt 构造、
+        工具调用、返回值校验全在公共层。这里只做委托。
 
-        "每轮别问同一句"不靠温度解决: 每轮 transcript 都在变, 输入本身
-        就不同; 而且 system prompt 明确要求不复述。若 temperature=0 下
-        仍反复问同一句, 那**本身就是有价值的结论**(公开信息没能给出新
-        推理方向), 不该用随机采样掩盖掉。
+        语义**逐字保持**: `temperature=0.0`(试玩结论决定一道已生成好的
+        题能不能入池, 必须可复现); "每轮别问同一句"靠 transcript 本身
+        在变 + system prompt 要求不复述, 不靠采样随机 —— 若 temperature=0
+        下仍反复问同一句, 那**本身就是有价值的结论**(公开信息没能给出
+        新推理方向), 不该用随机采样掩盖掉。
 
         以后要做多样化试玩, 正确做法是离线跑多个固定策略/角色, 而不是
         把一个 Player 调到 0.7 —— 那样多样性不可复现。
         """
-        res = self.client.messages(
-            system=_PLAYER_SYSTEM,
-            user=_player_prompt(puzzle, _public_transcript(transcript)),
-            tool=_PLAYER_TOOL,
-            temperature=0.0,
-        )
-        ti = _unwrap(res.tool_input) if res is not None else None
-        if res is None or res.error or not ti:
-            log.warning("Player 调用失败: %s",
-                        getattr(res, "error", "无响应"))
-            return None
-        kind = str(ti.get("kind") or "").strip()
-        text = str(ti.get("text") or "").strip()
-        if kind not in _MOVES or not text:
-            log.warning("Player 输出不合法: kind=%r text=%r", kind, text[:40])
-            return None
-        return kind, text[:200]
+        return self.player.ask(puzzle, transcript)
 
     def _host_answer(self, spec: Any, puzzle: str, answer: str,
                      text: str, turn: int) -> tuple:
@@ -352,59 +317,15 @@ class Playtester:
 # ======================================================================
 # prompt 构造(唯一入口 —— 隔离就靠它)
 # ======================================================================
-def _public_transcript(transcript: list) -> list:
-    """只留 Player **该看到**的字段。
-
-    `role=puzzle` 给谜面; `role=player` 给玩家自己说过的话; `role=host`
-    **只给 verdict + comment**, 剥掉 touched_fact_ids / cause_hit /
-    mechanism_hit / matched_atoms 等内部覆盖信息。
-    """
-    out = []
-    for e in transcript:
-        role = e.get("role")
-        if role == "puzzle":
-            out.append({"role": "puzzle", "text": e.get("text", "")})
-        elif role == "player":
-            out.append({"role": "player", "text": e.get("text", "")})
-        elif role == "host":
-            line = f"主持人: {e.get('verdict', '')}"
-            cm = e.get("text", "")
-            if cm:
-                line += f"（{cm}）"
-            out.append({"role": "host", "text": line})
-    return out
+#: Step 10: 实现移到 `public_player.sanitize_transcript`。
+#: 保留模块级名字 —— 既有调用点与测试不受影响。
+_public_transcript = _sanitize
 
 
-def _player_prompt(puzzle: str, public: list) -> str:
-    """**唯一**的 Player prompt 构造点。
-
-    只接谜面 + 已公开的问答。任何 `answer`/`facts`/`solve_atoms`/
-    `signature`/`blueprint` 都不在这条链上 —— 隔离是构造性的, 不是靠
-    提示词祈使模型别看。
-    """
-    lines = [f"【谜面】{puzzle}", ""]
-    if len(public) > 1:
-        lines.append("【已公开的问答】")
-        for e in public[1:]:
-            if e["role"] == "player":
-                lines.append(f"你问: {e['text']}")
-            elif e["role"] == "host":
-                lines.append(f"  {e['text']}")
-        lines.append("")
-    lines.append("给出你的下一步。")
-    return "\n".join(lines)
+#: Step 10: 实现移到 `public_player.build_prompt`(唯一的 prompt
+#: 构造点在那边的签名上就**收不到**隐藏区字段)。保留模块级名字。
+_player_prompt = _public_prompt
 
 
-def _unwrap(ti: Any) -> Optional[dict]:
-    """把工具返回的 input 归一成字段字典(容忍网关套壳)。
-
-    与 `llm._unwrap_tool_input` 同源但更薄: 试玩只读 kind/text 两个键,
-    不需要 llm 那套 puzzle/answer 嵌套处理。
-    """
-    if not isinstance(ti, dict):
-        return None
-    for key in ("input", "arguments", "parameters", "data"):
-        inner = ti.get(key)
-        if isinstance(inner, dict):
-            return inner
-    return ti
+#: Step 10: 实现移到 `public_player.unwrap_tool_input`。保留模块级名字。
+_unwrap = unwrap_tool_input
