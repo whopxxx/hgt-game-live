@@ -437,7 +437,7 @@ class Director:
         def work():
             try:
                 if self.cfg.no_llm or not self.writer:
-                    text = self._fake_hint(payload.get("level", 1))
+                    text, err = self._fake_hint(payload.get("level", 1)), None
                 else:
                     text, err = self.writer.hint(
                         payload.get("puzzle", ""), payload.get("answer", ""),
@@ -445,11 +445,26 @@ class Director:
                         spec=payload.get("spec"),
                         touched_fact_ids=set(payload.get("touched_fact_ids")
                                              or ()))
+                # ---- 成功与失败**都必须回调** Engine ----
+                #
+                # 第四轮 review: 早先只有 `if text:` 才回调, 于是"三次全泄底"
+                # (hint() 返回 None) 或抛异常时, Engine 的 `_hint_pending`
+                # 永远挂着 True -> 本题后续提示**永久不再派发**。
+                # 失败也要回调, 由 Engine 清 pending + 设退避。
                 if text:
                     self._dispatch(self.engine.submit_hint(text))
+                else:
+                    self._dispatch(self.engine.submit_hint(
+                        None, error=err or "提示生成失败"))
                 self.push()
             except Exception as e:
                 log.exception("提示异常: %s", e)
+                # 异常同样要清 pending, 否则提示链在这里静默死掉。
+                try:
+                    self._dispatch(self.engine.submit_hint(None, error=str(e)))
+                    self.push()
+                except Exception:
+                    log.exception("提示失败回调也异常")
 
         threading.Thread(target=work, daemon=True, name="hint").start()
 

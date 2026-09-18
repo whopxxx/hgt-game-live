@@ -39,7 +39,8 @@ def mkcfg(**kw):
     # 测试默认**关掉重放检测**(replay_burst_n=0): 否则每条弹幕都要等
     # 缓冲窗口才提交, 所有测试都得改成异步写法。重放检测有专门的用例覆盖。
     kw.setdefault("replay_burst_n", 0)
-    return Config(sim_path="x", no_llm=True, **kw)
+    kw.setdefault("no_llm", True)
+    return Config(sim_path="x", **kw)
 
 
 def boot(cfg):
@@ -1404,6 +1405,171 @@ def test_hint_success_still_advances():
     check("三条都给过", len(eng._hints_shown) == 3, eng._hints_shown)
 
 
+def test_hint_repeat_also_backs_off():
+    """P1(第四轮 review): "安全但重复"的提示也要退避, 不能立刻重发。
+
+    冷场时 Writer 三次都生成"安全但重复"的提示 -> 返回 `last_safe`,
+    它与上一条完全相同。早先 Engine 直接 `return []` —— pending 清了
+    但**没设退避**, 下一次 tick 立刻再发 HINT。tick 是 4Hz, 于是变成
+    每秒 4 次重复的 LLM 请求(冷场本身就意味着这种情况会持续发生)。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=45.0, restate_seconds=999999,
+                            hint_retry_seconds=15.0), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    clk.advance(46)
+    check("第一次派出", [a for a in eng.tick() if a.kind == ActionKind.HINT])
+    eng.submit_hint("看他的方向")
+    check("第一条上屏", eng._hints_given == 1, eng._hints_given)
+    # 下一条时间点到 —— 但 worker 给回一条**与上一条相同**的提示
+    clk.advance(45)
+    check("第二次派出", [a for a in eng.tick() if a.kind == ActionKind.HINT])
+    check("在途", eng._hint_pending is True, eng._hint_pending)
+    acts = eng.submit_hint("看他的方向")
+    check("重复不上屏", acts == [], acts)
+    check("重复不消耗槽位", eng._hints_given == 1, eng._hints_given)
+    check("pending 已清", eng._hint_pending is False, eng._hint_pending)
+    check("重复也设了退避",
+          eng._hint_retry_at > clk.t, eng._hint_retry_at - clk.t)
+    # 关键: 退避期内 tick 不再产生 HINT(否则就是重复请求风暴)
+    check("退避期内不重发",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] == [])
+    clk.advance(13)
+    check("仍在退避", [a for a in eng.tick()
+                       if a.kind == ActionKind.HINT] == [])
+    clk.advance(3)
+    check("退避结束后重试",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] != [])
+
+
+def test_hint_never_stuck_pending_on_failure():
+    """P1: 失败回调必须让 pending 归位 —— 否则本题提示永久停摆。
+
+    这是 Engine 侧的契约, Director 侧见 test_director_hint_*。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(hint_seconds=45.0, restate_seconds=999999,
+                            hint_retry_seconds=15.0), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    clk.advance(46)
+    eng.tick()
+    check("在途", eng._hint_pending is True, eng._hint_pending)
+    # writer 三次全泄底 -> hint() 返回 (None, err)
+    eng.submit_hint(None, error="连续生成的提示都存在泄底风险")
+    check("pending 归位", eng._hint_pending is False, eng._hint_pending)
+    clk.advance(16)
+    check("退避后还能再派发",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] != [],
+          kinds(eng.tick()))
+
+
+class _FlakyHintWriter:
+    """假 Writer: hint() 按脚本返回 (text, err), 或抛异常。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = 0
+
+    def hint(self, puzzle, answer, level, given=None, spec=None,
+             touched_fact_ids=None, focus=None):
+        self.calls += 1
+        item = self.script.pop(0) if self.script else ("兜底提示", None)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _director_hint_round(writer):
+    """建一个 Director, 进入 QA 并派发一次 HINT, 返回 (d, eng, clk)。"""
+    from director import Director
+    clk = FakeClock()
+    # no_llm=False: 要走真实 writer.hint 分支(`no_llm=True` 会直接
+    # 走 `_fake_hint`, 那正是绕过这个集成断点的原因)。
+    cfg = mkcfg(no_llm=False, hint_seconds=45.0, restate_seconds=999999,
+                hint_retry_seconds=15.0)
+    d = Director(cfg)
+    # Director 内部会自建 RoundEngine(真实时钟), 测试要的是 FakeClock,
+    # 所以整个换掉 —— 这也正是我们想测的: Director._hint 与 Engine
+    # 之间的**回调契约**, 而不是 Engine 内部。
+    eng = RoundEngine(cfg, clock=clk)
+    d.engine = eng
+    d.writer = writer
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a", "b", "c"])
+    clk.advance(46)
+    acts = eng.tick()
+    hint_acts = [a for a in acts if a.kind == ActionKind.HINT]
+    check("派发了 HINT", len(hint_acts) == 1, kinds(acts))
+    # `_hint` 会把 work() 丢进后台线程。测试要断言线程**跑完之后**的
+    # 状态, 所以这里把 Thread 换成"同步执行"版本 —— 否则断言会跑在
+    # 回调之前, 变成随机失败(而且掩盖真实 bug)。
+    import director as _D
+    real_thread = _D.threading.Thread
+
+    class _InlineThread:
+        def __init__(self, target=None, daemon=None, name=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    _D.threading.Thread = _InlineThread
+    try:
+        d._hint(hint_acts[0].payload)
+    finally:
+        _D.threading.Thread = real_thread
+    return d, eng, clk, hint_acts[0]
+
+
+def test_director_hint_none_clears_pending():
+    """P0(第四轮 review): writer.hint 返回 None/err 时, Director
+    **必须**回调 Engine —— 否则 `_hint_pending` 永远挂着 True,
+    本题后续提示永久不再派发。
+
+    早先 Director 只有 `if text:` 才回调, 这条路径是真实可达的:
+    Q6 之后 hint() 在"三次全泄底"时返回 (None, err)。
+    """
+    w = _FlakyHintWriter([(None, "连续生成的提示都存在泄底风险")])
+    d, eng, clk, _ = _director_hint_round(w)
+    check("Writer 被调用了", w.calls == 1, w.calls)
+    check("pending 已清(不再永久挂起)",
+          eng._hint_pending is False, eng._hint_pending)
+    check("退避已设置", eng._hint_retry_at > clk.t, eng._hint_retry_at - clk.t)
+    check("槽位未消耗", eng._hints_given == 0, eng._hints_given)
+    # 退避期内不再派发
+    check("退避期内不重发",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] == [])
+    # 退避结束后能再次产生 HINT —— 提示链没死
+    clk.advance(16)
+    again = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("退避后能再次派发 HINT", len(again) == 1, kinds(eng.tick()))
+
+
+def test_director_hint_exception_clears_pending():
+    """P0: writer 抛异常时同样要回调 —— 异常路径也要清 pending。"""
+    w = _FlakyHintWriter([RuntimeError("网关 500")])
+    d, eng, clk, _ = _director_hint_round(w)
+    check("异常后 pending 已清",
+          eng._hint_pending is False, eng._hint_pending)
+    check("异常后退避已设置",
+          eng._hint_retry_at > clk.t, eng._hint_retry_at - clk.t)
+    clk.advance(16)
+    check("异常后提示链仍活着",
+          [a for a in eng.tick() if a.kind == ActionKind.HINT] != [])
+
+
+def test_director_hint_success_still_works():
+    """回归: 成功路径不能被这次改动弄坏。"""
+    w = _FlakyHintWriter([("留意他面朝的方向。", None)])
+    d, eng, clk, _ = _director_hint_round(w)
+    check("成功上屏", eng._hints_given == 1, eng._hints_given)
+    check("pending 已清", eng._hint_pending is False, eng._hint_pending)
+    check("退避未设置", eng._hint_retry_at == 0.0, eng._hint_retry_at)
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -1440,6 +1606,12 @@ def main():
              test_fallback_judge_gate_actually_works,
              test_hint_slot_not_consumed_on_failure,
              test_hint_success_still_advances,
+             # ---- 第四轮 review (hint 收尾) ----
+             test_hint_repeat_also_backs_off,
+             test_hint_never_stuck_pending_on_failure,
+             test_director_hint_none_clears_pending,
+             test_director_hint_exception_clears_pending,
+             test_director_hint_success_still_works,
              # ---- Q7 ----
              test_archive_writes_full_schema,
              test_archive_metrics_survive_missing_spec,

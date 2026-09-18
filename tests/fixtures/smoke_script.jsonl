@@ -1,0 +1,14 @@
+// CI 装配冒烟用的**最小**弹幕脚本。
+//
+// 这里刻意只有几条: 冒烟的目的是"进程能装起来并出题", 不是跑完整
+// 演示。完整脚本在 data/demo_script.jsonl —— 那是**本地文件**, 被
+// .gitignore 忽略(data/*.jsonl), 所以 CI 上并不存在。冒烟必须用
+// 仓库里真实存在的东西, 否则会在 checkout 干净的机器上直接挂掉。
+//
+// at_ms 是相对本轮开始的毫秒偏移。
+{"at_ms":1500,"user_name":"路人甲","content":"这题有意思"}
+{"at_ms":2200,"user_name":"观众甲","content":"#他是自己走进餐厅的吗"}
+{"at_ms":3000,"user_name":"观众乙","content":"#汤里有毒吗"}
+{"at_ms":3800,"user_name":"观众丙","content":"#他以前喝过海龟汤吗"}
+{"at_ms":4600,"user_name":"观众丁","content":"#他是盲人吗"}
+{"at_ms":6000,"user_name":"观众戊","content":"#下一条提示"}

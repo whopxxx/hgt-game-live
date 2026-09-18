@@ -553,7 +553,16 @@ class RoundEngine:
                 return []
             text = text.strip()[:80]
             # 文本与上一条相同 -> 不重复上屏(否则冷场时同一句刷屏)
-            if text and text == self._hint_text:
+            #
+            # 但这**不能**当成成功: 早先这里直接 `return []`, pending 虽然
+            # 清了, 却没有设退避 —— 下一次 tick 会立刻再发一次 HINT。冷场
+            # 时 Writer 三次都给出"安全但重复"的 `last_safe`, 于是 4Hz 的
+            # tick 会变成每秒 4 次重复请求。当成一次失败处理: 清 pending,
+            # 退避后再试。
+            if text == self._hint_text:
+                self._hint_retry_at = now + self.cfg.hint_retry_seconds
+                log.info("提示与上一条相同, 不重复上屏, %.0fs 后重试",
+                         self.cfg.hint_retry_seconds)
                 return []
             # ---- 成功: 现在才真正消耗槽位 ----
             self._hints_given += 1
