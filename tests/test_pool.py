@@ -25,6 +25,7 @@ from story.puzzle import (  # noqa: E402
     SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.state import Phase  # noqa: E402
 
 FAIL = [0]
 
@@ -95,7 +96,8 @@ def mkcfg(tmp, **kw):
     kw.setdefault("pool_enabled", True)
     kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
     kw.setdefault("pool_used_path", os.path.join(tmp, "used.jsonl"))
-    return Config(sim_path="x", no_llm=True, **kw)
+    kw.setdefault("no_llm", True)
+    return Config(sim_path="x", **kw)
 
 
 class tmpdir:
@@ -472,6 +474,137 @@ def test_recent_none_is_safe():
         check("None 也能挑出", pool.pop_next(recent_signatures=None) is not None)
 
 
+def test_director_serves_from_pool_end_to_end():
+    """Q8c 端到端: 池里有题 -> Director **真的**走池子, 不调 gen_spec,
+    且 archive 记 source="pool"。
+
+    这是整条链的验收: 前面所有单测都是零件, 这条才证明它们接得起来。
+    """
+    print("\n[6a] Director 端到端走题池")
+    import json
+    from director import Director
+
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        cfg.puzzle_out_path = os.path.join(d, "arch.jsonl")
+        # 池里放一道题
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+
+        dr = Director(cfg)
+        # Director.__init__ 里已经自己开了一个池子, 用这个就好
+        check("Director 持有题池", dr.pool is not None)
+        check("池里 1 道可用", dr.pool.pending_count() == 1,
+              dr.pool.pending_count())
+
+        # writer 换成"一旦被调用就报错" —— 证明真的没走现场生成
+        class _NoGen:
+            def gen_spec(self, *a, **k):
+                raise AssertionError("不该调 gen_spec: 池子明明有题")
+
+            def hint(self, *a, **k):
+                return ("提示", None)
+
+            def reveal(self, *a, **k):
+                return ("谜底", None)
+
+        dr.writer = _NoGen()
+        dr.engine.start()
+        # 触发一次 RIDDLE(同步执行 work())
+        import director as _D
+        real_thread = _D.threading.Thread
+
+        class _Inline:
+            def __init__(self, target=None, daemon=None, name=None, **kw):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        _D.threading.Thread = _Inline
+        try:
+            dr._riddle({"reason": "riddle", "avoid": [],
+                        "recent_signatures": []})
+        finally:
+            _D.threading.Thread = real_thread
+
+        check("题已上屏(来自池子)", dr.engine.phase == Phase.QA, dr.engine.phase)
+        check("engine 记下来源是 pool",
+              dr.engine._spec_source == "pool", dr.engine._spec_source)
+        # 池子标记为已用
+        check("池子已把它记为已用", dr.pool.pending_count() == 0,
+              dr.pool.pending_count())
+
+        # 走到揭晓 -> archive
+        acts = dr.engine._enter_revealing_locked(0.0, "giveup", "")
+        rev = [a for a in acts if a.kind.name == "REVEAL"][0]
+        dr._archive_reveal(rev.payload, "谜底")
+        rec = json.loads(open(cfg.puzzle_out_path, encoding="utf-8")
+                         .read().strip())
+        check("archive 记 source=pool", rec.get("source") == "pool",
+              rec.get("source"))
+        check("archive 带 metrics(不丢溯源)",
+              isinstance(rec.get("metrics"), dict), rec.get("metrics"))
+
+
+def test_director_falls_back_when_pool_empty():
+    """池空 -> 回落现场生成(不能因为池子空就不出题)。"""
+    print("\n[6b] 池空时回落现场生成")
+    from director import Director
+    with tmpdir() as d:
+        # no_llm=False: 要真的走到 gen_spec 那条路(no_llm=True 会走假题,
+        # 那是另一条分支, 验不到"池空 -> 现场生成")。
+        cfg = mkcfg(d, no_llm=False)
+        dr = Director(cfg)
+        called = {"n": 0}
+
+        class _Gen:
+            class client:
+                class cfg:
+                    model = "fake"
+
+            def gen_spec(self, *a, **k):
+                called["n"] += 1
+                s = good_spec()
+                return s
+
+            def hint(self, *a, **k):
+                return ("h", None)
+
+        dr.writer = _Gen()
+        dr.engine.start()
+        import director as _D
+        real_thread = _D.threading.Thread
+
+        class _Inline:
+            def __init__(self, target=None, daemon=None, name=None, **kw):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        _D.threading.Thread = _Inline
+        try:
+            dr._riddle({"reason": "riddle", "avoid": [],
+                        "recent_signatures": []})
+        finally:
+            _D.threading.Thread = real_thread
+        check("确实调了 gen_spec", called["n"] == 1, called["n"])
+        check("来源是 live_generate",
+              dr.engine._spec_source == "live_generate", dr.engine._spec_source)
+
+
+def test_director_with_pool_disabled_never_touches_pool():
+    """pool_enabled=False -> Director 完全不开池子(逐位回到 Q8 之前)。"""
+    print("\n[6c] pool_enabled=False 时 Director 不碰题池")
+    from director import Director
+    with tmpdir() as d:
+        dr = Director(mkcfg(d, pool_enabled=False))
+        check("pool 是 None", dr.pool is None, dr.pool)
+
+
 # ======================================================================
 def main():
     tests = [
@@ -501,6 +634,10 @@ def main():
         test_never_raises_on_weird_input,
         test_pool_disabled_is_truly_off,
         test_recent_none_is_safe,
+        # ---- Q8c: 接线 ----
+        test_director_serves_from_pool_end_to_end,
+        test_director_falls_back_when_pool_empty,
+        test_director_with_pool_disabled_never_touches_pool,
     ]
     for t in tests:
         t()

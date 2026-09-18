@@ -45,6 +45,7 @@ from story.ingest import (ChatEvent, LiveSource,    # noqa: E402
 from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
                        _spec_to_riddle)
+from story.pool import PuzzlePool                   # noqa: E402
 from story.server import RenderServer, StateHub     # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
 
@@ -172,6 +173,11 @@ class Director:
 
         self.engine.model_requested = cfg.llm.model
         self.engine.source = cfg.source_label
+
+        # ---- Q8: 题池 ----
+        # `pool_enabled=False` -> open() 返回 None, 下面整条路径都不碰池子。
+        # 用注入的同一把 rng, 保证 quality_seed 固定时出题可复现。
+        self.pool = PuzzlePool.open(cfg, rng=self._rng)
 
         if not cfg.no_llm:
             self.client = AnthropicMessagesClient(cfg.llm)
@@ -356,13 +362,35 @@ class Director:
                 return
             failure: Optional[str] = None
             try:
-                if self.cfg.no_llm or not self.writer:
+                recent = payload.get("recent_signatures") or []
+                # ---- Q8: 题池优先 ----
+                # 池子里有**此刻**可用的题就直接用, 省掉一次 LLM + 审稿
+                # (10–40s)。挑不到再走原来的路径。
+                #
+                # 注意这一层在 `no_llm` **之前** —— 池子里的题已经生成好
+                # 了, 上屏不需要任何 LLM 调用, 所以 `--no-llm` 时也该用它。
+                # (早先 `--no-llm` 直接走假题, 池子等于白建。)
+                #
+                # `pop_next` 契约上不抛、坏了也返回 None, 所以这里不需要
+                # 额外的 try —— 它的失败模式就是"回落"。
+                spec = None
+                source = "live_generate"
+                if self.pool is not None:
+                    spec = self.pool.pop_next(
+                        recent_signatures=recent,
+                        avoid=payload.get("avoid"))
+                    if spec is not None:
+                        source = "pool"
+
+                if spec is not None:
+                    # 池子里来的: 结构已经齐了, 直接上屏。
+                    self._submit_spec(spec, source)
+                elif self.cfg.no_llm or not self.writer:
                     res_p, res_a = self._fake_riddle()
                     self._dispatch(self.engine.submit_riddle(
                         res_p, res_a, list(P.FALLBACK_HINTS),
-                        title="海龟汤", model="no-llm"))
+                        title="海龟汤", model="no-llm", source=source))
                 else:
-                    recent = payload.get("recent_signatures") or []
                     bp = self._pick_blueprint(recent)
                     spec = self.writer.gen_spec(
                         avoid=payload.get("avoid"), blueprint=bp,
@@ -373,14 +401,8 @@ class Director:
                     # 只有**通过质量门**的 spec 才允许上直播。
                     # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
                     if spec.puzzle and not spec.error:
-                        r = _spec_to_riddle(spec)
-                        self._dispatch(self.engine.submit_riddle(
-                            r.puzzle, r.answer, r.hints, r.title,
-                            error=r.error, usage=r.usage, model=r.model,
-                            solve_atoms=r.solve_atoms, fair_clues=r.fair_clues,
-                            signature=spec.signature.to_dict(),
-                            spec=spec))
-                        if r.puzzle and not r.answer:
+                        self._submit_spec(spec, source)
+                        if not spec.answer:
                             log.info("本题未解析出谜底, 揭晓时将重新生成")
                     else:
                         # 记下来, **等释放锁之后**再提交 —— 见上面①
@@ -401,6 +423,21 @@ class Director:
             self.push()
 
         threading.Thread(target=work, daemon=True, name="riddle").start()
+
+    def _submit_spec(self, spec, source: str) -> None:
+        """把一道**已通过质量门**的 spec 提交给引擎上屏。
+
+        池子来的题与现场生成的题走这里同一段代码 —— 免得两条路各写
+        一遍 `submit_riddle(...)` 参数, 然后其中一条漏传字段(第四轮
+        的 P0 就是"两条路参数不一致"造成的)。
+        """
+        r = _spec_to_riddle(spec)
+        self._dispatch(self.engine.submit_riddle(
+            r.puzzle, r.answer, r.hints, r.title,
+            error=r.error, usage=r.usage, model=r.model,
+            solve_atoms=r.solve_atoms, fair_clues=r.fair_clues,
+            signature=spec.signature.to_dict(),
+            spec=spec, source=source))
 
     def _pick_blueprint(self, recent: list):
         """选下一条 blueprint(方案 §11 的 weighted-LRU)。
@@ -479,6 +516,15 @@ class Director:
                         payload.get("reason", ""), payload.get("winner", ""))
                 if text:
                     self._archive_reveal(payload, text)
+                # 题池来源的题: 补记 air:true。`pop_next` 交付时已经写了
+                # air:false, 所以即使这一行丢了, 题也**不会**复活 ——
+                # 这行只是让"是否真的播完"可查。
+                if self.pool is not None and payload.get("spec") is not None:
+                    try:
+                        self.pool.mark_used(payload.get("spec"), aired=True)
+                    except Exception:               # noqa: BLE001
+                        # 题池只是加速器, 记不上不能影响揭晓。
+                        log.exception("题池 mark_used 异常(忽略)")
                 self._dispatch(self.engine.submit_reveal(text))
                 self.push()
             except Exception as e:
@@ -504,6 +550,12 @@ class Director:
             session=self.session_id, puzzle_index=snap.puzzle_index,
             # ---- 版本(方案 §55): 没有它就分不清成绩属于哪一版 ----
             spec_version=2,
+            # ---- 来源(Q8) ----
+            # "pool" / "live_generate" / "fallback", 由 engine 显式标记并
+            # 一路带过来。**不从任何值推断** —— 我们在 blueprint_specified
+            # 上已经踩过"从值猜来源"的坑(两个方向都会猜错)。
+            # 老记录没有这个字段, 读的时候按 "live_generate" 理解即可。
+            source=payload.get("spec_source") or "live_generate",
             prompt_version=spec_d.get("prompt_version", ""),
             quality_policy_version=spec_d.get("quality_policy_version", ""),
             puzzle=payload.get("puzzle", ""),
@@ -731,6 +783,14 @@ class Director:
         print(f"  揭晓展示    : {cfg.reveal_hold_seconds:.0f}s 后开下一题")
         print(f"  输出 JSONL  : {os.path.abspath(cfg.out_path)}")
         print(f"  谜题 JSONL  : {os.path.abspath(cfg.puzzle_out_path)}")
+        # 题池状态打出来 —— 否则"到底有没有在用池子"只能靠翻日志。
+        if self.pool is None:
+            print("  题池        : 已关闭(pool_enabled=False)")
+        else:
+            st = self.pool.stats()
+            print(f"  题池        : {st['available']}/{st['size']} 道可用, "
+                  f"已用 {st['used']} (已播 {st['aired']})")
+            print(f"                {os.path.abspath(st['path'])}")
         if cfg.no_llm:
             print("  LLM         : 已禁用(--no-llm), 使用固定文案")
         else:

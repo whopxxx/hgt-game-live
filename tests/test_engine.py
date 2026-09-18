@@ -1570,6 +1570,118 @@ def test_director_hint_success_still_works():
     check("退避未设置", eng._hint_retry_at == 0.0, eng._hint_retry_at)
 
 
+def test_spec_source_defaults_to_live_generate():
+    """Q8: 不传 source 时默认 live_generate(老调用点不受影响)。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a"])
+    check("默认来源", eng._spec_source == "live_generate", eng._spec_source)
+
+
+def test_spec_source_is_recorded_and_reaches_reveal():
+    """Q8: 来源要一路进 REVEAL payload —— archive 靠它区分 pool/现场。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle("谜面。为什么?", "底", ["a"], source="pool")
+    check("存下来了", eng._spec_source == "pool", eng._spec_source)
+    acts = eng._enter_revealing_locked(clk.t, "giveup", "")
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    check("产出了 REVEAL", len(rev) == 1, kinds(acts))
+    if rev:
+        check("payload 带 spec_source",
+              rev[0].payload.get("spec_source") == "pool",
+              rev[0].payload.get("spec_source"))
+
+
+def test_fallback_marks_source_as_fallback():
+    """Q8: 兜底是**引擎自己**标的第三种来源。
+
+    不让 director 猜: 兜底发生在 director 的 worker 已经返回失败之后,
+    是引擎内部的决定。让 director 去预测它 = 并行维护一份"当前是哪道题"
+    的状态, 而 `Director._current_spec` 正是上一轮专门删掉的东西。
+    """
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(riddle_max_attempts=2), clock=clk)
+    eng.start()
+    eng.submit_riddle(None, error="挂了")
+    eng.submit_riddle(None, error="又挂了")
+    check("进了 QA(兜底题上屏)", eng.phase == Phase.QA, eng.phase)
+    check("来源标记为 fallback", eng._spec_source == "fallback",
+          eng._spec_source)
+    acts = eng._enter_revealing_locked(clk.t, "giveup", "")
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    if rev:
+        check("REVEAL 带 fallback",
+              rev[0].payload.get("spec_source") == "fallback",
+              rev[0].payload.get("spec_source"))
+
+
+def test_spec_source_resets_between_puzzles():
+    """Q8: 开新题必须重置来源, 否则会串题(上一题 pool -> 这一题误报 pool)。"""
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(reveal_hold_seconds=1.0), clock=clk)
+    eng.start()
+    eng.submit_riddle("第一题。为什么?", "底", ["a"], source="pool")
+    check("第一题是 pool", eng._spec_source == "pool", eng._spec_source)
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("谜底")
+    clk.advance(2)
+    eng.tick()
+    check("已进入下一题", eng.phase == Phase.SETTING, eng.phase)
+    check("来源已重置", eng._spec_source == "live_generate", eng._spec_source)
+
+
+def test_archive_records_source():
+    """Q8: archive 里 source 是显式字段(不从值推断)。"""
+    import io as _io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleSpec
+
+    out = os.path.join(tempfile.gettempdir(), "_hgt_src_arch.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg = mkcfg()
+    cfg.puzzle_out_path = out
+    d = Director(cfg)
+    d.pool = None                      # 这条用例只验 archive 本身
+    d.engine.start()
+    sp = PuzzleSpec.from_dict({
+        "puzzle": "灯塔题。为什么?", "answer": "礁石。",
+        "facts": [{"id": "f1", "text": "退潮礁石露出", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "退潮",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "标礁石",
+                         "fact_ids": ["f1"]}],
+        "fair_clues": [{"quote": "只在退潮时亮灯", "supports_atoms": ["a1"]}],
+        "signature": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+        "blueprint": {"mechanism_family": "hidden_function",
+                      "solution_shape": "hidden_function_explains_behavior",
+                      "domain": "maritime"},
+    })
+    sp.prompt_version = "riddle-v3"
+    sp.quality_policy_version = "quality-v3"
+    d.engine.submit_riddle(sp.puzzle, sp.answer, [], solve_atoms=sp.solve_atoms,
+                           fair_clues=sp.fair_clues, spec=sp, source="pool")
+    acts = d.engine._enter_revealing_locked(0.0, "giveup", "")
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL][0]
+    d._archive_reveal(rev.payload, "谜底")
+    rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
+    check("archive 记了 source=pool", rec.get("source") == "pool",
+          rec.get("source"))
+    # 老记录(没有 spec_source)应退化为 live_generate, 而不是 None
+    d._archive_reveal({"puzzle": "x", "answer": "y"}, "z")
+    rec2 = json.loads(_io.open(out, encoding="utf-8").read().strip().split("\n")[-1])
+    check("缺字段时退化为 live_generate",
+          rec2.get("source") == "live_generate", rec2.get("source"))
+
+
 def main():
     tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
@@ -1606,6 +1718,12 @@ def main():
              test_fallback_judge_gate_actually_works,
              test_hint_slot_not_consumed_on_failure,
              test_hint_success_still_advances,
+             # ---- Q8c: source provenance ----
+             test_spec_source_defaults_to_live_generate,
+             test_spec_source_is_recorded_and_reaches_reveal,
+             test_fallback_marks_source_as_fallback,
+             test_spec_source_resets_between_puzzles,
+             test_archive_records_source,
              # ---- 第四轮 review (hint 收尾) ----
              test_hint_repeat_also_backs_off,
              test_hint_never_stuck_pending_on_failure,

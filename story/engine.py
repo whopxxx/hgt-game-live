@@ -109,6 +109,8 @@ class RoundEngine:
         # 当前这题的完整 spec(方案 §49 的收拢方向; 现阶段与上面几个
         # 平铺字段并存, 供 archive 用)
         self._spec: Optional[PuzzleSpec] = None
+        #: 这道题的来源(见 submit_riddle)。默认现场生成。
+        self._spec_source = "live_generate"
         self._hints_shown: list[str] = []    # **实际展示过**的提示文本
         self._hints_given = 0
         # 失败重试(第三轮 review P1)。语义:
@@ -393,7 +395,8 @@ class RoundEngine:
                       solve_atoms: Optional[list] = None,
                       fair_clues: Optional[list] = None,
                       signature: Optional[dict] = None,
-                      spec: Optional[PuzzleSpec] = None
+                      spec: Optional[PuzzleSpec] = None,
+                      source: str = "live_generate"
                       ) -> list[EngineAction]:
         now = self._now(now)
         with self._lock:
@@ -424,6 +427,20 @@ class RoundEngine:
             self._solve_atoms = [_atom_dict(a) for a in (solve_atoms or [])]
             self._fair_clues = [_clue_dict(c) for c in (fair_clues or [])]
             self._spec = spec
+            # 这道题**从哪来**(Q8 provenance)。三种取值:
+            #   "pool"          题池里挑出来的
+            #   "live_generate" 现场生成(含 no-llm 假题)
+            #   "fallback"      引擎内部兜底(见 _riddle_failed_locked)
+            #
+            # 为什么放在 engine 而不是 director: 兜底是**引擎内部**的决定,
+            # 发生在 director 的 worker 已经返回失败之后。让 director 去
+            # 预测它 = 并行维护一份"当前是哪道题"的状态, 而
+            # `Director._current_spec` 正是上一轮专门删掉的东西(它会串题)。
+            # engine 才是"此刻哪道题在台上"的唯一无竞争所有者。
+            #
+            # 显式字段, **绝不从值推断** —— 我们在 blueprint_specified 上
+            # 已经踩过一次"从值猜来源"的坑, 两个方向都会猜错。
+            self._spec_source = source
             # 记下这题的指纹 —— 下一题的 blueprint 选择与跨题配额要用
             # (方案 §10)。只留最近 window 条, 不放进 Snapshot。
             if signature:
@@ -690,6 +707,8 @@ class RoundEngine:
                 spec.puzzle, spec.answer, list(spec.hints), title=spec.title,
                 now=now, solve_atoms=spec.solve_atoms,
                 fair_clues=spec.fair_clues, spec=spec,
+                # 兜底是第三种来源, 由**引擎自己**标记 —— 见上面的说明。
+                source="fallback",
                 # 注意: **不传 signature** —— 兜底题不该挤占跨题配额,
                 # 否则"出题全挂了"这一事实会污染全局分布统计。
                 signature=None)
@@ -842,6 +861,9 @@ class RoundEngine:
         self._solve_atoms = []
         self._fair_clues = []
         self._spec = None
+        # 来源也一起重置: 否则上一题是池子来的, 这一题还没回调时
+        # REVEAL payload 就可能带着**上一题的**来源(串题)。
+        self._spec_source = "live_generate"
         self._title = ""
         self._pending.clear()
         self._inflight.clear()
@@ -905,6 +927,8 @@ class RoundEngine:
             # 完整 spec 也带上 —— archive 要按方案 §34 落盘结构化定义
             # (facts/hints/blueprint/signature), 不只是谜面谜底两段文本。
             "spec": self._spec,
+            # provenance 一路带到 archive(director._archive_reveal 读它)。
+            "spec_source": self._spec_source,
             "transcript": self._transcript_locked(),
         })]
 
