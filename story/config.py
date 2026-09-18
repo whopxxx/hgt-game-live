@@ -171,6 +171,32 @@ class Config:
     disconnect_grace: float = 60.0
     sim_loop_gap: float = 20.0            # SimSource loop 每遍之间的间隔
 
+    # ---- 题池(方案 §40) ----
+    # 第一版 pool 只是"预生成好的题放哪", 不改变实时出题路径。
+    pool_enabled: bool = True
+    pool_target_size: int = 5
+    pool_min_size: int = 2
+
+    # ---- 题目分布配额(方案 §10) ----
+    # **全部代码判断**, 不写进 reviewer prompt —— 它没有全局状态。
+    quality_recent_window: int = 10       # 看最近多少题
+    quota_same_mechanism: int = 2         # 同一诡计类型最多几道
+    quota_same_solution_shape: int = 2    # 同一解法形状最多几道
+    quota_death: int = 2                  # 死人题上限
+    quota_past_trauma: int = 2            # 依赖既往创伤的上限
+    quota_trauma_ritual: int = 1          # "创伤 + 长年怪规矩"上限(实测坍缩最重)
+
+    # ---- AI 试玩(方案 §40/§42): 直播热路径里**默认关闭** ----
+    playtest_enabled: bool = False
+
+    # ---- 采样温度(方案 §30) ----
+    # 裁决/裁判必须确定性(temperature=0), 出题才需要发散。
+    # 网关若不支持, 会记日志而不是默默假设生效。
+    answer_temperature: float = 0.0
+    judge_temperature: float = 0.0
+    review_temperature: float = 0.2
+    generate_temperature: float = 0.8
+
     # ---- 上下文 ----
     qa_max_records: int = 60              # 喂回 LLM 的问答记录条数上限
     qa_max_chars: int = 2200              # 喂回 LLM 的问答记录字符上限
