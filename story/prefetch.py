@@ -888,7 +888,30 @@ class PoolPrefetcher:
                     or "空谜面", {})
 
         # ---- Q10: AI 试玩(默认关闭, 开着才跑) ----
+        #
+        # ---- G4-C: 试玩也必须在**开始之前**让路 ----
+        #
+        # G1 让 `gen_spec` 在每一次尚未发出的昂贵调用前检查谓词, 但
+        # `_playtest` **不在 `gen_spec` 里面** —— 它在它返回之后。于是
+        # 存在这条缝:
+        #
+        #     gen_spec 成功返回(一次完整的多稿生成 + 审稿 + audit)
+        #     ↓  这一段之间直播已经进入 SETTING
+        #     ↓  prefetch 仍然启动一次 AI 试玩
+        #
+        # 试玩本身是**若干次 LLM 调用**(模拟提问者反复问), 会和下一题
+        # 的现场生成抢同一个网关。
+        #
+        # G1 冻结的原则是"后台每一个尚未开始的昂贵 LLM 阶段都必须让 live
+        # 优先", 试玩没有理由例外 —— 只是因为它在 gen_spec 之外, 被漏掉了。
+        #
+        # 两层检查并不冲突: 这里管"要不要**开始**", 而 playtester 自己
+        # 内部若也有协作取消, 管的是"试玩**过程中**还继续吗"。
         if self._playtest_enabled():
+            if not self._should_continue():
+                log.info("补池: 直播变忙, 试玩前让路(已生成的稿子丢弃)")
+                return ("interrupted", "直播变忙, 试玩前让路",
+                        {"interrupted": True})
             pt, why = self._playtest(spec)
             if pt is not None:
                 # 试玩结论落进 metrics —— Q8 的序列化链天然保存它。

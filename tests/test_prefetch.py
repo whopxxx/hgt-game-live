@@ -2492,6 +2492,159 @@ def test_g1_interrupted_probe_fails_closed():
         check("presence: 谓词不抛", True)
 
 
+
+def test_g4c_playtest_yields_before_starting():
+    """**G4-C**: 试玩**开始之前**也必须让路。
+
+    G1 让 `gen_spec` 在每一次尚未发出的昂贵调用前检查谓词, 但
+    `_playtest` **不在 `gen_spec` 里面** —— 它在它返回之后。于是有这条缝:
+
+        gen_spec 成功返回(完整的多稿生成 + 审稿 + audit)
+        ↓  这一段之间直播已经进入 SETTING
+        ↓  prefetch 仍然启动一次 AI 试玩
+
+    试玩本身是若干次 LLM 调用, 会和下一题的现场生成抢同一个网关。
+    G1 冻结的原则是"后台每一个尚未开始的昂贵 LLM 阶段都必须让 live
+    优先", 试玩没有理由例外 —— 只是因为它在 gen_spec 之外, 被漏掉了。
+
+    (当前 `playtest_enabled` 默认 False, 所以这不是实播 blocker,
+     但它是 G1 原则的**明文缺口**, 一笔补掉最合适。)
+    """
+    print("\n[G4-C1] 试玩前让路")
+    with tmpdir() as d:
+        calls = {"run": 0}
+
+        class _Playtester:
+            def run(self, spec):
+                # ⚠️ **只计数, 绝不抛**。`_playtest()` 把试玩的一切异常都
+                # 吞成 (None, why) —— 那是生产代码的正确行为(试玩坏不能
+                # 冒泡), 但它会让这里的 AssertionError 变成静默, 于是
+                # "不该启动" 那条断言在 mutation 下照样全绿。计数是唯一
+                # 不会被吞掉的证据。
+                calls["run"] += 1
+                from story.playtest import PASS, PlaytestResult
+                return PlaytestResult(status=PASS)
+
+        # 提交那一刻切 SETTING: 精确复现"gen_spec 已成功返回,
+        # 返回之后直播已开始"
+        state = {"busy": False}
+
+        def probe():
+            v = Phase.SETTING if state["busy"] else Phase.QA
+            return {"phase": v, "pending": 0, "inflight": 0,
+                    "hint_inflight": False, "reveal_inflight": False,
+                    "reveal_remaining_seconds": None,
+                    "puzzle_index": 5, "stopped": False}
+
+        from story.prefetch import PoolPrefetcher
+        cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
+                    pool_target_size=5)
+        pool = PuzzlePool.open(cfg)
+
+        # ⚠️ **不能**用 `_GatedWriter`: 它自己在 gen_spec 内部消费
+        # should_continue, 于是让路发生在 G1 那条检查点上(G1-B), 根本
+        # 走不到试玩 —— 删掉试玩守卫测试照样绿, 测的就不是 G4-C 了。
+        #
+        # G4-C 要复现的是**另一条缝**: gen_spec **完整跑完**、返回了一道
+        # 合格的题, 而这段时间里直播变忙了。所以这里需要一个"不看谓词、
+        # 必定返回合格 spec"的 writer。
+        class _AlwaysGoodWriter:
+            """必定返回合格 spec, **完全无视** should_continue。"""
+
+            def __init__(self):
+                self.calls = []
+
+            def gen_spec(self, avoid=None, blueprint=None, recent=None,
+                         enforce_blueprint=None, should_continue=None,
+                         max_attempts=None, budget_s=None, **kw):
+                self.calls.append({"has_predicate": should_continue is not None})
+                return good_spec()
+
+        w = _AlwaysGoodWriter()
+        ex = _SyncExecutor()
+        pf = PoolPrefetcher(
+            cfg=cfg, pool=pool, writer=w, probe=probe,
+            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+            pick_blueprint=lambda recent, rng=None: None,
+            executor=ex, playtester=_Playtester())
+        fill(pf.pool, 1)
+        real_submit = ex.submit
+
+        def submit(fn, *a, **kw):
+            # gen_spec 在 worker 里跑; 让它跑完之后相位才变忙是测不到
+            # 这条缝的 —— 必须在**试玩那一步之前**翻。
+            # `_SyncExecutor` 是同步的, 所以这里翻相位等价于
+            # "gen_spec 返回的那一刻相位已变"。
+            state["busy"] = True
+            return real_submit(fn, *a, **kw)
+
+        ex.submit = submit
+        pf.on_tick()
+        pf.on_tick()
+        check("**试玩一次都没启动(让路生效)**", calls["run"] == 0,
+              calls["run"])
+        check("gen_spec 确实**完整跑完**了(不是在里面就被让路)",
+              len(w.calls) == 1, len(w.calls))
+        check("**interrupted +1**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("**gen_fail 仍为 0**", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+        check("**不设退避**", pf._retry_at == 0.0, pf._retry_at)
+        check("**不入池**", pf.pool.stock_count() == 1, pf.pool.stock_count())
+
+
+def test_g4c_playtest_still_runs_when_live_is_idle():
+    """对照腿: 直播空闲时试玩**照常跑**。
+
+    没有这一条, 一个"永远不试玩"的实现也能让上面那条测试变绿 ——
+    那就是测夹具而不是测实现。
+    """
+    print("\n[G4-C2] 空闲时试玩照常跑(对照)")
+    with tmpdir() as d:
+        calls = {"run": 0}
+
+        class _PT:
+            def run(self, spec):
+                calls["run"] += 1
+                from story.playtest import PASS, PlaytestResult
+                return PlaytestResult(status=PASS)
+
+        from story.prefetch import PoolPrefetcher
+        cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
+                    pool_target_size=5)
+        pool = PuzzlePool.open(cfg)
+        w = _GatedWriter()
+        real = w.gen_spec
+
+        def gen_spec(**kw):
+            kw["should_continue"] = pf._should_continue
+            return real(**kw)
+
+        w.gen_spec = gen_spec
+        pf = PoolPrefetcher(
+            cfg=cfg, pool=pool, writer=w,
+            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
+                           "hint_inflight": False, "reveal_inflight": False,
+                           "reveal_remaining_seconds": None,
+                           "puzzle_index": 5, "stopped": False},
+            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+            pick_blueprint=lambda recent, rng=None: None,
+            executor=_SyncExecutor(), playtester=_PT())
+        fill(pf.pool, 1)
+        try:
+            pf.on_tick()
+            pf.on_tick()
+        except Exception as e:                  # noqa: BLE001
+            print("     异常:", e)
+        # 断言的是"至少真的跑过", 不是精确 1 次: 池子仍未到 target, 所以
+        # 每一拍都可能再补一道 —— 那个数字取决于池子的滞回, 不是这条
+        # 要测的性质。这条腿唯一的职责是证明"空闲时试玩不会被跳过"。
+        check("**空闲时试玩真的跑了(否则上一条是假的)**",
+              calls["run"] >= 1, calls["run"])
+        check("空闲时不会记 interrupted", pf.interrupted_count == 0,
+              pf.interrupted_count)
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -2570,6 +2723,9 @@ def main():
         test_g1_midflight_switch_stops_reviewer_and_next_draft,
         test_g1_interrupted_yields_without_retry_storm,
         test_g1_backoff_schedule_increases_then_caps,
+        # ---- G4-C: 试玩前让路 ----
+        test_g4c_playtest_yields_before_starting,
+        test_g4c_playtest_still_runs_when_live_is_idle,
         test_g1_success_resets_backoff_streak,
         test_g1_scene_change_resets_long_backoff_once,
         test_g1_effective_guard_covers_budget,
