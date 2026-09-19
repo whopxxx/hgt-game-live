@@ -234,215 +234,374 @@ def test_each_fixture_has_no_obvious_tag():
               word not in blob or True)   # 只是留痕, 不构成断言
 
 
-def test_all_fixtures_rejected_by_story_gate():
-    """§十: 四道永久 fixture 都必须被拦下, 且理由是**故事门**那一类。
+def test_gate_and_signal_split_is_declared():
+    """H4-D §二/§三: **硬门与信号是两份互不相交的清单**。
 
-    分两种拦法(这正是 v3 与 v2 的区别):
-      - q10000 / render  -> **编译侧** self-report 就能判出来
-      - elevator / jeep  -> 编译侧会被骗过, 必须靠**复核**(§六)
-
-    所以这里不假设"哪一侧拦的", 只断言"最终一定拦得住", 并为每道题
-    指定它应该走的那条路 —— 走错了说明防线退化了。
+    这一条守的是 v5 最核心的那一刀。如果哪天有人把某个信号字段又塞回
+    门里(或反过来), 下面的不变量会立刻红 —— 而那种改动在日志上表现为
+    "某些题忽然进不来了", 极难归因。
     """
-    print("\n[H3-D] 四道 fixture 全部拦得下")
-    # ---- 编译侧: 模型自己就判出来了 ----
-    for name, d in (("q10000", _truck_tool()),
-                    ("render", _mk_fixture_tool("render"))):
-        sgr = CC.story_gate_reasons(d)
-        check(f"**{name} 编译侧故事门拦下**", bool(sgr), sgr)
-        check(f"{name} check_tool_result 也不合格",
-              not CC.check_tool_result(d)[0])
-    # ---- 复核侧: 编译模型十三条全填"没问题", 只有复核能拦 ----
-    for name in ("elevator", "jeep"):
-        d = _mk_fixture_tool(name)
-        check(f"{name}: 编译侧**确实**被蒙过去(这是 v2 漏网的成因)",
-              CC.check_tool_result(d)[0] is True, CC.check_tool_result(d)[1])
-        check(f"{name}: 编译侧故事门无话可说",
-              CC.story_gate_reasons(d) == [], CC.story_gate_reasons(d))
+    print("\n[H4-D §二/§三] 硬门 / 信号 分成两份")
+    hard = set(CC.CURATED_HARD_CHECKS)
+    soft = set(CC.CURATED_SOFT_SIGNALS)
+    check("两份**不相交**(一个字段要么是门要么是信号)",
+          not (hard & soft), sorted(hard & soft))
+    check("两份合起来 = 全部字段 - 第13条",
+          (hard | soft) == (set(CC.CURATED_CHECK_ORDER)
+                            - {"no_external_knowledge_dependency"}),
+          sorted((hard | soft) ^ (set(CC.CURATED_CHECK_ORDER)
+                                  - {"no_external_knowledge_dependency"})))
+    # ⚠️ 第 13 条**故意**不在这两份里。它**是**硬门(见
+    # `hard_check_reasons` / `check_tool_result` 的显式补判), 但它问的
+    # 是"公不公平"而不是"能不能玩", 引用它的阶段不同(prompt 分两段讲,
+    # 报告分开统计)。把三种关系写死在测试里, 免得将来有人"顺手"把它
+    # 挪进任一份而没人发现语义变了。
+    check("**第 13 条既不在门也不在信号**(它单独判)",
+          "no_external_knowledge_dependency" not in hard
+          and "no_external_knowledge_dependency" not in soft)
+    check("**但它确实是硬门**(判 false 会拒)",
+          not CC.check_tool_result(
+              {"accepted": True,
+               "quality_checks": _qc_good(
+                   no_external_knowledge_dependency=False)})[0])
+    check("**六条硬门**正是任务书 §二 那六条",
+          hard == {"clear_anomaly", "yes_no_progress",
+                   "reasonable_explanation", "no_obscure_system",
+                   "no_external_media", "livestream_safe"}
+          or hard == {"clear_anomaly", "unique_explanation",
+                      "yes_no_progress", "no_obscure_system",
+                      "no_external_media", "livestream_safe"},
+          sorted(hard))
+    # 故事三问**必须**在信号那一侧(v5 的要点)
+    for k in ("story_reconstruction", "multi_step_deduction",
+              "single_trick"):
+        check(f"**{k} 是信号不是门**", k in soft and k not in hard, k)
 
 
-def test_elevator_and_jeep_are_caught_by_review():
-    """§六的核心断言: 复核**独立**地拦下编译侧放过的题。
+def test_reviewer_contract_matches_compiler_policy():
+    """**H4-D §七: 两层门必须口径一致** —— 否则外面放宽了里面还在拒。
 
-    十八楼(经典脑筋急转弯)与吉普车(纯物理单机制)在编译模型眼里
-    "像模像样", 所以它们**只能**靠第二次独立判断拦下。这条测试就是
-    v2 漏网成因的回归。
+    任务书原话:
+
+        现在 Reviewer 对 curated 仍要求很多 quality_checks 全部通过。
+        这必须一起改。否则只改 CuratedCompiler 外层没有用:
+        Reviewer 还是会在里面把稿子拒掉。
+
+    这个陷阱是**真实**的: `_apply_review` 自己有一份 fail-closed 清单
+    (`story/llm.py`), 而编译侧有另一份(`tools/curated_compiler.py`)。
+    两边分属**生产链**与**离线工具**, 所以清单是**复制**的而不是 import
+    的(理由见 `_CURATED_HARD_CHECK_FIELDS` 的说明)。复制就会漂移 ——
+    这条测试就是防漂移的那一道闸。
+
+    断言:
+      1. curated 的 Reviewer 契约里**没有**任何降级为信号的字段;
+      2. 信号字段**仍然在** `_QUALITY_CHECK_FIELDS` 里(要问, 只是不判);
+      3. 两侧的硬门**条数相同**(九条: 六条硬门 + 公平性 + 真实性两项)。
     """
-    print("\n[H3-D] 复核拦下编译侧放过的题")
-    for name in ("elevator", "jeep"):
-        d = _mk_fixture_tool(name)
-        check(f"前提: {name} 编译侧被蒙过去",
-              CC.check_tool_result(d)[0] is True)
-        sgr = CC.story_gate_from_review(_FIXTURES[name]["review"])
-        check(f"**{name} 复核拦下**", bool(sgr), sgr)
-        check(f"{name} 复核点名 single_trick", "single_trick" in sgr, sgr)
+    print("\n[H4-D §七] Reviewer 契约与编译侧口径一致")
+    from story import llm as _llm
+    curated_fields = _llm._quality_check_contract(
+        type("S", (), {"source_type": "curated"})())
+    # ① 降级的信号**绝不能**出现在 curated 的 fail-closed 清单里
+    leaked = set(CC.CURATED_SOFT_SIGNALS) & set(curated_fields)
+    check("**信号字段没有漏进 Reviewer 的 fail-closed 清单**",
+          not leaked, sorted(leaked))
+    # ② 每个信号字段必须**至少在一侧被问到** —— 否则以后无法排序。
+    #
+    # ⚠️ 两侧的字段集**本来就不一样**, 这不是漂移:
+    #   编译侧问 13 条(`CURATED_CHECK_ORDER`), 含 not_pure_puzzle /
+    #     has_reversal / detail_recontextualized 这三条**只有编辑视角**
+    #     才问得出来的问题;
+    #   Reviewer 侧问 12 条(`_QUALITY_CHECK_FIELDS`), 它审的是"这稿能不能
+    #     用", 那三条与它的职责无关 —— 它们**从来就不在**它的清单里
+    #     (v4 时代就是这样, 不是 v5 删掉的)。
+    #
+    # 所以要断言的是"信号不丢", 而不是"两边字段一样"。
+    for k in CC.CURATED_SOFT_SIGNALS:
+        check(f"{k} 至少在一侧被问到(信号不丢)",
+              k in _llm._QUALITY_CHECK_FIELDS
+              or k in CC.CURATED_CHECK_ORDER, k)
+    # ③ 两侧硬门条数一致 —— 六条硬门 + 公平性 + 真实性两项 = 9
+    check("**两侧硬门条数一致**(6 + 1 + 2 = 9)",
+          len(curated_fields) == len(CC.CURATED_HARD_CHECKS) + 1 + 2,
+          (len(curated_fields), len(CC.CURATED_HARD_CHECKS)))
+    # ④ 最后一条(§四 的公平性硬门)两侧同名
+    check("**公平性硬门两侧同名**",
+          "no_external_knowledge_dependency" in curated_fields)
+    # ⑤ 自由生成链**没被顺手改**(§九: 只改 curated)
+    free_fields = _llm._quality_check_contract(
+        type("S", (), {"source_type": ""})())
+    check("**自由生成链仍是 8 项**(§九 不跟改)",
+          len(free_fields) == 8, free_fields)
+    check("自由生成链**不含**题型字段",
+          not (set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)),
+          sorted(set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)))
 
 
-def test_elevator_fixture_rejected_even_if_model_says_good():
-    """十八楼那道: 编译模型十三条全填"没问题", 复核必须拦下(§六)。
+def test_soft_signals_never_reject():
+    """**H4-D §三/§十四 的核心断言**: 信号不理想**不得**导致 rejected。
 
-    这正是 v2 漏网的**真实成因**: 模型认为"按钮用途反转"是真反转。
-    所以单靠 compile 侧的自报判不出来 —— 必须靠 Reviewer 的独立复核。
+    任务书点名四条:
+        single_trick=true            不再自动拒绝
+        multi_step_deduction=false   不再自动拒绝
+        story_reconstruction=false   不再自动拒绝
+        has_reversal=false           不再自动拒绝
+
+    这里把它们**全部**设成最差, 然后断言 `check_tool_result` 仍然通过。
+    任何一条被重新塞回门里, 这条就会红。
     """
-    print("\n[H3-D] 十八楼: 编译自报全过, 复核拦下")
-    d = _mk_fixture_tool("elevator")
-    check("前提: 编译侧十三条全过(所以 compile gate 拦不住)",
-          CC.check_tool_result(d)[0] is True,
-          CC.check_tool_result(d)[1])
-    check("前提: compile 侧故事门无话可说",
-          CC.story_gate_reasons(d) == [], CC.story_gate_reasons(d))
-    # 复核说它是 single_trick
-    rev = {"story_reconstruction": True, "multi_step_deduction": False,
-           "single_trick": True, "no_external_knowledge_dependency": True}
-    sgr = CC.story_gate_from_review(rev)
-    check("**复核拦下**", bool(sgr), sgr)
-    check("复核点名 single_trick", "single_trick" in sgr, sgr)
-    check("复核点名 no_multi_step_deduction",
-          "no_multi_step_deduction" in sgr, sgr)
+    print("\n[H4-D §三] 信号不理想 -> 仍然可以 accepted")
+    worst = _qc_good(
+        single_trick=True,              # 最差
+        multi_step_deduction=False,     # 最差
+        story_reconstruction=False,     # 最差
+        has_reversal=False,
+        detail_recontextualized=False,
+        not_pure_puzzle=False,
+    )
+    ok, why = CC.check_tool_result({"accepted": True, "quality_checks": worst})
+    check("**六条硬门全过时, 信号再差也收**", ok, why)
+    check("**故事信号如实记录**(供以后排序)",
+          set(CC.story_gate_reasons({"quality_checks": worst}))
+          == {"single_trick", "not_story_reconstruction",
+              "no_multi_step_deduction"},
+          CC.story_gate_reasons({"quality_checks": worst}))
+    # 逐条单独验一遍(报告要按条分类, 不能只测"全部最差")
+    for key, val in (("single_trick", True),
+                     ("multi_step_deduction", False),
+                     ("story_reconstruction", False),
+                     ("has_reversal", False)):
+        qc = _qc_good(**{key: val})
+        ok1, why1 = CC.check_tool_result({"accepted": True,
+                                          "quality_checks": qc})
+        check(f"**{key}={val!r} 单独出现也不拒**", ok1, why1)
 
 
-def test_review_missing_is_fail_closed():
-    """复核调不动 -> **不放过**(fail closed)。
+def test_hard_gates_still_reject():
+    """**H4-D §五/§十四**: 真硬门一条都不能松。
 
-    代价是网关抖动会丢掉一些本来合格的题 —— 但那些题走
-    `technical_defer` 下次再来, 不是 rejected, 所以不会永久损失。
-    反过来(复核缺失当通过)会让"网关抖一下"变成"烂题进池"。
+    任务书要求证明这些**仍然拒绝**:
+        livestream_safe=false
+        no_external_media=false
+        真正 obscure external knowledge
+        谜底无法合理解释谜面
+
+    ⚠️ 这条与上一条是**成对**的: 上一条防"门太紧", 这一条防"门太松"。
+    只测一边的测试在这类政策调整里毫无价值 —— 把门整个删掉也能让
+    "信号不拒题"通过。
     """
-    print("\n[H3-D] 复核缺失 -> fail closed")
-    check("None -> 不合格",
-          CC.story_gate_from_review(None) == ["story_review_missing"])
-    check("{} -> 四项全不合格",
-          len(CC.story_gate_from_review({})) == 4,
-          CC.story_gate_from_review({}))
-    ok = {"story_reconstruction": True, "multi_step_deduction": True,
-          "single_trick": False, "no_external_knowledge_dependency": True}
-    check("四项齐备且合格 -> 通过", CC.story_gate_from_review(ok) == [])
+    print("\n[H4-D §五/§十四] 真硬门仍然拒")
+    cases = (
+        ("clear_anomaly", False),        # 谜面无反常点
+        ("unique_explanation", False),   # 谜底解释不了谜面
+        ("yes_no_progress", False),      # 问不出来
+        ("no_obscure_system", False),    # 依赖冷门系统
+        ("no_external_media", False),    # 必须看图才能答
+        ("livestream_safe", False),      # 内容不合规
+        ("no_external_knowledge_dependency", False),   # 冷知识
+    )
+    for key, val in cases:
+        d = {"accepted": True, "quality_checks": _qc_good(**{key: val})}
+        ok, why = CC.check_tool_result(d)
+        check(f"**{key}={val!r} -> 拒**", not ok, why)
+        check(f"{key} 出现在硬门原因里",
+              key in CC.hard_check_reasons(d)
+              or (key == "no_external_knowledge_dependency"
+                  and "external_knowledge_dependency"
+                  in CC.hard_check_reasons(d)),
+              CC.hard_check_reasons(d))
+    # 缺项仍然 fail closed(门不能靠"没说"蒙过去)
+    qc = _qc_good()
+    del qc["clear_anomaly"]
+    ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
+    check("**硬门缺项 -> 拒**(fail closed)", not ok, why)
 
 
-def test_render_fixture_needs_external_knowledge():
-    """2<3 心形: `no_external_knowledge_dependency` 是拦它的那条。
+def test_q10000_can_now_be_accepted():
+    """**H4-D §五: q10000 卡车烧油不再要求永久 reject。**
 
-    ⚠️ 另外三条它都"像那么回事"(确实有反转、确实是两步), 所以这道题
-    证明新判据**不是冗余的** —— 少了它, 这一类冷知识题全部漏网。
+    任务书原话:
+
+        不再要求永久 reject。
+        如果模型判断属于普通常识、能正常问答, 可以 accept。
+
+    它的六条硬门全过(有反常点、答案解释了那个反常、烧油是常识、
+    能问答、不需要介质、内容安全), 差的是**趣味信号** —— 那是风格,
+    不是准入。所以 v5 判它**合格**。
+
+    ⚠️ 这与 H3-A 的 `test_q10000_is_rejected_by_story_gate` 是**冲突的**,
+    而那是**正确的** —— 政策变了, 测试跟着产品走, 不是反过来绑架产品
+    (任务书 §五 明写)。
     """
-    print("\n[H3-D] 渲染冷知识题靠新判据拦下")
-    d = _mk_fixture_tool("render")
-    sgr = CC.story_gate_reasons(d)
-    check("**点名 external_knowledge_dependency**",
-          "external_knowledge_dependency" in sgr, sgr)
-    check("其余三条它都'像那么回事'(所以新判据不冗余)",
-          "single_trick" not in sgr
-          and "not_story_reconstruction" not in sgr
-          and "no_multi_step_deduction" not in sgr, sgr)
-
-
-def test_q10000_is_rejected_by_story_gate():
-    """**本批最关键的回归**: q10000 型被故事门拒。
-
-    它九条全过 —— 所以拒它的**必须**是 v2 那三条, 不能是别的门
-    (否则换个门它又能进来)。
-    """
-    print("\n[H3-A] q10000 被 v2 故事门拒(**九条全过**)")
+    print("\n[H4-D §五] q10000: 硬门全过 -> 可以 accept")
     d = _truck_tool()
-    # 先确认"九条真的全过" —— 否则这条测试可能只是在测别的门
-    nine_ok = all(d["quality_checks"].get(k) is True
-                  for k in CC.CURATED_CHECKS)
-    check("前提: H2 的九条**全部通过**(所以 H2 拦不住它)", nine_ok)
     ok, why = CC.check_tool_result(d)
-    check("**v2 判它不合格**", not ok, why)
-    sgr = CC.story_gate_reasons(d)
-    check("**点名 single_trick**", "single_trick" in sgr, sgr)
-    check("**点名 not_story_reconstruction**",
-          "not_story_reconstruction" in sgr, sgr)
-    check("**点名 no_multi_step_deduction**",
-          "no_multi_step_deduction" in sgr, sgr)
+    check("**v5 判它合格**", ok, why)
+    check("但它确实是个单点题(信号如实记录)",
+          "single_trick" in CC.story_gate_reasons(d),
+          CC.story_gate_reasons(d))
+    check("**它的成功靠的是硬门真的过了**(不是门坏了)",
+          CC.hard_check_reasons(d) == [], CC.hard_check_reasons(d))
 
 
-def test_q10000_rejected_without_physics_tag():
-    """**删掉 physics 标签也照样拒**(任务书六的明确要求)。
+def test_elevator_and_jeep_can_now_be_accepted():
+    """**H4-D §五: 十八楼 / 吉普车允许 accept。**
 
-    这条防的是"用标签黑名单糊弄过去": 如果哪天有人把
-    `physics` 加进 NON_STORY_TAGS 就宣布修好了, 那么一道**没有**
-    physics 标签但结构相同的题仍然会溜进来。所以 fixture 不带标签。
+    任务书:
+        十八楼按钮 —— 允许 accept。它虽然 single_trick, 但很适合
+        轻量直播竞猜。
+        吉普车泥泞/普通物理推理 —— 如果只靠普通常识即可理解, 允许
+        accept。
+
+    两道题的硬门都过(十八楼: 有反常、答案解释得通、能问答、不需要
+    外部知识 —— 个子矮是常识; 吉普车: 四驱留四道辙也是常识物理)。
+    v4 里它们死在"复核说它 single_trick", v5 起那是信号。
     """
-    print("\n[H3-A] 没有 physics tag 也一样拒(测的是结构不是标签)")
-    rec = mk_truck_rec(tags=[])
-    check("fixture 确实没有 physics tag",
-          "physics" not in rec.tags, rec.tags)
-    d = _truck_tool()
-    ok, _ = CC.check_tool_result(d)
-    check("**仍然被拒**", not ok)
+    print("\n[H4-D §五] 十八楼 / 吉普车 -> 可以 accept")
+    for name in ("elevator", "jeep"):
+        d = _mk_fixture_tool(name)
+        ok, why = CC.check_tool_result(d)
+        check(f"**{name} 硬门全过**", ok, why)
+        rev = _FIXTURES[name]["review"]
+        sig = CC.story_gate_from_review(rev)
+        check(f"{name} 复核信号记下了(但不拒题)", bool(sig), sig)
 
 
-def test_q10000_via_compile_loop():
-    """端到端: 走 `compile_one`, q10000 拿不到 spec, 且**不重试**。
+def test_render_still_rejected_for_external_knowledge():
+    """**H4-D §五: 2<3 心形**仍然拒绝 —— 但理由**不是** single_trick。
 
-    结构性判定 -> 重试不会变好 -> 只烧一次 LLM。这一点很实际:
-    Lazy Curator 每次运行只处理有限条数, 在垃圾题上重试等于挤占
-    好题的预算。
+    任务书原话:
+
+        继续 reject。
+        原因不是 single_trick,
+        而是依赖特定外部系统知识。
+
+    这条**必须**守住"理由是对的": 如果哪天它变成因为 single_trick 被拒,
+    说明 `single_trick` 又溜回门里了, 而那会让十八楼一起被误杀。
     """
-    print("\n[H3-A] q10000 端到端: 无 spec 且不重试")
-    from tools.curated_compiler import CuratedCompiler
-    from tests.test_curated_compile import _writer
-    from story.llm import LLMResult
-    w, fc = _writer([LLMResult(tool_input=_truck_tool(), model="m")])
-    spec, info = CuratedCompiler(w).compile_one(mk_truck_rec(), recent=[],
-                                                max_attempts=3)
-    check("**没有 spec**", spec is None, info)
-    check("**只调了一次 LLM**(结构性拒绝不重试)",
-          len(fc.calls) == 1, len(fc.calls))
-    check("stage 标 story_gate", info["stage"] == "story_gate", info)
-    check("story_gate 带原因", info.get("story_gate"), info)
+    print("\n[H4-D §五] 2<3 心形: 因**外部系统知识**被拒(不是 single_trick)")
+    d = _mk_fixture_tool("render")     # 它的 qc 里那一条是 False
+    ok, why = CC.check_tool_result(d)
+    check("**仍然被拒**", not ok, why)
+    hcr = CC.hard_check_reasons(d)
+    check("**理由是 external_knowledge_dependency**",
+          "external_knowledge_dependency" in hcr, hcr)
+    check("**理由不是 single_trick**(它那一条是合格的)",
+          "single_trick" not in hcr, hcr)
+
+
+def test_new_true_rejects():
+    """**H4-D §五: 新增真正必须拒绝的 regression。**
+
+    任务书点名六类:
+
+        谜底完全解释不了谜面 / 纯随机答案 / 必须看图片才能答 /
+        依赖某个冷门软件行为 / 依赖专业职业规定才能答 / 直播内容不合规
+
+    它们映射到硬门:
+        解释不了谜面   -> unique_explanation=false
+        纯随机答案     -> unique_explanation=false
+        必须看图片     -> no_external_media=false
+        冷门软件行为   -> no_external_knowledge_dependency=false
+        专业职业规定   -> no_external_knowledge_dependency=false
+        内容不合规     -> livestream_safe=false
+
+    ⚠️ 这是 §十六 说的"真正不能接受"那一类。放宽趣味标准**不等于**
+    放宽这些 —— 把两者混为一谈是本次政策调整最容易犯的错。
+    """
+    print("\n[H4-D §五] 六类真正必须拒的题")
+    cases = (
+        ("谜底完全解释不了谜面", {"unique_explanation": False}),
+        ("纯随机答案", {"unique_explanation": False}),
+        ("必须看图片才能答", {"no_external_media": False}),
+        ("依赖冷门软件行为",
+         {"no_external_knowledge_dependency": False}),
+        ("依赖专业职业规定才能答",
+         {"no_external_knowledge_dependency": False}),
+        ("直播内容不合规", {"livestream_safe": False}),
+    )
+    for label, kw in cases:
+        d = {"accepted": True, "quality_checks": _qc_good(**kw)}
+        ok, why = CC.check_tool_result(d)
+        check(f"**{label} -> 拒**", not ok, why)
+
+
+def test_review_missing_signals_is_not_technical_failure():
+    """**H4-D §七: 缺 soft 字段**不要**技术失败。**
+
+    任务书原话:
+
+        故事/反转/层次类字段: 虽可返回, 但不是 pass/fail 条件。
+        缺少这些 soft 字段也不要技术失败。
+
+    所以 `story_gate_from_review(None)` / `({})` 都必须是**空列表**
+    (无信号), 而不是 v4 那种 `["story_review_missing"]` —— 后者会把
+    "Reviewer 少答一个字段"升级成"这道题这次没审成"。
+    """
+    print("\n[H4-D §七] 缺信号字段 != 技术失败")
+    check("None -> 无信号(不是故事门失败)",
+          CC.story_gate_from_review(None) == [],
+          CC.story_gate_from_review(None))
+    check("{} -> 无信号",
+          CC.story_gate_from_review({}) == [],
+          CC.story_gate_from_review({}))
+    ok_sig = {"story_reconstruction": True, "multi_step_deduction": True,
+              "single_trick": False}
+    check("信号全好 -> 也是无信号(不是'通过'的意思)",
+          CC.story_gate_from_review(ok_sig) == [],
+          CC.story_gate_from_review(ok_sig))
 
 
 def test_good_story_still_passes():
     """**反向确认**: 一道真海龟汤必须仍然能过 —— 否则我们只是把门焊死。
 
     用 test_curated_compile 里那道灯塔题(它有真正的身份/物品意义反转),
-    证明 v2 不是"什么都拒"。
+    证明 v5 不是"什么都收"(硬门仍然在)。
     """
-    print("\n[H3-A] 反向确认: 真海龟汤仍然过")
+    print("\n[H4-D] 反向确认: 真海龟汤仍然过")
     from tests.test_curated_compile import _compile_tool
     d = _compile_tool()
     ok, why = CC.check_tool_result(d)
-    check("**真故事通过 v2**", ok, why)
-    check("故事门无话可说", CC.story_gate_reasons(d) == [],
-          CC.story_gate_reasons(d))
+    check("**真故事通过 v5**", ok, why)
+    check("硬门无话可说", CC.hard_check_reasons(d) == [],
+          CC.hard_check_reasons(d))
 
 
 def test_inverted_check_direction():
-    """`single_trick` 是**反向**判据(true = 坏)。方向写反是致命的。
+    """`single_trick` 是**反向**信号(true = 更简单)。方向写反是致命的。
 
-    如果哪天有人把它和其余十一条一样当成 true = 好, 那么:
-      好题(single_trick=False) -> 被判不合格 -> **全部拒**
-      卡车题(single_trick=True) -> 被判合格 -> **放进来**
-    两个方向同时错, 而且错了以后测试若还是用
-    `{k: True for k in CHECKS}` 构造 fixture, 会一起绿。
+    ⚠️ v5 起它**不再参与准入**, 所以"方向写反 -> 全部拒题"那个后果
+    已经不可能发生。但方向仍然要正确 —— 它会进信号统计, 而统计里
+    反向会让"这批题偏简单还是偏复杂"的结论整个倒过来。
+
+    这里断言的是: 明确 true -> 记成信号; 缺项 -> **无信号**(不是坏信号)。
     """
-    print("\n[H3-A] single_trick 方向(反向判据)")
+    print("\n[H4-D] single_trick 方向(反向信号)")
     check("声明为反向", "single_trick" in CC._INVERTED_CHECKS)
-    # 缺这一项 -> 不合格(不能默认成"没问题")
-    qc = _qc_good()
-    del qc["single_trick"]
-    ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
-    check("**缺 single_trick -> 拒**(不能默认通过)", not ok, why)
-    # 明确 False -> 合格
-    ok2, _ = CC.check_tool_result(
-        {"accepted": True, "quality_checks": _qc_good()})
-    check("**明确 False -> 合格**", ok2)
+    check("**明确 true -> 记成信号**",
+          "single_trick" in CC.story_gate_reasons(
+              {"quality_checks": _qc_good(single_trick=True)}))
+    check("**缺项 -> 无信号**(不是坏信号)",
+          "single_trick" not in CC.story_gate_reasons(
+              {"quality_checks": {}}))
+    check("**明确 false -> 无信号**(它本来就是好的)",
+          "single_trick" not in CC.story_gate_reasons(
+              {"quality_checks": _qc_good()}))
 
 
-def test_story_gate_beats_self_reported_accepted():
+def test_hard_gate_beats_self_reported_accepted():
     """模型自报 accepted=true 也不作数 —— 代码独立判一次。
 
-    这是"prompt 是请求, 代码才是保证"的具体体现。
+    这是"prompt 是请求, 代码才是保证"的具体体现。v5 只对**硬门**这样,
+    信号不参与。
     """
-    print("\n[H3-A] 自报 accepted=true 不能覆盖故事门")
-    d = _truck_tool(accepted=True)
+    print("\n[H4-D] 自报 accepted=true 不能覆盖硬门")
+    d = {"accepted": True,
+         "quality_checks": _qc_good(livestream_safe=False)}
     check("模型确实自称 accepted", d["accepted"] is True)
     ok, _ = CC.check_tool_result(d)
     check("**代码仍然拒**", not ok)
-    check("**故事门独立表态**", CC.story_gate_reasons(d) != [])
+    check("**硬门独立表态**", CC.hard_check_reasons(d) != [])
 
 
 # ======================================================================
@@ -823,36 +982,50 @@ def test_story_gate_stage_depth():
            CC._STAGE_DEPTH.get("ai_gate")))
 
 
-def test_prompt_declares_v3_rules():
-    """prompt 里必须**真的写着**四条 —— 否则模型不知道要判它们。
+def test_prompt_declares_v5_rules():
+    """prompt 里必须**真的写着** v5 的口径 —— 否则模型不知道政策变了。
 
-    同时守 §九: prompt **不得**再自相矛盾地同时说"九条"和"十三条"。
+    同时守三件事:
+      1. 五条硬门与信号都**被提到**(模型要知道哪些是门);
+      2. 过期政策**必须删干净**(§八 列了具体三句);
+      3. schema 的 required 仍然等于全量十三条(要问, 只是不全判)。
     """
-    print("\n[H3-D] prompt 声明四条故事判据, 且不再自相矛盾")
+    print("\n[H4-D] prompt 声明 v5 口径, 且过期政策已删除")
     sysp = CC.CURATED_COMPILE_SYSTEM
     for k in ("story_reconstruction", "multi_step_deduction",
               "single_trick", "no_external_knowledge_dependency"):
         check(f"prompt 提到 {k}", k in sysp)
     check("prompt 给出硬门表述", "硬门" in sysp)
-    check("prompt 有正例/反例对照", "烧油" in sysp or "卡车" in sysp)
-    # §九: 不能再出现"**九条**必须全部为 true 才能 accepted"这种与十三条
-    # 冲突的**总结性**表述。注意: 正文里提到"以上九条"(指 1~9 那一组)
-    # 是**正确**的 —— 那九条确实要全过。被禁的是把它说成**准入门整体**。
-    check("**prompt 不再把'九条'说成准入门整体**",
-          "九条必须全部为 true 才能 accepted" not in sysp)
-    check("prompt 声明十三条判据", "十三条" in sysp)
-    # 工具 schema 的 accepted 描述也必须同步
+    check("prompt 给出**信号**表述(降级的落点)", "信号" in sysp)
+    # ---- §八: 三句过期政策必须消失 ----
+    for stale in ("十三条全部必须通过", "比上面九条更硬",
+                  "宁可少收一道也不能放过脑筋急转弯",
+                  "**必须全部为 true**"):
+        check(f"**过期政策已删除**: {stale!r}", stale not in sysp)
+    # ---- §八: 新的产品口径必须在 ----
+    check("prompt 说明这是**直播娱乐题库**", "直播娱乐题库" in sysp)
+    check("prompt 明确简单题可以收", "脑筋急转弯" in sysp)
+    check("prompt 明确不要因为 single_trick 拒题",
+          "single_trick" in sysp and "accepted=false" in sysp)
+    # ---- §四: 冷知识的允许/禁止清单必须在 prompt 里 ----
+    for allowed in ("日常生活常识", "简单直觉物理"):
+        check(f"prompt 允许 {allowed}", allowed in sysp)
+    for forbidden in ("专业知识", "冷门设备功能", "罕见科学知识"):
+        check(f"prompt 禁止 {forbidden}", forbidden in sysp)
+    check("prompt 给出'哦, 原来如此'判据", "原来如此" in sysp)
+    # 工具 schema 的 accepted 描述必须同步(不能再写"十三条全 true")
     acc = CC._TOOL_CURATED["input_schema"]["properties"]["accepted"]
-    check("**_TOOL_CURATED 的 accepted 描述也不再写'九条'**",
-          "九条" not in acc["description"], acc["description"])
-    check("工具 schema 声明十三条", "十三条" in acc["description"],
+    check("**_TOOL_CURATED 的 accepted 只要求硬门**",
+          "硬门" in acc["description"], acc["description"])
+    check("**_TOOL_CURATED 不再要求'十三条全 true'**",
+          "十三条判据全部为 true" not in acc["description"],
           acc["description"])
-    # required 必须等于全量判据
+    # required 仍然等于全量 —— 十三条都要**问**, 只是不全**判**
     req = set(CC._TOOL_CURATED["input_schema"]["properties"]
               ["quality_checks"]["required"])
-    check("**schema required == CURATED_CHECKS_V3**",
-          req == set(CC.CURATED_CHECKS_V3),
-          sorted(set(CC.CURATED_CHECKS_V3) - req))
+    check("**schema required == 全量十三条**(都要问)",
+          req == set(CC.CURATED_CHECK_ORDER),
+          sorted(set(CC.CURATED_CHECK_ORDER) - req))
 
 
 def test_checks_v3_is_superset_of_v2():
@@ -920,27 +1093,38 @@ def test_accepted_binds_content_hash_not_just_external_id():
                 os.path.join("data", "curated_decisions.jsonl"))
 
 
-def test_policy_version_is_v3():
-    """§七: 本次实质改变了题型定义 -> 必须 bump。
+def test_policy_version_is_v5():
+    """§一: 准入语义实质变化 -> 必须 bump, 且 v4 的 decision 不直接继承。
 
-    v4 的 bump 理由与 v3 不同 —— v3 是**收紧判据**(加第四条外部知识
-    依赖), v4 是**修正拒绝语义 + 去掉一个污染源**:
+    v5 的 bump 理由与 v3/v4 都不同:
 
-        §一~§三  curated 不再被 target Blueprint 控制
-        §四~§六  compile 失败不再写永久 rejected
-        §十二     审核证据落盘
+        v3  收紧判据(加"外部知识依赖"一条)
+        v4  修正**拒绝语义** + 去掉 Blueprint 污染源(判据本身没变)
+        v5  **产品政策调整** —— 把"够不够精彩"从准入降为信号
 
-    所以 v3 下被**错误 Blueprint 永久拒掉**的候选, 必须能在 v4 下重新
-    被审 —— 这就是 `CURATED_POLICY_VERSION` 存在的意义(它同时是旧库存
-    的隔离开关)。
+    v5 是三次里唯一一次**放宽**: 它砍掉的是"因为不够精彩而拒一道能玩的
+    题", 没有动 safety, 也没有动"谜底要能解释谜面"。
+
+    为什么要 bump 而不是原地改: v4 下被故事门误杀的题**必须重审** ——
+    那些 decision 是按旧标准写的, 留着它们等于让新政策对存量无效。
+    `CURATED_POLICY_VERSION` 同时是旧库存的隔离开关。
     """
-    print("\n[H4-C] policy 已 bump 到 curated-v4")
-    check("**CURATED_POLICY_VERSION == 'curated-v4'**",
-          CC.CURATED_POLICY_VERSION == "curated-v4",
+    print("\n[H4-D] policy 已 bump 到 curated-v5")
+    check("**CURATED_POLICY_VERSION == 'curated-v5'**",
+          CC.CURATED_POLICY_VERSION == "curated-v5",
           CC.CURATED_POLICY_VERSION)
     check("与 quality policy 是**两个**独立的号",
           CC.CURATED_POLICY_VERSION != CC.QUALITY_POLICY_VERSION,
           (CC.CURATED_POLICY_VERSION, CC.QUALITY_POLICY_VERSION))
+    # §一: v4 的 decision 不继承 —— 同一道题在 v5 下必须重新可审
+    with tmpdir() as d:
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        rec = mk_truck_rec()
+        led.record(rec, decision=CL.REJECTED,
+                   policy_version="curated-v4", reasons=["single_trick"])
+        check("v4 下已是终态", led.is_settled(rec, "curated-v4"))
+        check("**v5 下必须重审**(v4 的结论不继承)",
+              not led.is_settled(rec, CC.CURATED_POLICY_VERSION))
 
 
 # ======================================================================
@@ -1196,17 +1380,20 @@ def test_structural_reason_beats_shallow_stage():
 # ======================================================================
 def main():
     tests = [
-        test_q10000_is_rejected_by_story_gate,
-        test_q10000_rejected_without_physics_tag,
-        test_q10000_via_compile_loop,
+        # ---- H4-D: curated-v5 硬门/信号拆分 ----
+        test_gate_and_signal_split_is_declared,
+        test_reviewer_contract_matches_compiler_policy,
+        test_soft_signals_never_reject,
+        test_hard_gates_still_reject,
+        test_q10000_can_now_be_accepted,
+        test_elevator_and_jeep_can_now_be_accepted,
+        test_render_still_rejected_for_external_knowledge,
+        test_new_true_rejects,
+        test_review_missing_signals_is_not_technical_failure,
+        test_hard_gate_beats_self_reported_accepted,
         test_each_fixture_has_no_obvious_tag,
-        test_all_fixtures_rejected_by_story_gate,
-        test_elevator_fixture_rejected_even_if_model_says_good,
-        test_review_missing_is_fail_closed,
-        test_render_fixture_needs_external_knowledge,
         test_good_story_still_passes,
         test_inverted_check_direction,
-        test_story_gate_beats_self_reported_accepted,
         test_ledger_four_states_are_distinct,
         test_accepted_is_terminal_and_stats,
         test_different_policy_reopens_the_question,
@@ -1223,10 +1410,10 @@ def main():
         test_content_hash_round_trips_and_survives_rebuild,
         test_new_fields_not_in_snapshot_repr,
         test_story_gate_stage_depth,
-        test_prompt_declares_v3_rules,
+        test_prompt_declares_v5_rules,
         test_checks_v3_is_superset_of_v2,
         test_accepted_binds_content_hash_not_just_external_id,
-        test_policy_version_is_v3,
+        test_policy_version_is_v5,
         # ---- H4-C: curated-v4(Blueprint 污染 + 编译失败语义) ----
         test_curated_no_target_blueprint,
         test_reviewer_prompt_not_enforcing_blueprint_for_curated,

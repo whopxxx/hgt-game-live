@@ -1071,22 +1071,35 @@ def test_c6b_current_policy_field_lists_all_include_beats():
     check("**CHECK_SYSTEM 不再写'六样'(已是七样)**",
           "六样" not in _llm.CHECK_SYSTEM)
     check("CHECK_SYSTEM 写的是七样", "七样" in _llm.CHECK_SYSTEM)
-    check("**quality_checks 标题写八项(不是四项)**",
-          "八项" in _llm.CHECK_SYSTEM and "四项**" not in _llm.CHECK_SYSTEM)
+    check("**quality_checks 标题写十二项(不是四项)**",
+          "十二项" in _llm.CHECK_SYSTEM
+          and "四项**" not in _llm.CHECK_SYSTEM)
     # _QUALITY_CHECK_FIELDS 必须真的是十二项 —— 标题与实现不能各说各话。
     #
     # H3-D3: 契约清单是**十二项**(v8 八项 + 题型四问), 但题型四问只对
     # curated 题生效 —— 见 `_quality_check_contract`。自由生成链仍是
     # 八项, 所以这里断言的是"清单有十二项", 而不是"每次都查十二项"。
+    #
+    # ⚠️ H4-D §七: curated 的**门**从十二项缩到九项 —— 题型三问降为
+    # 信号。清单本身(模型要回答什么)没变, 变的是哪几项有否决权。
     check("_QUALITY_CHECK_FIELDS 确实是 12 项",
           len(_llm._QUALITY_CHECK_FIELDS) == 12,
           _llm._QUALITY_CHECK_FIELDS)
     check("**自由生成链只查前 8 项**(题型四问不适用于它)",
           len(_llm._quality_check_contract(
               type("S", (), {"source_type": ""})())) == 8)
-    check("curated 链查 12 项",
+    check("**curated 链只查 9 项**(题型三问已降为信号)",
           len(_llm._quality_check_contract(
-              type("S", (), {"source_type": "curated"})())) == 12)
+              type("S", (), {"source_type": "curated"})())) == 9,
+          _llm._quality_check_contract(
+              type("S", (), {"source_type": "curated"})()))
+    check("**那 9 项里没有被降级的三个信号字段**",
+          not (set(_llm._CURATED_SIGNAL_FIELDS)
+               & set(_llm._quality_check_contract(
+                   type("S", (), {"source_type": "curated"})()))),
+          sorted(set(_llm._CURATED_SIGNAL_FIELDS)
+                 & set(_llm._quality_check_contract(
+                     type("S", (), {"source_type": "curated"})()))))
     # 工具 schema 的 required 必须含 beats(模型最直接遵守的那一层)
     check("_TOOL_RIDDLE.required 含 discovery_beats",
           "discovery_beats" in _llm._TOOL_RIDDLE["input_schema"]["required"],

@@ -212,6 +212,25 @@ def _print_source_quality(led: DecisionLedger) -> None:
     print(f"    **source yield** : "
           + ("n/a(还没有内容判决)" if y is None else f"{y:.1%}")
           + "  = accepted / (accepted + content_rejected)")
+    # ---- H4-D §十二: 信号分布(不是死因) ----
+    #
+    # ⚠️ 这一段的措辞很重要。信号**不拒题**, 所以这里回答的是
+    # "收进来的题有多少偏简单", 而不是"有多少题因为偏简单被拒"。
+    # 后者在 v5 里**恒为 0** —— 混着说会让人以为门还卡在那儿。
+    sig = led.signal_stats(CURATED_POLICY_VERSION)
+    if sig["accepted_with_signal"] or sig["accepted_clean"]:
+        print()
+        print("  信号分布(§十二 —— 信号**不拒题**, 只用于以后排序):")
+        print(f"    accepted 且无任何信号 : {sig['accepted_clean']}"
+              f"   (层次/反转都齐)")
+        for k, v in sorted(sig["accepted_with_signal"].items(),
+                           key=lambda kv: -kv[1]):
+            print(f"    accepted 带信号 {k:26s} {v}")
+        if sig["rejected_with_signal"]:
+            print("    rejected 也带信号(说明它不是死因):")
+            for k, v in sorted(sig["rejected_with_signal"].items(),
+                               key=lambda kv: -kv[1]):
+                print(f"      {k:28s} {v}")
 
 
 def _print_samples(pool_path: str, n: int) -> None:
@@ -416,6 +435,14 @@ def _write_item_report(path: str, recs: list, led: DecisionLedger,
         if isinstance(checks, dict) and checks:
             row["compile_checks"] = checks.get("compile") or {}
             row["review_checks"] = checks.get("review") or {}
+            # ---- H4-D §十二: 信号单独给一格 ----
+            #
+            # 它**不是**拒绝理由 —— 只是一道题"偏简单"的记录。审批端要看
+            # 的是"被 accepted 的题里有多少是单点脑筋急转弯", 所以它必须
+            # 与 reject reason 分开呈现, 否则会被误读成死因。
+            sig = checks.get("signals")
+            if isinstance(sig, dict) and sig:
+                row["signals"] = sig
         items.append(row)
     payload = dict(out)
     payload["items"] = items

@@ -585,17 +585,34 @@ class LazyCurator:
             style_tags = list(info.get("style_tags") or [])
             # ---- §十二: 题型审核证据(审计用, **不进前端**) ----
             #
-            # `compile_checks` / `review_checks` 是本次编译/审稿对四条
-            # 故事判据的逐条回答。它们**不参与** decision identity
-            # (键仍是 id+hash+policy), 只是让事后复盘能回答"当时判了
+            # `compile_checks` / `review_checks` 是本次编译/审稿对十三条
+            # 判据的逐条回答。它们**不参与** decision identity
+            # (键仍是 id+hash+policy), 只让事后复盘能回答"当时判了
             # 什么" —— Reject Audit 正是卡在这里: 字段没落盘, 于是
             # "12.5% 是源差还是门误杀"无法从证据回答。
+            #
+            # ⚠️ H4-D §十二: v5 起这里落的是**全量十三条**(以前只留四条)
+            # —— 题型三问降级成信号之后, 它们**唯一的用途**就是以后排序
+            # (库存充足时优先更有反转的题)。只留四条的话, "这题简不简单"
+            # 这个信息就永久丢了。
+            #
+            # ⚠️ 仍然**不进前端**: 观众看不到任何一格信号。
             checks = {}
             for _k, _dst in (("compile_checks", "compile"),
                              ("review_checks", "review")):
                 _v = info.get(_k)
                 if isinstance(_v, dict):
                     checks[_dst] = _v
+            # ---- H4-D §三/§六: 题型信号单独落一格 ----
+            #
+            # 它**不是**拒绝理由, 只是"这道题偏简单"的记录。与 checks
+            # 分开存: checks 是**原始逐条答复**, signal 是**判定后的
+            # 结论**(只有"明确不理想"才在里面)。混在一起会让人分不清
+            # "模型答了 false"与"我们认为这是个负面信号"。
+            for _k in ("story_signal", "review_signal"):
+                _v = info.get(_k)
+                if _v:
+                    checks.setdefault("signals", {})[_k] = list(_v)
 
             # ---- §四: accepted 是**最终 commit marker**, 必须最后写 ----
             #
@@ -943,10 +960,15 @@ class LazyCurator:
         # 稿件时, 会出现 stage=truth_audit 而 reason="第 2 条提示超过
         # 30 字"。只看 stage 会把一条 hint 超长算成"审计没过"。
         #
-        # ⚠️ 但**硬内容门优先**: ai_gate / story_gate / story_review 是
-        # 确定性内容判决, 它们一旦出现就说明这道题**内容**已经被否了 ——
+        # ⚠️ 但**硬内容门优先**: `ai_gate` / `hard_gate` 是确定性内容
+        # 判决, 它们一旦出现就说明这道题**内容**已经被否了 ——
         # 那时不该因为 reason 里恰好有个"提示"字样就改判成 defer。
-        if stage not in ("ai_gate", "story_gate", "story_review") and \
+        #
+        # ⚠️ H4-D §六: 这里**不再包含** `story_gate` / `story_review`。
+        # v5 起题型信号不拒题, 所以那两个 stage 不会再产生; 留着它们
+        # 会让"旧账本里那条 decision 是什么"与"新代码会怎么判"看起来
+        # 不一致 —— 而旧 decision 是**已经落盘的事实**, 不重判。
+        if stage not in ("ai_gate", "hard_gate") and \
                 looks_like_compile_invalid(stage, reasons):
             return (TECHNICAL_DEFER, stage or "compile_invalid",
                     reasons or [f"compile_invalid:{stage}"])
@@ -956,6 +978,10 @@ class LazyCurator:
         # 答复, 或答复里没有那四个字段。两种都是"没审成", 换一次网络
         # 可能就好了。记成 rejected 会永久吃掉一道题 —— 那正是 §一-3
         # 要禁止的。
+        #
+        # ⚠️ H4-D §七: v5 里**Reviewer 缺信号字段不算技术失败** ——
+        # 那三个题型字段只是信号, 没答就没答, 不影响这道题能不能播。
+        # 所以这条只对**旧 policy 的 decision** 有意义(v5 不会再产生它)。
         if "story_review_missing" in reasons:
             return TECHNICAL_DEFER, stage or "story_review", reasons
         return REJECTED, stage or "unknown", reasons

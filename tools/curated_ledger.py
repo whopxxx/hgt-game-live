@@ -119,8 +119,8 @@ COMPILE_INVALID_STAGES = frozenset({
 #: hint 超长 —— 结构问题。分类必须读 reason 文本才能纠正。
 #:
 #: ⚠️ 这些指纹只在**没有更硬的内容判决理由**时才用于归类:
-#: `_classify` 先让 `ai_gate` / `story_gate` / `story_review` 这些
-#: **确定性内容门**胜出, 免得一个恰好提到"提示"两字的内容拒绝被误归。
+#: `_classify` 先让 `ai_gate` / `hard_gate` 这些**确定性内容门**胜出,
+#: 免得一个恰好提到"提示"两字的内容拒绝被误归。
 COMPILE_INVALID_REASON_MARKS = (
     "提示超过",           # hint 长度
     "hints 应为",         # hint 数量
@@ -427,4 +427,55 @@ class DecisionLedger:
             "by_stage": by_stage,
             # 真正的源 yield —— 分母**不含** defer / interrupted。
             "source_yield": (acc / denom) if denom else None,
+        }
+
+    def signal_stats(self, policy_version: str) -> dict:
+        """H4-D §十二: 统计**信号**(不含准入理由)的分布。
+
+        ## 为什么要单独一个函数
+
+        v5 起"这道题是不是故事 / 有没有反转 / 是不是单点技巧"不再拒题,
+        于是它们从**死因**变成了**风格统计**。审批端要回答的问题也随之
+        变了:
+
+            旧: "被拒的题里有多少是因为不够曲折?"   (已无意义)
+            新: "收进来的题里有多少是单点脑筋急转弯?" (这才是有用的)
+
+        第二个问题只能从 signals 里读, 而它**不能**与 reject reason 混在
+        一起 —— 一个 `single_trick` 出现在 rejected 那条里是死因, 出现在
+        accepted 那条里是风格。混着统计会得出"single_trick 拒了很多题"
+        这种**与事实相反**的结论。
+
+        返回:
+            {
+              "accepted_with_signal": {signal: count},
+              "accepted_clean": int,           # 无任何信号的题数
+              "rejected_with_signal": {signal: count},
+            }
+        """
+        acc_sig: dict = {}
+        rej_sig: dict = {}
+        acc_clean = 0
+        for (_eid, _h, pol), d in self._idx.items():
+            if pol != policy_version:
+                continue
+            dec = d.get("decision")
+            if dec not in (ACCEPTED, REJECTED):
+                continue
+            sig = (d.get("checks") or {}).get("signals") or {}
+            names: list = []
+            for _k, _v in sig.items():
+                names.extend(str(x) for x in (_v or []))
+            if dec == ACCEPTED:
+                if not names:
+                    acc_clean += 1
+                for nm in names:
+                    acc_sig[nm] = acc_sig.get(nm, 0) + 1
+            else:
+                for nm in names:
+                    rej_sig[nm] = rej_sig.get(nm, 0) + 1
+        return {
+            "accepted_with_signal": acc_sig,
+            "accepted_clean": acc_clean,
+            "rejected_with_signal": rej_sig,
         }
