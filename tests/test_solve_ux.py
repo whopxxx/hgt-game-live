@@ -47,6 +47,7 @@ from story.llm import (  # noqa: E402
     ANSWER_SYSTEM, CHECK_SYSTEM, RIDDLE_SYSTEM,
 )
 from story.puzzle import (  # noqa: E402
+    DiscoveryBeat,
     FairClue, PuzzleFact, PuzzleSpec, SolveAtom, runtime_spec_key,
 )
 from story.quality import MAX_COMPLETION_FACTS, validate_spec  # noqa: E402
@@ -82,9 +83,32 @@ def mkcfg(**kw):
 # ----------------------------------------------------------------------
 # 构造器
 # ----------------------------------------------------------------------
+def _stamp_beats(spec):
+    """给 v8 夹具补上 2 个发现阶段。
+
+    当前政策要求 2~4 条, 而这些夹具是为了测**别的**东西(通关判定、
+    贡献链、复核 …)才存在的 —— 不补的话每个用例都会先在
+    "缺 discovery_beats" 上失败, 掩盖真正要测的行为。
+    第一条指向第一个 completion fact, 保证"至少一条通向通关路径"。
+    """
+    if getattr(spec, "discovery_beats", None):
+        return spec
+    comp = [str(x).strip() for x in
+            (getattr(spec, "completion_fact_ids", None) or []) if str(x).strip()]
+    f1 = comp[0] if comp else ""
+    f2 = comp[1] if len(comp) > 1 else f1
+    spec.discovery_beats = [
+        DiscoveryBeat(id="b1", text="先注意到最反常的那个细节",
+                      fact_ids=[x for x in (f1,) if x]),
+        DiscoveryBeat(id="b2", text="再想通它为什么会这样",
+                      fact_ids=[x for x in (f2,) if x]),
+    ]
+    return spec
+
+
 def ident_spec(completion=("f1", "f2"), core="门外女人是父亲的亲生女儿。"):
     """集体身份题: 两个核心事实, 可由两个不同的观众分别建立。"""
-    return PuzzleSpec(
+    return _stamp_beats(PuzzleSpec(
         id="ux-ident", title="门外",
         puzzle="门外站着一个女人, 开门的人一见她就愣住了。为什么?",
         answer="门外女人是父亲的亲生女儿, 她昨晚才与父亲同桌吃饭相认。",
@@ -108,12 +132,12 @@ def ident_spec(completion=("f1", "f2"), core="门外女人是父亲的亲生女�
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["注意她的身份", "注意昨晚发生了什么", "注意饭桌"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
 
 
 def flight_spec():
     """飞行测试: 与 A 同构, 换成"测试飞行"题材。"""
-    return PuzzleSpec(
+    return _stamp_beats(PuzzleSpec(
         id="ux-flight", title="测试飞行",
         puzzle="飞机落地后机长长舒一口气, 乘客却在鼓掌。为什么?",
         answer="这是一次考核飞行, 复飞本身就是测试项目, 落地才意味着通过。",
@@ -131,7 +155,7 @@ def flight_spec():
         ],
         fair_clues=[FairClue(quote="乘客却在鼓掌", supports_atoms=["a1"])],
         hints=["注意掌声", "注意民航流程", "注意考核"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
 
 
 def auction_spec():
@@ -141,7 +165,7 @@ def auction_spec():
     completion 也只拆成两条核心命题(不含"鉴定人定价权"那种行业细节)。
     所以房间说出核心机制就应该能通关 —— 这正是 v6 要守住的东西。
     """
-    return PuzzleSpec(
+    return _stamp_beats(PuzzleSpec(
         id="ux-auction", title="旧箱子",
         puzzle="古董商把自己收藏的旧箱子送去拍卖, 每次都是他自己举牌"
               "买回来。几年后, 他手里同类的箱子都卖出了高价。为什么?",
@@ -169,7 +193,7 @@ def auction_spec():
         fair_clues=[FairClue(quote="每次都是他自己举牌买回来",
                              supports_atoms=["a1"])],
         hints=["注意谁在举牌", "想想成交记录有什么用", "注意他手里还有别的箱子"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
 
 
 def _completion_match(ids):
@@ -572,7 +596,8 @@ def test_closeout_b1_minimal_identity_puzzle_valid():
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["a", "b", "c"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+        prompt_version="riddle-v8", quality_policy_version="quality-v8")
+    _stamp_beats(sp)
     vr = validate_spec(sp)
     check("validate_spec 通过", vr.ok, vr.why())
     check("只有 1 条 atom", len(sp.solve_atoms) == 1)
@@ -611,7 +636,7 @@ def test_closeout_b2_v5_must_have_contract():
     ]
     vr3 = validate_spec(sp3)
     check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
-    check("版本常量确实是 v7", _Q == "quality-v7", _Q)
+    check("版本常量确实是 v7", _Q == "quality-v8", _Q)
     # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
     check("has_completion_contract 仍是运行时判据",
           ident_spec().has_completion_contract())
@@ -1016,18 +1041,18 @@ def test_v6_versions_bumped():
                            RIDDLE_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
     check("QUALITY_POLICY_VERSION == quality-v7",
-          QUALITY_POLICY_VERSION == "quality-v7", QUALITY_POLICY_VERSION)
+          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION == riddle-v7",
-          RIDDLE_PROMPT_VERSION == "riddle-v7", RIDDLE_PROMPT_VERSION)
+          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v7",
-          CHECK_PROMPT_VERSION == "check-v7", CHECK_PROMPT_VERSION)
+          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION == answer-v6",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
-    # spec_version 这次**不动** —— v6 没有改 PuzzleSpec schema。
+    # v8 bump 到 4: discovery_beats 改了 PuzzleSpec 的 schema。
     from story.puzzle import PuzzleSpec
-    check("spec_version 仍是 3",
+    check("spec_version 升到 4",
           PuzzleSpec(puzzle="p", answer="a").to_archive().get("spec_version")
-          == 3)
+          == 4)
 
 
 def test_v6_pool_quarantines_quality_v5():
@@ -1056,7 +1081,7 @@ def test_v6_pool_quarantines_quality_v5():
     ok, why = PuzzlePool._validate_pool_spec(_full("quality-v6"))
     check("quality-v6(旧政策) -> 入池被拒", not ok, why)
     check("理由点名政策不兼容", "不兼容" in why, why)
-    ok2, why2 = PuzzlePool._validate_pool_spec(_full("quality-v7"))
+    ok2, why2 = PuzzlePool._validate_pool_spec(_full("quality-v8"))
     check("quality-v7 完整题 -> 入池", ok2, why2)
 
     # 出池门: 盘上**残留**的 v5 题也绝不能 pop 出来 —— 只拦入池不够,
@@ -1110,9 +1135,13 @@ def test_v6_reviewer_has_minimality_rule():
     # fail-closed 必须还在: 四项仍全部 required。
     req = (_TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
            ["required"])
-    check("四项仍全部 required",
+    # v8: 从四项扩到八项(后四项查"好不好玩"), 仍是**全部** required ——
+    # fail-closed 的语义没变: 任一项不是 True 就整稿拒收。
+    check("八项仍全部 required",
           set(req) == {"narrator_truthful", "mechanism_consistent",
-                       "core_answer_direct", "completion_contract_minimal"},
+                       "core_answer_direct", "completion_contract_minimal",
+                       "concrete_anomaly", "clue_recontextualized",
+                       "dramatic_payoff", "reasoning_beats_nonredundant"},
           req)
 
 
@@ -2246,7 +2275,7 @@ def frame_spec():
     只说"画框有问题"时, 公开信息只有"画框存在某种问题", 不足以建立
     报警结构。这正是 A1 要挡住的东西。
     """
-    return PuzzleSpec(
+    return _stamp_beats(PuzzleSpec(
         id="ux-frame", title="画框",
         puzzle="博物馆一幅名画在闭馆后触发了警报, 但画本身完好无损。"
                "为什么?",
@@ -2265,7 +2294,7 @@ def frame_spec():
         ],
         fair_clues=[FairClue(quote="画本身完好无损", supports_atoms=["a1"])],
         hints=["注意不是画本身", "想想画框"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
 
 
 def test_a1_r1_broad_question_cannot_complete():
@@ -2393,8 +2422,8 @@ def test_a1_non_candidate_verifier_cannot_widen():
         solve_atoms=[SolveAtom(id="a1", role="key", text="丙",
                                fact_ids=["f1", "f2"])],
         fair_clues=[FairClue(quote="同时发生", supports_atoms=["a1"])],
-        hints=["h"], prompt_version="riddle-v7",
-        quality_policy_version="quality-v7")
+        hints=["h"], prompt_version="riddle-v8",
+        quality_policy_version="quality-v8")
     # 复核回 f1(第一层自报的那条) + f2(观众**没**说过的那条)。
     fc = FakeClient([
         _verdict(established=["f1"], cand=False),

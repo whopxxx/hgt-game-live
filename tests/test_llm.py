@@ -161,6 +161,13 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
              "fact_ids": ["f2", "f3"]},
         ],
         "fair_clues": clues_for(puzzle),
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        "discovery_beats": [
+            {"id": "b1", "text": "先注意到灯只在退潮时亮",
+             "fact_ids": ["f1"]},
+            {"id": "b2", "text": "再想到灯是在标礁石, 不是引路",
+             "fact_ids": ["f2"]},
+        ],
         "signature": {
             "mechanism_family": "hidden_function",
             "solution_shape": "hidden_function_explains_behavior",
@@ -218,7 +225,10 @@ def qc_ok(**kw):
     都必须带上它。
     """
     d = {"narrator_truthful": True, "mechanism_consistent": True,
-         "core_answer_direct": True, "completion_contract_minimal": True}
+         "core_answer_direct": True, "completion_contract_minimal": True,
+         # quality-v8: 后四项查"好不好玩", 同样是 fail-closed 的硬门。
+         "concrete_anomaly": True, "clue_recontextualized": True,
+         "dramatic_payoff": True, "reasoning_beats_nonredundant": True}
     d.update(kw)
     return d
 
@@ -1400,9 +1410,9 @@ def test_v4_prompt_versions_bumped():
     print("\n[V4-1] riddle/check prompt 版本")
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
     check("RIDDLE_PROMPT_VERSION == riddle-v7",
-          RIDDLE_PROMPT_VERSION == "riddle-v7", RIDDLE_PROMPT_VERSION)
+          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v7",
-          CHECK_PROMPT_VERSION == "check-v7", CHECK_PROMPT_VERSION)
+          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1565,8 +1575,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v7",
-          QUALITY_POLICY_VERSION == "quality-v7", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v8",
+          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -2910,7 +2920,7 @@ def test_truth5_v6_pool_quarantined_but_v7_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v7", QUALITY_POLICY_VERSION == "quality-v7",
+    check("当前政策是 v8", QUALITY_POLICY_VERSION == "quality-v8",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q1pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -2940,6 +2950,219 @@ def test_truth5_v6_pool_quarantined_but_v7_eligible():
     check("**v7: 正常 eligible**", pool.add(new) is True)
     check("v7 入池后 stock=1", pool.stock_count() == 1, pool.stock_count())
     check("v7 能 pop 出来", pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_q2_discovery_beats_schema_and_prompts():
+    """**Q2-A**: 层次进 schema/prompt, 且通关不被它绑架。"""
+    print("\n[Q2-A] discovery_beats 进 schema 与 prompt")
+    from story.llm import (_TOOL_RIDDLE, _TOOL_CHECK, RIDDLE_SYSTEM,
+                           CHECK_SYSTEM, _QUALITY_CHECK_FIELDS)
+    rb = _TOOL_RIDDLE["input_schema"]["properties"].get("discovery_beats")
+    check("RIDDLE 工具接受 discovery_beats", rb is not None)
+    check("条数区间 2~4", (rb or {}).get("minItems") == 2
+          and (rb or {}).get("maxItems") == 4,
+          ((rb or {}).get("minItems"), (rb or {}).get("maxItems")))
+    check("Reviewer 工具也能带回 discovery_beats",
+          "discovery_beats" in _TOOL_CHECK["input_schema"]["properties"])
+    # ---- 通关不被层次绑架: completion 仍是 1~2 ----
+    comp = _TOOL_RIDDLE["input_schema"]["properties"]["completion_fact_ids"]
+    check("**completion 仍限 1~2 条(通关必须简单)**",
+          comp.get("minItems") == 1 and comp.get("maxItems") == 2,
+          (comp.get("minItems"), comp.get("maxItems")))
+    # ---- 修正"把题写简单"的措辞 ----
+    check("**RIDDLE 不再说'换一个更简单的骨架'**",
+          "换一个更简单的骨架" not in RIDDLE_SYSTEM,
+          "仍在教模型把题写简单")
+    check("RIDDLE 明确 completion 不是复杂度上限",
+          "不是对整道题复杂度的限制" in RIDDLE_SYSTEM)
+    check("RIDDLE 写了'题目允许有层次, 通关必须简单'",
+          "题目允许有层次" in RIDDLE_SYSTEM)
+    td = _TOOL_RIDDLE["input_schema"]["properties"][
+        "completion_fact_ids"]["description"]
+    check("工具描述也不再教'换更简单的骨架'",
+          "换一个更简单的骨架" not in td, td[:80])
+    # ---- 基调 ----
+    check("RIDDLE 有'诡异但现实可解释'基调段",
+          "诡异但现实可解释" in RIDDLE_SYSTEM)
+    check("RIDDLE 点名优先的机制家族",
+          "identity_misread" in RIDDLE_SYSTEM
+          and "object_misuse" in RIDDLE_SYSTEM)
+    check("RIDDLE 明说不要用惨烈程度替代推理质量",
+          "重口" in RIDDLE_SYSTEM)
+    # ---- 四个"好不好玩"硬字段 ----
+    for f in ("concrete_anomaly", "clue_recontextualized",
+              "dramatic_payoff", "reasoning_beats_nonredundant"):
+        check(f"quality_checks 含 {f}", f in _QUALITY_CHECK_FIELDS)
+    check("CHECK_SYSTEM 解释了 concrete_anomaly",
+          "concrete_anomaly" in CHECK_SYSTEM)
+    check("CHECK_SYSTEM 解释了 reasoning_beats_nonredundant",
+          "reasoning_beats_nonredundant" in CHECK_SYSTEM)
+
+
+def test_q2_v7_pool_quarantined_but_v8_eligible():
+    """**Q2-K**: 旧 quality-v7 库存被隔离; v8 正常 eligible。
+
+    实播冒烟的日志里能看到这一条真的在生产路径上生效:
+
+        题池 8 道候选全部被挡(回落现场生成): …
+        quality policy 不兼容(spec='quality-v7', current='quality-v8')
+
+    隔离靠 `_validate_pool_spec` 既有那一扇门自动生效 —— **不迁移 /
+    不伪装 / 不删旧行**。
+    """
+    print("\n[Q2-K] v7 quarantine / v8 eligible")
+    import os
+    import json
+    import tempfile
+    from story.config import Config
+    from story.pool import PuzzlePool, spec_key
+    from story.quality import QUALITY_POLICY_VERSION
+    import importlib.util as _ilu
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "test_pool.py")
+    _spec = _ilu.spec_from_file_location("_tp_for_q2", _p)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _pool_good_spec = _mod.good_spec
+    check("当前政策是 v8", QUALITY_POLICY_VERSION == "quality-v8",
+          QUALITY_POLICY_VERSION)
+    d = tempfile.mkdtemp(prefix="q2pool_")
+    cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
+                 pool_path=os.path.join(d, "p.jsonl"),
+                 pool_used_path=os.path.join(d, "u.jsonl"))
+    # 盘上放一条 v7 —— 它**必须**留在盘上但被一致地挡住。
+    old = _pool_good_spec()
+    old.quality_policy_version = "quality-v7"
+    with open(cfg.pool_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"pool_version": 1, "pool_key": spec_key(old),
+                            "added_at": 0.0, "added_by": "legacy",
+                            "spec": old.to_archive()},
+                           ensure_ascii=False) + "\n")
+    pool = PuzzlePool.open(cfg)
+    check("**v7: stock_count 不算它**", pool.stock_count() == 0,
+          pool.stock_count())
+    check("**v7: pop_next 不返回**",
+          pool.pop_next(recent_signatures=[]) is None)
+    check("**v7: playable_count 也不算**", pool.playable_count([]) == 0,
+          pool.playable_count([]))
+    check("**旧行仍在盘上(没删)**",
+          sum(1 for _ in open(cfg.pool_path, encoding="utf-8")) == 1)
+    # v8 新题正常 eligible(换谜面, 免得撞内容哈希去重)
+    new = _pool_good_spec(
+        puzzle="钟楼的守夜人每晚敲钟, 但只在涨潮的那几个小时敲。为什么?",
+        fair_clues=[_mod.FairClue(quote="只在涨潮的那几个小时敲",
+                                  supports_atoms=["a1"]),
+                    _mod.FairClue(quote="每晚敲钟", supports_atoms=["a2"])])
+    check("**v8: 正常 eligible**", pool.add(new) is True)
+    check("v8 入池后 stock=1", pool.stock_count() == 1, pool.stock_count())
+    check("v8 能 pop 出来", pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_q2_reviewer_all_four_new_fields_required():
+    """**Q2-B**: 四个新字段是 fail-closed 的硬门(缺一项就拒稿)。
+
+    这个替身只回**四项** -> 必须被拒。若不拒, 说明新字段是装饰。
+    """
+    print("\n[Q2-B] 新四项缺一即拒")
+    from story.llm import PuzzleWriter
+    from story.puzzle import PuzzleSpec
+    r = riddle()
+    spec = PuzzleSpec(puzzle=r["puzzle"], answer=r["answer"],
+                      core_answer=r["core_answer"],
+                      completion_fact_ids=r["completion_fact_ids"],
+                      quality_policy_version=QUALITY_POLICY_VERSION)
+    ti = dict(r)
+    ti["decision"] = "pass"
+    ti["observed_signature"] = r["signature"]
+    ti["quality_checks"] = {"narrator_truthful": True,
+                            "mechanism_consistent": True,
+                            "core_answer_direct": True,
+                            "completion_contract_minimal": True}
+    out, why = PuzzleWriter._apply_review(
+        spec, ti, bp_for(), r["puzzle"])
+    check("**缺四个新字段 -> 拒稿**", out is None, why)
+    check("原因点名了缺的字段",
+          why and ("concrete_anomaly" in why or "quality_checks" in why), why)
+
+
+def test_q2_beats_never_reach_frontend():
+    """**Q2-C**: discovery_beats **绝不**进 Snapshot / 前端。
+
+    它没有胜负权, 也不该让观众提前看到"这题有几层"。
+    """
+    print("\n[Q2-C] beats 不进前端")
+    from story.state import Snapshot
+    from story.engine import RoundEngine
+    from story.config import Config
+    j = Snapshot().to_json()
+    check("**Snapshot 里没有 discovery_beats**",
+          "discovery_beats" not in j, sorted(j))
+    check("也没有 beats 这个键", "beats" not in j, sorted(j))
+    eng = RoundEngine(Config(sim_path="x", reveal_hold_seconds=5.0))
+    check("engine.snapshot 也没有",
+          "discovery_beats" not in eng.snapshot().to_json())
+    check("pressure 里也没有",
+          "discovery_beats" not in eng.pressure(), sorted(eng.pressure()))
+
+
+def test_q2_beats_have_no_victory_power():
+    """**Q2-D**: beats 不参与胜负 —— Engine 只认 completion ⊆ established。"""
+    print("\n[Q2-D] beats 无胜负权")
+    import inspect
+    from story.engine import RoundEngine
+    src = inspect.getsource(RoundEngine)
+    # Engine 里**不该**出现 discovery_beats / beats 的引用。
+    check("Engine 源码不提 discovery_beats",
+          "discovery_beats" not in src, "Engine 读了 beats —— 它有胜负权了?")
+    # submit_qa 的胜负判定仍然只看 completion
+    sq = inspect.getsource(RoundEngine.submit_qa)
+    check("submit_qa 只按 completion_fact_ids 判胜负",
+          "completion_fact_ids" in sq and "discovery_beats" not in sq)
+
+
+def test_q2_quota_tightened_and_tone_target():
+    """**Q2-E**: 两类无聊题 quota 收到 1; 诡异基调目标代码化。"""
+    print("\n[Q2-E] quota 收紧 + 基调目标")
+    from story.config import Config
+    from story.quality import Quotas
+    c = Config(sim_path="x")
+    check("**straight_explanation 收到 1**",
+          c.quota_straight_explanation == 1, c.quota_straight_explanation)
+    check("**procedural_rule 收到 1**",
+          c.quota_procedural_rule == 1, c.quota_procedural_rule)
+    check("基调目标带 5~6",
+          (c.quality_dark_tone_min, c.quality_dark_tone_max) == (5, 6),
+          (c.quality_dark_tone_min, c.quality_dark_tone_max))
+    # 两条路径必须一致(直接构造 vs from_config) —— 只改一边是经典的坑。
+    q_direct = Quotas()
+    q_cfg = Quotas.from_config(c)
+    check("**Quotas() 与 from_config 一致(straight)**",
+          q_direct.straight_explanation == q_cfg.straight_explanation == 1,
+          (q_direct.straight_explanation, q_cfg.straight_explanation))
+    check("**Quotas() 与 from_config 一致(procedural)**",
+          q_direct.procedural_rule == q_cfg.procedural_rule == 1,
+          (q_direct.procedural_rule, q_cfg.procedural_rule))
+
+
+def test_q2_versions_bumped():
+    """**Q2-F**: 版本统一 bump。"""
+    print("\n[Q2-F] 版本 bump")
+    from story.llm import (RIDDLE_PROMPT_VERSION, CHECK_PROMPT_VERSION,
+                           ANSWER_PROMPT_VERSION)
+    from story.quality import QUALITY_POLICY_VERSION
+    from story.puzzle import PuzzleSpec
+    check("QUALITY_POLICY_VERSION = quality-v8",
+          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
+    check("RIDDLE_PROMPT_VERSION = riddle-v8",
+          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v8",
+          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
+    # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
+    check("ANSWER_PROMPT_VERSION 仍是 C0 升的 answer-v7",
+          ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
+    check("spec_version = 4",
+          PuzzleSpec(puzzle="p", answer="a").to_archive().get("spec_version")
+          == 4)
 
 
 def test_truth_prompt_has_scanning_rules():
@@ -3087,6 +3310,14 @@ def main():
               test_truth4_audit_technical_failure_rejects,
               test_truth4b_conflicts_nonempty_forces_reject,
               test_truth5_v6_pool_quarantined_but_v7_eligible,
+              # ---- Q2: quality-v8 题目允许复杂, 通关仍然简单 ----
+              test_q2_discovery_beats_schema_and_prompts,
+              test_q2_v7_pool_quarantined_but_v8_eligible,
+              test_q2_reviewer_all_four_new_fields_required,
+              test_q2_beats_never_reach_frontend,
+              test_q2_beats_have_no_victory_power,
+              test_q2_quota_tightened_and_tone_target,
+              test_q2_versions_bumped,
               test_truth_prompt_has_scanning_rules,
               test_truth_prompt_hardened_in_riddle_and_check):
         t()

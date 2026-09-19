@@ -319,9 +319,21 @@ class Config:
     # 数的是 **observed**(Reviewer 读完如实回传的 Signature), 不是调度器
     # 的目标值 —— 目标只是输入, 配额反映的是观众真实看到的分布。
     quota_same_reveal_mode: int = 2       # 同一揭晓结构最多几道
-    quota_straight_explanation: int = 2   # "没有翻转的正面解释"上限
+    # v8 收紧 2 -> 1: 实播里"没有翻转、就是正面解释"和"主要靠制度性
+    # 设定成立"这两类最容易让观众觉得无聊。**这是有意的内容 policy
+    # 修改**(任务书明确), 不是"调整现有 quota 数值"那条限制的对象。
+    quota_straight_explanation: int = 1   # "没有翻转的正面解释"上限
     quota_neutral_emotion: int = 3        # "中性气氛"上限(去掉固定偏置后的护栏)
-    quota_procedural_rule: int = 2        # 主要靠制度性设定成立的题上限
+    quota_procedural_rule: int = 1        # 主要靠制度性设定成立的题上限
+
+    # ---- v8: 最近 10 题的"诡异/紧张"目标带 ----
+    # 内容基调要**代码化**, 不能只写在 prompt 里 —— prompt 说了模型也
+    # 可能连续出 10 道温馨题。目标: 最近 10 题里约 5~6 道是 eerie/tense
+    # (不低于 ~50%, 不长期超过 ~60%)。
+    # 区间而不是定值: 定值会让调度器每轮都硬凑, 反而挤压 absurd/warm/
+    # neutral/grief 的空间 —— 那些也要留位置。
+    quality_dark_tone_min: int = 5
+    quality_dark_tone_max: int = 6
 
     # ---- AI 试玩(方案 §40/§42): 直播热路径里**默认关闭** ----
     # 只在后台 prefetch candidate 上跑, `_riddle` 永远不试玩。

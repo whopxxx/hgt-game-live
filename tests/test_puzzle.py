@@ -16,8 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.puzzle import (  # noqa: E402
-    EMOTION_MODES, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
-    PuzzleSpec, REVEAL_DEFAULT, REVEAL_MODES, SolveAtom,
+    DiscoveryBeat, EMOTION_MODES, FairClue, PuzzleBlueprint, PuzzleFact,
+    PuzzleSignature, PuzzleSpec, REVEAL_DEFAULT, REVEAL_MODES, SolveAtom,
     has_closing_question, is_first_person, quote_in_puzzle,
 )
 from story.quality import (  # noqa: E402
@@ -82,7 +82,16 @@ def good_spec(**kw) -> PuzzleSpec:
                        domain="maritime", emotion_mode="neutral",
                        relation="stranger", time_shape="habitual"),
                    prompt_version="riddle-v3",
-                   quality_policy_version=QUALITY_POLICY_VERSION)
+                   quality_policy_version=QUALITY_POLICY_VERSION,
+                   # quality-v8: 当前政策要求 2~4 个发现阶段。夹具必须
+                   # 自己就是一份**合格**的 v8 spec, 否则每个用例都会
+                   # 先在"缺 discovery_beats"上失败, 掩盖真正要测的东西。
+                   discovery_beats=[
+                       DiscoveryBeat(id="b1", text="先注意到灯只在退潮时亮",
+                                     fact_ids=["f1"]),
+                       DiscoveryBeat(id="b2", text="再想到灯是在标礁石, 不是引路",
+                                     fact_ids=["f2"]),
+                   ])
     for k, v in kw.items():
         setattr(s, k, v)
     return s
@@ -129,7 +138,7 @@ def test_v5_completion_contract_roundtrip():
     check("round trip 保持 completion",
           s2.completion_fact_ids == ["f1", "f2"], s2.completion_fact_ids)
     a = s.to_archive()
-    check("archive spec_version=3", a.get("spec_version") == 3, a.get("spec_version"))
+    check("archive spec_version=4", a.get("spec_version") == 4, a.get("spec_version"))
     check("archive 带合同", a.get("completion_fact_ids") == ["f1", "f2"], a)
     check("has_completion_contract() 为真", s.has_completion_contract())
     check("completion_facts() 返回真对象",
@@ -236,7 +245,7 @@ def test_spec_roundtrip():
     check("signature 保持", s2.signature.domain == "maritime", s2.signature)
     # archive 形态
     a = s.to_archive()
-    check("archive 带 spec_version=3", a.get("spec_version") == 3, a.get("spec_version"))
+    check("archive 带 spec_version=4", a.get("spec_version") == 4, a.get("spec_version"))
     # 老 archive(只有 puzzle/answer)也要能读
     old = PuzzleSpec.from_dict({"puzzle": "老谜面。为什么?", "answer": "老谜底。"})
     check("老 archive 能读", old.puzzle == "老谜面。为什么?" and old.answer == "老谜底。",
@@ -1059,6 +1068,124 @@ def test_s1_fallback_degrades_when_all_blocked():
           (bp.mechanism_family, bp.solution_shape))
 
 
+def test_q2_discovery_beat_validation():
+    """**Q2-G**: discovery_beats 的确定性硬校验。
+
+    只判**结构**: 条数 / 唯一 / 非空 / 引用存在 / 整组重复 / 通向通关。
+    "这两个 beat 语义上是不是重复" 交给 Reviewer —— 代码硬判会误伤。
+    """
+    print("\n[Q2-G] discovery_beats 硬校验")
+    from story.quality import MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS
+
+    def mk(beats):
+        s = good_spec()
+        s.discovery_beats = beats
+        return s
+
+    ok = mk([DiscoveryBeat(id="b1", text="先注意到灯的时机",
+                           fact_ids=["f1"]),
+             DiscoveryBeat(id="b2", text="再理解灯在标礁石",
+                           fact_ids=["f2"])])
+    check("合法的 2 条 -> 过", validate_spec(ok).ok,
+          validate_spec(ok).errors[:1])
+    check("常量区间是 2~4",
+          (MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS) == (2, 4),
+          (MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS))
+
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="x", fact_ids=["f1"])]))
+    check("**只有 1 条 -> 拒**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id=f"b{i}", text=f"t{i}",
+                                         fact_ids=["f1"])
+                           for i in range(5)]))
+    check("**5 条 -> 拒(太多观众会跟丢)**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="a", fact_ids=["f1"]),
+                           DiscoveryBeat(id="b1", text="b", fact_ids=["f2"])]))
+    check("**id 重复 -> 拒**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="", fact_ids=["f1"]),
+                           DiscoveryBeat(id="b2", text="b", fact_ids=["f2"])]))
+    check("**text 为空 -> 拒**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="a", fact_ids=["f999"]),
+                           DiscoveryBeat(id="b2", text="b", fact_ids=["f2"])]))
+    check("**引用不存在的 fact -> 拒**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="同一句",
+                                         fact_ids=["f1"]),
+                           DiscoveryBeat(id="b2", text="同一句",
+                                         fact_ids=["f2"])]))
+    check("**整组文本完全相同 -> 拒**", not vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([DiscoveryBeat(id="b1", text="a", fact_ids=["f3"]),
+                           DiscoveryBeat(id="b2", text="b", fact_ids=["f4"])]))
+    check("**没有任何 beat 通向通关 -> 拒**", not vr.ok, vr.errors[:1])
+
+
+def test_q2_completion_stays_one_or_two():
+    """**Q2-H**: 层次变多了, 但**通关仍然只需 1~2 条**。
+
+    这是整笔的核心产品规则: 题目允许有层次, 通关必须简单。
+    """
+    print("\n[Q2-H] 通关仍限 1~2 条")
+    from story.quality import MAX_COMPLETION_FACTS
+    check("MAX_COMPLETION_FACTS 仍是 2", MAX_COMPLETION_FACTS == 2,
+          MAX_COMPLETION_FACTS)
+    # 3 条 -> 拒(即使 beats 齐全)
+    s = good_spec(completion_fact_ids=["f1", "f2", "f3"])
+    s.discovery_beats = [
+        DiscoveryBeat(id="b1", text="a", fact_ids=["f1"]),
+        DiscoveryBeat(id="b2", text="b", fact_ids=["f2"]),
+    ]
+    vr = validate_spec(s)
+    check("**3 条 completion -> 拒**", not vr.ok,
+          [e for e in vr.errors if "completion_fact_ids" in e][:1])
+    # **1 条 completion + 3 个 beat -> 合法**(证明"通关简单 != 题目简单")
+    s2 = good_spec(completion_fact_ids=["f1"])
+    s2.discovery_beats = [
+        DiscoveryBeat(id="b1", text="第一层: 注意潮水", fact_ids=["f1"]),
+        DiscoveryBeat(id="b2", text="第二层: 灯的用途不是引路", fact_ids=["f3"]),
+        DiscoveryBeat(id="b3", text="第三层: 行为的真实目的", fact_ids=["f3"]),
+    ]
+    vr2 = validate_spec(s2)
+    check("**1 条 completion + 3 个 beat -> 合法**", vr2.ok, vr2.errors[:2])
+
+
+def test_q2_legacy_archive_without_beats_still_reads():
+    """**Q2-I**: 旧 archive 没有 discovery_beats -> 照常读出(空表), 不报错。
+
+    绝不从 facts/atoms 反推 —— 那等于给旧题编一个它从没声明过的层次。
+    """
+    print("\n[Q2-I] 旧 archive 无 beats 仍可读")
+    old = {"puzzle": "旧题?", "answer": "旧谜底。",
+           "quality_policy_version": "quality-v4"}
+    sp = PuzzleSpec.from_dict(old)
+    check("读出空表", sp.discovery_beats == [], sp.discovery_beats)
+    check("旧题**不**被 v8 的 beats 要求卡住",
+          validate_spec(sp).ok or all(
+              "discovery_beats" not in e for e in validate_spec(sp).errors),
+          validate_spec(sp).errors[:2])
+    # roundtrip
+    d = sp.to_dict()
+    check("to_dict 带上(空)discovery_beats", "discovery_beats" in d,
+          sorted(d))
+    check("from_dict(to_dict(x)) 稳定",
+          PuzzleSpec.from_dict(d).discovery_beats == [], "roundtrip 漂移")
+
+
+def test_q2_dark_tone_target_is_code():
+    """**Q2-J**: 诡异基调目标是**代码**, 不只是 prompt 里的一句话。"""
+    print("\n[Q2-J] 基调目标代码化")
+    from story.config import Config
+    c = Config(sim_path="x")
+    check("目标带在 config 里",
+          hasattr(c, "quality_dark_tone_min")
+          and hasattr(c, "quality_dark_tone_max"),
+          "缺 quality_dark_tone_* 字段")
+    check("区间合理(不低于 50%, 不高于 60%)",
+          c.quality_dark_tone_min >= 5 and c.quality_dark_tone_max <= 6,
+          (c.quality_dark_tone_min, c.quality_dark_tone_max))
+    # eerie / tense 都在 EMOTION_MODES 里(调度器要能数它们)
+    check("eerie / tense 是合法情绪档",
+          "eerie" in EMOTION_MODES and "tense" in EMOTION_MODES,
+          EMOTION_MODES)
+
+
 def test_cross_puzzle_gate():
     print("[跨题门: 生成后按最近的题判分布]")
     recent = [PuzzleSignature(mechanism_family="object_misuse",
@@ -1765,6 +1892,11 @@ def main():
         test_s1_never_returns_duplicate_while_alternative_exists,
         test_s1_fallback_also_avoids_recent_pair,
         test_s1_fallback_degrades_when_all_blocked,
+        # ---- Q2: quality-v8 discovery_beats ----
+        test_q2_discovery_beat_validation,
+        test_q2_completion_stays_one_or_two,
+        test_q2_legacy_archive_without_beats_still_reads,
+        test_q2_dark_tone_target_is_code,
         test_cross_puzzle_gate,
         test_template_tables_have_no_dead_ends,
         test_scheduler_output_always_valid_blueprint,

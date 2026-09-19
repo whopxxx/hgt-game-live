@@ -25,8 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
 from story.puzzle import (  # noqa: E402
-    FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
-    SolveAtom,
+    DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
+    PuzzleSpec, SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
@@ -76,6 +76,12 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             FairClue(quote="涨潮后他反而把灯熄掉", supports_atoms=["a2"]),
         ],
         hints=["注意灯的开关时机", "想想潮水的变化", "灯是在给谁传递信息?"],
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text="先注意到灯只在退潮时亮", fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text="再想到灯是在标礁石, 不是引路",
+                          fact_ids=["f2"]),
+        ],
         blueprint=PuzzleBlueprint(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
@@ -128,6 +134,13 @@ def variant(i: int) -> PuzzleSpec:
         fair_clues=[
             FairClue(quote=f"每晚都把钟敲{i + 1}下", supports_atoms=["a1"]),
             FairClue(quote="白天一声不响", supports_atoms=["a2"]),
+        ],
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text=f"先注意到只有夜里敲{i + 1}下",
+                          fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text="再想到钟声是在报暗礁, 不是报时",
+                          fact_ids=["f2"]),
         ],
     )
 

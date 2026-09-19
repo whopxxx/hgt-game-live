@@ -81,7 +81,7 @@ from .puzzle import (
 #: 为什么必须 bump 政策版本而不是兼容 v5: 盘上已经存在按 quality-v5
 #: Reviewer 生成的题, 它们正是这次真实故障的来源。不 bump 的话修完
 #: prompt 旧题仍然能进直播 —— 所以 v5 一律 quarantine, 不迁移、不猜。
-QUALITY_POLICY_VERSION = "quality-v7"
+QUALITY_POLICY_VERSION = "quality-v8"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -139,7 +139,15 @@ class ValidationResult:
 #: 而揭晓是**确定性**地念它(不再经 LLM 加工) —— 长答案会直接拖垮体验。
 CORE_ANSWER_MAX_LEN = 80
 #: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
+#:
+#: ⚠️ 它**不是**整道题的复杂度上限。v8 起这一点由 `discovery_beats`
+#: 显式承载: 题目可以有 2~4 个发现阶段, 而通关仍然只需 1~2 条事实。
+#: 产品规则: **题目允许有层次, 通关必须简单。**
 MAX_COMPLETION_FACTS = 2
+#: discovery_beats 的条数区间(quality-v8)。少于 2 = 没有层次;
+#: 多于 4 = 一道海龟汤塞不下, 观众会跟丢。
+MIN_DISCOVERY_BEATS = 2
+MAX_DISCOVERY_BEATS = 4
 
 
 def validate_spec(spec: PuzzleSpec,
@@ -381,6 +389,60 @@ def validate_spec(spec: PuzzleSpec,
         if len(h or "") > max_hint_len:
             r.fail(f"第 {i + 1} 条提示超过 {max_hint_len} 字")
 
+    # ---- quality-v8: discovery_beats ----
+    #
+    # 只做**确定性**校验。这里刻意**不**判断"这两个 beat 语义上是不是
+    # 重复" —— 那是 Reviewer 的活(它读得懂语义), 代码硬判只会误伤。
+    # 代码能判的是结构: 条数、唯一、非空、引用存在、整组不重复、
+    # 至少一条通向通关路径。
+    beats = list(getattr(spec, "discovery_beats", None) or [])
+    if is_v5:
+        # 只对**当前政策**的题强制。旧 archive 读到空表是合法的 ——
+        # 那时还没有这个概念, 不能因此判旧题不合格。
+        if not (MIN_DISCOVERY_BEATS <= len(beats) <= MAX_DISCOVERY_BEATS):
+            r.fail(f"当前政策({QUALITY_POLICY_VERSION}) 的 "
+                   f"discovery_beats 有 {len(beats)} 条, 应为 "
+                   f"{MIN_DISCOVERY_BEATS}~{MAX_DISCOVERY_BEATS} 条"
+                   f"(题目允许有层次 —— 但通关仍只需 "
+                   f"completion_fact_ids 那 1~{MAX_COMPLETION_FACTS} 条)")
+    if beats:
+        known_facts = {f.id for f in (spec.facts or []) if f.id}
+        seen_ids: set = set()
+        seen_texts: list = []
+        for i, b in enumerate(beats):
+            bid = str(getattr(b, "id", "") or "").strip()
+            btxt = str(getattr(b, "text", "") or "").strip()
+            if not bid:
+                r.fail(f"discovery_beat #{i + 1} 缺 id")
+            elif bid in seen_ids:
+                r.fail(f"discovery_beat id 重复: {bid}")
+            else:
+                seen_ids.add(bid)
+            if not btxt:
+                r.fail(f"discovery_beat {bid or ('#' + str(i + 1))} 的 text 为空")
+            else:
+                seen_texts.append(btxt)
+            for fid in (getattr(b, "fact_ids", None) or []):
+                if known_facts and str(fid).strip() not in known_facts:
+                    r.fail(f"discovery_beat {bid or i + 1} 引用了不存在的 "
+                           f"fact: {fid}")
+        # 整组完全相同 = 没有层次。**逐条**判断是否只差一个词的
+        # 语义重复交给 Reviewer(代码判不了)。
+        if len(seen_texts) >= 2 and len(set(seen_texts)) == 1:
+            r.fail("discovery_beats 整组文本完全相同(没有层次)")
+        # 至少一个 beat 要通向通关路径 —— 否则这套层次与"解出这题"
+        # 毫无关系, 纯粹是装饰。
+        if spec.completion_fact_ids:
+            comp = {str(x).strip() for x in spec.completion_fact_ids
+                    if str(x).strip()}
+            reaches = any(
+                comp & {str(x).strip()
+                        for x in (getattr(b, "fact_ids", None) or [])}
+                for b in beats)
+            if not reaches:
+                r.fail("discovery_beats 里没有任何一条通向通关事实"
+                       "(层次与'解出这题'无关, 是装饰)")
+
     return r
 
 
@@ -513,12 +575,12 @@ class Quotas:
     #: `straight_explanation`(没有翻转的正面解释)上限。
     #: 单独一条, 因为它是"不翻转"这个**默认态**的护栏: 即使每个具体
     #: reveal_mode 都没超 `same_reveal_mode`, 也可能连着好几道都不翻转。
-    straight_explanation: int = 2
+    straight_explanation: int = 1
     #: `neutral` 情绪上限。Step 02 去掉了"永远选 neutral"的固定偏置,
     #: 这条是防止它从另一个方向坍缩(比如全变 warm)。
     neutral_emotion: int = 3
     #: 主要靠制度性设定成立的题上限(`procedural_rule_dependency`, observed)。
-    procedural_rule: int = 2
+    procedural_rule: int = 1
 
     @classmethod
     def from_config(cls, cfg: Any) -> "Quotas":
@@ -534,9 +596,9 @@ class Quotas:
             past_trauma=g("quota_past_trauma", 2),
             trauma_ritual=g("quota_trauma_ritual", 1),
             same_reveal_mode=g("quota_same_reveal_mode", 2),
-            straight_explanation=g("quota_straight_explanation", 2),
+            straight_explanation=g("quota_straight_explanation", 1),
             neutral_emotion=g("quota_neutral_emotion", 3),
-            procedural_rule=g("quota_procedural_rule", 2),
+            procedural_rule=g("quota_procedural_rule", 1),
         )
 
 

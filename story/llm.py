@@ -32,7 +32,8 @@ from .config import LLMConfig
 from .puzzle import (
     DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, REVEAL_MODES,
     SOLUTION_SHAPES, TIME_SHAPES,
-    FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec, SolveAtom,
+    DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
+    PuzzleSpec, SolveAtom,
     normalize_for_match, quote_in_puzzle,
 )
 from .quality import (
@@ -187,6 +188,31 @@ def _atom_texts(atoms) -> list:
             for a in (atoms or [])]
 
 
+def _review_beats(ti: dict, spec: "PuzzleSpec") -> list:
+    """Reviewer 改稿时的 discovery_beats。
+
+    Reviewer **没回**就沿用原 spec 的 —— 审稿不该悄悄丢掉层次信息
+    (那会让一道本来有层次的题在 fix 之后突然变成 0 条, 然后被
+    validate_spec 以"缺 discovery_beats"拒掉, 而错不在稿子)。
+
+    Reviewer **回了**就用它回的(它可以修正同义重复的伪层次)。
+
+    非 list / 空列表都按"没回"处理 —— 空列表几乎必然是模型漏填,
+    而不是"这道题不该有层次"(当前政策要求 2~4 条)。
+    """
+    raw = ti.get("discovery_beats")
+    if not isinstance(raw, list) or not raw:
+        return list(getattr(spec, "discovery_beats", None) or [])
+    out = []
+    for i, x in enumerate(raw):
+        b = DiscoveryBeat.from_dict(x)
+        if not b.text:
+            continue
+        b.id = b.id or f"b{i + 1}"
+        out.append(b)
+    return out or list(getattr(spec, "discovery_beats", None) or [])
+
+
 def _norm_clues(raw) -> list:
     """把 fair_clues 归一成 [{"quote":..., "supports_atoms":[...]}]。
 
@@ -253,6 +279,16 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
 
     clues = [FairClue.from_dict(c) for c in _norm_clues(d.get("fair_clues"))]
 
+    # quality-v8: 发现阶段。模型可能漏给(旧 prompt 缓存 / 拒稿重出) ——
+    # 那就留空, 由 validate_spec 按政策判(当前政策要求 2~4 条)。
+    beats = []
+    for i, raw in enumerate(d.get("discovery_beats") or []):
+        b = DiscoveryBeat.from_dict(raw)
+        if not b.text:
+            continue
+        b.id = b.id or f"b{i + 1}"
+        beats.append(b)
+
     sig_raw = d.get("signature") if isinstance(d.get("signature"), dict) else {}
     sig = PuzzleSignature.from_dict(sig_raw)
     bp = blueprint or PuzzleBlueprint(
@@ -283,6 +319,7 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
         core_answer=core_answer,
         completion_fact_ids=comp_ids,
         facts=facts, solve_atoms=atoms, fair_clues=clues,
+        discovery_beats=beats,
         hints=[str(h).strip() for h in (d.get("hints") or [])
                if str(h).strip()][:3],
         blueprint=bp, signature=sig,
@@ -813,8 +850,8 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v7"
-CHECK_PROMPT_VERSION = "check-v7"
+RIDDLE_PROMPT_VERSION = "riddle-v8"
+CHECK_PROMPT_VERSION = "check-v8"
 ANSWER_PROMPT_VERSION = "answer-v7"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
@@ -827,8 +864,10 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 3. 建 facts(6~10 条): 主持判断「是/不是/无关」的事实空间, 别凑数。
    至少 1 条 kind=exclusion(排除常见错误路线)。
 4. **定通关合同 `completion_fact_ids`(1~2 条)** —— 它是 `core_answer`
-   的**最小语义拆分**, 见下面的硬规则。压不进 2 条就说明这题太绕,
-   **换一个更简单的骨架重出**, 不要硬塞, 也不要把细节塞进合同。
+   的**最小语义拆分**, 见下面的硬规则。
+   ⚠️ **它不是对整道题复杂度的限制。** 压不进 2 条说明的是"合同写细了"
+   —— 该做的是把合同**收窄到 core_answer 的最小语义**, 而不是把整道题
+   **改简单**。完整故事可以有多条 support / reframe / mechanism 事实。
 5. 写 `core_answer`(一句话, ≤60 字, 不换行): 普通观众一听就懂的核心答案,
    必须**直接回答谜面最后那个问题**。
 6. 写 answer(2-4 句, 第一句正面解释核心反常)。
@@ -842,7 +881,11 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 
 ═══ completion_fact_ids 是**通关合同**, 不是"谜底要点" ═══
 它回答的是: **房间最少要公开确认哪几件事, 这道题就算解出来了?**
-- 1~2 条。超过 2 条说明题太绕 —— 请换骨架, 不要放宽成 4、5 条。
+- 1~2 条。超过 2 条说明**合同**写细了 —— 收窄它, 不要放宽成 4、5 条。
+  但这**不是**"这题必须只有 1~2 个信息点": 完整谜底、facts 与
+  `discovery_beats` 都可以比合同丰富得多。
+- **题目允许有层次, 通关必须简单。** 观众要经历 2~4 个发现阶段
+  (`discovery_beats`), 而通关只要求合同那 1~2 条。
 - 只能指向 kind=core 且 visibility=hidden 的 fact。
   **support / exclusion 永远不能作为通关要求。**
 - 每条都必须被某条 solve_atom 引用(否则观众没有推理抓手)。
@@ -885,6 +928,42 @@ core_answer "古董商通过人为制造虚高成交记录, 抬高手中同类�
   ✗ "她与父亲有血缘关系, 是父亲的亲生女儿"
      (观众问"她与父亲有关系吗"答"是", 只确认了前半句)
   ✓ 拆成两条: "门外女人是父亲的亲生女儿" / "门外女人昨晚与父亲同桌吃饭"
+
+═══ v8: 诡异但现实可解释(内容基调) ═══
+
+**谜面先制造一个具体、视觉化、让人立刻觉得"不对劲"的异常**,
+谜底再通过身份 / 物品意义 / 时间 / 空间 / 视角 / 目的 / 隐藏利害关系
+把它重新解释清楚。
+
+优先这些方向(它们天然带"不对劲"的画面感):
+    identity_misread / observer_misread / hidden_function /
+    time_reinterpretation / space_reinterpretation / object_misuse /
+    causal_reversal / goal_reversal
+
+**压低**默认权重(不是禁掉): rule_constraint / social_rule /
+纯 procedural explanation —— "因为该单位有一条规定"这类解释,
+逻辑上成立但观众不会觉得"原来如此"。
+
+⚠️ 不要用"多死人 / 更惨 / 更重口"去替代推理质量。诡异感来自
+**重新理解**, 不是来自惨烈程度。优先现实可解释的诡异。
+
+═══ v8: 题目允许有层次, 通关必须简单 ═══
+
+一道题应当有 **2~4 个发现阶段**(`discovery_beats`): 观众正常玩下来
+会一层层想通什么。例如:
+
+    b1 先意识到时间/地点理解错了
+    b2 再意识到某物的用途不是表面用途
+    b3 最后理解异常行为真正的目的
+
+而通关**仍然只要求** `completion_fact_ids` 那 1~2 条。
+
+  ✗ "压不进 2 条 -> 把整道题改简单"  —— 那是把**合同**和**题目**搞混了。
+  ✓ 合同写细了就收窄合同; 故事本身该有的层次要保留。
+
+**每一条 beat 必须是不同的发现阶段。** 不要写
+"b1 画框有问题 / b2 画框比较特殊 / b3 画框不正常" 这种同义重复 ——
+那是伪层次, Reviewer 会拒。
 
 ═══ 谜面陈述**必须为真**(v5 新增硬规则) ═══
 谜面中由**全知叙述者直接陈述**的事实, 必须在 canonical world 里字面为真。
@@ -1202,6 +1281,11 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 _QUALITY_CHECK_FIELDS = (
     "narrator_truthful", "mechanism_consistent",
     "core_answer_direct", "completion_contract_minimal",
+    # ---- quality-v8: "好不好玩" ----
+    # 前四项查"正确不正确", 这四项查"值不值得玩"。同一个 Reviewer 调用,
+    # **不新增第四个内容审核 LLM**(任务书明确)。
+    "concrete_anomaly", "clue_recontextualized",
+    "dramatic_payoff", "reasoning_beats_nonredundant",
 )
 
 _OBSERVED_SIGNATURE_FIELDS = (
@@ -1247,13 +1331,41 @@ _TOOL_RIDDLE = {
                     "**不是**\"完整谜底需要解释什么\"。\n"
                     "support / exclusion **绝不能**填在这里(它们是背景与"
                     "排除项, 不是解法)。\n"
-                    "⚠️ 若压不进 2 条, 说明这题太绕 —— 请**换一个更简单的"
-                    "骨架**, 不要把 4、5 条都塞进来(代码会拒稿)。"),
+                    "⚠️ 若压不进 2 条, 说明**合同**写细了 —— 请收窄到"
+                    "core_answer 的最小语义, 不要把 4、5 条都塞进来"
+                    "(代码会拒稿)。这**不是**要求你把整道题写简单: "
+                    "题目允许有层次(2~4 个 discovery_beats), 通关仍需简单。"),
             },
             "hints": {
                 "type": "array", "minItems": 3, "maxItems": 3,
                 "items": {"type": "string"},
                 "description": "3 条由浅入深的提示, 每条不超过 30 字, 不剧透",
+            },
+            "discovery_beats": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string",
+                               "description": "如 b1, b2 … 唯一"},
+                        "text": {"type": "string",
+                                 "description": "观众在正常推理中应当发现的"
+                                                "**一层**, 一句话。"},
+                        "fact_ids": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "这一层涉及哪些 fact id(必须存在)",
+                        },
+                    },
+                    "required": ["id", "text"],
+                },
+                "description": (
+                    "2~4 个**发现阶段** —— 观众正常玩下来会一层层想通什么。"
+                    "⚠️ 它**不是**通关条件: 通关只由 completion_fact_ids 决定。"
+                    "用途是让题目**有层次**: 先意识到 A, 再意识到 B, 最后理解 C。"
+                    "每条必须是**不同的发现阶段** —— 不要写"
+                    "『画框有问题』『画框比较特殊』『画框不正常』这种同义重复。"
+                    "至少一条要指向 completion 里的 fact(否则这套层次与"
+                    "『解出这题』无关, 代码会拒稿)。"),
             },
             "facts": {
                 "type": "array", "minItems": 4, "maxItems": 10,
@@ -1653,6 +1765,24 @@ _TOOL_CHECK = {
                     "改完后**必须至少保留一条**, 且**必须支持某条 required "
                     "atom** —— 否则这道题就没有公平推理路径, 应该 rewrite。"),
             },
+            "discovery_beats": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "fact_ids": {"type": "array",
+                                      "items": {"type": "string"}},
+                    },
+                    "required": ["id", "text"],
+                },
+                "description": (
+                    "2~4 个**发现阶段**。原样保留即可; 只有当你发现"
+                    "它们是同义重复的伪层次时才改写。"
+                    "**不要**把它当成通关条件 —— 通关只由 "
+                    "completion_fact_ids 决定。"),
+            },
             "observed_signature": {
                 "type": "object",
                 "properties": {
@@ -1754,14 +1884,57 @@ _TOOL_CHECK = {
                             "删除测试: 删掉该细节后观众仍能完整回答谜面末尾的问题,"
                             " 就必须删除或降为 support。"),
                     },
+                    "concrete_anomaly": {
+                        "type": "boolean",
+                        "description": (
+                            "**谜面有一个具体、可感知的异常。**\n"
+                            "应当是一个看得见/听得见的画面: 行为、物件、"
+                            "时间、空间、身份、声音、位置、顺序。\n"
+                            "  例: \"他在同一个路口等了三年, 每天只等十分钟\"\n"
+                            "  反例: \"某单位为什么会有那条规定?\"(抽象, 无画面)\n"
+                            "只是抽象的制度疑问 -> false。"),
+                    },
+                    "clue_recontextualized": {
+                        "type": "boolean",
+                        "description": (
+                            "**至少一条 fair_clue 在揭晓后意义变了。**\n"
+                            "揭晓前它看起来是 A, 揭晓后理解成 B。\n"
+                            "  反例: 谜面提到\"画框\", 谜底也提到\"画框\" —— "
+                            "那只是同一个词出现两次, 不是换义。\n"
+                            "  例: 谜面\"画本身完好无损\" 揭晓后变成"
+                            "\"被偷的是画框, 不是画\" —— 同一句话被重新理解。"),
+                    },
+                    "dramatic_payoff": {
+                        "type": "boolean",
+                        "description": (
+                            "**核心答案揭开后能明显重新解释开头的异常。**\n"
+                            "  反例: \"因为该单位有一条规定\" —— 只是补了一条"
+                            "背景, 开头的异常没有被重新理解。\n"
+                            "  例: 开头的异常在新解释下变成\"原来如此\"。\n"
+                            "逻辑成立但只补背景、没有重构异常 -> false。"),
+                    },
+                    "reasoning_beats_nonredundant": {
+                        "type": "boolean",
+                        "description": (
+                            "**2~4 个 discovery_beats 是真正不同的发现阶段。**\n"
+                            "  反例: b1 画框有问题 / b2 画框比较特殊 / b3 画框"
+                            "不正常 —— 同义重复, 伪层次。\n"
+                            "  例: b1 先意识到时间理解错了 / b2 再意识到某物的"
+                            "用途不是表面用途 / b3 最后理解行为的真实目的。\n"
+                            "只有 1 个阶段、或两三个只是换个说法 -> false。"),
+                    },
                 },
                 "required": ["narrator_truthful", "mechanism_consistent",
                              "core_answer_direct",
-                             "completion_contract_minimal"],
+                             "completion_contract_minimal",
+                             "concrete_anomaly", "clue_recontextualized",
+                             "dramatic_payoff",
+                             "reasoning_beats_nonredundant"],
                 "description": (
-                    "**四项必须全部为 true, 代码才接受这一稿。** 这不是"
+                    "**八项必须全部为 true, 代码才接受这一稿。** 这不是"
                     "参考项 —— 任一项 false 而 decision 写 pass, 会被整稿"
-                    "拒收(假绿比 rewrite 更糟: 它会直接进正式 Q&A)。"),
+                    "拒收(假绿比 rewrite 更糟: 它会直接进正式 Q&A)。"
+                    "前四项查\"正确不正确\", 后四项查\"好不好玩\"。"),
             },
             "note": {"type": "string",
                      "description": "改了什么、为什么(一句话)"},
@@ -1901,6 +2074,22 @@ core_answer 普通人**一句能懂**, 并且**直接回答谜面末尾那个问
 completion_fact_ids 只包含**真正通关所需**的 1~2 个事实, 只指向
 kind=core 且 visibility=hidden。混进 support/exclusion, 或者为了保险
 塞到 4、5 条, 都是 false(那会让通关变得要么太易要么太绕)。
+
+**5. concrete_anomaly**
+谜面有一个**具体、可感知**的异常(行为/物件/时间/空间/身份/声音/
+位置/顺序), 而不是抽象的制度疑问。
+
+**6. clue_recontextualized**
+至少一条 fair_clue 在揭晓后**意义变了**: 之前看起来是 A, 之后理解成 B。
+只是同一个词出现两次(谜面提画框、谜底也提画框)不算。
+
+**7. dramatic_payoff**
+核心答案揭开后能**明显重新解释开头的异常**。逻辑成立但只是补了一条
+背景("因为单位有规定")、没有重构异常 -> false。
+
+**8. reasoning_beats_nonredundant**
+2~4 个 discovery_beats 是真正不同的发现阶段。同义重复
+("画框有问题"/"画框比较特殊"/"画框不正常")是伪层次 -> false。
 
 **v6 新增 —— 不得严于 core_answer**(这条最容易漏):
 合同必须是 core_answer 的**最小语义拆分**, 不能比 core_answer 更细。
@@ -2841,6 +3030,14 @@ class PuzzleWriter:
             user += ("\n【现有 fair_clues(必须至少保留一条, quote 要逐字出自谜面)】\n"
                      + "\n".join(f'- "{c.quote}" -> {c.supports_atoms or []}'
                                   for c in spec.fair_clues))
+        _beats = list(getattr(spec, "discovery_beats", None) or [])
+        if _beats:
+            # quality-v8: 审稿人要看到层次, 才能判"是不是同义重复的伪层次"。
+            user += ("\n【现有 discovery_beats(2~4 个发现阶段; 原样带回, "
+                     "发现伪层次才改写 —— 它不是通关条件)】\n"
+                     + "\n".join(f"{b.id}. {b.text}  "
+                                 f"(facts={b.fact_ids or '[]'})"
+                                 for b in _beats))
         if spec.signature and _is_v2(spec):
             user += ("\n【现有 observed_signature(改完核心就**如实重判**, "
                      "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
@@ -3194,6 +3391,9 @@ class PuzzleWriter:
             core_answer=new_core,
             completion_fact_ids=comp,
             facts=facts, solve_atoms=atoms, fair_clues=clues,
+            # quality-v8: Reviewer 改了稿也要带上 discovery_beats。它没回
+            # 就沿用原 spec 的 —— 审稿不该**悄悄丢掉**层次信息。
+            discovery_beats=_review_beats(ti, spec),
             hints=[str(h).strip() for h in (ti.get("hints") or [])
                    if str(h).strip()][:3] or list(spec.hints),
             blueprint=bp, signature=sig,

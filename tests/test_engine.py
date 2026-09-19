@@ -1622,7 +1622,7 @@ def test_archive_writes_full_schema():
               "solve_atoms", "fair_clues", "hints", "qa", "winner",
               "reason", "metrics"):
         check(f"archive 有 {k}", k in rec, sorted(rec))
-    check("spec_version=3", rec.get("spec_version") == 3, rec.get("spec_version"))
+    check("spec_version=4", rec.get("spec_version") == 4, rec.get("spec_version"))
     check("prompt_version 落盘",
           rec.get("prompt_version") == RIDDLE_PROMPT_VERSION, rec)
     check("policy_version 落盘",

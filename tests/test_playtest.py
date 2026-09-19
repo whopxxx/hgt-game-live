@@ -26,8 +26,8 @@ from story.playtest import (  # noqa: E402
     UNSOLVED, Playtester, _player_prompt, _public_transcript,
 )
 from story.puzzle import (  # noqa: E402
-    FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
-    SolveAtom,
+    DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
+    PuzzleSpec, SolveAtom,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import Phase  # noqa: E402
@@ -84,6 +84,13 @@ def mk_spec(**kw) -> PuzzleSpec:
         hints=["SENTINEL_HINT 注意灯的开关时机",
                "SENTINEL_HINT2 想想潮水变化",
                "SENTINEL_HINT3 灯在给谁传递信息?"],
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text="SENTINEL_BEAT 先注意到退潮才亮",
+                          fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text="SENTINEL_BEAT2 再想到是在标礁石",
+                          fact_ids=["f2"]),
+        ],
         blueprint=PuzzleBlueprint(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",

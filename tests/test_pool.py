@@ -22,8 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.config import Config  # noqa: E402
 from story.puzzle import (  # noqa: E402
-    FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature, PuzzleSpec,
-    SolveAtom,
+    DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
+    PuzzleSpec, SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
@@ -77,6 +77,12 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             FairClue(quote="涨潮后他反而把灯熄掉", supports_atoms=["a2"]),
         ],
         hints=["注意灯的开关时机", "想想潮水的变化", "灯是在给谁传递信息?"],
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text="先注意到灯只在退潮时亮", fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text="再想到灯是在标礁石, 不是引路",
+                          fact_ids=["f2"]),
+        ],
         blueprint=PuzzleBlueprint(
             mechanism_family="hidden_function",
             solution_shape="hidden_function_explains_behavior",
@@ -1299,8 +1305,8 @@ def test_real_v3_to_v4_quarantine():
         v3.quality_policy_version = "quality-v3"
         _raw_pool(cfg.pool_path, v3)
         pool = PuzzlePool.open(cfg)
-        check("当前政策确实是 v7",
-              QUALITY_POLICY_VERSION == "quality-v7", QUALITY_POLICY_VERSION)
+        check("当前政策确实是 v8",
+              QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
         check("pending 看得见(盘上有候选)", pool.pending_count() == 1,
               pool.pending_count())
         check("**stock == 0**(v3 已失去 live 资格)", pool.stock_count() == 0,

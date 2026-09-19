@@ -188,6 +188,74 @@ class PuzzleFact:
 
 
 @dataclass
+class DiscoveryBeat:
+    """**正常游戏过程中, 观众应当逐层发现的一步**(quality-v8 新增)。
+
+    ## 它解决什么问题
+
+    v7 之前 prompt 里写着"压不进 2 条说明这题太绕, 换一个更简单的骨架"
+    —— 那把 `completion_fact_ids`(1~2 条, **什么时候算解出**)当成了
+    **整道题的复杂度上限**。结果题目只有 1~2 个信息点, 观众没有推理层次。
+
+    产品规则冻结:
+
+        **题目允许有层次, 通关必须简单。**
+
+    ## 四个概念不能混
+
+        facts               canonical world 的事实空间(主持人判定依据)
+        discovery_beats     正常游戏应该**逐层发现什么**(叙事节拍)
+        solve_atoms         对谜底的**分析**拆分(提示/复盘用)
+        completion_fact_ids **最低胜利要求**(集合覆盖判定)
+
+    例如一道题内部可以有:
+
+        b1 先意识到时间/地点理解错了
+        b2 再意识到某物的用途不是表面用途
+        b3 最后理解异常行为真正的目的
+
+    而通关仍然只要求 `completion_fact_ids = [f1, f2]`。
+
+    ## ⚠️ 它**没有**任何运行时胜负权
+
+    禁止(任何一条都会让系统自己把题解掉):
+
+        beat 全覆盖     -> solved
+        beat 数量       -> solved
+        hint            -> 自动建立 beat
+        Detective       -> 建立 beat
+
+    Engine 的胜负判定**永远只有**一条:
+
+        completion_fact_ids ⊆ established_fact_ids
+        (且 established 只能由真人 QA 写, 见
+         `RoundEngine._record_human_established_locked`)
+
+    `discovery_beats` 本轮只用于: 生成质量 / Reviewer / archive,
+    以及后续提示与 Clue Tags 的结构基础。**不进前端 Snapshot**。
+    """
+
+    id: str
+    text: str
+    fact_ids: list = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "text": self.text,
+                "fact_ids": list(self.fact_ids or [])}
+
+    @classmethod
+    def from_dict(cls, d: Any) -> "DiscoveryBeat":
+        if not isinstance(d, dict):
+            return cls(id="", text=str(d or ""))
+        raw = d.get("fact_ids")
+        ids = ([str(x).strip() for x in raw if str(x).strip()]
+               if isinstance(raw, list) else [])
+        return cls(id=str(d.get("id", "") or "").strip(),
+                   text=str(d.get("text", "") or "").strip(),
+                   fact_ids=ids)
+
+
+@dataclass
 class SolveAtom:
     """谜底的**分析拆分**(提示 / 解释 / 复盘用)。
 
@@ -500,6 +568,9 @@ class PuzzleSpec:
 
     facts: list = field(default_factory=list)          # list[PuzzleFact]
     solve_atoms: list = field(default_factory=list)     # list[SolveAtom]
+    #: quality-v8: 正常游戏应逐层发现的步骤(2~4 条)。**没有胜负权** ——
+    #: 见 `DiscoveryBeat` 的 docstring。旧 archive 里没有这一项, 读到空表。
+    discovery_beats: list = field(default_factory=list)  # list[DiscoveryBeat]
     fair_clues: list = field(default_factory=list)      # list[FairClue]
     hints: list = field(default_factory=list)           # list[str]
 
@@ -588,6 +659,7 @@ class PuzzleSpec:
             "completion_fact_ids": list(self.completion_fact_ids or []),
             "facts": [f.to_dict() for f in self.facts],
             "solve_atoms": [a.to_dict() for a in self.solve_atoms],
+            "discovery_beats": [b.to_dict() for b in self.discovery_beats],
             "fair_clues": [c.to_dict() for c in self.fair_clues],
             "hints": list(self.hints),
             "blueprint": self.blueprint.to_dict(),
@@ -612,7 +684,7 @@ class PuzzleSpec:
         混进来)。所以显式记一个标记。
         """
         d = self.to_dict()
-        d["spec_version"] = 3
+        d["spec_version"] = 4
         d["blueprint_specified"] = bool(self.blueprint_specified)
         d["signature_present"] = bool(
             self.signature and (self.signature.mechanism_family
@@ -641,6 +713,11 @@ class PuzzleSpec:
             facts=[PuzzleFact.from_dict(x) for x in (d.get("facts") or [])],
             solve_atoms=[SolveAtom.from_dict(x, i)
                          for i, x in enumerate(d.get("solve_atoms") or [])],
+            # quality-v8: 旧 archive 没有这一项 -> 读到空表(合法, 只是没
+            # 有 v8 的层次信息)。**不**从 atoms/facts 反推 —— 那等于给
+            # 旧题编一个它从来没声明过的层次结构。
+            discovery_beats=[DiscoveryBeat.from_dict(x)
+                             for x in (d.get("discovery_beats") or [])],
             fair_clues=[FairClue.from_dict(x) for x in (d.get("fair_clues") or [])],
             hints=[str(h).strip() for h in (d.get("hints") or []) if str(h).strip()],
             blueprint=PuzzleBlueprint.from_dict(d.get("blueprint")),
