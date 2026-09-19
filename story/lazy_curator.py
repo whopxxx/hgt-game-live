@@ -110,10 +110,12 @@ def source_priority(rec: Any) -> tuple:
 
 
 def select_candidate(recs: list, ledger: DecisionLedger,
-                     policy_version: str) -> Optional[Any]:
+                     policy_version: str,
+                     skip_ids: Optional[set] = None) -> Optional[Any]:
     """挑**一条**尚未处理的 candidate。没有则 None。
 
     跳过条件(全部满足才候选):
+      - 在 `skip_ids` 里(本次运行已经碰过的 —— 见 `LazyCurator.step`)
       - license 不可用(`license_ok()`)—— 版权上根本不能收
       - 被 safety screen 标记过
       - 已被 near-duplicate 层标记(dup_reason 非空)
@@ -121,8 +123,11 @@ def select_candidate(recs: list, ledger: DecisionLedger,
 
     **不跳** technical_defer / interrupted —— 它们明确是"下次再来"。
     """
+    skip = skip_ids or set()
     todo = []
     for r in recs:
+        if str(getattr(r, "external_id", "") or "") in skip:
+            continue
         if str(getattr(r, "safety_flag", "") or ""):
             continue
         if str(getattr(r, "dup_reason", "") or ""):
@@ -280,9 +285,26 @@ class LazyCurator:
 
         `max_candidates` 是**尝试**上限, 不是成功数上限(任务书十六:
         `--limit` 原先"一直审到成功 20 道", 拒绝率高时会调用上百次)。
+
+        ## 为什么本次内不再碰同一条(实测踩到的)
+
+        `technical_defer` / `interrupted` **不写终态**, 所以那条题仍然是
+        候选 —— 于是 `select_candidate` 下一轮又把它挑出来, 在**同一次
+        运行里**立刻重试。
+
+        实测: `turtlebench:b51c7fba5006` 因为网关回了空 tool_input 被
+        defer, 紧接着又被挑出来重审了一遍; 30 条预算里白白吃掉两条。
+
+        这是错的。defer 的语义是"**下次**再试"(换个网络状况 / 换个
+        上下文), 不是"立刻重试" —— 网关刚刚才抖过一次, 同一秒再问
+        它一次几乎必然还是抖。真正的重试发生在**下一次运行**, 那时
+        账本还在、候选还在。
+
+        所以本次已经碰过的 external_id 记进 `_tried`, 同一轮不再回头。
         """
         out = {"processed": 0, "accepted": 0, "rejected": 0,
                "technical_defer": 0, "interrupted": 0, "skipped": 0}
+        tried: set = set()
         for _ in range(max(0, int(max_candidates))):
             ok, why = self.should_start()
             if not ok:
@@ -290,10 +312,12 @@ class LazyCurator:
                 out["stop_reason"] = why
                 break
             rec = select_candidate(self.candidates, self.ledger,
-                                   CURATED_POLICY_VERSION)
+                                   CURATED_POLICY_VERSION,
+                                   skip_ids=tried)
             if rec is None:
                 out["stop_reason"] = "没有未处理的 candidate"
                 break
+            tried.add(str(getattr(rec, "external_id", "") or ""))
             res = self._curate_one(rec)
             out["processed"] += 1
             key = res.get("decision")

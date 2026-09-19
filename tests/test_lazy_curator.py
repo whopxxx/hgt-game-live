@@ -300,6 +300,75 @@ def test_worker_started_then_pressure_interrupts():
               not led.is_settled(mk_rec(), CC.CURATED_POLICY_VERSION))
 
 
+def test_deferred_candidate_not_retried_in_same_run():
+    """**同一次运行里不重复碰同一条**(实跑踩到的)。
+
+    `technical_defer` 不写终态 -> 那条题仍是候选 -> 早先的实现会在
+    下一轮循环立刻把它再挑出来重审。实测 `turtlebench:b51c7fba5006`
+    因网关回空 tool_input 被 defer, 紧接着又被审了一遍, 30 条预算里
+    白白吃掉两条。
+
+    defer 的语义是"**下次**再试" —— 网关刚抖完, 同一秒再问几乎必然
+    还是抖。真正的重试在**下一次运行**。
+    """
+    print("\n[H3-B] 同一次运行不重试已碰过的题")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        recs = [mk_rec(eid="pse:q:1"), mk_rec(eid="pse:q:2")]
+        # 两条都 defer
+        comp = _FakeCompiler([("defer", "compile_call"),
+                              ("defer", "compile_call")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, recs, led, lambda: dict(FREE))
+        r = lc.step(max_candidates=2)
+        check("处理了 2 条", r["processed"] == 2, r)
+        check("**两条是不同的题**",
+              len({c["external_id"] for c in comp.calls}) == 2,
+              [c["external_id"] for c in comp.calls])
+        check("各只调一次", len(comp.calls) == 2, len(comp.calls))
+
+        # ⚠️ 但**下一次运行**仍然可以重审它们(defer 还是可重试的)
+        got = select_candidate(recs, led, CC.CURATED_POLICY_VERSION)
+        check("**下一次运行仍是候选**", got is not None, got)
+
+
+def test_defer_then_next_run_retries():
+    """defer 的题在下一次 `step()` 里会再被挑中。"""
+    print("\n[H3-B] 下一次运行会重试 defer 的题")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        recs = [mk_rec(eid="pse:q:1")]
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        # 第一次运行: defer
+        c1 = _FakeCompiler([("defer", "compile_call")])
+        _mk(cfg, pool, c1, recs, led, lambda: dict(FREE)).step()
+        check("第一轮 defer 了", len(c1.calls) == 1, c1.calls)
+        # 第二次运行: 这次成功
+        c2 = _FakeCompiler([("accept", "")])
+        r2 = _mk(cfg, pool, c2, recs, led, lambda: dict(FREE)).step()
+        check("**第二轮重审了它**", len(c2.calls) == 1, c2.calls)
+        check("第二轮 accepted", r2["accepted"] == 1, r2)
+
+
+def test_skip_ids_does_not_affect_settled_logic():
+    """`skip_ids` 只影响本次选择, 不改账本语义。"""
+    print("\n[H3-B] skip_ids 不污染账本判定")
+    with tmpdir() as d:
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        recs = [mk_rec(eid="a"), mk_rec(eid="b")]
+        PV = CC.CURATED_POLICY_VERSION
+        check("无 skip: 选 a",
+              select_candidate(recs, led, PV).external_id == "a")
+        check("skip a: 选 b",
+              select_candidate(recs, led, PV,
+                               skip_ids={"a"}).external_id == "b")
+        check("skip 全部: None",
+              select_candidate(recs, led, PV,
+                               skip_ids={"a", "b"}) is None)
+
+
 def test_interrupted_candidate_is_retried_next_time():
     """任务书廿二-13: interrupted 的题稍后能重新审。"""
     print("\n[H3-B] interrupted 下次会重审")
@@ -730,6 +799,9 @@ def main():
         test_should_continue_is_actually_wired,
         test_should_continue_false_interrupts_midway,
         test_worker_started_then_pressure_interrupts,
+        test_deferred_candidate_not_retried_in_same_run,
+        test_defer_then_next_run_retries,
+        test_skip_ids_does_not_affect_settled_logic,
         test_interrupted_candidate_is_retried_next_time,
         test_technical_defer_is_retryable,
         test_exception_becomes_defer_not_reject,

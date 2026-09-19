@@ -218,8 +218,13 @@ CURATED_COMPILE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用�
   **它没有胜负权**, 只是叙事层次。至少一条指向 completion。
 - `solve_atoms`: 1~4 条, 用 fact_ids 指向 facts。身份/时间/物品/因果
   反转用 `key`, 只有真有因果链才用 cause/mechanism。
-- `fair_clues`: 从**谜面原文**里逐字摘取, 并注明支持哪条 atom。
-  谜面里没有可回溯的线索 -> **reject**(不要从谜底倒灌一条 clue)。
+- `fair_clues`: **逐字**摘自你**将要输出的 `puzzle` 字段**(不是原始
+  外文 surface, 也不是任何改写前的版本)。摘一段你自己写下的连续文字,
+  一模一样的字符。
+  ⚠️ 这是**代码**会逐字校验的: 你引的字符串必须能在你的 `puzzle` 里
+  原样找到。所以**先定稿 `puzzle`, 再从里面复制**(不要凭记忆重写一遍,
+  那几乎必然差一两个字 —— 实测这是最高频的失败原因)。
+  谜面里确实没有可回溯的线索 -> **reject**(不要从谜底倒灌一条 clue)。
 - `hints`: 3 条, ≤30 字, 由浅入深, 不剧透。
 - `signature`: 如实回传这道题的机制/解法形状/领域/关系/情绪等。
 
@@ -383,9 +388,11 @@ _TOOL_CURATED = {
                     "type": "object",
                     "properties": {
                         "quote": {"type": "string",
-                                  "description": ("**逐字**出自谜面原文的一"
-                                                  "段。不得改写, 不得从谜底"
-                                                  "倒灌。")},
+                                  "description": ("**逐字**摘自你自己输出的 "
+                                                  "`puzzle` 字段的一段连续"
+                                                  "文字。代码会逐字校验, "
+                                                  "所以要从定稿的 puzzle 里"
+                                                  "**复制**, 不要凭记忆重写。")},
                         "supports_atoms": {"type": "array",
                                            "items": {"type": "string"}},
                     },
