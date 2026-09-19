@@ -445,6 +445,13 @@ def _pass_review(**qc):
              "fact_ids": ["f2"]}],
         "fair_clues": [{"quote": "开门的人一见她就愣住了",
                         "supports_atoms": ["a1"]}],
+        # ---- C5: 当前政策下 beats 是**必须显式回传**的字段之一 ----
+        # 少了它 `_apply_review` 会以 invalid_bundle 拒稿(与 facts /
+        # solve_atoms / fair_clues 同级)。
+        "discovery_beats": [
+            {"id": "b1", "text": "先注意到开门的人反应异常", "fact_ids": ["f3"]},
+            {"id": "b2", "text": "再想到两人其实有血缘关系",
+             "fact_ids": ["f1"]}],
         "observed_signature": {
             "mechanism_family": "identity_misread",
             "solution_shape": "identity_reversal", "domain": "family",
@@ -810,6 +817,31 @@ def test_closeout_p1_reviewer_sync_fail_closed():
     # 4) 完整 bundle -> 通过
     merged, = run(_copy.deepcopy(base))
     check("完整 bundle -> 通过", merged is not None, merged)
+
+    # ---- C5: discovery_beats 与 facts/atoms/clues **同级同步** ----
+    #
+    # 必须与"改了谜底却漏回 facts"同等处置。理由: beats 引用的 fact id
+    # 在改稿后往往**仍然存在**(改稿常保留原 id), 所以结构校验
+    # (validate_spec)完全合法 —— 混合版本"新事实 + 旧推理层次"抓不到。
+    for label, mutate in (
+            ("漏回 beats", lambda t: t.pop("discovery_beats")),
+            ("beats 空列表", lambda t: t.__setitem__("discovery_beats", [])),
+            ("beats 不是列表",
+             lambda t: t.__setitem__("discovery_beats", "b1")),
+            ("beats 元素无 text",
+             lambda t: t.__setitem__("discovery_beats",
+                                     [{"id": "b1"}, {"id": "b2"}])),
+    ):
+        t = _copy.deepcopy(base)
+        mutate(t)
+        merged, = run(t)
+        check(f"**当前政策 + {label} -> 拒稿**", merged is None, merged)
+
+    # 但**只改 facts 却原样带回 beats** 是合法的(同步了就该放行)
+    t_ok = _copy.deepcopy(base)
+    t_ok["facts"] = [dict(f, text=f["text"] + "改") for f in t_ok["facts"]]
+    merged, = run(t_ok)
+    check("改了 facts 且 beats 原样带回 -> 通过", merged is not None, merged)
     if merged is not None:
         check("  新 spec 带上合同", merged.completion_fact_ids == ["f1", "f2"],
               merged.completion_fact_ids)
@@ -832,6 +864,17 @@ def test_closeout_p1_legacy_reviewer_unchanged():
     merged, why, rewrite = w._review_spec(legacy)
     check("legacy: 没改就沿用 -> 不因缺 bundle 被拒",
           not (merged is None and "同步合同" in (why or "")), (merged, why))
+
+    # ---- C5 对照: legacy **漏回 beats 也不该被拒** ----
+    #
+    # v8 之前根本没有 discovery_beats 这个概念, 所以旧稿不能因为
+    # "Reviewer 没回 beats" 被拒 —— 那时沿用(空)是正确的兼容行为。
+    # 判据必须是**政策版本**(与 `is_v5_review` 同口径), 不是"有没有
+    # 这个 key"。
+    merged2, why2, _ = w._review_spec(legacy)
+    check("**legacy: 漏回 beats -> 仍放行(旧政策没这个概念)**",
+          not (merged2 is None and "discovery_beats" in (why2 or "")),
+          (merged2, why2))
 
 
 def test_final_closeout_v5_empty_values_rejected():

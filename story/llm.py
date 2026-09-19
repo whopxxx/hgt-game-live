@@ -188,20 +188,38 @@ def _atom_texts(atoms) -> list:
             for a in (atoms or [])]
 
 
-def _review_beats(ti: dict, spec: "PuzzleSpec") -> list:
+def _review_beats(ti: dict, spec: "PuzzleSpec", current_policy: bool) -> list:
     """Reviewer 改稿时的 discovery_beats。
 
-    Reviewer **没回**就沿用原 spec 的 —— 审稿不该悄悄丢掉层次信息
-    (那会让一道本来有层次的题在 fix 之后突然变成 0 条, 然后被
-    validate_spec 以"缺 discovery_beats"拒掉, 而错不在稿子)。
+    ## 当前政策(quality-v8+): 与 facts/atoms/clues **同级同步**
 
-    Reviewer **回了**就用它回的(它可以修正同义重复的伪层次)。
+    `discovery_beats` 已经是**持久化 schema**(`to_dict`/`from_dict`/
+    `to_archive`)并且是 Reviewer `reasoning_beats_nonredundant` 判据的
+    对象, 所以它必须和 facts/solve_atoms/fair_clues 走**同一套**规则:
+    当前政策下 Reviewer **必须显式回传非空**的 beats, 缺/空/类型不对
+    一律由调用方拒稿 —— 不能"没回就沿用旧的"。
 
-    非 list / 空列表都按"没回"处理 —— 空列表几乎必然是模型漏填,
-    而不是"这道题不该有层次"(当前政策要求 2~4 条)。
+    ## 为什么"沿用旧的"是错的(C5)
+
+    早先这里在 Reviewer 没回 beats 时静默沿用原 spec 的。后果与"新谜底
+    + 旧事实表"完全同构: Reviewer 改了谜底与 facts, 但漏回 beats ——
+    于是产出**新事实 + 旧推理阶段**的混合版本。而 `validate_spec` 的
+    结构校验**抓不到**它: beats 引用的 fact id 只要还存在(改稿常常保留
+    原 id), 结构上就完全合法, 语义却已经过期。
+
+    ## 旧政策 / legacy 仍允许没有 beats
+
+    v8 之前根本没有这个概念, 所以旧稿不能因为"没有 beats"被拒 ——
+    那时沿用(空)是正确的兼容行为。判据用 `current_policy`, 与
+    `_apply_review` 里 `is_v5_review` 的口径一致。
+
+    返回解析后的 `DiscoveryBeat` 列表; 当前政策下返回空列表表示
+    "Reviewer 没给", 由调用方转成拒稿。
     """
     raw = ti.get("discovery_beats")
     if not isinstance(raw, list) or not raw:
+        if current_policy:
+            return []                    # 调用方据此拒稿(不再静默沿用)
         return list(getattr(spec, "discovery_beats", None) or [])
     out = []
     for i, x in enumerate(raw):
@@ -210,6 +228,8 @@ def _review_beats(ti: dict, spec: "PuzzleSpec") -> list:
             continue
         b.id = b.id or f"b{i + 1}"
         out.append(b)
+    if not out and current_policy:
+        return []                        # 有元素但全部解析不出文本 -> 同样算没给
     return out or list(getattr(spec, "discovery_beats", None) or [])
 
 
@@ -1513,7 +1533,7 @@ _TOOL_RIDDLE = {
         },
         "required": ["puzzle", "answer", "core_answer", "hints", "facts",
                      "completion_fact_ids", "solve_atoms",
-                     "fair_clues", "signature"],
+                     "fair_clues", "discovery_beats", "signature"],
     },
 }
 
@@ -3033,8 +3053,14 @@ class PuzzleWriter:
         _beats = list(getattr(spec, "discovery_beats", None) or [])
         if _beats:
             # quality-v8: 审稿人要看到层次, 才能判"是不是同义重复的伪层次"。
-            user += ("\n【现有 discovery_beats(2~4 个发现阶段; 原样带回, "
-                     "发现伪层次才改写 —— 它不是通关条件)】\n"
+            #
+            # ⚠️ C5: 当前政策下这是**必须显式回传**的字段之一(与 facts /
+            # solve_atoms / fair_clues 同级) —— 漏回会被 `_apply_review`
+            # 直接拒稿。所以要在这里明说"必须带上", 而不是像早先那样
+            # 含蓄地说"原样带回"(漏了也能过)。
+            user += ("\n【现有 discovery_beats(2~4 个发现阶段; **必须原样带回**, "
+                     "发现伪层次才改写 —— 它不是通关条件; "
+                     "当前政策下漏回会被拒稿)】\n"
                      + "\n".join(f"{b.id}. {b.text}  "
                                  f"(facts={b.fact_ids or '[]'})"
                                  for b in _beats))
@@ -3205,7 +3231,7 @@ class PuzzleWriter:
                 if not isinstance(_v, str) or not _v.strip():
                     invalid_bundle.append(_name)
             for _name in ("completion_fact_ids", "facts", "solve_atoms",
-                          "fair_clues"):
+                          "fair_clues", "discovery_beats"):
                 _v = ti.get(_name)
                 if not isinstance(_v, list) or not _v:
                     invalid_bundle.append(_name)
@@ -3264,7 +3290,7 @@ class PuzzleWriter:
                           + ", ".join(invalid_bundle)
                           + ") —— v5 要求 puzzle/answer/core_answer/"
                             "completion_fact_ids/facts/solve_atoms/"
-                            "fair_clues 全部**非空**显式回传, "
+                            "fair_clues/discovery_beats 全部**非空**显式回传, "
                             "代码不会替你沿用旧值")
 
         # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
@@ -3350,6 +3376,27 @@ class PuzzleWriter:
         else:
             sig = PuzzleSignature.from_dict(obs)
 
+        # ---- C5: discovery_beats 在当前政策下**同级同步** ----
+        #
+        # 与 facts / solve_atoms / fair_clues 同一条规则: 当前政策
+        # (quality-v8+) 要求 Reviewer **显式回传非空**, 缺/空/解析不出
+        # 一律拒稿 —— 不能"没回就沿用旧的"。
+        #
+        # 拒绝的理由不是洁癖, 而是**混合版本无法被结构校验抓到**:
+        # Reviewer 改了谜底与 facts 却漏回 beats 时, beats 引用的 fact id
+        # 往往还存在(改稿常保留原 id), validate_spec 完全合法, 但语义
+        # 已经过期 —— 观众看到的是"新谜底 + 旧推理层次"。
+        #
+        # 旧政策/legacy 仍允许没有 beats(那时没这个概念), 由
+        # `_review_beats` 内部按 `current_policy` 区分。
+        #
+        # ⚠️ 必须在下面那个 `if bad:` **之前**追加 —— 那里是唯一的
+        # 拒稿出口, 加在它后面等于没加(beats 缺了也会照常返回一个
+        # 混合版本稿)。
+        beats = _review_beats(ti, spec, is_v5_review)
+        if is_v5_review and not beats:
+            bad.append("discovery_beats")
+
         if bad:
             # 文案要能区分两类拒稿原因, 否则看日志会误以为是改了没同步:
             #   - 同步类: facts / atoms / clues / core_answer / completion
@@ -3363,7 +3410,7 @@ class PuzzleWriter:
                 _parts.append(
                     "审稿改了谜面/谜底, 但没有同步 " + " / ".join(_sync)
                     + " —— facts/atoms/clues/core_answer/completion_fact_ids"
-                      " 是一套, 不能只改谜底")
+                      "/discovery_beats 是一套, 不能只改谜底")
             if _qual:
                 _parts.append("审稿结论不合格: " + " / ".join(_qual))
             return None, "; ".join(_parts)
@@ -3386,14 +3433,29 @@ class PuzzleWriter:
                         return None, (f"审稿给的 solve_atom({a.id}) 引用了"
                                       f"不存在的 fact {fid!r}")
 
+        # ---- C5: discovery_beats 在当前政策下**同级同步** ----
+        #
+        # 与 facts / solve_atoms / fair_clues 同一条规则: 当前政策
+        # (quality-v8+) 要求 Reviewer **显式回传非空**, 缺/空/解析不出
+        # 一律拒稿 —— 不能"没回就沿用旧的"。
+        #
+        # 拒绝的理由不是洁癖, 而是**混合版本无法被结构校验抓到**:
+        # Reviewer 改了谜底与 facts 却漏回 beats 时, beats 引用的 fact id
+        # 往往还存在(改稿常保留原 id), validate_spec 完全合法, 但语义
+        # 已经过期 —— 观众看到的是"新谜底 + 旧推理层次"。
+        #
+        # 旧政策/legacy 仍允许没有 beats(那时没这个概念), 由
+        # `_review_beats` 内部按 `current_policy` 区分。
+        beats = _review_beats(ti, spec, is_v5_review)
+        if is_v5_review and not beats:
+            bad.append("discovery_beats")
+
         return PuzzleSpec(
             id=spec.id, title=spec.title, puzzle=new_puzzle, answer=new_answer,
             core_answer=new_core,
             completion_fact_ids=comp,
             facts=facts, solve_atoms=atoms, fair_clues=clues,
-            # quality-v8: Reviewer 改了稿也要带上 discovery_beats。它没回
-            # 就沿用原 spec 的 —— 审稿不该**悄悄丢掉**层次信息。
-            discovery_beats=_review_beats(ti, spec),
+            discovery_beats=beats,
             hints=[str(h).strip() for h in (ti.get("hints") or [])
                    if str(h).strip()][:3] or list(spec.hints),
             blueprint=bp, signature=sig,
