@@ -2220,7 +2220,12 @@ def test_reveal_contributors_reach_archive():
         check(f"派发 ANSWER({name})", len(ans) == 1, kinds(ans))
         p = ans[0].payload
         d.engine.submit_qa(
-            [QAResult(qid=p["qid"], verdict="是", established_fact_ids=[fid])],
+            [QAResult(qid=p["qid"], verdict="是", established_fact_ids=[fid],
+                      # J1-B: 合同内的 id 必须同时被复核确认才能进房间共识。
+                      # 这条走的是裸 submit_qa(没经过 `_answer_and_submit`
+                      # 的自动补全), 所以要显式给出 —— 模拟 Writer 已经
+                      # 正常复核过。
+                      completion_verified_fact_ids=[fid])],
             expect_round=p.get("expect_round"),
             expect_spec_key=p.get("expect_spec_key"))
 
@@ -2688,11 +2693,31 @@ def boot_v5(cfg=None, completion=("f1", "f2"), **spec_kw):
 
 
 def _answer_and_submit(eng, clk, uid, name, text, **kw):
-    """发一条'#提问' -> 拿 ANSWER 动作 -> 按 kw 回一个 QAResult。"""
+    """发一条'#提问' -> 拿 ANSWER 动作 -> 按 kw 回一个 QAResult。
+
+    ## J1-B: completion id 必须**同时**带 verified
+
+    Engine 现在要求: 落在合同里的 fact 只有同时出现在
+    `completion_verified_fact_ids` 里才能进房间共识(J1-B 的
+    defense-in-depth)。这些用例测的是**通关/贡献链/落盘**这些别的
+    东西, 不是"未复核的 completion 能不能蒙混过关"(那条有专门的
+    J1 regression)。
+
+    所以这里默认把 `established_fact_ids` 里的合同 id 自动补一份到
+    `completion_verified_fact_ids` —— 模拟"Writer 已经正常复核过"。
+    **不要**在这里无条件复制全部 id: 那样就测不出 J1-B 了。
+    需要测"未复核"的调用方显式传 `completion_verified_fact_ids=[...]`
+    (传空列表也算显式, 不会被这里覆盖)。
+    """
     acts = [a for a in say(eng, clk, uid, name, "#" + text)
             if a.kind == ActionKind.ANSWER]
     assert acts, "没有派发 ANSWER"
     p = acts[0].payload
+    if "completion_verified_fact_ids" not in kw:
+        contract = set(eng._completion_fact_ids or ())
+        est = [str(x) for x in (kw.get("established_fact_ids") or [])]
+        kw["completion_verified_fact_ids"] = [
+            x for x in est if x in contract or not contract]
     return eng.submit_qa([QAResult(qid=p["qid"], **kw)],
                          expect_round=p.get("expect_round"),
                          expect_spec_key=p.get("expect_spec_key")), p

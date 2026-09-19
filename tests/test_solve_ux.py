@@ -196,6 +196,80 @@ def auction_spec():
         prompt_version="riddle-v8", quality_policy_version="quality-v8"))
 
 
+def wardrobe_spec():
+    """J1: **实播截图那道题**的等价 fixture。
+
+    谜面问的是"为什么不敢关灯 / 为什么睡在衣柜前", 但真正的核心机制是
+    **空间关系**: 衣柜只是封住原房门的隔板, 人一直睡在被封住的那扇门前。
+
+    关键设计: 两条 completion 都是**具体空间命题**, 与谜面的表层措辞
+    ("衣柜""睡")看似相关, 实际上"不是高空坠落"**推不出**它们中的任何
+    一条。这正是实播里被误判的场景:
+
+        观众 "不敢关灯是因为有高空坠落风险吗？"
+        Host "不是"
+        -> 只得到"不是高空坠落", 与衣柜/原门无关。
+
+    fact id / 文本都是**测试自造**的, 不复刻直播内部命名; 但 canonical
+    语义与实播一致。
+    """
+    return _stamp_beats(PuzzleSpec(
+        id="ux-wardrobe", title="衣柜",
+        puzzle="他每晚都不敢关灯, 却一直睡在衣柜前面。为什么?",
+        answer="他一直睡在原房门的正前方, 衣柜就是后来封住那扇门的隔板。",
+        core_answer="他一直睡在原房门的正前方, 衣柜是封住那扇门的隔板。",
+        completion_fact_ids=["f1", "f2"],
+        facts=[
+            PuzzleFact(id="f1", text="衣柜实际上是后来封住原房门的隔板",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f2", text="人和床所在的位置实际上就是原房门前",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f3", text="房间曾经被隔断过", kind="support",
+                       visibility="hidden"),
+            PuzzleFact(id="f4", text="不是因为高空坠落风险", kind="exclusion",
+                       visibility="hidden"),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="key",
+                      text="衣柜封住了原来的房门", fact_ids=["f1"]),
+            SolveAtom(id="a2", role="key",
+                      text="床的位置就是原门前", fact_ids=["f2"]),
+        ],
+        fair_clues=[FairClue(quote="却一直睡在衣柜前面",
+                             supports_atoms=["a2"])],
+        hints=["注意衣柜的位置", "注意床原本在哪", "想想那面墙原来是干什么的"],
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+
+
+def plane_spec():
+    """J1-5: 合法 NO 的正例 —— "飞机没有机械故障"。
+
+    completion 的核心命题**就是**被否定掉的那件事, 所以"不是"直接
+    等价于它, 应当建立。
+    """
+    return _stamp_beats(PuzzleSpec(
+        id="ux-plane", title="地勤旗",
+        puzzle="飞机明明可以正常起飞, 机长却主动取消了航班。为什么?",
+        answer="他把与自己无关的地勤警示旗误读成自己飞机有故障, 于是主动"
+               "取消了本可正常起飞的航班。",
+        core_answer="他把与自己无关的地勤警示旗误读成自己飞机有故障。",
+        completion_fact_ids=["f1"],
+        facts=[
+            PuzzleFact(id="f1", text="这架飞机本身没有机械故障",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f2", text="警示旗指向的是另一架飞机",
+                       kind="support", visibility="hidden"),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="key", text="飞机没有故障",
+                      fact_ids=["f1"]),
+        ],
+        fair_clues=[FairClue(quote="主动取消了本可正常起飞的航班",
+                             supports_atoms=["a1"])],
+        hints=["注意他看到了什么", "注意旗子是谁的"],
+        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+
+
 def _completion_match(ids):
     """第二层 completion 复核的 canned 返回。"""
     return LLMResult(tool_input={"matched_completion_fact_ids": list(ids)},
@@ -212,12 +286,32 @@ def boot(spec):
 
 
 def ask(eng, clk, uid, name, text, **kw):
-    """发一条 #提问 -> 拿 ANSWER payload -> 按 kw 回一个 QAResult。"""
+    """发一条 #提问 -> 拿 ANSWER payload -> 按 kw 回一个 QAResult。
+
+    ## J1-B: 合同内的 id 必须**同时**带 verified
+
+    Engine 现在要求 completion fact 只有同时出现在
+    `completion_verified_fact_ids` 里才能进房间共识(J1-B 的
+    defense-in-depth)。绝大多数用例测的是**别的**东西(通关覆盖、
+    贡献链、提示节奏 …), 不该因为这条新门全部变红。
+
+    所以这里默认把 `established_fact_ids` 里的合同 id 补一份到
+    `completion_verified_fact_ids` —— 模拟"Writer 已经正常复核过"。
+
+    ⚠️ **不要**改成无条件复制全部 id: 那样就再也测不出 J1-B 了。
+    要测"未复核的 completion 进不来"的用例, 显式传
+    `completion_verified_fact_ids=[]`(显式传空也算显式, 不会被覆盖)。
+    """
     eng.submit_danmaku(uid, name, "#" + text)
     clk.advance(20.0)
     acts = [a for a in eng.tick() if a.kind == ActionKind.ANSWER]
     assert acts, "没有派发 ANSWER"
     p = acts[0].payload
+    if "completion_verified_fact_ids" not in kw:
+        contract = set(eng._completion_fact_ids or ())
+        est = [str(x) for x in (kw.get("established_fact_ids") or [])]
+        kw["completion_verified_fact_ids"] = [
+            x for x in est if x in contract or not contract]
     return eng.submit_qa([QAResult(qid=p["qid"], **kw)],
                          expect_round=p.get("expect_round"),
                          expect_spec_key=p.get("expect_spec_key"))
@@ -2099,15 +2193,20 @@ def test_r1_c_concurrent_commit_order():
     check("两条 qid 按派发顺序", a1["qid"] == 1 and a2["qid"] == 2,
           (a1["qid"], a2["qid"]))
     # 真实完成顺序反转: qid=2 先回来
-    eng.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"])])
+    # J1-B: 合同内 id 必须同时被复核确认 —— 这条走裸 submit_qa, 显式给出
+    # (模拟 Writer 已正常复核)。
+    eng.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"])])
     # qid=1 后回来, 也声称建立了 f1
-    eng.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f1"])])
+    eng.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"])])
     # 第三条补齐 f2
     eng.submit_danmaku("u3", "丙", "#问题三")
     clk.advance(20.0)
     a3 = [a for a in eng.tick() if a.kind == ActionKind.ANSWER][0].payload
     eng.submit_qa([QAResult(qid=a3["qid"], verdict="是",
-                            established_fact_ids=["f2"])])
+                            established_fact_ids=["f2"],
+                            completion_verified_fact_ids=["f2"])])
     check("已通关", eng.phase == Phase.REVEALING, eng.phase)
     # archive 按 qid 重排 —— 它是 1,2,3
     check("archive 顺序为 qid 1,2,3",
@@ -2141,9 +2240,11 @@ def test_r1_c_concurrent_commit_order():
     check("派发顺序 1,2", (b1["qid"], b2["qid"]) == (1, 2),
           (b1["qid"], b2["qid"]))
     # qid=2 先提交并建立 f1 —— 它是第一位贡献者
-    eng2.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"])])
+    eng2.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"],
+                             completion_verified_fact_ids=["f1"])])
     # qid=1 后提交并建立 f2 —— 它是**最后**一块, 必须拿 is_final
-    eng2.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f2"])])
+    eng2.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f2"],
+                             completion_verified_fact_ids=["f2"])])
     check("已通关", eng2.phase == Phase.REVEALING, eng2.phase)
     check("archive 按 qid 排成 1,2",
           [r.qid for r in eng2._qa_archive] == [1, 2],
@@ -3155,6 +3256,296 @@ def test_a2_engine_never_accepts_irrelevant_candidate():
               r.verdict)
 
 
+# ======================================================================
+# J1 —— 排除错误解释 ≠ 建立正确核心解释(实播截图回归)
+# ======================================================================
+# 实播: 观众问"不敢关灯是因为有高空坠落风险吗?", Host 答"不是", 系统却
+# 把这条算成他补齐了谜底的最后一块, 并在公屏标上「✓ 最后线索」。
+#
+# 冻结成一句规则:
+#
+#     not(X) 只蕴含"X 不成立"; 它永远蕴含不出那个真正的原因 Y。
+#
+# 同时冻结反向: **合法**的 NO 必须照旧能建立事实("飞机有机械故障吗?
+# -> 不是" -> 建立"飞机没有机械故障")。禁止的从来不是 NO 本身, 而是
+# 借 hidden truth 把"不是 X"升级成真正原因 Y。
+def test_j1_1_wrong_exclusion_is_not_a_completion():
+    """J1-1(最重要): 错误排除不得成为最后线索 —— 全链四道都要干净。
+
+    模拟一个**有 bug 的第一层**: 判"不是", 却自报建立了 f2
+    (衣柜封门那条 completion), 且没给 verified。
+
+    Engine 必须自己拦住 —— 这是 J1-B 的 defense-in-depth。
+    """
+    print("\n[J1-1] 错误排除不得成为最后线索")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "佛狸", "不敢关灯是因为有高空坠落风险吗",
+        verdict="不是",
+        established_fact_ids=["f2"],             # 第一层错误自报
+        completion_verified_fact_ids=[])          # 复核没确认
+    check("**Engine 拒绝未复核的 completion**",
+          eng._established_fact_ids == set(), eng._established_fact_ids)
+    check("不通关", eng.phase == Phase.QA, eng.phase)
+    check("不 solved", not eng._solved, eng._solved)
+    check("**贡献链不含这条**",
+          eng._reveal_contributors_locked() == [],
+          eng._reveal_contributors_locked())
+    rec = eng._qa_archive[-1]
+    check("该条贡献为空", not rec.completion_contribution_fact_ids,
+          rec.completion_contribution_fact_ids)
+    # is_final 不可能为 true —— 逐条查, 不靠"列表长度为 0"间接推。
+    check("没有任何 is_final",
+          all(not c.get("is_final")
+              for c in eng._reveal_contributors_locked()),
+          eng._reveal_contributors_locked())
+
+
+def test_j1_2_verifier_must_reject_the_no_leap():
+    """J1-2: 复核员本身也必须拒它 —— 不能只靠 Engine 兜。
+
+    直接测 `_completion_verify`: 第一层答"不是"并自报 f2, 复核回空
+    -> 最终 established 不含 f2。
+
+    并冻结 prompt contract: 共享规则里必须有"否定回答的直接蕴含规则",
+    防止以后这条规则又被删掉。
+    """
+    print("\n[J1-2] 复核员拒收 NO 跳跃")
+    sp = wardrobe_spec()
+    fc = FakeClient([
+        _verdict(established=["f2"], cand=False, verdict="不是"),
+        _completion_match([]),                    # 复核: 一条都不认
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        sp.puzzle, sp.answer, [], 1, "佛狸", "不敢关灯是因为有高空坠落风险吗",
+        spec=sp, completion_fact_ids=sp.completion_fact_ids,
+        core_answer=sp.core_answer, room_established_fact_ids=[])
+    check("复核被调用(自报了 completion)", len(fc.calls) == 2, len(fc.calls))
+    check("最终 established 不含 f2",
+          out and out[0].established_fact_ids == [],
+          out[0].established_fact_ids if out else None)
+    check("verdict 保留'不是'", out and out[0].verdict == "不是",
+          out[0].verdict if out else None)
+    check("completion_verified 为空",
+          out and not out[0].completion_verified_fact_ids,
+          out[0].completion_verified_fact_ids if out else None)
+
+    # ---- prompt contract 冻结 ----
+    from story.llm import (COMPLETION_SPECIFICITY_RULES as SP,
+                           COMPLETION_VERIFY_SYSTEM as CV,
+                           CANDIDATE_RECHECK_SYSTEM as CR)
+    check("共享规则含否定蕴含章节",
+          "否定回答的直接蕴含规则" in SP, SP[:200])
+    check("  **两个消费者都拿到同一份**",
+          "否定回答的直接蕴含规则" in CV
+          and "否定回答的直接蕴含规则" in CR)
+    check("规则写明了核心判据",
+          "排除一个错误解释" in SP and "建立正确核心解释" in SP)
+    check("规则含实播反例(高空坠落)",
+          "高空坠落" in SP, "反例必须留在 prompt 里")
+
+
+def test_j1_3_and_4_real_core_facts_do_establish():
+    """J1-3 / J1-4: 真正问到核心的 Yes 照旧建立, 且能正常通关拿 is_final。
+
+    这才是"最后线索"的正确例子: 有人先建立 f1(衣柜封门), 另一位
+    问出 f2(床就在原门前) 补齐 -> 他是 winner 且 is_final。
+    """
+    print("\n[J1-3/4] 真核心可以建立, 最后一块仍是最后一块")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "衣柜其实是后来拿来挡住原来的门吗",
+        verdict="是", established_fact_ids=["f1"])
+    check("1/2 -> 仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("f1 已建立", eng._established_fact_ids == {"f1"},
+          eng._established_fact_ids)
+    acts = ask(eng, clk, "u2", "乙", "所以他的床其实一直摆在以前那扇门的位置",
+               verdict="是", established_fact_ids=["f2"])
+    check("补齐 -> REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是补齐者(乙)", eng._solved_by == "乙", eng._solved_by)
+    c = eng._reveal_contributors_locked()
+    check("贡献链 2 条", len(c) == 2, c)
+    check("**最后一条 is_final**",
+          c and c[-1]["is_final"] is True, c)
+    check("最后一条属于乙", c and c[-1]["user_name"] == "乙", c)
+    check("第一条不是 is_final", c and c[0]["is_final"] is False, c)
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    check("REVEAL 带 core_answer",
+          rev and rev[0].payload.get("core_answer") == sp.core_answer,
+          rev[0].payload.get("core_answer") if rev else None)
+
+
+def test_j1_5_legitimate_no_still_completes():
+    """J1-5(反向必测): 合法 NO 不能被误杀。
+
+    completion 就是"飞机没有机械故障", 而观众问"飞机有机械故障吗?",
+    "不是"**直接等价于**该 fact —— 必须建立、必须能通关。
+
+    这条与 J1-1 一起构成"不是禁止 NO, 而是禁止 hidden-truth leap"。
+    """
+    print("\n[J1-5] 合法 NO 仍能建立事实")
+    sp = plane_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "飞机有机械故障吗", verdict="不是",
+        established_fact_ids=["f1"])
+    check("**f1 被建立**", eng._established_fact_ids == {"f1"},
+          eng._established_fact_ids)
+    check("直接通关(合同只有 1 条)",
+          eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是甲", eng._solved_by == "甲", eng._solved_by)
+    c = eng._reveal_contributors_locked()
+    check("贡献链 1 条且 is_final", len(c) == 1 and c[0]["is_final"] is True, c)
+    check("裁决显示为'不是'", c and c[0]["verdict"] == "不是", c)
+
+
+def test_j1_6_keyword_hit_is_not_proposition():
+    """J1-6: 关键词命中 ≠ 命题成立。
+
+    谜底里有"衣柜", 但 canonical 并没有"人睡在衣柜**上**"。所以
+    "他睡在衣柜上吗"应当是「不是」, 且**不能**建立任何 completion ——
+    不能因为"衣柜"是核心物件就判"是"。
+
+    这条钉的是 prompt 里的判据(位置/主体被换掉 = 另一个命题),
+    所以同时冻结文案。
+    """
+    print("\n[J1-6] 关键词命中不等于命题成立")
+    from story.llm import COMPLETION_SPECIFICITY_RULES as SP
+    check("规则写明主体/位置被换掉就是另一个命题",
+          "关键词相关不等于命题成立" in SP or
+          "关键词命中 ≠ 命题成立" in SP or
+          "已经是" in SP, SP[-500:])
+    check("规则点名了衣柜这个反例", "衣柜" in SP, SP[-600:])
+    # 第一层判"不是"(正确), 且不建立任何 fact -> Engine 什么都不推进
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "乙", "他睡在衣柜上吗", verdict="不是",
+        established_fact_ids=[])
+    check("不建立任何事实", eng._established_fact_ids == set(),
+          eng._established_fact_ids)
+    check("不推进通关", eng.phase == Phase.QA, eng.phase)
+
+
+def test_j1_b_invariant_contribution_subset_of_verified():
+    """J1-C: 贡献 ⊆ 已复核 —— 结构性不变量。
+
+    对每一条 qa 记录: `completion_contribution_fact_ids` 必须是
+    `completion_verified_fact_ids` 的子集。
+
+    ⚠️ 这条不能只在 `_reveal_contributors_locked` 里临时过滤就了事:
+    那样 UI 干净了, 但 `_established_fact_ids` 已被污染、题可能提前
+    solved。所以 Engine 的过滤在**写房间共识之前**(J1-B), 这里同时
+    断言两件事。
+    """
+    print("\n[J1-B] 贡献 ⊆ 已复核(结构性不变量)")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    # 一条正常 + 一条"错误自报且未复核"混在一起
+    ask(eng, clk, "u1", "甲", "衣柜其实是后来拿来挡住原来的门吗",
+        verdict="是", established_fact_ids=["f1"])
+    ask(eng, clk, "u2", "乙", "不敢关灯是因为有高空坠落风险吗",
+        verdict="不是", established_fact_ids=["f1", "f2"],
+        completion_verified_fact_ids=["f1"])       # 只确认了 f1
+    for rec in eng._qa_archive:
+        if rec.kind != "qa":
+            continue
+        contrib = set(rec.completion_contribution_fact_ids or ())
+        verified = set(rec.completion_verified_fact_ids or ())
+        check(f"qid={rec.qid} 贡献 ⊆ 已复核",
+              contrib <= verified, (sorted(contrib), sorted(verified)))
+    check("房间共识里不含未复核的 f2",
+          "f2" not in eng._established_fact_ids, eng._established_fact_ids)
+    check("仍未通关", eng.phase == Phase.QA, eng.phase)
+
+
+def test_j1_b_noncompletion_ids_pass_through():
+    """J1-B 不能误伤: 非 completion 的 fact 行为必须**完全不变**。
+
+    support(f3)/exclusion(f4) 既不在合同里, 就不该被新门拦下 ——
+    否则就是把"A1/J1 的 completion 门"错误地扩大成全量白名单。
+    """
+    print("\n[J1-B] 非 completion fact 原样放行")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "房间曾经被隔断过吗", verdict="是",
+        established_fact_ids=["f3"])
+    check("support 正常建立", eng._established_fact_ids == {"f3"},
+          eng._established_fact_ids)
+    check("不推进通关", eng.phase == Phase.QA, eng.phase)
+    eng2, clk2 = boot(wardrobe_spec())
+    ask(eng2, clk2, "u1", "甲", "是因为高空坠落风险吗", verdict="不是",
+        established_fact_ids=["f4"])
+    check("exclusion 正常建立", eng2._established_fact_ids == {"f4"},
+          eng2._established_fact_ids)
+
+
+def test_j1_engine_gate_is_fail_closed_without_verified_field():
+    """J1-B fail-closed: `completion_verified_fact_ids` 缺失 -> 视为空。
+
+    老 producer / 测试桩不给这个字段时, completion 一律进不来。宁可少
+    建立一条(观众多说一句), 不可多建立一条(题提前结束)。
+    """
+    print("\n[J1-B] 缺失 verified 字段 -> fail closed")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    eng.submit_danmaku("u1", "甲", "#衣柜其实是后来拿来挡住原来的门吗")
+    clk.advance(20.0)
+    p = [a for a in eng.tick() if a.kind == ActionKind.ANSWER][0].payload
+    eng.submit_qa([QAResult(qid=p["qid"], verdict="是",
+                            established_fact_ids=["f1"])])   # 完全没有该字段
+    check("**completion 被拦下**", eng._established_fact_ids == set(),
+          eng._established_fact_ids)
+    check("不通关", eng.phase == Phase.QA, eng.phase)
+
+
+def test_j1_c_reveal_chain_refilters_stale_archive_rows():
+    """J1-C: 揭晓贡献链必须**自己**再挡一次未复核的 completion。
+
+    ## 为什么需要这条(它是 M3 mutation 逼出来的)
+
+    J1-B 之后, 正常路径写进 `_qa_archive` 的 contribution 已经是
+    verified 子集 —— 于是 J1-C 那道过滤在**公共路径上看起来是死的**,
+    把它删掉(M3 mutation)也没有任何测试会红。
+
+    但"正常路径走不到"不等于"永远走不到"。`_qa_archive` 是**存量的**:
+    一条在改动之前落盘、或者由别的 producer(将来某个 adapter / 回放
+    工具)写下的记录, 完全可能带着"未复核却算作贡献"的形态。揭晓是
+    观众唯一能看到"谁补上了最后一块"的地方, 值得对存量数据也守一遍。
+
+    所以这里**直接构造**一条这样的 archive 记录(不走 submit_qa),
+    断言贡献链不认它。这样 J1-C 就有了真正会红的测试。
+    """
+    print("\n[J1-C] 贡献链对存量记录再挡一次")
+    sp = wardrobe_spec()
+    eng, clk = boot(sp)
+    # 直接塞一条"声称贡献了 f2, 但从未被复核确认"的存量记录。
+    eng._qa_archive.append(QARec(
+        qid=99, user_name="佛狸", text="不敢关灯是因为有高空坠落风险吗",
+        verdict="不是", kind="qa", ts=1.0, commit_seq=1, status="ok",
+        established_fact_ids=["f2"],
+        completion_verified_fact_ids=[],            # 没被确认
+        completion_contribution_fact_ids=["f2"],    # 却算成了贡献
+    ))
+    c = eng._reveal_contributors_locked()
+    check("**这条不进贡献链**", c == [], c)
+    check("没有任何 is_final",
+          all(not x.get("is_final") for x in c), c)
+
+    # 反向: 同一条记录**被复核确认过**时, 它必须照常出现(不能把门焊死)
+    eng2, clk2 = boot(wardrobe_spec())
+    eng2._qa_archive.append(QARec(
+        qid=99, user_name="甲", text="衣柜其实是后来拿来挡住原来的门吗",
+        verdict="是", kind="qa", ts=1.0, commit_seq=1, status="ok",
+        established_fact_ids=["f1"],
+        completion_verified_fact_ids=["f1"],
+        completion_contribution_fact_ids=["f1"],
+    ))
+    c2 = eng2._reveal_contributors_locked()
+    check("已复核的那条照常出现", len(c2) == 1, c2)
+    check("  **且它不是 is_final**(合同还有一条没覆盖)",
+          c2 and c2[0]["is_final"] is False, c2)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -3256,6 +3647,16 @@ def main():
         # ---- C1: 重判一旦触发即终局(成功与失败都 return) ----
         test_c1_recheck_failure_is_terminal_without_contract,
         test_c1_recheck_success_is_terminal_without_contract,
+        # ---- J1: 排除错误解释 ≠ 建立正确核心解释 ----
+        test_j1_1_wrong_exclusion_is_not_a_completion,
+        test_j1_2_verifier_must_reject_the_no_leap,
+        test_j1_3_and_4_real_core_facts_do_establish,
+        test_j1_5_legitimate_no_still_completes,
+        test_j1_6_keyword_hit_is_not_proposition,
+        test_j1_b_invariant_contribution_subset_of_verified,
+        test_j1_b_noncompletion_ids_pass_through,
+        test_j1_engine_gate_is_fail_closed_without_verified_field,
+        test_j1_c_reveal_chain_refilters_stale_archive_rows,
     ]
     for t in tests:
         t()

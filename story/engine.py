@@ -884,8 +884,36 @@ class RoundEngine:
                 # 这一刻算, 不能等揭晓时从 established 倒推 —— 见
                 # `QARec.completion_contribution_fact_ids` 的说明。
                 before = set(self._established_fact_ids)
+                # ---- J1-B: completion fact 必须**同时**被 verifier 确认 ----
+                #
+                # defense-in-depth。Writer 侧已经有 A1 的强制复核
+                # (`_completion_verify` / `_candidate_recheck`), 但那只保证
+                # **当前的** Writer 实现是对的。Engine 是通关状态的唯一
+                # 写入口, 不能把胜负押在"上游每个 producer 都记得先复核"
+                # 上 —— 将来任何一个新的 producer / no-llm 路径 / 测试桩 /
+                # legacy adapter 只要往 `established_fact_ids` 里塞一条
+                # completion, 合同就会被白送覆盖。
+                #
+                # 语义:
+                #   普通 support / 非 completion fact -> 原行为不变
+                #   completion fact                    -> 必须已复核确认
+                #
+                # 实播事故(这条防线要挡的正是它):
+                #   观众 "不敢关灯是因为有高空坠落风险吗？" -> 不是
+                #   第一层却自报 established=["f2"](衣柜封门), 而 f2 是
+                #   completion。复核若没拦下(或将来某条路径绕过复核),
+                #   Engine 这一层必须自己拦 —— 否则观众排除了一个错误
+                #   猜测, 系统却宣布他补齐了谜底最后一块。
+                #
+                # ⚠️ 过滤必须发生在**写房间共识之前**。只在
+                # `_reveal_contributors_locked` 里过滤是不够的: 那样 UI
+                # 不显示错误贡献, 但 `_established_fact_ids` 已经被污染,
+                # 题仍可能提前 solved。
+                safe_est = self._verified_established_locked(
+                    r.established_fact_ids,
+                    r.completion_verified_fact_ids)
                 est = self._record_human_established_locked(
-                    r.established_fact_ids, verdict=r.verdict,
+                    safe_est, verdict=r.verdict,
                     status=r.status)
                 # R2: 真实提交顺序。**必须在这个 lock 内自增** —— 出了这里
                 # 就可能被别的 worker 插队, 序号就不再等于提交顺序。
@@ -1600,20 +1628,21 @@ class RoundEngine:
                 continue
             if rec.verdict not in (P.YES, P.NO):
                 continue
-            if not rec.completion_contribution_fact_ids:
+            # J1-C: 只认**已复核确认**的那部分贡献。
+            contrib = self._verified_contribution_locked(rec)
+            if not contrib:
                 continue
-            rows.append(rec)
+            rows.append((rec, contrib))
         # 按真实提交顺序 ── 这才是"谁先补上"的顺序。
-        rows.sort(key=lambda r: r.commit_seq)
+        rows.sort(key=lambda t: t[0].commit_seq)
         out: list[dict] = []
         covered: set = set()
-        for rec in rows:
+        for rec, contrib in rows:
             # 累计覆盖, 谁让 `comp <= covered` 第一次成立谁就是最后一块。
             #
             # ⚠️ 刻意**不用** `user_name == solved_by` 来判定 is_final:
             # 两个观众可以同名, 名字不是 identity。用集合覆盖推是确定性的。
-            covered |= {str(x) for x in (rec.completion_contribution_fact_ids
-                                         or [])}
+            covered |= contrib
             out.append({
                 "qid": rec.qid,
                 "user_name": rec.user_name,
@@ -1621,6 +1650,96 @@ class RoundEngine:
                 "verdict": rec.verdict,
                 "is_final": comp <= covered,
             })
+        return out
+
+    def _verified_contribution_locked(self, rec: "QARec") -> set:
+        """J1-C: 一条记录的贡献里, 只保留**已被复核确认**的 completion id。
+
+        ## 为什么这不是多余的一层(M3 mutation 逼出来的结论)
+
+        J1-B 之后, 正常路径写进 `_qa_archive` 的 contribution 已经是
+        verified 子集 —— 于是这道过滤在**公共路径上看起来是死的**, 删掉
+        它也没有任何测试会红。
+
+        但"正常路径走不到"不等于"永远走不到"。`_qa_archive` 是**存量的**:
+        一条由别的 producer(将来某个 adapter / 回放工具 / 旧版本落盘)
+        写下的记录, 完全可能带着"未复核却算作贡献"的形态。揭晓是观众
+        唯一能看到"谁补上了最后一块"的地方, 值得对存量数据也守一遍。
+
+        实播事故: 观众用"不是"排除了一个错误解释(高空坠落), 第一层却把
+        真正的 hidden 原因(衣柜封门)算成他建立的 —— 于是公屏给这条打上
+        「✓ 最后线索」。
+
+        非 completion id 原样保留, 这样本函数不偷偷改变 contribution 的
+        语义, 只是把"没被复核确认的 completion"剔掉。
+        """
+        verified = {str(x).strip()
+                    for x in (rec.completion_verified_fact_ids or ())
+                    if str(x).strip()}
+        out: set = set()
+        for x in (rec.completion_contribution_fact_ids or ()):
+            fid = str(x).strip()
+            if not fid:
+                continue
+            if fid in self._completion_fact_ids and fid not in verified:
+                continue
+            out.add(fid)
+        return out
+
+    def _verified_established_locked(self, raw_ids, verified_ids) -> list:
+        """J1-B: 把"自报的 established"过滤成"可以进房间共识的 established"。
+
+        ## 规则(只有一条)
+
+            completion fact  ->  必须同时出现在 completion_verified_fact_ids
+            其它 fact        ->  原样放行
+
+        ## 为什么 Engine 还要再做一遍
+
+        Writer 侧的 A1 已经强制复核 completion。但 Engine 是**通关状态的
+        唯一写入口** —— 把胜负押在"每个上游 producer 都记得先复核"上,
+        等于没有防线。这一层保证:
+
+            即使第一层 Answer / 某个新 producer / 测试桩 / legacy
+            adapter 错误地把 completion 塞进 `established_fact_ids`,
+            Engine 也不会白送通关。
+
+        实播事故: 观众用"不是"排除了一个错误解释, 第一层却把真正的
+        hidden 原因(衣柜封门)标成 established。A1 复核该拦; 这一层
+        是它没拦住时的最后一道。
+
+        ## 为什么不用 `_completion_fact_ids` 是否为空来短路
+
+        legacy 题(无合同)本来就没有 completion 概念, 那条分支下
+        `completion` 是空集, 循环自然全部放行 —— 不需要额外的 early
+        return。写成同一套判断, 少一条分支就少一处漂移。
+
+        ## fail-closed 方向
+
+        `completion_verified_fact_ids` 缺失/None/类型不对 -> 视为**空**,
+        于是所有 completion id 全被丢弃。宁可少建立一条(观众多说一句),
+        不可多建立一条(题提前结束, 而且是以"没人真正想明白"的方式)。
+        """
+        completion = {str(x).strip() for x in (self._completion_fact_ids or ())
+                      if str(x).strip()}
+        if not completion:
+            return list(raw_ids or [])
+        verified = {str(x).strip() for x in (verified_ids or ())
+                    if str(x).strip()}
+        out: list = []
+        dropped: list = []
+        for x in (raw_ids or ()):
+            fid = str(x).strip()
+            if not fid:
+                continue
+            if fid in completion and fid not in verified:
+                dropped.append(fid)
+                continue
+            out.append(fid)
+        if dropped:
+            # 只打 id, 不打文本 —— INFO 日志会进 data/run.log。
+            log.warning("J1: 未复核确认的 completion 被 Engine 拦下: %s",
+                        sorted(set(dropped)))
         return out
 
     def _record_human_established_locked(
