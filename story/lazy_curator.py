@@ -75,7 +75,8 @@ from typing import Any, Callable, Optional
 
 from tools.curated_compiler import CURATED_POLICY_VERSION, CuratedCompiler
 from tools.curated_ledger import (
-    ACCEPTED, INTERRUPTED, REJECTED, TECHNICAL_DEFER, DecisionLedger,
+    ACCEPTED, COMPILE_INVALID_STAGES, INTERRUPTED, REJECTED, TECHNICAL_DEFER,
+    DecisionLedger, content_hash_of,
 )
 log = logging.getLogger("hgt.lazycurator")
 
@@ -155,6 +156,67 @@ def select_candidate(recs: list, ledger: DecisionLedger,
         return None
     todo.sort(key=source_priority)
     return todo[0]
+
+
+def stratified_sample(recs: list, n: int, *, buckets: int = 20) -> list:
+    """§十五: **固定 seed 的确定性分层抽样**。
+
+    ## 为什么不能用"按 external_id 字典序取头部"
+
+    那是**最坏**的取样方式, 而且错得很隐蔽:
+
+      - id 空间不是随机的。SE 的问题号递增, 于是字典序头部 = **最早
+        的帖子**, 而那正是最老、最可能被编辑过、标签最不规范的一批;
+      - haiguitang 的 id 是 `haiguitang:<hash>`, 字典序头部等于取哈希
+        前缀最小的一批 —— 与"题目质量"完全无关, 但**看起来**像是
+        随机;
+      - 更要紧的是**不可复现地偏**: 换一次语料顺序就换一批题, 于是
+        "上轮的 12.5%" 与 "这轮的 yield" 不可比。
+
+    ## 做法: 按内容哈希分桶, 每桶取一条
+
+    把 id 空间切成 `buckets` 个桶(默认 20), 每条记录按
+    `content_hash` 的前缀落桶, 每桶取第一条 —— 于是:
+
+        可复现    同语料 + 同 N -> 永远同一批(不依赖时间/随机)
+        覆盖全体  id 空间被均匀切分, 不是只看哈希前缀最小的那批
+        无偏      与来源顺序无关, 与字典序无关
+
+    取不满 N 时就取到多少算多少(语料比 N 小是正常情况)。
+    """
+    if n <= 0 or not recs:
+        return []
+    nb = max(1, min(int(buckets), len(recs)))
+    # 按**内容哈希**排序 —— 确定性, 且与语料里的顺序无关。
+    def _h(r):
+        return content_hash_of(r)
+    ordered = sorted(recs, key=_h)
+    picked: list = []
+    seen: set = set()
+    # ---- 第一轮: 每桶取一条(轮转, 保证覆盖整个哈希空间) ----
+    for i in range(nb):
+        if len(picked) >= n:
+            break
+        # 均匀取桶中心, 避免总是从同一个偏移开始
+        idx = (i * len(ordered)) // nb
+        while idx < len(ordered):
+            r = ordered[idx]
+            k = str(getattr(r, "external_id", "") or "")
+            if k and k not in seen:
+                seen.add(k)
+                picked.append(r)
+                break
+            idx += 1
+    # ---- 第二轮: 还不够就按哈希序补齐(仍然确定性) ----
+    if len(picked) < n:
+        for r in ordered:
+            if len(picked) >= n:
+                break
+            k = str(getattr(r, "external_id", "") or "")
+            if k and k not in seen:
+                seen.add(k)
+                picked.append(r)
+    return picked[:n]
 
 
 # ======================================================================
@@ -521,6 +583,19 @@ class LazyCurator:
 
             decision, stage, reasons = self._classify(spec, info, elapsed)
             style_tags = list(info.get("style_tags") or [])
+            # ---- §十二: 题型审核证据(审计用, **不进前端**) ----
+            #
+            # `compile_checks` / `review_checks` 是本次编译/审稿对四条
+            # 故事判据的逐条回答。它们**不参与** decision identity
+            # (键仍是 id+hash+policy), 只是让事后复盘能回答"当时判了
+            # 什么" —— Reject Audit 正是卡在这里: 字段没落盘, 于是
+            # "12.5% 是源差还是门误杀"无法从证据回答。
+            checks = {}
+            for _k, _dst in (("compile_checks", "compile"),
+                             ("review_checks", "review")):
+                _v = info.get(_k)
+                if isinstance(_v, dict):
+                    checks[_dst] = _v
 
             # ---- §四: accepted 是**最终 commit marker**, 必须最后写 ----
             #
@@ -551,7 +626,8 @@ class LazyCurator:
                                        policy_version=CURATED_POLICY_VERSION,
                                        stage=fail_where,
                                        reasons=[f"{fail_where}_failed"],
-                                       style_tags=style_tags)
+                                       style_tags=style_tags,
+                                       checks=checks)
                     log.error("curated deferred: %s reason=%s_failed",
                               eid, fail_where)
                     return {"decision": TECHNICAL_DEFER}
@@ -559,7 +635,8 @@ class LazyCurator:
                 if not self.ledger.record(rec, decision=ACCEPTED,
                                           policy_version=CURATED_POLICY_VERSION,
                                           stage="accepted", reasons=[],
-                                          style_tags=style_tags):
+                                          style_tags=style_tags,
+                                          checks=checks):
                     # accepted 写不下去 -> 本次**不算成功**。
                     #
                     # ⚠️ 光靠"没有 accepted 决策 -> 不可播"这条**不够**:
@@ -576,7 +653,8 @@ class LazyCurator:
                                        policy_version=CURATED_POLICY_VERSION,
                                        stage="ledger_write",
                                        reasons=["accepted_write_failed"],
-                                       style_tags=style_tags)
+                                       style_tags=style_tags,
+                                       checks=checks)
                     log.error("accepted 决策写盘失败(该题不可播, 下次重试): %s",
                               eid)
                     return {"decision": TECHNICAL_DEFER}
@@ -602,7 +680,8 @@ class LazyCurator:
             self.ledger.record(rec, decision=decision,
                                policy_version=CURATED_POLICY_VERSION,
                                stage=stage, reasons=reasons,
-                               style_tags=style_tags)
+                               style_tags=style_tags,
+                               checks=checks)
             if decision == REJECTED:
                 log.info("curated rejected: %s reason=%s", eid,
                          ",".join(reasons[:3]) or stage)
@@ -772,6 +851,27 @@ class LazyCurator:
 
 
     # ------------------------------------------------------------------
+    #: 这些 stage 的死因是**这次没编成**, 不是"这道 canonical 题不合格"。
+    #:
+    #: 任务书 §五/§六: `rejected` 是**终态**, 它必须只表示一件事 ——
+    #:
+    #:     canonical surface + canonical bottom 本身不符合 curated policy
+    #:
+    #: 而下面这些全是**编译期结构问题**: fair_clue quote 抄错一个字 /
+    #: hint 数量不对 / hint 超长 / fact id 引用错 / discovery beat 接线错 /
+    #: 生成结构超内部上限。它们的共同点是:
+    #:
+    #:     原题可能完全没问题 —— 是**这一次搬运**没搬成功。
+    #:
+    #: 记成 rejected 会让那道题**永久消失**(而它可能是好题), 而且会让
+    #: source yield 被系统性低估 —— 审计已经证明同一种"酒吧止嗝"题里
+    #: 一条 accepted、另一条仅因为 fair_clue quote 错就被 rejected。
+    #: 那是**确定性误分类**, 不是源质量差。
+    #:
+    #: 所以它们一律 technical_defer(可重试), 报告里单独统计成
+    #: `compile_invalid`。清单定义在账本里(报告口径与决策语义必须同源)。
+    _COMPILE_INVALID_STAGES = COMPILE_INVALID_STAGES
+
     def _classify(self, spec: Any, info: dict, elapsed: float) -> tuple:
         """把 `compile_one` 的结果翻成 **四态之一**。返回 `(decision, stage, reasons)`。
 
@@ -781,11 +881,25 @@ class LazyCurator:
         会显示"我们丢了几道"。所以判定必须集中、可读、可测, 不能散落
         在 if/else 里。
 
-        映射:
-            info["interrupted"]  -> interrupted          (可重试)
-            spec 非空            -> accepted             (终态)
-            预算是超了            -> technical_defer      (可重试)
-            其它没收             -> rejected             (终态)
+        ## v4: `rejected` 的语义被**收窄**了(任务书 §四/§六)
+
+        只有**内容判决**才有资格写 `rejected`:
+
+            无反常点 / 答案不解释谜面 / 纯知识点 / 纯物理技巧 /
+            依赖冷知识 / 纯文字游戏 / 完全无唯一解释 / 内容不适合直播
+
+        编译期结构失败(quote 抄错 / hint 数量 / fact id / schema / 接线)
+        **不在此列** —— 那是"这一次没编成", 不是"原题永远是垃圾"。
+
+        映射(v4):
+
+            info["interrupted"]        -> interrupted          (可重试)
+            spec 非空                  -> accepted             (终态)
+            info["technical"]          -> technical_defer      (可重试)
+            stage 属于 _COMPILE_INVALID-> technical_defer      (可重试)
+            预算超了 / compile_call    -> technical_defer      (可重试)
+            内容判决(ai_gate/story_gate/
+              story_review)            -> rejected             (终态)
         """
         reasons = [str(r) for r in (info.get("reject_reasons") or []) if r]
         stage = str(info.get("stage") or "")
@@ -812,6 +926,16 @@ class LazyCurator:
             return TECHNICAL_DEFER, stage, reasons or ["technical"]
         if stage in ("exception", "pool_write"):
             return TECHNICAL_DEFER, stage, reasons or [stage]
+        # ---- §五/§六: 编译期结构失败 -> compile_invalid(可重试) ----
+        #
+        # ⚠️ 这一支必须排在下面的 `REJECTED` **之前**。审计里 30 条样本
+        # 有 6 条死在这里, 而它们**全部**是接线/枚举问题, 没有一条是
+        # 内容判决 —— 也就是说旧实现把 6 道可能是好题的题永久吃掉了。
+        #
+        # stage 保持原值(报告要按原因分类), 但 decision 是 defer。
+        if stage in self._COMPILE_INVALID_STAGES:
+            return (TECHNICAL_DEFER, stage,
+                    reasons or [f"compile_invalid:{stage}"])
         # ---- 复核**缺失**同样是技术失败, 不是内容拒绝 ----
         #
         # `story_review_missing` 出现在两处: 编译期拿不到 Reviewer 的

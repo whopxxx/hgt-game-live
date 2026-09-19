@@ -1983,14 +1983,14 @@ def test_accepted_ledger_write_failure_is_retryable_single_active():
             state = {"fail": True}
 
             def flaky(r, *, decision, policy_version, stage="", reasons=None,
-                      style_tags=None):
+                      style_tags=None, checks=None):
                 if decision == CL.ACCEPTED and state["fail"]:
                     state["fail"] = False
                     return False             # 注入: 只失败这一次
                 return real_record(r, decision=decision,
                                    policy_version=policy_version,
                                    stage=stage, reasons=reasons,
-                                   style_tags=style_tags)
+                                   style_tags=style_tags, checks=checks)
 
             led.record = flaky
             lc = _mk(cfg, pool, _Comp(), [rec], led, lambda: dict(FREE))

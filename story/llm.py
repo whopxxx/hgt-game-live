@@ -599,6 +599,41 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
     return bool(sig and (sig.mechanism_family or sig.solution_shape))
 
 
+def _blueprint_block_for_review(bp) -> str:
+    """审稿 prompt 的 Blueprint 段落(§二, curated-v4)。
+
+    抽成模块级纯函数是为了**可测**: 这段文案决定了审稿人会不会拿一份
+    目标骨架去判一道**已有**的 canonical 题, 而那正是 H4-A 审计发现的
+    误杀来源。测试必须能直接断言这段文案, 而不是靠"读一遍源码"。
+
+        AI 原创题: 印硬约束 —— 代码**先选**了骨架, 生成器照着写。
+        curated 题: 印**观察声明** —— 题目已存在, 没有 target 骨架。
+                     observed classification != target requirement。
+
+    ⚠️ 判据是**身份**(`_unconstrained` 标记), 不是值比较 ——
+    `PuzzleBlueprint()` 的默认值长得和无约束一模一样, 但它对原创链
+    是**真指令**。
+    """
+    if getattr(bp, "_unconstrained", False):
+        return (
+            "\n\n【本题**没有** target Blueprint —— 不要按骨架判它】\n"
+            "这是一道具**已有** canonical 谜面/谜底的题, 我们只是把它"
+            "结构化, 不是重新创作。\n"
+            "**禁止**因为下面这些与某个目标骨架不一致而要求它重出:\n"
+            "  relation / domain / emotion_mode / time_shape / "
+            "mechanism_family / solution_shape\n"
+            "  death / past_trauma / repeated_ritual / "
+            "long_term_profession 的**配额**\n"
+            "这些字段只作为**观察到的分类**记录(observed_signature), "
+            "供以后选题多样性用 —— "
+            "**observed classification != target requirement**。\n"
+            "判它只看一件事: **它本身是不是一道合格的直播海龟汤**"
+            "(谜面有无清楚反常点 / 谜底是否唯一解释 / 能否靠是/否问答"
+            "逼近 / 有无认知反转 / 是否适合直播)。")
+    return ("\n\n【本题 Blueprint 硬约束(题若违反它就是不合格)】\n"
+            + bp.describe())
+
+
 def _facts_block(spec: "PuzzleSpec", completion_fact_ids=None) -> str:
     """把 spec 的 facts 渲染成给裁决模型的"判定依据"块。
 
@@ -3764,8 +3799,23 @@ class PuzzleWriter:
             user += ("\n【现有 observed_signature(改完核心就**如实重判**, "
                      "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
                                                    ensure_ascii=False))
-        user += ("\n\n【本题 Blueprint 硬约束(题若违反它就是不合格)】\n"
-                 + bp.describe())
+        # ---- v4(任务书 §二): curated 题**不**受 target Blueprint 约束 ----
+        #
+        # 这一段原先无条件印:
+        #
+        #     【本题 Blueprint 硬约束(题若违反它就是不合格)】
+        #
+        # 对 AI 原创题那是对的: 代码**先选**了骨架, 生成器照着写, 审稿人
+        # 验它有没有照做。
+        #
+        # 对 curated 题那是**错的**: 题目已经存在, 我们只是把它搬进 schema。
+        # 套一份 target 骨架上去, 等于要一道 canonical 题**迎合一个随机
+        # 分配的默认约束** —— 实测这就是"not stranger / not neutral /
+        # not instant / 含 death / 含 past_trauma"这些拒绝的真正来源, 而
+        # 它们与"这道题是不是好海龟汤"**毫无关系**。
+        #
+        # 文案由 `_blueprint_block_for_review` 生成(纯函数, 可测)。
+        user += _blueprint_block_for_review(bp)
 
         # 代码已经确定的毛病, 直接点名让它改
         hard = must_fix or ""

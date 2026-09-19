@@ -921,14 +921,237 @@ def test_accepted_binds_content_hash_not_just_external_id():
 
 
 def test_policy_version_is_v3():
-    """§七: 本次实质改变了题型定义 -> 必须 bump。"""
-    print("\n[H3-D] policy 已 bump 到 curated-v3")
-    check("**CURATED_POLICY_VERSION == 'curated-v3'**",
-          CC.CURATED_POLICY_VERSION == "curated-v3",
+    """§七: 本次实质改变了题型定义 -> 必须 bump。
+
+    v4 的 bump 理由与 v3 不同 —— v3 是**收紧判据**(加第四条外部知识
+    依赖), v4 是**修正拒绝语义 + 去掉一个污染源**:
+
+        §一~§三  curated 不再被 target Blueprint 控制
+        §四~§六  compile 失败不再写永久 rejected
+        §十二     审核证据落盘
+
+    所以 v3 下被**错误 Blueprint 永久拒掉**的候选, 必须能在 v4 下重新
+    被审 —— 这就是 `CURATED_POLICY_VERSION` 存在的意义(它同时是旧库存
+    的隔离开关)。
+    """
+    print("\n[H4-C] policy 已 bump 到 curated-v4")
+    check("**CURATED_POLICY_VERSION == 'curated-v4'**",
+          CC.CURATED_POLICY_VERSION == "curated-v4",
           CC.CURATED_POLICY_VERSION)
     check("与 quality policy 是**两个**独立的号",
           CC.CURATED_POLICY_VERSION != CC.QUALITY_POLICY_VERSION,
           (CC.CURATED_POLICY_VERSION, CC.QUALITY_POLICY_VERSION))
+
+
+# ======================================================================
+# H4-C: curated-v4 —— Blueprint 污染 + 编译失败语义
+# ======================================================================
+def test_curated_no_target_blueprint():
+    """§一/§三: curated 题**没有** target Blueprint。
+
+    旧实现是 `blueprint=bp or PuzzleBlueprint()` —— None 被换成一份带
+    真实默认约束的 Blueprint, 下游 Reviewer 又把它当硬约束。这就把
+    "AI 原创题的目标骨架"错误地套到了**已有 canonical 题**上。
+    """
+    print("\n[H4-C §一/§三] curated 的 blueprint 是'无目标约束'")
+    rec = mk_truck_rec()
+    d = {"accepted": True, "quality_checks": _qc_good()}
+    spec = CC.spec_from_tool(d, rec, None)
+    check("bp=None 生成的 spec.blueprint 存在(不是 None)",
+          spec.blueprint is not None)
+    check("**且被标记为 unconstrained**",
+          CC.is_unconstrained_blueprint(spec.blueprint),
+          repr(getattr(spec.blueprint, "_unconstrained", "?")))
+    # 反向: 真分配过 blueprint 时**不能**被误判成无约束 —— 否则原创链
+    # 会静默丢掉审稿人的 adherence 检查。
+    real = CC.PuzzleBlueprint(relation="family", death=True)
+    spec2 = CC.spec_from_tool(d, rec, real)
+    check("显式传入的 blueprint 不被误判为 unconstrained",
+          not CC.is_unconstrained_blueprint(spec2.blueprint))
+    check("显式传入的 blueprint 值被原样保留",
+          spec2.blueprint.relation == "family"
+          and spec2.blueprint.death is True)
+    # 默认值长得和无约束**一模一样**, 所以判据必须是身份而不是值。
+    check("**默认 PuzzleBlueprint() 不算 unconstrained(身份判据)**",
+          not CC.is_unconstrained_blueprint(CC.PuzzleBlueprint()))
+
+
+def test_reviewer_prompt_not_enforcing_blueprint_for_curated():
+    """§二: 审稿 prompt 对 curated 题**不许**印 target Blueprint 硬约束。"""
+    print("\n[H4-C §二] Reviewer prompt 不再按骨架判 canonical 题")
+    rec = mk_truck_rec()
+    d = {"accepted": True, "quality_checks": _qc_good()}
+    spec = CC.spec_from_tool(d, rec, None)
+    from story.llm import _blueprint_block_for_review
+    prompt = _blueprint_block_for_review(spec.blueprint)
+    check("**不再出现'Blueprint 硬约束'字样**",
+          "Blueprint 硬约束" not in prompt)
+    check("出现'没有 target Blueprint'的明确声明",
+          "没有" in prompt and "target Blueprint" in prompt)
+    check("prompt 明确 observed != target",
+          "observed classification != target requirement" in prompt)
+
+
+def test_family_grief_long_death_not_rejected_by_default_blueprint():
+    """§三 的 regression: 一道 relation=family / 长期 / 死亡的 canonical 题,
+    只要内容本身符合 curated policy, **不得**因为默认 Blueprint 要求
+    stranger/neutral/instant/death=false 而被拒。
+    """
+    print("\n[H4-C §三] family/long/grief 题不因默认骨架被拒")
+    rec = RawCuratedPuzzle(
+        source="haiguitang",
+        external_id="curated-v4:regression:family-grief-long-death",
+        surface=("一个男人每天下班后都在楼下坐一小时才上楼。"
+                 "邻居问他为什么, 他说车里凉快。为什么?") + "真相是什么?",
+        bottom=("他的妻子三年前在楼上去世了, 他没法面对空房间, "
+                "所以在车里坐到不得不上去。"),
+        tags=[],
+    )
+    # 观察到的 signature 明摆着违反**默认** Blueprint 的每一个字段。
+    d = {
+        "accepted": True,
+        "quality_checks": _qc_good(),
+        "observed_signature": {
+            "mechanism_family": "information_gap",
+            "solution_shape": "information_advantage",
+            "relation": "family",
+            "emotion_mode": "grief",
+            "time_shape": "long",
+            "death": True,
+            "past_trauma": True,
+        },
+    }
+    spec = CC.spec_from_tool(d, rec, None)
+    check("**题本身判定合格(check_tool_result 过)**",
+          CC.check_tool_result(d)[0], CC.check_tool_result(d)[1])
+    check("**blueprint 是无约束的(不是那份默认骨架)**",
+          CC.is_unconstrained_blueprint(spec.blueprint))
+    # 核心断言: 那份会误杀的**默认骨架硬约束**根本不进 prompt。
+    from story.llm import _blueprint_block_for_review
+    prompt = _blueprint_block_for_review(spec.blueprint)
+    check("**审稿 prompt 里没有 Blueprint 硬约束段**",
+          "Blueprint 硬约束" not in prompt)
+    check("**改成了观察声明(明确禁止按骨架判)**",
+          "没有" in prompt and "禁止" in prompt)
+    # 反向: AI 原创题那条链**必须**继续印硬约束 —— 不能顺手把原创链
+    # 的 adherence 检查也关掉。
+    real = CC.PuzzleBlueprint(relation="family", death=True)
+    real_prompt = _blueprint_block_for_review(real)
+    check("**原创链仍然印 Blueprint 硬约束**",
+          "Blueprint 硬约束" in real_prompt, real_prompt[:80])
+
+
+def test_compile_invalid_is_not_permanent_reject():
+    """§五/§六: 编译期结构失败 -> technical_defer, **不是** rejected。"""
+    print("\n[H4-C §五/§六] 编译失败不得成为永久 content reject")
+    from story.lazy_curator import LazyCurator
+    from tools.curated_ledger import REJECTED, TECHNICAL_DEFER
+    cur = LazyCurator.__new__(LazyCurator)
+    cur._budget = 45.0
+    for st in ("validate", "curated_validate", "post_review_validate",
+               "post_review_curated", "reveal_adherence", "too_similar"):
+        dec, stage, reasons = cur._classify(None, {"stage": st}, 0.5)
+        check(f"**stage={st} -> technical_defer**",
+              dec == TECHNICAL_DEFER, f"{dec} (stage={stage})")
+    # 内容判决仍然是**终态** —— 不能因为放宽编译失败就把内容门也松开。
+    for st in ("ai_gate", "story_gate", "story_review"):
+        dec, _s, _r = cur._classify(None, {"stage": st}, 0.5)
+        check(f"内容判决 stage={st} 仍是 rejected",
+              dec == REJECTED, dec)
+    # compile_call / technical 也照旧是 defer。
+    dec, _s, _r = cur._classify(None, {"stage": "compile_call"}, 0.5)
+    check("compile_call 仍是 technical_defer", dec == TECHNICAL_DEFER, dec)
+
+
+def test_ledger_records_checks_evidence():
+    """§十二: compile_checks / review_checks 必须落盘(且旧账本不用迁移)。"""
+    print("\n[H4-C §十二] 审核证据落盘")
+    with tmpdir() as d:
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        rec = mk_truck_rec()
+        led.record(rec, decision=CL.REJECTED, policy_version="curated-v4",
+                   stage="ai_gate", reasons=["not_a_story"],
+                   checks={"compile": {"story_reconstruction": False},
+                           "review": {"single_trick": True}})
+        led2 = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        got = led2.last(rec, "curated-v4")
+        check("checks 落盘且能读回", isinstance(got.get("checks"), dict),
+              got.get("checks"))
+        check("compile 侧四字段在",
+              got["checks"]["compile"]["story_reconstruction"] is False)
+        check("review 侧四字段在",
+              got["checks"]["review"]["single_trick"] is True)
+        # 旧账本(没有 checks 键)-> 读出空 dict, **不用迁移**。
+        import json as _json
+        with open(os.path.join(d, "old.jsonl"), "w", encoding="utf-8") as f:
+            f.write(_json.dumps({"external_id": "x", "content_hash": "h",
+                                 "policy_version": "v", "decision": "rejected",
+                                 "stage": "ai_gate", "reasons": []}) + "\n")
+        old = CL.DecisionLedger(os.path.join(d, "old.jsonl"))
+        row = old.rows[0]
+        check("旧行没有 checks 也能读(append-only 不迁移)",
+              "checks" not in row or row.get("checks") == {})
+
+
+def test_checks_do_not_affect_decision_identity():
+    """§十二: checks 只是审计证据 —— **不影响** decision identity。"""
+    print("\n[H4-C §十二] checks 不进 decision identity")
+    rec = mk_truck_rec()
+    a = CL.make_decision(rec, decision=CL.REJECTED, policy_version="curated-v4",
+                         stage="ai_gate", checks={"compile": {"x": False}})
+    b = CL.make_decision(rec, decision=CL.REJECTED, policy_version="curated-v4",
+                         stage="ai_gate")
+    check("**有无 checks 的 decision_key 完全相同**",
+          CL.decision_key(a["external_id"], a["content_hash"],
+                          a["policy_version"])
+          == CL.decision_key(b["external_id"], b["content_hash"],
+                             b["policy_version"]))
+    check("没有 checks 时写空 dict(不是 None)",
+          b.get("checks") == {}, b.get("checks"))
+
+
+def test_fair_clue_requote_is_deterministic_and_never_touches_puzzle():
+    """§八: 修 fair_clue 是**重选 quote**, 一个字都不许改谜面。"""
+    print("\n[H4-C §八] fair_clue 重选 quote(确定性, 不改谜面)")
+    puzzle = "他每天都把车停在楼下。邻居问他为什么。他没有回答。真相是什么?"
+    q = CC._requote_from_puzzle(puzzle)
+    check("挑出的 quote **逐字**在谜面里", q and q in puzzle, repr(q))
+    check("**谜面本身没被改动**(函数是纯的)",
+          "他每天都把车停在楼下。" in puzzle)
+    # 修完必须真的过逐字校验。
+    from story.puzzle import FairClue, quote_in_puzzle
+    c = FairClue(quote="不存在的句子")
+    c.quote = CC._requote_from_puzzle(puzzle)
+    check("修后的 quote 过 quote_in_puzzle", quote_in_puzzle(c.quote, puzzle))
+    check("空谜面挑不出 quote(修不了 -> 上层走 defer)",
+          CC._requote_from_puzzle("") == "")
+
+
+def test_stratified_sample_is_deterministic_and_spread():
+    """§十五: 抽样必须**可复现**且**覆盖全体 id 空间**(不是字典序头部)。"""
+    print("\n[H4-C §十五] deterministic stratified sample")
+    from story.lazy_curator import stratified_sample
+    recs = [RawCuratedPuzzle(
+        source="haiguitang", external_id=f"haiguitang:{i:04d}",
+        surface=f"谜面 {i} 真相是什么?", bottom=f"谜底 {i}", tags=[])
+        for i in range(200)]
+    a = stratified_sample(recs, 20)
+    b = stratified_sample(recs, 20)
+    check("取满 20 条", len(a) == 20, len(a))
+    check("**同一输入两次抽样完全相同(可复现)**",
+          [r.external_id for r in a] == [r.external_id for r in b])
+    check("无重复", len({r.external_id for r in a}) == 20)
+    # **关键**: 与"字典序头部"不同 —— 否则这道回归没测到东西。
+    head = [r.external_id for r in sorted(
+        recs, key=lambda r: r.external_id)[:20]]
+    check("**不是字典序头部**(抽样真的铺开了)",
+          [r.external_id for r in a] != head)
+    # 覆盖度: 20 条应当散布在整个 id 空间, 而不是挤在一端。
+    idx = sorted(int(r.external_id.split(":")[1]) for r in a)
+    check("**覆盖全体 id 空间(首尾都够到)**",
+          idx[0] < 40 and idx[-1] > 160, (idx[0], idx[-1]))
+    check("语料不足时取到多少算多少",
+          len(stratified_sample(recs, 999)) == 200)
 
 
 # ======================================================================
@@ -965,6 +1188,15 @@ def main():
         test_checks_v3_is_superset_of_v2,
         test_accepted_binds_content_hash_not_just_external_id,
         test_policy_version_is_v3,
+        # ---- H4-C: curated-v4(Blueprint 污染 + 编译失败语义) ----
+        test_curated_no_target_blueprint,
+        test_reviewer_prompt_not_enforcing_blueprint_for_curated,
+        test_family_grief_long_death_not_rejected_by_default_blueprint,
+        test_compile_invalid_is_not_permanent_reject,
+        test_ledger_records_checks_evidence,
+        test_checks_do_not_affect_decision_identity,
+        test_fair_clue_requote_is_deterministic_and_never_touches_puzzle,
+        test_stratified_sample_is_deterministic_and_spread,
     ]
     for t in tests:
         try:

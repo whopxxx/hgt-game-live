@@ -91,6 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="只打印语料/账本统计, 不调 LLM")
     ap.add_argument("--show-samples", type=int, default=0,
                     help="打印 N 道 accepted 样本(验收人工看用)")
+    # ---- §十五/§十六: 确定性分层抽样 + 逐条报告 ----
+    ap.add_argument("--sample", type=int, default=0,
+                    help=("从待处理 candidate 里做**固定 seed 的确定性"
+                          "分层抽样**, 取 N 条(按内容哈希分桶, 覆盖全体"
+                          " id 空间, 不是字典序头部)"))
+    ap.add_argument("--report-json", default="",
+                    help=("把**逐条**结果写成 JSON(§十六: 全部 candidate "
+                          "的 external_id/surface/bottom/最终状态/拒因; "
+                          "accepted 另给 core_answer/style/compile_checks/"
+                          "review_checks)"))
     ap.add_argument("--no-llm", action="store_true",
                     help="不使用 LLM(只能干跑)")
     ap.add_argument("--log-level", default="INFO")
@@ -158,6 +168,7 @@ def _print_report(rep: dict, led: DecisionLedger) -> None:
     print(f"  账本累计(policy={CURATED_POLICY_VERSION}):")
     print(f"    accepted {st['accepted']} / rejected {st['rejected']} / "
           f"defer {st['technical_defer']} / interrupted {st['interrupted']}")
+    _print_source_quality(led)
     settle = led.settle_stats(CURATED_POLICY_VERSION)
     if settle["by_stage"]:
         print()
@@ -171,6 +182,36 @@ def _print_report(rep: dict, led: DecisionLedger) -> None:
                                 key=lambda kv: -kv[1]))[:12]:
             print(f"    {k:44s} {v}")
     print()
+
+
+def _print_source_quality(led: DecisionLedger) -> None:
+    """§十四: 把 source quality 拆成**几个不同的数字**。
+
+    ⚠️ 这一段的重点不是"多打几行", 而是**不再只报 accepted/processed**。
+    把网关抖动 / schema 错误 / hint 生成失败 / fair_clue 接线失败算成
+    "源质量差"是**统计错误** —— 一次网络抖动会让 yield 看起来掉一半,
+    而源本身没变。
+
+    真正的 source yield:
+
+        accepted / (accepted + content_rejected)
+
+    分母**不含** defer / interrupted。
+    """
+    q = led.source_quality(CURATED_POLICY_VERSION)
+    print()
+    print("  源质量拆分(§十四 —— 不要把技术失败算成源差):")
+    print(f"    processed        : {q['processed']}")
+    print(f"    accepted         : {q['accepted']}")
+    print(f"    content_rejected : {q['content_rejected']}"
+          f"   <- **真**内容不合格")
+    print(f"    technical_defer  : {q['technical_defer']}"
+          f"   (含 compile_invalid {q['compile_invalid']})")
+    print(f"    interrupted      : {q['interrupted']}")
+    y = q["source_yield"]
+    print(f"    **source yield** : "
+          + ("n/a(还没有内容判决)" if y is None else f"{y:.1%}")
+          + "  = accepted / (accepted + content_rejected)")
 
 
 def _print_samples(pool_path: str, n: int) -> None:
@@ -284,6 +325,13 @@ def main(argv=None) -> int:
 
     t0 = time.monotonic()
     calls0 = _count_llm_calls(lc)
+    # ---- §十五: 确定性分层抽样(替换候选集, **不再是字典序头部**) ----
+    if a.sample and a.sample > 0:
+        from story.lazy_curator import stratified_sample
+        before = len(lc.candidates)
+        lc.candidates = stratified_sample(lc.candidates, int(a.sample))
+        print(f"\n  [§十五] 分层抽样: {before} -> {len(lc.candidates)} 条"
+              f"(固定 seed / 按内容哈希分桶, 可复现)")
     rep = lc.step(max_candidates=max(0, int(a.max_candidates)))
     elapsed = time.monotonic() - t0
 
@@ -317,9 +365,105 @@ def main(argv=None) -> int:
     write_meta(os.path.join(os.path.dirname(a.corpus) or ".",
                             "compile_report.json"), **out)
     _print_report(out, led)
+    # ---- §十六: 逐条报告(全部 candidate 的最终状态 + 拒因) ----
+    if a.report_json:
+        _write_item_report(a.report_json, getattr(lc, "candidates", []),
+                           led, out)
     if a.show_samples:
         _print_samples(a.pool_out, a.show_samples)
     return 0
+
+
+def _write_item_report(path: str, recs: list, led: DecisionLedger,
+                       out: dict) -> None:
+    """§十六: 把**逐条**结果写成 JSON。
+
+    每条给: external_id / surface / bottom / 最终状态 / 内容 reject reason。
+    accepted 的**再**给 core_answer / style / reasoning_shape /
+    compile_checks / review_checks。
+
+    ⚠️ `surface` / `bottom` 是 canonical 原文, 必须**全文**给 —— 只给
+    标题的话人工无法判断"门有没有误杀"(Reject Audit 的教训)。
+    """
+    import json
+    items = []
+    for r in recs:
+        eid = str(getattr(r, "external_id", "") or "")
+        d = led.last(r, CURATED_POLICY_VERSION) or {}
+        dec = str(d.get("decision") or "unprocessed")
+        row = {
+            "external_id": eid,
+            "source": str(getattr(r, "source", "") or ""),
+            "surface": getattr(r, "surface", "") or "",
+            "bottom": getattr(r, "bottom", "") or "",
+            "decision": dec,
+            "stage": str(d.get("stage") or ""),
+            "reasons": list(d.get("reasons") or []),
+            # §十四: 这一条落在哪个桶里(报告要能按它分组)
+            "bucket": _bucket_of(d),
+        }
+        if dec == "accepted":
+            spec = _pool_spec_by_id(out.get("pool_out", ""), eid)
+            if spec:
+                row.update({
+                    "core_answer": spec.get("core_answer"),
+                    "answer": spec.get("answer"),
+                    "style_tags": spec.get("style_tags"),
+                    "content_style": spec.get("content_style"),
+                    "reasoning_shape": _reasoning_shape(spec),
+                })
+        checks = d.get("checks")
+        if isinstance(checks, dict) and checks:
+            row["compile_checks"] = checks.get("compile") or {}
+            row["review_checks"] = checks.get("review") or {}
+        items.append(row)
+    payload = dict(out)
+    payload["items"] = items
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  -> 逐条报告 {len(items)} 条: {path}")
+
+
+def _bucket_of(d: dict) -> str:
+    """把一条决策归入 §十四 的桶(报告口径)。"""
+    dec = str(d.get("decision") or "")
+    st = str(d.get("stage") or "")
+    if dec == "accepted":
+        return "accepted"
+    if dec == "rejected":
+        return "content_rejected"
+    if dec == "interrupted":
+        return "interrupted"
+    if dec == "technical_defer":
+        from tools.curated_ledger import COMPILE_INVALID_STAGES
+        return ("compile_invalid" if st in COMPILE_INVALID_STAGES
+                else "technical_defer")
+    return "unprocessed"
+
+
+def _pool_spec_by_id(pool_path: str, eid: str) -> dict:
+    """从池文件里按 external_id 取 spec(accepted 的补充信息用)。"""
+    if not pool_path or not os.path.exists(pool_path):
+        return {}
+    for row in read_jsonl(pool_path):
+        spec = row.get("spec") if isinstance(row, dict) else None
+        if isinstance(spec, dict) and str(spec.get("external_id")) == eid:
+            return spec
+    return {}
+
+
+def _reasoning_shape(spec: dict) -> dict:
+    """§十六 的 `reasoning_shape`: atoms 的 role 分布 + facts 计数。"""
+    atoms = spec.get("solve_atoms") or []
+    roles: dict = {}
+    for a in atoms:
+        if isinstance(a, dict):
+            k = str(a.get("role") or "?")
+            roles[k] = roles.get(k, 0) + 1
+    return {"roles": roles,
+            "n_facts": len(spec.get("facts") or []),
+            "n_beats": len(spec.get("discovery_beats") or []),
+            "completion_fact_ids": spec.get("completion_fact_ids") or []}
 
 
 # ======================================================================

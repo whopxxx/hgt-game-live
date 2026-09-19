@@ -103,7 +103,63 @@ CURATED_PROMPT_VERSION = "curated-v1"
 #: 所以 v3 加一条正交判据 `no_external_knowledge_dependency`, 而**不是**
 #: 给 elevator/physics/jeep/render 写关键词黑名单 —— 黑名单挡不住下一个
 #: 没被想起来的词, 而且会误伤真故事(一道关于电梯的**身份**题是好的)。
-CURATED_POLICY_VERSION = "curated-v3"
+CURATED_POLICY_VERSION = "curated-v4"
+
+#: v4 修的是一个**污染源**, 不是收紧判据(任务书 §一~§三)。
+#:
+#: v3 之前, `spec_from_tool` 里写着:
+#:
+#:     blueprint=bp or PuzzleBlueprint()
+#:
+#: Lazy Curator 正确传了 `blueprint=None`(curated 题**没有** target
+#: Blueprint —— 题目已经存在, 我们只是搬运它), 但那个 `or` 把 None 变成
+#: 了一份**带真实默认约束**的 Blueprint, 随后 `_review_spec` 又把它当
+#: **硬约束**印进审稿 prompt:
+#:
+#:     【本题 Blueprint 硬约束(题若违反它就是不合格)】
+#:
+#: 于是已有 canonical 题会因为"不是 stranger / 不是 neutral / 不是
+#: instant / 不是 information_gap / 包含 death / 包含 past_trauma"被
+#: 要求推倒重出。那不是内容不合格, 是**把 AI 原创题的目标骨架套到了
+#: 外部已有题上**。
+#:
+#: 职责必须分清:
+#:
+#:     AI original:  choose Blueprint -> 创作符合它的题 -> Reviewer 查 adherence
+#:     curated:      已有 canonical puzzle -> 判断它**本身**好不好 -> 结构化
+#:
+#: v4 起 curated 链**不传** target Blueprint 给 Reviewer, 且
+#: `spec.blueprint` 允许为 None("无目标约束")。观察到的 signature 仍然
+#: 照常记录 —— observed classification != target requirement。
+
+#: curated 题的 `blueprint` 字段用**这一个**哨兵实例表示"无目标约束"。
+#:
+#: 为什么不是 `None`: `PuzzleSpec.to_archive()` / 池读取 / `cross_puzzle_gate`
+#: 都直接摸 `spec.blueprint.<field>`, 让它是 None 会在那些地方炸。一个
+#: 全字段"无要求"的实例既满足"必须存在"的旧契约, 又不会假装自己是目标。
+#: 判别方式是 `is_unconstrained_blueprint()` —— **不是**比字段值(默认值
+#: 恰好长得像它, 拿值比较会把真默认 Blueprint 误判成无约束)。
+def make_unconstrained_blueprint() -> PuzzleBlueprint:
+    """构造"无 target 约束"的 Blueprint 实例。
+
+    ⚠️ 它的字段值与 `PuzzleBlueprint()` 默认值**完全相同** —— 这是刻意
+    的(它必须是一个合法 Blueprint)。区分它靠的是**身份**
+    (`is_unconstrained_blueprint`), 不是值。
+    """
+    bp = PuzzleBlueprint()
+    bp._unconstrained = True          # type: ignore[attr-defined]
+    return bp
+
+
+def is_unconstrained_blueprint(bp: Any) -> bool:
+    """这份 blueprint 是"没有目标约束"吗?
+
+    判据是**显式标记**, 不是值比较。值比较会有一个真实误判:
+    `PuzzleBlueprint()` 的默认值长得和它一模一样, 而那份默认值在
+    AI 原创链里是**真指令** —— 把它当成"无约束"会让原创链静默丢掉
+    审稿人的 adherence 检查。
+    """
+    return bool(getattr(bp, "_unconstrained", False))
 
 
 # ======================================================================
@@ -743,6 +799,17 @@ def spec_from_tool(d: dict, rec, bp: Optional[PuzzleBlueprint]
 
     与 `_spec_from_tool` 的关键差别: 这里**注入 provenance**。curated 题
     必须永远带着"它从哪来", 否则版权与排查都无从谈起(H2-F/H2-H)。
+
+    ## v4: `bp=None` 不再被替换成一份默认 Blueprint(任务书 §一/§三)
+
+    旧实现是 `blueprint=bp or PuzzleBlueprint()`。对 curated 题那是**错的**:
+    题目已经存在, 我们不对它下达目标骨架, 所以 `bp` 本来就该是 None。
+    那个 `or` 把它变成一份带真实默认约束的 Blueprint, 而下游
+    `_review_spec` 会把它当硬约束印给审稿人 -> 已有 canonical 题因为
+    "不是 stranger / 不是 neutral / 不是 instant"被要求推倒重出。
+
+    None 现在如实保留为"无目标约束"的哨兵实例, 由
+    `is_unconstrained_blueprint()` 识别。
     """
     sig_raw = d.get("observed_signature") or {}
     sig = PuzzleSignature.from_dict(sig_raw)
@@ -762,7 +829,8 @@ def spec_from_tool(d: dict, rec, bp: Optional[PuzzleBlueprint]
         fair_clues=[FairClue.from_dict(x) for x in (d.get("fair_clues") or [])],
         hints=[str(h).strip() for h in (d.get("hints") or [])
                if str(h).strip()],
-        blueprint=bp or PuzzleBlueprint(),
+        # v4: 不再 `bp or PuzzleBlueprint()`。None = 无目标约束(见上)。
+        blueprint=(bp if bp is not None else make_unconstrained_blueprint()),
         signature=sig,
         prompt_version=CURATED_PROMPT_VERSION,
         quality_policy_version=QUALITY_POLICY_VERSION,
@@ -846,6 +914,93 @@ def validate_curated(spec: PuzzleSpec, bp: Optional[PuzzleBlueprint] = None
     return (not reasons), reasons
 
 
+#: `_repair_hints` 的第二个参数要一份 `vb`(blueprint 校验结果), 而
+#: curated 链**没有** target blueprint 可验 —— 传一个"永远通过"的桩,
+#: 因为那个检查在这里不适用(见 v4 的 Blueprint 说明)。
+class _Ok:
+    ok = True
+    fixable: tuple = ()
+    errors: tuple = ()
+
+
+def _requote_from_puzzle(puzzle: str) -> str:
+    """从谜面里**逐字**挑一段连续文字当 fair_clue。
+
+    §八: canonical puzzle 不许为迁就 fair_clue 被修改 —— 所以修法只能是
+    **改 quote**, 且新 quote 必须是谜面里原样存在的一段。
+
+    策略(确定性, 无 LLM, 可复现):
+      1. 按句读切分(。！？；\\n), 取**最长**的一句 —— 它最可能携带
+         可回溯的线索;
+      2. 去掉首尾空白后若仍非空且确实在谜面里 -> 用它;
+      3. 都挑不出来 -> 返回空串(调用方据此判"修不了")。
+
+    刻意**不**做"截取任意子串": 一段没有语义边界的半句话不是线索,
+    它只会让 `validate_spec` 的另一条(线索指不到 completion)再次失败。
+    """
+    import re as _re
+    text = (puzzle or "").strip()
+    if not text:
+        return ""
+    parts = [p.strip() for p in _re.split(r"[。！？；\n]+", text)]
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    parts.sort(key=len, reverse=True)
+    for p in parts:
+        if quote_in_puzzle(p, text):
+            return p
+    return ""
+
+
+def _merge_duplicate_core_facts(spec: PuzzleSpec) -> bool:
+    """把**文本完全相同**(归一后)的 core+hidden facts 归并成一条。
+
+    §九: "如果 canonical 题内容很好但 compiler 拆成了 4 个: 优先重新
+    归并事实"。这里只做代码能**确定**的那一半 —— 两条文本一模一样的
+    事实本来就是同一条, 合并它不改任何真相。
+
+    语义等价但措辞不同的**不做** —— 那需要判断, 而判断错了就是"为了
+    过 schema 改真相"。那些走 technical_defer。
+
+    返回 True 表示真的合并过。所有引用(completion_fact_ids /
+    solve_atoms.fact_ids / discovery_beats.fact_ids)重指到保留下来的 id。
+    """
+    from story.puzzle import normalize_for_match
+    core_hidden = [f for f in (spec.facts or [])
+                   if f.kind == "core" and f.visibility == "hidden"]
+    by_key: dict = {}
+    drop: dict = {}          # 被合并掉的 id -> 保留下来的 id
+    for f in core_hidden:
+        k = normalize_for_match(f.text or "")
+        if not k:
+            continue
+        if k in by_key:
+            drop[f.id] = by_key[k]
+        else:
+            by_key[k] = f.id
+    if not drop:
+        return False
+
+    def _remap(ids):
+        out, seen = [], set()
+        for i in (ids or []):
+            j = drop.get(i, i)
+            if j not in seen:
+                seen.add(j)
+                out.append(j)
+        return out
+
+    spec.facts = [f for f in spec.facts if f.id not in drop]
+    spec.completion_fact_ids = _remap(spec.completion_fact_ids)
+    for a in (spec.solve_atoms or []):
+        a.fact_ids = _remap(a.fact_ids)
+    for b in (getattr(spec, "discovery_beats", None) or []):
+        b.fact_ids = _remap(b.fact_ids)
+    log.info("core hidden facts 归并: %s", drop)
+    return True
+
+
 # ======================================================================
 # 编译器
 # ======================================================================
@@ -858,6 +1013,93 @@ class CuratedCompiler:
 
     def __init__(self, writer):
         self.writer = writer
+
+    # ------------------------------------------------------------------
+    def _repair_spec(self, spec: PuzzleSpec, vr) -> Optional[PuzzleSpec]:
+        """§七/§八: 对**确定性可修**的结构问题做一次窄修复。
+
+        返回修好之后的 spec, 或 None 表示"修不了"(调用方按原路走)。
+
+        ## 铁律: **canonical puzzle 不许为迁就 fair_clue 被修改**
+
+        这条继续有效。但审计已经证明旧行为是**确定性误分类**:
+
+            同一种"酒吧止嗝"题:
+              一条 accepted
+              另一条仅因为 fair_clue quote 抄错一个字就被 rejected
+
+        正确修法是**修 fair_clue.quote**, 不是 reject 整道题 —— 而且
+        重选 quote 必须**逐字取自现有 puzzle**, 一个字都不许改谜面。
+
+        ## 分词修什么
+
+            hints 超长 / 数量对         -> 复用 `writer._repair_hints`(一次 LLM,
+                                          但它只改 hints, 不碰任何 canonical 字段)
+            fair_clue quote 不在谜面   -> **确定性**重选(0 LLM):
+                                          在谜面里找一句连续文字替换
+
+        ## 修不了的一律返回 None
+
+        completion fact 引用不存在的 fact / core hidden facts > 3 这类
+        **改变真相才能修**的问题, 不许在这里硬修 —— 那会违反"编辑不改
+        canonical 真相"。它们继续走 technical_defer(见 §九)。
+        """
+        fixed = False
+
+        # ---- ① fair_clue quote: 确定性重选(0 LLM 调用) ----
+        #
+        # §八: "让 repair 从现有 puzzle 中逐字重新选择一个 quote"。所以
+        # 这是纯字符串操作 —— 不需要也不应该问模型(问了它就可能顺手
+        # 改写谜面, 那正是禁止的)。
+        bad_clues = [c for c in (spec.fair_clues or [])
+                     if c.quote and spec.puzzle
+                     and not quote_in_puzzle(c.quote, spec.puzzle)]
+        if bad_clues:
+            for c in bad_clues:
+                q = _requote_from_puzzle(spec.puzzle)
+                if not q:
+                    return None            # 谜面里挑不出连续文字 -> 修不了
+                log.info("fair_clue 重选 quote: %r -> %r", c.quote[:24], q[:24])
+                c.quote = q
+            fixed = True
+
+        # ---- ② hints: 只在**全部** fixable 都是提示相关时才动 ----
+        #
+        # 与 `_repair_hints` 的触发条件一致: 混进别的类别说明问题不在
+        # hints —— 那时补 hints 只是掩盖。这里额外要求谜面/谜底一个字
+        # 都不会变(窄修复窄到只碰 hints)。
+        hint_fixable = [f for f in (vr.fixable or []) if "提示" in f]
+        if hint_fixable and len(hint_fixable) == len(vr.fixable or []):
+            try:
+                # ⚠️ `enforce_blueprint=False`: curated 题**没有** target
+                # blueprint(v4), 传 True 会让它拿一份默认骨架去判这道
+                # canonical 题 —— 正是本轮要消灭的那个错误。
+                new_spec, did = self.writer._repair_hints_if_only_issue(
+                    spec, vr, _Ok(), enforce_blueprint=False)
+                if did:
+                    spec = new_spec
+                    fixed = True
+            except Exception:                   # noqa: BLE001
+                log.exception("hints 窄修复异常, 放弃")
+
+        # ---- ③ §九: core hidden facts 超限 -> 先试**归并重复事实** ----
+        #
+        # `core hidden facts <= 3` 是**我们内部的直播 schema / completion
+        # 契约**设计, 不是"世界上超过 3 个隐藏事实的海龟汤都是坏题"。
+        #
+        # 如果 canonical 题内容很好但 compiler 把同一个事实拆成了多条,
+        # 正确做法是**归并**它 —— 那不改真相。所以这里做一个**确定性**
+        # 归并: 文本(归一后)相同的 core+hidden 事实合成一条, 并把所有
+        # 引用重指过去。
+        #
+        # ⚠️ 只能做**文本相同**的归并。语义等价但措辞不同的两条事实
+        # 要不要合并, 代码判不了 —— 硬判就是"为了过 schema 改真相"。
+        # 那种情况返回 None, 走 technical_defer(§九明确允许)。
+        n_core = len(spec.core_hidden_facts())
+        if n_core > 3 and _merge_duplicate_core_facts(spec):
+            fixed = True
+
+        return spec if fixed else None
 
     # ------------------------------------------------------------------
     def compile_one(self, rec, *, recent: Optional[list] = None,
@@ -888,6 +1130,12 @@ class CuratedCompiler:
                       "accepted": False, "reject_reasons": [], "stage": ""}
         client = self.writer.client
         user = build_user_prompt(rec, target_blueprint=blueprint)
+
+        #: §七: 每道题的**窄修复预算**。1 次 —— 修不掉就走 technical_defer,
+        #: 下次再说。**不是**无限重试: 那会把预算烧在一个持续坏掉的
+        #: 结构上, 而这一整轮什么也产不出。
+        repair_budget = 1
+        _repairs: list = []
 
         def _live_busy() -> bool:
             """直播需要资源 -> True。回调坏了也不能让编译崩溃。"""
@@ -928,6 +1176,18 @@ class CuratedCompiler:
                 continue
 
             d = _unwrap(res.tool_input)
+            # ---- §十二: 留住题型审核证据(**在命运分叉之前**) ----
+            #
+            # `quality_checks` 是**编译模型**对十三判据的逐条回答。Reject
+            # Audit 发现它运行完就丢 —— 事后无法回答"当时那四项到底判了
+            # 什么"。所以每条出口(accepted / 各 stage 的 reject)都带上它。
+            #
+            # 只留**四字段**(故事门那四条)而不留全部十三项: 那四项才是
+            # 本批要复盘的对象, 其余九条已在 reasons 里有精准表述。
+            _qc = d.get("quality_checks")
+            if isinstance(_qc, dict):
+                info["compile_checks"] = {
+                    k: _qc.get(k) for k in STORY_GATE_FIELDS}
             # ---- ① AI 审题门 ----
             ok, reasons = check_tool_result(d)
             if not ok:
@@ -1009,9 +1269,32 @@ class CuratedCompiler:
             vr = validate_spec(spec)
             if not vr.ok:
                 last_err = vr.why()
-                _bump(info, "validate")
-                log.info("第 %d 稿结构不过: %s", attempt, last_err[:120])
-                continue
+                # ---- §七: 确定性**可修**的结构问题 -> 先修一次 ----
+                #
+                # `vr.fixable` 是代码已经点名、且**不需要动 canonical
+                # 内容**就能改的项(hints 数量/长度、fact id 拼错之类)。
+                # 早先直接 `continue` 重出整稿 —— 那等于因为"提示只有
+                # 1 条"就把一道好题重造一遍, 而且下一稿是**另一道题**。
+                #
+                # 现在先试一次**窄修复**(只动被点名的那一项, 谜面谜底
+                # 一个字都不碰)。修成了就继续走后面的门。
+                #
+                # ⚠️ 这是**有界**的: `repair_budget` 每道题只有 1 次,
+                # 用完就退化成原来的行为。不修成技术债, 也不无限烧钱。
+                if vr.fixable and repair_budget > 0:
+                    repair_budget -= 1
+                    fixed = self._repair_spec(spec, vr)
+                    if fixed is not None:
+                        spec = fixed
+                        _repairs.append("validate:" + ",".join(vr.fixable))
+                        info["repairs"] = list(_repairs)
+                        log.info("第 %d 稿窄修复(%s)后继续",
+                                 attempt, ", ".join(vr.fixable))
+                        vr = validate_spec(spec)
+                if not vr.ok:
+                    _bump(info, "validate")
+                    log.info("第 %d 稿结构不过: %s", attempt, last_err[:120])
+                    continue
             # ---- ③ curated 额外门(fair_clue 逐字 / provenance) ----
             cok, creasons = validate_curated(spec, blueprint)
             if not cok:
@@ -1073,6 +1356,10 @@ class CuratedCompiler:
             # ⚠️ 判据方向由 `story_gate_from_review` 处理(它读的是
             # `check_value_ok` 同一份方向定义)。
             srev = getattr(self.writer, "_last_review_checks", None)
+            if isinstance(srev, dict):
+                # §十二: Reviewer 侧四字段同样落盘(审计证据, 不进前端)。
+                info["review_checks"] = {k: srev.get(k)
+                                         for k in STORY_GATE_FIELDS}
             sgr2 = story_gate_from_review(srev)
             _answered = isinstance(srev, dict) and any(
                 k in srev for k in STORY_GATE_FIELDS)
