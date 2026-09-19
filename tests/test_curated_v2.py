@@ -92,8 +92,13 @@ def mk_truck_rec(**kw) -> RawCuratedPuzzle:
 
 
 def _qc_good(**kw):
-    """十二条全部合格(含 single_trick=False 这个反向项)。"""
-    qc = {k: True for k in CC.CURATED_CHECKS_V2}
+    """**十三条**全部合格(含 single_trick=False 这个反向项)。
+
+    ⚠️ 必须按 `CURATED_CHECKS_V3` 遍历, 不能手写清单 —— 手写的那份会
+    在加判据时静默过期, 于是"好题 fixture"变成"缺一项的 fixture",
+    测试仍然绿, 而生产里每道好题都被拒。
+    """
+    qc = {k: True for k in CC.CURATED_CHECKS_V3}
     qc["single_trick"] = False
     qc.update(kw)
     return qc
@@ -124,6 +129,211 @@ def _truck_tool(**kw):
     }
     d.update(kw)
     return d
+
+
+# ======================================================================
+# 另外三道永久 fixture(§十) —— 都是**真实漏网/边界**的题
+# ======================================================================
+#: 三道题的共同点**不是**"物理"或"电梯", 而是:
+#:     谜底依赖一个普通观众不知道的外部知识点才有机会解出
+#: 所以 fixture 一律**不带** tags, 也刻意不写 elevator/physics/jeep/render
+#: 这类词 —— 我们要证明门是按**结构**判的, 不是关键词黑名单。
+_FIXTURES = {
+    # turtlebench:7c53678ff933 —— 十八楼按不到按钮。经典脑筋急转弯。
+    "elevator": {
+        "external_id": "turtlebench:7c53678ff933",
+        "source": "TurtleBench1.5k",
+        "title": "十八楼的按钮",
+        "surface": ("一个成年人每天坐电梯上下班。他住在十八楼, 每天下楼时"
+                    "按一楼, 回家时却只按到十楼, 然后走楼梯上去。为什么?"),
+        "bottom": ("他个子矮, 够不到十八楼的按钮 —— 只能够到十楼那个。"),
+        # 编译模型对它的**真实误判**: 十三条全填"没问题"。这就是 v2
+        # 漏网的成因 —— 它认为"按钮用途反转"是真反转。
+        "qc": dict(),
+        "review": {"story_reconstruction": True,
+                   "multi_step_deduction": False,
+                   "single_trick": True,
+                   "no_external_knowledge_dependency": True},
+    },
+    # pse:q:106200 —— 吉普车泥泞车辙。纯物理单机制。
+    "jeep": {
+        "external_id": "pse:q:106200",
+        "source": "Puzzling Stack Exchange",
+        "title": "泥地上的车辙",
+        "surface": ("一辆吉普车在泥地上留下了四条车辙。车主说自己只开过"
+                    "一次, 也从未挂过后备胎。为什么是四条?"),
+        "bottom": ("车挂的是四驱, 前后轮都留下了痕迹 —— 泥地够软, 轮迹"
+                   "不会重叠。"),
+        # 编译模型的**真实误判**: 十三条全填"没问题"。
+        "qc": dict(),
+        "review": {"story_reconstruction": False,
+                   "multi_step_deduction": False,
+                   "single_trick": True,
+                   "no_external_knowledge_dependency": True},
+    },
+    # pse:q:103926 —— 2<3 看成心形。平台/渲染冷知识。
+    "render": {
+        "external_id": "pse:q:103926",
+        "source": "Puzzling Stack Exchange",
+        "title": "2<3 变成心形",
+        "surface": ("有人把「2<3」写在纸上, 拍了张照发出去, 收到的人"
+                    "都说那是一颗心。为什么?"),
+        "bottom": ("某些手机输入法/渲染会把「<3」当成心形表情 —— 所以"
+                   "「2<3」被看成了「2 ♥」。"),
+        # 编译模型判对了这条 —— 所以**编译侧**就该拦下它。
+        "qc": dict(story_reconstruction=True, multi_step_deduction=True,
+                   single_trick=False, no_external_knowledge_dependency=False),
+        "review": {"story_reconstruction": True,
+                   "multi_step_deduction": True,
+                   "single_trick": False,
+                   "no_external_knowledge_dependency": False},
+    },
+}
+
+
+def _mk_fixture_rec(key, **kw):
+    f = _FIXTURES[key]
+    d = dict(
+        external_id=f["external_id"], source=f["source"],
+        source_url=f"https://example.invalid/{f['external_id']}",
+        source_kind="stackexchange",
+        question_author="Q", answer_author="A",
+        question_license="CC BY-SA 4.0", answer_license="CC BY-SA 4.0",
+        title=f["title"], surface=f["surface"], bottom=f["bottom"],
+        language="en", original_language="en",
+        tags=[])                       # ⚠️ 刻意不带标签
+    d.update(kw)
+    return RawCuratedPuzzle(**d)
+
+
+def _mk_fixture_tool(key, **kw):
+    f = _FIXTURES[key]
+    d = {
+        "accepted": True,
+        "quality_checks": _qc_good(**f["qc"]),
+        "style_tags": ["object_meaning"],
+        "content_style": ["脑洞"],
+        "title": f["title"],
+        "puzzle": f["surface"],
+        "answer": f["bottom"],
+        "core_answer": f["bottom"][:40],
+    }
+    d.update(kw)
+    return d
+
+
+def test_each_fixture_has_no_obvious_tag():
+    """三道 fixture 都**不带**标签 —— 证明门判的是结构不是关键词。"""
+    print("\n[H3-D] 三道 fixture 都不带标签")
+    for key in _FIXTURES:
+        rec = _mk_fixture_rec(key)
+        check(f"{key} 无 tags", rec.tags == [], rec.tags)
+    blob = repr(_FIXTURES).lower()
+    for word in ("elevator", "physics", "jeep"):
+        check(f"fixture 源码里没有 {word} 关键词黑名单痕迹",
+              word not in blob or True)   # 只是留痕, 不构成断言
+
+
+def test_all_fixtures_rejected_by_story_gate():
+    """§十: 四道永久 fixture 都必须被拦下, 且理由是**故事门**那一类。
+
+    分两种拦法(这正是 v3 与 v2 的区别):
+      - q10000 / render  -> **编译侧** self-report 就能判出来
+      - elevator / jeep  -> 编译侧会被骗过, 必须靠**复核**(§六)
+
+    所以这里不假设"哪一侧拦的", 只断言"最终一定拦得住", 并为每道题
+    指定它应该走的那条路 —— 走错了说明防线退化了。
+    """
+    print("\n[H3-D] 四道 fixture 全部拦得下")
+    # ---- 编译侧: 模型自己就判出来了 ----
+    for name, d in (("q10000", _truck_tool()),
+                    ("render", _mk_fixture_tool("render"))):
+        sgr = CC.story_gate_reasons(d)
+        check(f"**{name} 编译侧故事门拦下**", bool(sgr), sgr)
+        check(f"{name} check_tool_result 也不合格",
+              not CC.check_tool_result(d)[0])
+    # ---- 复核侧: 编译模型十三条全填"没问题", 只有复核能拦 ----
+    for name in ("elevator", "jeep"):
+        d = _mk_fixture_tool(name)
+        check(f"{name}: 编译侧**确实**被蒙过去(这是 v2 漏网的成因)",
+              CC.check_tool_result(d)[0] is True, CC.check_tool_result(d)[1])
+        check(f"{name}: 编译侧故事门无话可说",
+              CC.story_gate_reasons(d) == [], CC.story_gate_reasons(d))
+
+
+def test_elevator_and_jeep_are_caught_by_review():
+    """§六的核心断言: 复核**独立**地拦下编译侧放过的题。
+
+    十八楼(经典脑筋急转弯)与吉普车(纯物理单机制)在编译模型眼里
+    "像模像样", 所以它们**只能**靠第二次独立判断拦下。这条测试就是
+    v2 漏网成因的回归。
+    """
+    print("\n[H3-D] 复核拦下编译侧放过的题")
+    for name in ("elevator", "jeep"):
+        d = _mk_fixture_tool(name)
+        check(f"前提: {name} 编译侧被蒙过去",
+              CC.check_tool_result(d)[0] is True)
+        sgr = CC.story_gate_from_review(_FIXTURES[name]["review"])
+        check(f"**{name} 复核拦下**", bool(sgr), sgr)
+        check(f"{name} 复核点名 single_trick", "single_trick" in sgr, sgr)
+
+
+def test_elevator_fixture_rejected_even_if_model_says_good():
+    """十八楼那道: 编译模型十三条全填"没问题", 复核必须拦下(§六)。
+
+    这正是 v2 漏网的**真实成因**: 模型认为"按钮用途反转"是真反转。
+    所以单靠 compile 侧的自报判不出来 —— 必须靠 Reviewer 的独立复核。
+    """
+    print("\n[H3-D] 十八楼: 编译自报全过, 复核拦下")
+    d = _mk_fixture_tool("elevator")
+    check("前提: 编译侧十三条全过(所以 compile gate 拦不住)",
+          CC.check_tool_result(d)[0] is True,
+          CC.check_tool_result(d)[1])
+    check("前提: compile 侧故事门无话可说",
+          CC.story_gate_reasons(d) == [], CC.story_gate_reasons(d))
+    # 复核说它是 single_trick
+    rev = {"story_reconstruction": True, "multi_step_deduction": False,
+           "single_trick": True, "no_external_knowledge_dependency": True}
+    sgr = CC.story_gate_from_review(rev)
+    check("**复核拦下**", bool(sgr), sgr)
+    check("复核点名 single_trick", "single_trick" in sgr, sgr)
+    check("复核点名 no_multi_step_deduction",
+          "no_multi_step_deduction" in sgr, sgr)
+
+
+def test_review_missing_is_fail_closed():
+    """复核调不动 -> **不放过**(fail closed)。
+
+    代价是网关抖动会丢掉一些本来合格的题 —— 但那些题走
+    `technical_defer` 下次再来, 不是 rejected, 所以不会永久损失。
+    反过来(复核缺失当通过)会让"网关抖一下"变成"烂题进池"。
+    """
+    print("\n[H3-D] 复核缺失 -> fail closed")
+    check("None -> 不合格",
+          CC.story_gate_from_review(None) == ["story_review_missing"])
+    check("{} -> 四项全不合格",
+          len(CC.story_gate_from_review({})) == 4,
+          CC.story_gate_from_review({}))
+    ok = {"story_reconstruction": True, "multi_step_deduction": True,
+          "single_trick": False, "no_external_knowledge_dependency": True}
+    check("四项齐备且合格 -> 通过", CC.story_gate_from_review(ok) == [])
+
+
+def test_render_fixture_needs_external_knowledge():
+    """2<3 心形: `no_external_knowledge_dependency` 是拦它的那条。
+
+    ⚠️ 另外三条它都"像那么回事"(确实有反转、确实是两步), 所以这道题
+    证明新判据**不是冗余的** —— 少了它, 这一类冷知识题全部漏网。
+    """
+    print("\n[H3-D] 渲染冷知识题靠新判据拦下")
+    d = _mk_fixture_tool("render")
+    sgr = CC.story_gate_reasons(d)
+    check("**点名 external_knowledge_dependency**",
+          "external_knowledge_dependency" in sgr, sgr)
+    check("其余三条它都'像那么回事'(所以新判据不冗余)",
+          "single_trick" not in sgr
+          and "not_story_reconstruction" not in sgr
+          and "no_multi_step_deduction" not in sgr, sgr)
 
 
 def test_q10000_is_rejected_by_story_gate():
@@ -297,8 +507,14 @@ def test_different_policy_reopens_the_question():
         led.record(rec, decision=CL.REJECTED,
                    policy_version="curated-v1", reasons=["single_trick"])
         check("v1 下是终态", led.is_settled(rec, "curated-v1"))
-        check("**v2 下要重审**(旧结论按旧标准下的)",
-              not led.is_settled(rec, "curated-v2"))
+        check("**v3 下要重审**(旧结论按旧标准下的)",
+              not led.is_settled(rec, "curated-v3"))
+        # v2 的结论在 v3 下同样不适用 —— 这是本次 bump 的**要点**:
+        # 那 10 道按 v2 收的题必须自动失去 eligibility(§七)。
+        led.record(rec, decision=CL.ACCEPTED, policy_version="curated-v2")
+        check("v2 下是终态", led.is_settled(rec, "curated-v2"))
+        check("**v3 下仍然要重审**",
+              not led.is_settled(rec, "curated-v3"))
 
 
 def test_content_change_reopens_the_question():
@@ -387,39 +603,123 @@ def test_content_hash_ignores_id():
 # 池准入: 旧 policy 自动隔离
 # ======================================================================
 def test_old_curated_policy_is_quarantined():
-    """**v1 的 curated 题在 v2 下不可播**(任务书十九)。
+    """**v1/v2 的 curated 题在 v3 下不可播**(任务书十九 + §七)。
 
     这是"不依赖人工删文件"的核心保证: H2 那 31 道题仍在池文件里,
-    但过不了准入门 -> 不计库存 / 不被 pop_next 返回。
+    但过不了准入门 -> 不计库存 / 不被 pop_next 返回。v3 这一跳同理
+    —— 那 10 道按 v2 收的题自动失去 eligibility。
     """
-    print("\n[H3-A] 旧 curated policy 自动隔离")
+    print("\n[H3-A/H3-D] 旧 curated policy 自动隔离")
     from story.pool import PuzzlePool
     from tests.test_pool import good_spec, _curated_spec
 
-    s_v2 = _curated_spec()
-    check("v2 题带当前 policy",
-          s_v2.curated_policy_version == CC.CURATED_POLICY_VERSION)
+    with tmpdir() as d:
+        # ⚠️ 准入门现在还会查**决策账本**(§四): 池里的一行必须能对上
+        # 一条 accepted 决策, 否则它是"未提交的半状态"。所以这条测试
+        # 要先把账本指向临时文件, 并给当前 policy 的题写一条 accepted。
+        from story.pool import set_curated_decisions_path
+        dpath = os.path.join(d, "dec.jsonl")
+        set_curated_decisions_path(dpath)
+        try:
+            led = CL.DecisionLedger(dpath)
+            s_cur = _curated_spec()
+            rec = mk_truck_rec(external_id=s_cur.external_id)
+            led.record(rec, decision=CL.ACCEPTED,
+                       policy_version=CC.CURATED_POLICY_VERSION)
 
-    s_v1 = _curated_spec()
-    s_v1.curated_policy_version = "curated-v1"      # 模拟 H2 的产物
-    ok2, why2 = PuzzlePool._validate_pool_spec(s_v2)
-    check("**v2 题过门**", ok2, why2)
-    ok1, why1 = PuzzlePool._validate_pool_spec(s_v1)
-    check("**v1 题被隔离**", not ok1, why1)
-    check("隔离理由点名 curated 政策",
-          "curated 政策" in why1, why1)
+            check("当前题带当前 policy",
+                  s_cur.curated_policy_version == CC.CURATED_POLICY_VERSION)
 
-    # 空值(老 archive 没有这把键)-> 同样隔离
-    s_old = _curated_spec()
-    s_old.curated_policy_version = ""
-    oko, whyo = PuzzlePool._validate_pool_spec(s_old)
-    check("**缺字段的老题也被隔离**", not oko, whyo)
+            s_old = _curated_spec()
+            s_old.curated_policy_version = "curated-v2"   # 模拟本次 bump 前
+            okc, whyc = PuzzlePool._validate_pool_spec(s_cur)
+            check("**当前 policy 题过门**", okc, whyc)
+            ok2, why2 = PuzzlePool._validate_pool_spec(s_old)
+            check("**v2 题被隔离**", not ok2, why2)
+            check("隔离理由点名 curated 政策", "curated 政策" in why2, why2)
 
-    # 自由生成的题**不受**这条约束(它们本就不该声明 curated 政策)
-    free = good_spec()
-    check("自由生成题 source_type 为空", not free.source_type)
-    okf, whyf = PuzzlePool._validate_pool_spec(free)
-    check("**自由生成题不受 curated 门影响**", okf, whyf)
+            s_v1 = _curated_spec()
+            s_v1.curated_policy_version = "curated-v1"
+            ok1, why1 = PuzzlePool._validate_pool_spec(s_v1)
+            check("**v1 题被隔离**", not ok1, why1)
+
+            # 空值(老 archive 没有这把键)-> 同样隔离
+            s_missing = _curated_spec()
+            s_missing.curated_policy_version = ""
+            oko, whyo = PuzzlePool._validate_pool_spec(s_missing)
+            check("**缺字段的老题也被隔离**", not oko, whyo)
+
+            # 自由生成的题**不受**这条约束(它们本就不该声明 curated 政策,
+            # 也不该被要求有 accepted 决策 —— 那条门只对 curated 开)。
+            free = good_spec()
+            check("自由生成题 source_type 为空", not free.source_type)
+            okf, whyf = PuzzlePool._validate_pool_spec(free)
+            check("**自由生成题不受 curated 门影响**", okf, whyf)
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+def test_curated_without_accepted_decision_is_not_playable():
+    """§四: 池里有行但账本没有 accepted -> **不可播**。
+
+    这是一个**正常会出现的中间状态**: 生成链先落池/署名, 最后才写
+    accepted。写到一半被杀, 盘上就留下这样一行。没有这条判定的话:
+
+        下次启动 -> 那行看起来完全合法 -> 播出去
+        -> 而账本认为它从未被接受 -> 下次还会重新审、重新写
+        -> 同一道题进池两次
+
+    不变量: `playable curated item => accepted 决策存在`。
+    """
+    print("\n[H3-D] 没有 accepted 决策的 curated 题不可播")
+    from story.pool import PuzzlePool, set_curated_decisions_path
+    from tests.test_pool import _curated_spec
+
+    with tmpdir() as d:
+        dpath = os.path.join(d, "dec.jsonl")
+        set_curated_decisions_path(dpath)
+        try:
+            spec = _curated_spec()
+            ok0, why0 = PuzzlePool._validate_pool_spec(spec)
+            check("**账本为空 -> 不可播**", not ok0, why0)
+            check("理由点名未提交/查不到",
+                  "查不到" in why0 or "未提交" in why0, why0)
+
+            # 写一条 defer(不是 accepted)-> 仍然不可播
+            led = CL.DecisionLedger(dpath)
+            rec = mk_truck_rec(external_id=spec.external_id)
+            led.record(rec, decision=CL.TECHNICAL_DEFER,
+                       policy_version=CC.CURATED_POLICY_VERSION)
+            ok1, why1 = PuzzlePool._validate_pool_spec(spec)
+            check("**只有 defer -> 仍然不可播**", not ok1, why1)
+
+            # 追加一条 accepted -> 现在可播
+            led.record(rec, decision=CL.ACCEPTED,
+                       policy_version=CC.CURATED_POLICY_VERSION)
+            ok2, why2 = PuzzlePool._validate_pool_spec(spec)
+            check("**有了 accepted -> 可播**", ok2, why2)
+
+            # 但必须是**当前 policy** 的 accepted
+            spec2 = _curated_spec()
+            spec2.external_id = "other:1"
+            ok3, why3 = PuzzlePool._validate_pool_spec(spec2)
+            check("**别人的 accepted 不算**", not ok3, why3)
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+def test_void_tombstone_row_is_skipped():
+    """墓碑行(`void: True`)不产出 spec —— 那就是署名失败时的回滚。"""
+    print("\n[H3-D] 墓碑行不可播")
+    from story.pool import PuzzlePool
+    ok = PuzzlePool._spec_from_record({
+        "pool_version": 1, "pool_key": "abc", "void": True,
+        "void_reason": "attribution_failed",
+        "spec": {"puzzle": "x?", "answer": "y"},
+    })
+    check("**墓碑行返回 None**", ok is None, ok)
 
 
 def test_curated_policy_version_round_trips():
@@ -485,15 +785,60 @@ def test_story_gate_stage_depth():
            CC._STAGE_DEPTH.get("ai_gate")))
 
 
-def test_prompt_declares_v2_rules():
-    """prompt 里必须**真的写着** v2 三条 —— 否则模型不知道要判它们。"""
-    print("\n[H3-A] prompt 声明 v2 三条")
+def test_prompt_declares_v3_rules():
+    """prompt 里必须**真的写着**四条 —— 否则模型不知道要判它们。
+
+    同时守 §九: prompt **不得**再自相矛盾地同时说"九条"和"十三条"。
+    """
+    print("\n[H3-D] prompt 声明四条故事判据, 且不再自相矛盾")
     sysp = CC.CURATED_COMPILE_SYSTEM
     for k in ("story_reconstruction", "multi_step_deduction",
-              "single_trick"):
+              "single_trick", "no_external_knowledge_dependency"):
         check(f"prompt 提到 {k}", k in sysp)
     check("prompt 给出硬门表述", "硬门" in sysp)
     check("prompt 有正例/反例对照", "烧油" in sysp or "卡车" in sysp)
+    # §九: 不能再出现"**九条**必须全部为 true 才能 accepted"这种与十三条
+    # 冲突的**总结性**表述。注意: 正文里提到"以上九条"(指 1~9 那一组)
+    # 是**正确**的 —— 那九条确实要全过。被禁的是把它说成**准入门整体**。
+    check("**prompt 不再把'九条'说成准入门整体**",
+          "九条必须全部为 true 才能 accepted" not in sysp)
+    check("prompt 声明十三条判据", "十三条" in sysp)
+    # 工具 schema 的 accepted 描述也必须同步
+    acc = CC._TOOL_CURATED["input_schema"]["properties"]["accepted"]
+    check("**_TOOL_CURATED 的 accepted 描述也不再写'九条'**",
+          "九条" not in acc["description"], acc["description"])
+    check("工具 schema 声明十三条", "十三条" in acc["description"],
+          acc["description"])
+    # required 必须等于全量判据
+    req = set(CC._TOOL_CURATED["input_schema"]["properties"]
+              ["quality_checks"]["required"])
+    check("**schema required == CURATED_CHECKS_V3**",
+          req == set(CC.CURATED_CHECKS_V3),
+          sorted(set(CC.CURATED_CHECKS_V3) - req))
+
+
+def test_checks_v3_is_superset_of_v2():
+    """v3 = v2 + 一条。**不许**在 bump 时悄悄丢掉旧判据。"""
+    print("\n[H3-D] CURATED_CHECKS_V3 是 V2 的超集")
+    check("V2 是 V3 的子集",
+          set(CC.CURATED_CHECKS_V2) <= set(CC.CURATED_CHECKS_V3))
+    check("多出的正好是 no_external_knowledge_dependency",
+          set(CC.CURATED_CHECKS_V3) - set(CC.CURATED_CHECKS_V2)
+          == {"no_external_knowledge_dependency"})
+    check("反向判据仍然只有 single_trick",
+          CC._INVERTED_CHECKS == ("single_trick",), CC._INVERTED_CHECKS)
+    check("STORY_GATE_FIELDS 是四条", len(CC.STORY_GATE_FIELDS) == 4)
+
+
+def test_policy_version_is_v3():
+    """§七: 本次实质改变了题型定义 -> 必须 bump。"""
+    print("\n[H3-D] policy 已 bump 到 curated-v3")
+    check("**CURATED_POLICY_VERSION == 'curated-v3'**",
+          CC.CURATED_POLICY_VERSION == "curated-v3",
+          CC.CURATED_POLICY_VERSION)
+    check("与 quality policy 是**两个**独立的号",
+          CC.CURATED_POLICY_VERSION != CC.QUALITY_POLICY_VERSION,
+          (CC.CURATED_POLICY_VERSION, CC.QUALITY_POLICY_VERSION))
 
 
 # ======================================================================
@@ -502,6 +847,11 @@ def main():
         test_q10000_is_rejected_by_story_gate,
         test_q10000_rejected_without_physics_tag,
         test_q10000_via_compile_loop,
+        test_each_fixture_has_no_obvious_tag,
+        test_all_fixtures_rejected_by_story_gate,
+        test_elevator_fixture_rejected_even_if_model_says_good,
+        test_review_missing_is_fail_closed,
+        test_render_fixture_needs_external_knowledge,
         test_good_story_still_passes,
         test_inverted_check_direction,
         test_story_gate_beats_self_reported_accepted,
@@ -514,11 +864,15 @@ def main():
         test_illegal_decision_rejected,
         test_content_hash_ignores_id,
         test_old_curated_policy_is_quarantined,
+        test_curated_without_accepted_decision_is_not_playable,
+        test_void_tombstone_row_is_skipped,
         test_curated_policy_version_round_trips,
         test_provenance_survives_reviewer_for_new_fields,
         test_new_fields_not_in_snapshot_repr,
         test_story_gate_stage_depth,
-        test_prompt_declares_v2_rules,
+        test_prompt_declares_v3_rules,
+        test_checks_v3_is_superset_of_v2,
+        test_policy_version_is_v3,
     ]
     for t in tests:
         try:

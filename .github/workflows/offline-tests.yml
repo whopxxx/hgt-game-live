@@ -122,20 +122,30 @@ jobs:
       - name: 离线套件 curated_compile
         run: uv run tests/test_curated_compile.py
 
-      # Batch H3-A: **curated-v2 题型准入 + 决策账本**。
+      # Batch H3-A: **curated 题型准入 + 决策账本**。
       # 最要紧的一条是 `test_q10000_is_rejected_by_story_gate`: 那道
       # "卡车烧油变轻"的物理脑筋急转弯在 H2 的九条判据下**全部通过**,
-      # 所以拒它的必须是 v2 新增的三条故事性判据。另含四条账本语义
+      # 所以拒它的必须是新增的故事性判据。另含四条账本语义
       # (defer/interrupted 必须可重试 —— 记成 rejected 会永久吃掉
       # 一道题, 而且没有任何地方会显示丢了)。
+      #
+      # H3-D 起还守 four fixtures(q10000 / 十八楼按钮 / 吉普车车辙 /
+      # 2<3 心形) —— 它们一律**不带标签**, 证明门是按**结构**判的,
+      # 不是关键词黑名单。
       - name: 离线套件 curated_v2
         run: uv run tests/test_curated_v2.py
 
-      # Batch H3-B: **Lazy Curator** —— 后台按需审题 + 直播让路。
-      # 最要紧的两条: (a) 真人 pending / AI 玩家在途 / hint / reveal /
-      # 下一题临近 —— 任一成立都不得启动新的 LLM; (b) 技术失败记
-      # `technical_defer`(可重试)而**不是** `rejected`(终态) ——
-      # 写错方向会永久吃掉一道题, 且没有任何地方会显示丢了。
+      # Batch H3-B/D: **Lazy Curator** —— 后台按需审题 + 直播让路。
+      # 最要紧的几条:
+      #   (a) phase 白名单 —— SETTING / REVEALING / STOPPED 一律不启动,
+      #       否则出题(直播主线)会和后台审题抢网关;
+      #   (b) 技术失败记 `technical_defer`(可重试)而**不是** `rejected`
+      #       (终态) —— 写错方向会永久吃掉一道题;
+      #   (c) refill cycle —— 跌破 min 就一路补到 target, 不是在 min 停;
+      #   (d) `accepted` 是**最终 commit marker** —— 池/署名写不成时,
+      #       append-only 历史里一条 accepted 都不能出现;
+      #   (e) 装配层: curator 卡在 worker 里时 scheduler 照常推进
+      #       (H3-B 那版把 LLM 放回了 tick 线程, 心跳会停)。
       - name: 离线套件 lazy_curator
         run: uv run tests/test_lazy_curator.py
 

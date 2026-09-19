@@ -1417,6 +1417,26 @@ class RoundEngine:
                 # 于"有人在飞"。
                 "ai_player_in_flight": bool(
                     self._ai_player_ledger.detective_reservation is not None),
+                # ---- H3-D: 正式出题是否在途 ----
+                #
+                # `phase == SETTING` 的**语义**是"已经请求了谜面, 等 LLM
+                # 回调", 但只判 phase 不够: SETTING 刚开始那一瞬间也满足,
+                # 而真正的危险是"出题 worker 正占着网关"。两者用
+                # `_setting_deadline is not None` 才区分得开 —— 它在
+                # `_enter_setting_locked` 里被设上, 在 callback 成功
+                # (`:747`) 或失败重试时被清掉, 正好等价于"这一轮出题
+                # 还没落定"。
+                #
+                # 为什么必须让后台审题看到它: 出题是**直播的主线**, 它
+                # 决定观众下一秒有没有题看。后台审题再着急也只是库存。
+                # 两者同时打网关的最坏结果是出题变慢 -> 观众空等 ——
+                # 而这正是整个直播优先原则要防的那件事。
+                #
+                # 只下发布尔(与 ai_player_in_flight 同一原则): deadline /
+                # attempts / spec_key 都是内部调度状态。
+                "riddle_inflight": bool(
+                    self.phase == Phase.SETTING
+                    and self._setting_deadline is not None),
                 # ---- G1: 场景指纹 ----
                 # 新一题开始 = 生成约束环境(recent window / 配额饱和状态)
                 # 整体换了一批。补池靠它判断"我那次失败是不是发生在**别的

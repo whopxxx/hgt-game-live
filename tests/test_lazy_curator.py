@@ -36,7 +36,7 @@ from story.lazy_curator import (  # noqa: E402
 )
 from tools import curated_compiler as CC  # noqa: E402
 from tools import curated_ledger as CL  # noqa: E402
-from tools.curated_common import RawCuratedPuzzle  # noqa: E402
+from tools.curated_common import RawCuratedPuzzle, read_jsonl  # noqa: E402
 
 FAIL = [0]
 
@@ -183,9 +183,16 @@ def _mk(cfg, pool, compiler, recs, ledger, pressure):
                        clock=lambda: 0.0)
 
 
-BUSY = {"pending": 1}
-FREE = {}
-AI_BUSY = {"ai_player_in_flight": True}
+#: 空闲的**QA** —— 唯一允许后台审题的稳态。刻意带上 phase: H3-D 起
+#: phase 是**白名单**(SETTING/REVEALING/STOPPED 一律禁止), 所以
+#: "没有 phase" 与 "phase 是 SETTING" 是**同样**的拒绝。这很重要 ——
+#: 早先的 fixture 全靠压力字段判断, 于是"忘了给 phase"会让整批测试
+#: 静默走另一条分支。
+_QA = "qa"
+_REVEALED = "revealed"
+FREE = {"phase": _QA}
+BUSY = {"phase": _QA, "pending": 1}
+AI_BUSY = {"phase": _QA, "ai_player_in_flight": True}
 
 
 # ======================================================================
@@ -230,7 +237,7 @@ def test_no_start_on_hint_or_reveal_inflight():
             comp = _FakeCompiler([("accept", "")])
             led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
             lc = _mk(cfg, pool, comp, [mk_rec()], led,
-                     lambda k=key: {k: True})
+                     lambda k=key: dict(FREE, **{k: True}))
             ok, why = lc.should_start()
             check(f"{key} -> 不启动", not ok, why)
 
@@ -244,11 +251,12 @@ def test_no_start_near_next_puzzle():
         comp = _FakeCompiler([("accept", "")])
         led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
         lc = _mk(cfg, pool, comp, [mk_rec()], led,
-                 lambda: {"reveal_remaining_seconds": 5.0})
+                 lambda: dict(FREE, reveal_remaining_seconds=5.0))
         ok, why = lc.should_start()
         check("**只剩 5s -> 不启动**", not ok, why)
         lc2 = _mk(cfg, pool, comp, [mk_rec()], led,
-                  lambda: {"reveal_remaining_seconds": 30.0})
+                  lambda: dict(FREE, phase=_REVEALED,
+                               reveal_remaining_seconds=30.0))
         ok2, why2 = lc2.should_start()
         check("还剩 30s -> 可以启动", ok2, why2)
 
@@ -441,21 +449,6 @@ def test_should_continue_false_interrupts_midway():
               last.get("decision") == CL.INTERRUPTED, last)
         check("**interrupted 不是终态**",
               not led.is_settled(mk_rec(), CC.CURATED_POLICY_VERSION))
-
-    """任务书廿二-13: interrupted 的题稍后能重新审。"""
-    print("\n[H3-B] interrupted 下次会重审")
-    with tmpdir() as d:
-        cfg = _cfg(curated_min_size=100)
-        pool = _FakePool(os.path.join(d, "p.jsonl"))
-        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
-        rec = mk_rec()
-        # 第一轮: 中断
-        comp1 = _FakeCompiler([("interrupt", "before_review")])
-        lc1 = _mk(cfg, pool, comp1, [rec], led, lambda: dict(FREE))
-        lc1.step()
-        # 第二轮: 它仍然是候选
-        got = select_candidate([rec], led, CC.CURATED_POLICY_VERSION)
-        check("**第二轮仍是候选**", got is not None, got)
 
 
 # ======================================================================
@@ -789,6 +782,906 @@ def test_engine_pressure_ai_field_tracks_reservation():
 
 
 # ======================================================================
+# 8. H3-D: phase 白名单(§二)
+# ======================================================================
+def test_forbidden_phases_never_start():
+    """SETTING / REVEALING / STOPPED 一律不启动 —— **哪怕压力全为 0**。
+
+    这是 §二 的核心断言。旧实现只查压力字段, 于是
+    `SETTING + 正式 RIDDLE worker 已启动 + Lazy Curator 同时打 LLM`
+    是可能的 —— 出题是直播的**主线**, 后台审题抢它的网关会直接变成
+    "观众等下一题"。
+    """
+    print("\n[H3-D] 禁止的 phase 不启动(即使压力全 0)")
+    for ph in ("setting", "revealing", "stopped", "idle"):
+        with tmpdir() as d:
+            cfg = _cfg(curated_min_size=100)
+            pool = _FakePool(os.path.join(d, "p.jsonl"))
+            comp = _FakeCompiler([("accept", "")])
+            led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+            # ⚠️ 除了 phase **一个压力字段都没有** —— 全是 0。
+            lc = _mk(cfg, pool, comp, [mk_rec()], led,
+                     lambda p=ph: {"phase": p})
+            ok, why = lc.should_start()
+            check(f"**{ph} -> 不启动**", not ok, why)
+            check(f"{ph} 理由点名 phase", "phase" in why, why)
+            r = lc.step()
+            check(f"{ph} 一次 LLM 都没调", comp.calls == [], comp.calls)
+
+
+def test_setting_with_riddle_inflight_never_starts():
+    """`riddle_inflight` 单独也足以拦住(§二的后半条)。"""
+    print("\n[H3-D] 正式出题在途 -> 不启动")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led,
+                 lambda: dict(FREE, riddle_inflight=True))
+        ok, why = lc.should_start()
+        check("**不启动**", not ok, why)
+        check("理由点名出题", "出题" in why, why)
+
+
+def test_qa_and_revealed_are_allowed():
+    """QA 与 REVEALED 是**允许**的两个 phase —— 否则补池永不工作。"""
+    print("\n[H3-D] QA / REVEALED 允许启动")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        for ph in (_QA, _REVEALED):
+            lc = _mk(cfg, pool, comp, [mk_rec()], led,
+                     lambda p=ph: {"phase": p})
+            ok, why = lc.should_start()
+            check(f"**{ph} 允许**", ok, why)
+
+
+def test_phase_accepts_enum_object_too():
+    """`pressure()` 给的是 Phase **枚举**, 测试假件给字符串 —— 都要认。
+
+    不认的后果很隐蔽: 生产侧传枚举 -> `_phase_ok` 判不出来 ->
+    后台审题**永远不启动**, 而所有测试(用字符串)全绿。
+    """
+    print("\n[H3-D] phase 枚举与字符串都认")
+    from story.state import Phase
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led,
+                 lambda: {"phase": Phase.QA})
+        ok, why = lc.should_start()
+        check("**Phase.QA 枚举被认**", ok, why)
+        lc2 = _mk(cfg, pool, comp, [mk_rec()], led,
+                  lambda: {"phase": Phase.SETTING})
+        ok2, why2 = lc2.should_start()
+        check("**Phase.SETTING 枚举被禁**", not ok2, why2)
+
+
+def test_pressure_has_riddle_inflight_bool():
+    """Engine.pressure() 必须公开 riddle_inflight, 且**只**是布尔。"""
+    print("\n[H3-D] pressure 暴露 riddle_inflight")
+    from story.engine import RoundEngine
+    from story.config import Config
+    cfg = Config(sim_path="x", no_llm=True)
+    eng = RoundEngine(cfg)
+    p = eng.pressure()
+    check("**有 riddle_inflight**", "riddle_inflight" in p, sorted(p))
+    check("是布尔", isinstance(p.get("riddle_inflight"), bool),
+          type(p.get("riddle_inflight")))
+    for bad in ("setting_deadline", "setting_attempts", "spec_key"):
+        check(f"**不含 {bad}**", bad not in p, sorted(p))
+
+
+# ======================================================================
+# 9. H3-D: refill cycle(§三)
+# ======================================================================
+def test_refill_cycle_goes_all_the_way_to_target():
+    """**3 -> 4 -> 5 -> ... -> 10 一路补到 target**, 不是在 min 就停。
+
+    这是 §三 的核心: 旧语义是"跌破 4 补一两道, 回到 4 就停", 那会让
+    库存长期钉在低水位 —— 而低水位正是最危险的(任何一次审题失败都
+    直接变成"下一题现场生成", 观众干等)。
+    """
+    print("\n[H3-D] refill cycle 一路补到 target")
+    with tmpdir() as d:
+        cfg = _cfg(curated_target_size=10, curated_min_size=4,
+                   curated_playable_min=2, curated_max_size=20)
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        comp = _FakeCompiler([])
+
+        def mk(stock, playable=9):
+            return _mk(cfg, _FakePool(os.path.join(d, "p.jsonl"),
+                                      stock=stock, playable=playable),
+                       comp, [], led, lambda: dict(FREE))
+
+        # 从未进入 refill cycle: stock=8 在 min 之上 -> 不启动
+        lc_fresh = mk(8)
+        check("**从未 refill: stock=8 -> 不启动**",
+              not lc_fresh.needs_work())
+        check("也还没进入 cycle", not lc_fresh._refilling)
+
+        # 跌破 min -> 进入 cycle
+        lc = mk(3)
+        check("stock=3 -> 启动", lc.needs_work())
+        check("**进入 refill cycle**", lc._refilling)
+        # 现在库存涨到 4/5/.../9 —— 只要还没到 target 就必须继续补
+        for s in range(4, 10):
+            lc._stock = lambda s=s, _lc=lc: (s, 9)
+            check(f"cycle 内 stock={s} -> 继续补", lc.needs_work())
+            check(f"stock={s} 仍在 cycle", lc._refilling)
+        lc._stock = lambda: (10, 9)
+        check("stock=10 (>= target) -> 停", not lc.needs_work())
+        check("**退出 refill cycle**", not lc._refilling)
+
+
+def test_playable_below_min_enters_refill_cycle():
+    """`playable < playable_min` 也触发一轮 refill cycle。
+
+    它与 stock 那个条件是**两个问题**: 池里可能堆着 8 道但全被当前
+    窗口挡住 -> playable=0, 而下一题马上要上。
+    """
+    print("\n[H3-D] playable 跌破线也进入 cycle")
+    with tmpdir() as d:
+        cfg = _cfg(curated_target_size=10, curated_min_size=4,
+                   curated_playable_min=2, curated_max_size=20)
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        comp = _FakeCompiler([])
+        lc = _mk(cfg, _FakePool(os.path.join(d, "p.jsonl"),
+                                stock=8, playable=1),
+                 comp, [], led, lambda: dict(FREE))
+        check("stock=8 但 playable=1 -> 启动", lc.needs_work())
+        check("**进入 refill cycle**", lc._refilling)
+        # playable 恢复但 stock 还没到 target -> 继续补
+        lc._stock = lambda: (8, 9)
+        check("**playable 恢复了但仍要补到 target**", lc.needs_work())
+
+
+def test_max_size_is_a_hard_cap_even_while_refilling():
+    """`curated_max_size` 是**绝对**硬上限, 不能被 refilling 绕过。"""
+    print("\n[H3-D] max_size 硬上限不被 refilling 绕过")
+    with tmpdir() as d:
+        cfg = _cfg(curated_target_size=10, curated_min_size=4,
+                   curated_playable_min=2, curated_max_size=20)
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        comp = _FakeCompiler([])
+        lc = _mk(cfg, _FakePool(os.path.join(d, "p.jsonl"), stock=3),
+                 comp, [], led, lambda: dict(FREE))
+        check("先进入 cycle", lc.needs_work() and lc._refilling)
+        lc._stock = lambda: (25, 25)
+        check("**到 max -> 不补**", not lc.needs_work())
+        check("**且退出 cycle**", not lc._refilling)
+
+
+def test_live_pressure_does_not_clear_refill_intent():
+    """直播压力只**暂停** worker, 不清除 refill 意图。
+
+    §三 明确: "不要因为一次真人提问就永久清除 refill intent"。
+    清掉的后果是每次有人提问就把补水计划归零 —— 而观众提问是
+    **常态**, 于是补池永远做不成。
+    """
+    print("\n[H3-D] 压力不清除 refill 意图")
+    with tmpdir() as d:
+        cfg = _cfg(curated_target_size=10, curated_min_size=4,
+                   curated_playable_min=2, curated_max_size=20)
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        busy = {"phase": _QA, "pending": 1}
+        lc = _mk(cfg, _FakePool(os.path.join(d, "p.jsonl"), stock=3),
+                 comp, [mk_rec()], led, lambda: dict(busy))
+        check("忙 -> 不启动", not lc.should_start()[0])
+        check("**但仍然进入了 refill cycle**", lc._refilling)
+        # 压力过去 -> 仍然要补(意图没丢)
+        lc._pressure = lambda: dict(FREE)
+        ok, why = lc.should_start()
+        check("**压力过去后仍然要补**", ok, why)
+
+
+# ======================================================================
+# 10. H3-D: 非阻塞调度(§一)
+# ======================================================================
+def test_on_tick_returns_fast_while_worker_blocks():
+    """**§一 的核心断言**: worker 卡在 LLM 里时, `on_tick` 立刻返回。
+
+    这条测的是**调度层**, 不是 `step()` 本身 —— H3-B 那版把 `step()`
+    放进 scheduler 线程, 于是 compile_one 一跑十几秒, tick 定时 /
+    hint deadline / reveal deadline / 下一题 deadline / push 全部
+    被拖住。那不是"这一拍慢一点", 是**心跳停了**。
+    """
+    print("\n[H3-D] on_tick 在 worker 阻塞时立刻返回")
+    import threading
+    import time as _time
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        release = threading.Event()
+
+        class _BlockingCompiler:
+            """模拟一个卡住的 LLM 调用。"""
+
+            def __init__(self):
+                self.entered = threading.Event()
+                self.calls = []
+
+            def compile_one(self, rec, **kw):
+                self.calls.append(getattr(rec, "external_id", ""))
+                self.entered.set()
+                release.wait(10)          # 卡住, 直到测试放行
+                return None, {"external_id": getattr(rec, "external_id", ""),
+                              "accepted": False, "stage": "ai_gate",
+                              "reject_reasons": ["x"]}
+
+        comp = _BlockingCompiler()
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        try:
+            t0 = _time.monotonic()
+            first = lc.on_tick()
+            dt = _time.monotonic() - t0
+            check("**第一次 on_tick 提交了活**", first["submitted"], first)
+            check(f"**立刻返回**({dt*1000:.1f}ms < 500ms)", dt < 0.5, dt)
+            check("worker 真的开始跑了", comp.entered.wait(5))
+            # worker 卡着的时候, 后续 on_tick 也必须立刻返回
+            t1 = _time.monotonic()
+            second = lc.on_tick()
+            dt2 = _time.monotonic() - t1
+            check("**worker 卡住时 on_tick 仍然立刻返回**", dt2 < 0.5, dt2)
+            check("**不能重复提交**(single-flight)",
+                  not second["submitted"], second)
+        finally:
+            release.set()
+            check("**worker 最终收尾**", lc.wait_idle(10))
+            lc.shutdown(wait=True)
+
+
+def test_on_tick_drops_submit_when_busy():
+    """single-flight: 已有活时**丢弃**新提交, 不排队。"""
+    print("\n[H3-D] 有活时不排队")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        lc._busy = True                      # 模拟"已有一个在跑"
+        r = lc.on_tick()
+        check("**没有提交**", not r["submitted"], r)
+        check("理由点名 worker", "worker" in r["reason"], r)
+        check("一次 LLM 都没调", comp.calls == [], comp.calls)
+
+
+def test_worker_survives_compiler_exception():
+    """worker 里抛异常**不能**让 `_busy` 永远卡在 True。"""
+    print("\n[H3-D] worker 异常后仍然可再提交")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+
+        class _Boom:
+            def __init__(self):
+                self.n = 0
+
+            def compile_one(self, rec, **kw):
+                self.n += 1
+                raise RuntimeError("kaboom")
+
+        comp = _Boom()
+        lc = _mk(cfg, pool, comp, [mk_rec(eid="pse:q:1"),
+                                   mk_rec(eid="pse:q:2")],
+                 led, lambda: dict(FREE))
+        try:
+            lc.on_tick()
+            check("**异常后 worker 收尾**", lc.wait_idle(10))
+            check("**`_busy` 没有卡住**", not lc._busy)
+            # 还能再提交(说明没有死锁)
+            lc5 = lc
+            r2 = lc5.on_tick()
+            check("**还能再提交**", r2["submitted"], r2)
+            lc5.wait_idle(10)
+        finally:
+            lc.shutdown(wait=True)
+
+
+def test_step_is_still_synchronous_for_cli():
+    """CLI 仍然用**同步** `step()` —— 它是离线批处理, 不需要 worker。
+
+    这条守的是"重构没有把同步路径弄丢": 预热 CLI 直接调 `step()`,
+    若它变成必须走 worker 才能干活, 预热就会静默变成 no-op。
+    """
+    print("\n[H3-D] step() 仍然同步可用(CLI 路径)")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        r = lc.step()                        # 直接调, 不等 worker
+        check("**同步跑完了**", r["accepted"] == 1, r)
+        check("确实调了 LLM", len(comp.calls) == 1, comp.calls)
+
+
+def test_tried_is_shared_across_ticks():
+    """`_tried` 必须**跨 tick** 累积 —— 否则 defer 的题每拍被重审一次。
+
+    这是 H3-D 把 `tried` 从 step 局部变量改成实例状态的**唯一理由**:
+    worker 之后, 每次 on_tick 都是一次独立的 `step()` 调用, 局部 set
+    会在每次提交时重置。
+    """
+    print("\n[H3-D] _tried 跨 tick 累积")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        recs = [mk_rec(eid="pse:q:1"), mk_rec(eid="pse:q:2")]
+        comp = _FakeCompiler([("defer", "compile_call"),
+                              ("defer", "compile_call")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, recs, led, lambda: dict(FREE))
+        lc.step(max_candidates=1)            # 第一次: 碰 q:1
+        lc.step(max_candidates=1)            # 第二次: 必须碰 q:2
+        check("**两次碰到的是不同的题**",
+              len({c["external_id"] for c in comp.calls}) == 2,
+              [c["external_id"] for c in comp.calls])
+        check("各只调一次", len(comp.calls) == 2, len(comp.calls))
+
+
+def test_status_exposes_refilling():
+    """`refilling` 必须出现在 status 里 —— 否则"补池怎么没动静"无从解释。"""
+    print("\n[H3-D] status 暴露 refilling")
+    with tmpdir() as d:
+        cfg = _cfg(curated_target_size=10, curated_min_size=4,
+                   curated_playable_min=2)
+        pool = _FakePool(os.path.join(d, "p.jsonl"), stock=3, playable=3)
+        comp = _FakeCompiler([])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [], led, lambda: dict(FREE))
+        check("初始未 refill", lc.status().get("refilling") is False)
+        lc.needs_work()                      # 触发进入 cycle
+        st = lc.status()
+        check("**status 里 refilling=True**", st.get("refilling") is True, st)
+        check("有 target/min", "target" in st and "min" in st, sorted(st))
+
+
+# ======================================================================
+# 11. H3-D: accepted 是最终 commit marker(§四)
+# ======================================================================
+def _hist(led, rec, policy_version):
+    """账本里这条记录**全部**历史行(不只是最后一条)。
+
+    §四 明确要求: 断言不能只看 `ledger.last(...)`, 必须查**整个
+    append-only 历史** —— "池写失败 -> 该 key 从未出现 accepted 行"。
+    """
+    from tools.curated_ledger import content_hash_of, decision_key
+    k = decision_key(getattr(rec, "external_id", ""), content_hash_of(rec),
+                     policy_version)
+    out = []
+    for row in led.rows:
+        rowk = decision_key(row.get("external_id", ""),
+                            row.get("content_hash", ""),
+                            row.get("policy_version", ""))
+        if rowk == k:
+            out.append(row)
+    return out
+
+
+def test_pool_write_failure_leaves_no_accepted_row_in_history():
+    """§四: 池写失败 -> 该 key 在**整个历史**里一条 accepted 都没有。"""
+    print("\n[H3-D] 池写失败 -> 历史里从无 accepted")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        bad = os.path.join(d, "afile")
+        with open(bad, "w") as f:
+            f.write("x")
+        pool = _FakePool(os.path.join(bad, "sub", "curated.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        r = lc.step()
+        check("没有 accepted", r["accepted"] == 0, r)
+        check("记成 technical_defer", r["technical_defer"] == 1, r)
+        hist = _hist(led, mk_rec(), CC.CURATED_POLICY_VERSION)
+        check("**历史里没有任何 accepted 行**",
+              all(h.get("decision") != CL.ACCEPTED for h in hist), hist)
+        check("历史里确实有 defer 行",
+              any(h.get("decision") == CL.TECHNICAL_DEFER for h in hist), hist)
+        check("stage 点名 pool_write",
+              any("pool_write" in str(h.get("stage")) for h in hist), hist)
+        check("下次仍是候选",
+              select_candidate([mk_rec()], led,
+                               CC.CURATED_POLICY_VERSION) is not None)
+
+
+def test_attribution_write_failure_leaves_no_accepted_and_no_live_item():
+    """§四: 署名写失败 -> **不能** accepted, 且不留 active playable 孤儿。
+
+    这是原任务**缺掉**的那条真实测试。旧实现署名失败时只打一条 ERROR
+    然后照常 accepted —— 那道题会带着"没有署名"的状态播出去。那不是
+    归档完整性问题, 是**版权**问题。
+    """
+    print("\n[H3-D] 署名写失败 -> 无 accepted + 无活孤儿")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool_path = os.path.join(d, "curated.jsonl")
+        # 让署名路径**不可能**写成功
+        bad = os.path.join(d, "blk")
+        with open(bad, "w") as f:
+            f.write("x")
+        cfg.attributions_path = os.path.join(bad, "sub", "ATTR.jsonl")
+        pool = _FakePool(pool_path)
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        r = lc.step()
+        check("**没有 accepted**", r["accepted"] == 0, r)
+        check("记成 technical_defer", r["technical_defer"] == 1, r)
+        hist = _hist(led, mk_rec(), CC.CURATED_POLICY_VERSION)
+        check("**历史里没有任何 accepted 行**",
+              all(h.get("decision") != CL.ACCEPTED for h in hist), hist)
+        check("**下次仍是候选**(可重试)",
+              select_candidate([mk_rec()], led,
+                               CC.CURATED_POLICY_VERSION) is not None)
+        # 池里那一行必须**不可播**: 要么被墓碑作废, 要么没有 accepted 决策
+        from story.pool import PuzzlePool
+        rows = [r_ for r_ in read_jsonl(pool_path)] if os.path.exists(
+            pool_path) else []
+        voided = PuzzlePool._voided_keys(rows)
+        live = []
+        for i, row in enumerate(rows):
+            spec = PuzzlePool._spec_from_record(row, voided, i)
+            if spec is None:
+                continue               # 墓碑/被作废 -> 不可播
+            ok, _why = PuzzlePool._validate_pool_spec(spec)
+            if ok:
+                live.append(spec)
+        check("**没有 active playable 的无署名题**", live == [], live)
+
+
+def test_retry_after_partial_failure_no_duplicates():
+    """§四: 部分失败后重试 -> **不能**产生重复的 active pool item。
+
+    场景: 第一次署名失败(池里留了一行 + 墓碑), 第二次重试成功。
+    最终必须**恰好一道**可播, 而不是两道(池里有孤儿 + 新的那道)。
+    """
+    print("\n[H3-D] 部分失败后重试不产生重复")
+    from story.pool import PuzzlePool
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool_path = os.path.join(d, "curated.jsonl")
+        attr_path = os.path.join(d, "ATTR.jsonl")
+        bad = os.path.join(d, "blk")
+        with open(bad, "w") as f:
+            f.write("x")
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        rec = mk_rec()
+
+        # ---- 第一次: 署名写不进去 -> 池里留一行 + 墓碑 ----
+        cfg.attributions_path = os.path.join(bad, "sub", "ATTR.jsonl")
+        pool = _FakePool(pool_path)
+        lc = _mk(cfg, pool, _FakeCompiler([("accept", "")]),
+                 [rec], led, lambda: dict(FREE))
+        r1 = lc.step()
+        check("第一次没成功", r1["accepted"] == 0, r1)
+
+        # ---- 第二次: 路径正常了 -> 这次应当成功 ----
+        cfg.attributions_path = attr_path
+        # 账本要指向同一个(它是**最终** commit marker)
+        lc2 = _mk(cfg, pool, _FakeCompiler([("accept", "")]),
+                  [rec], led, lambda: dict(FREE))
+        r2 = lc2.step()
+        check("第二次成功", r2["accepted"] == 1, r2)
+
+        # ---- 关键: 池里**只剩一行**有效记录, 恰好一份署名 ----
+        #
+        # ⚠️ 这里断的是**池记录层**, 不是"validate_spec 过得了" ——
+        # 本轮用的 `_FakeCompiler` 产出的 spec 刻意极简(puzzle="x?"),
+        # 本来就不该过结构硬门。要验的是**去重**这件事: 孤儿行必须被
+        # 墓碑按位置作废, 否则同一道题会进池两次。
+        from story.pool import set_curated_decisions_path
+        set_curated_decisions_path(led.path)
+        try:
+            rows = read_jsonl(pool_path)
+            voided = PuzzlePool._voided_keys(rows)
+            check("有墓碑", bool(voided), voided)
+            specs = []
+            for i, row in enumerate(rows):
+                spec = PuzzlePool._spec_from_record(row, voided, i)
+                if spec is not None:
+                    specs.append((i, spec))
+            check("**池里只剩一行有效记录**(孤儿被按位置作废)",
+                  len(specs) == 1, [(i, s.external_id) for i, s in specs])
+            check("**剩下的是重试的那一行**",
+                  bool(specs) and specs[0][0] == len(rows) - 1,
+                  [i for i, _ in specs])
+            attrs = read_jsonl(attr_path)
+            check("**恰好一份署名**", len(attrs) == 1, len(attrs))
+            hist = _hist(led, rec, CC.CURATED_POLICY_VERSION)
+            acc = [h for h in hist if h.get("decision") == CL.ACCEPTED]
+            check("**恰好一条 accepted 决策**", len(acc) == 1, len(acc))
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+def test_accepted_decision_is_written_after_side_effects():
+    """§四 的顺序断言: accepted **必须**在 pool/署名之后写。
+
+    用一个记录调用顺序的探针来验 —— 这是"顺序"这件事唯一可靠的
+    测法(读源码字符串会随注释变动而脆)。
+    """
+    print("\n[H3-D] accepted 决策写在副作用之后")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool_path = os.path.join(d, "curated.jsonl")
+        attr_path = os.path.join(d, "ATTR.jsonl")
+        cfg.attributions_path = attr_path
+        pool = _FakePool(pool_path)
+        comp = _FakeCompiler([("accept", "")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        order = []
+        orig_record = led.record
+
+        def spy_record(rec, *, decision, **kw):
+            order.append(("ledger", decision))
+            return orig_record(rec, decision=decision, **kw)
+
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        lc.ledger.record = spy_record
+        # 也让文件写入顺序可见
+        import story.lazy_curator as LC
+        orig_append = LC._append_jsonl
+
+        def spy_append(path, rec_):
+            tag = "attr" if path == attr_path else (
+                "pool" if path == pool_path else "other")
+            order.append((tag, rec_.get("void") and "void" or "row"))
+            return orig_append(path, rec_)
+
+        LC._append_jsonl = spy_append
+        try:
+            r = lc.step()
+            check("accepted=1", r["accepted"] == 1, r)
+        finally:
+            LC._append_jsonl = orig_append
+        kinds = [o[0] for o in order]
+        check("**pool 在 accepted 之前**",
+              kinds.index("pool") < kinds.index("ledger"), order)
+        check("**attr 在 accepted 之前**",
+              kinds.index("attr") < kinds.index("ledger"), order)
+        check("accepted 是**最后**一条 ledger 记录",
+              [o for o in order if o[0] == "ledger"][-1][1] == CL.ACCEPTED,
+              order)
+        check("没有墓碑(这次没失败)",
+              not any(o[0] == "pool" and o[1] == "void" for o in order), order)
+
+
+def test_only_accepted_requires_side_effects():
+    """非 accepted 的三态**立刻**记 —— 它们不需要等副作用。"""
+    print("\n[H3-D] 非 accepted 立刻记账")
+    for kind, stage, want in (("reject", "ai_gate", CL.REJECTED),
+                              ("defer", "compile_call", CL.TECHNICAL_DEFER)):
+        with tmpdir() as d:
+            cfg = _cfg(curated_min_size=100)
+            pool = _FakePool(os.path.join(d, "p.jsonl"))
+            comp = _FakeCompiler([(kind, stage)])
+            led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+            lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+            lc.step()
+            last = led.last(mk_rec(), CC.CURATED_POLICY_VERSION)
+            check(f"{kind} -> 账本写 {want}",
+                  last.get("decision") == want, last)
+
+
+# ======================================================================
+# 12. H3-D: CLI eligibility(§八)
+# ======================================================================
+def test_prewarm_stock_uses_live_policy_eligibility():
+    """§八: 池里 10 条 v2 + 2 条 v3, 当前 policy=v3 -> stock 必须是 **2**。
+
+    旧实现按**行数**数, 于是 bump 之后 CLI 会报 stock=10 而
+    live 真正能播的只有 2 —— "预热跑完了, 直播一看库存还是空的"。
+    """
+    print("\n[H3-D] prewarm stock 按 live policy 语义数")
+    import json as _json
+    from tools.compile_curated import _FakePoolForPrewarm
+    from tests.test_pool import _curated_spec
+    from story.pool import set_curated_decisions_path
+
+    with tmpdir() as d:
+        p = os.path.join(d, "pool.jsonl")
+        dpath = os.path.join(d, "dec.jsonl")
+        set_curated_decisions_path(dpath)
+        try:
+            led = CL.DecisionLedger(dpath)
+            rows = []
+            # ⚠️ 刻意**不改** spec 的谜面: `_curated_spec()` 的 fair_clue
+            # 逐字引用它, 改了字就会过不了 `validate_curated`(那正是
+            # "fair_clue 必须逐字来自谜面"那条硬门在起作用), 于是这条
+            # 测试会变成在测别的东西。区分新旧只用 policy + external_id。
+            for i in range(10):
+                s = _curated_spec()
+                s.external_id = f"old:{i}"
+                s.curated_policy_version = "curated-v2"
+                rows.append({"pool_version": 1, "pool_key": f"k_old_{i}",
+                             "added_at": 0, "spec": s.to_archive()})
+            for i in range(2):
+                s = _curated_spec()
+                s.external_id = f"new:{i}"
+                s.curated_policy_version = CC.CURATED_POLICY_VERSION
+                rows.append({"pool_version": 1, "pool_key": f"k_new_{i}",
+                             "added_at": 0, "spec": s.to_archive()})
+                led.record(mk_rec(external_id=f"new:{i}"),
+                           decision=CL.ACCEPTED,
+                           policy_version=CC.CURATED_POLICY_VERSION)
+            with open(p, "w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+
+            pool = _FakePoolForPrewarm(p)
+            check("**stock 是 2, 不是 12**", pool.stock_count() == 2,
+                  pool.stock_count())
+            check("**playable 也是 2**", pool.playable_count() == 2,
+                  pool.playable_count())
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+# ======================================================================
+# 13. H3-D: Director 装配层(§一 的"必须测装配层")
+# ======================================================================
+def test_scheduler_does_not_block_on_curator():
+    """**§一 的装配层断言**: scheduler 调的是**真** `LazyCurator` 时,
+    即使它的 worker 正卡在 LLM 里, 循环也照样推进。
+
+    为什么必须在**装配层**测: `test_on_tick_returns_fast_while_worker_blocks`
+    只证明 `on_tick` 自身快。但真正会退回"心跳停了"的写法是把
+    `step()` 塞进 `_scheduler` —— 那是**装配层的错误**, 单测
+    LazyCurator 永远发现不了。
+
+    所以这里装一个**真的** `LazyCurator`(带真的 worker), 让它的
+    compiler 卡住, 然后跑 scheduler 并量 tick 间隔。
+
+    ## 为什么不能用"假的慢 curator"来测
+
+    早先我写了一个 `on_tick` 故意 sleep 的假件, 然后断言 scheduler
+    不被拖 —— 那**必然失败**, 而且失败得有道理: scheduler 是同步调用
+    `on_tick` 的, 假件自己慢, 拖住它就是正确行为。
+
+    真正的不变量是**契约**: `on_tick` 不许慢(它只做判断 + 提交)。
+    所以这条测试要用**真件**来验这个契约在装配层成立。
+    """
+    print("\n[H3-D] 装配层: 真 curator 卡在 worker 里时 tick 照常推进")
+    import threading as _th
+    import time as _time
+    from director import Director
+    with tmpdir() as d:
+        cfg = _cfg_for_director(d)
+        dr = Director(cfg)
+        cfg.curated_min_size = 100          # 强制"库存不足" -> 会想开工
+        cfg.curated_background_enabled = True   # 见 `_cfg_for_director`
+
+        release = _th.Event()
+        entered = _th.Event()
+
+        class _BlockingCompiler:
+            def __init__(self):
+                self.calls = 0
+
+            def compile_one(self, rec, **kw):
+                self.calls += 1
+                entered.set()
+                release.wait(30)             # 卡住, 直到测试放行
+                return None, {"external_id": "x", "accepted": False,
+                              "stage": "ai_gate", "reject_reasons": ["x"]}
+
+        comp = _BlockingCompiler()
+        lc = LazyCurator(cfg, _FakePool(os.path.join(d, "p.jsonl")), comp,
+                         [mk_rec(eid=f"pse:q:{i}") for i in range(20)],
+                         CL.DecisionLedger(os.path.join(d, "dec.jsonl")),
+                         lambda: dict(FREE), clock=lambda: 0.0)
+        dr._lazy_curator = lc
+        # ⚠️ 必须先把引擎推进到 **QA**: §二 的 phase 白名单禁止在 IDLE /
+        # SETTING 开工。不 start 的话 curator 一次都不会被启动, 这条
+        # 测试就变成在测"什么都没发生"。
+        #
+        # 走 `dr.engine.submit_riddle` 的**真**路径(与 test_pool 的
+        # `_inline_riddle` 同一个做法), 而不是自己拼一个 action ——
+        # payload 的形状由引擎定义, 手工拼的那份会随它漂移。
+        from tests.test_pool import _inline_riddle
+        dr.engine.start()
+        _inline_riddle(dr)
+
+        ticks = {"n": 0, "gaps": []}
+        real_push = dr.push
+
+        def counting_push():
+            ticks["n"] += 1
+            if ticks["n"] >= 4:
+                dr._stop.set()
+            return real_push()
+
+        dr.push = counting_push
+        from story.ingest import ChatEvent
+        for i in range(4):
+            dr.inbox.put(ChatEvent(user_id=f"u{i}", user_name="u",
+                                   content="hi", ts=0.0))
+        t0 = _time.monotonic()
+        try:
+            dr._scheduler()
+        finally:
+            elapsed = _time.monotonic() - t0
+            release.set()
+            lc.wait_idle(10)
+            lc.shutdown(wait=True)
+        check("worker 真的开始跑了", entered.is_set(), comp.calls)
+        check(f"**调度没有停摆**({ticks['n']} 拍 / {elapsed:.2f}s)",
+              ticks["n"] >= 3, ticks["n"])
+        # 若 on_tick 走了同步 step(), 这里会等于 worker 的阻塞时间。
+        check(f"**总耗时远小于 worker 的卡住时间**(实际 {elapsed:.2f}s)",
+              elapsed < 2.0, f"{elapsed:.2f}s / {ticks['n']} 拍")
+        check("**只提交了一个 job**(single-flight)", comp.calls == 1,
+              comp.calls)
+
+
+def test_on_tick_is_non_blocking_by_contract():
+    """`on_tick` 的**契约**断言: 真实实现在 worker 忙时立刻返回。
+
+    这一条与 `test_on_tick_returns_fast_while_worker_blocks` 互补 ——
+    那条测"跑起来之后", 这条测"还没跑起来时提交的那一下"。
+    """
+    print("\n[H3-D] on_tick 契约: 立刻返回")
+    import time as _time
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+
+        class _Blocking:
+            def compile_one(self, rec, **kw):
+                _time.sleep(3)
+                return None, {"external_id": "x", "accepted": False,
+                              "stage": "ai_gate", "reject_reasons": ["x"]}
+
+        lc = _mk(cfg, pool, _Blocking(), [mk_rec()], led,
+                 lambda: dict(FREE))
+        try:
+            t0 = _time.monotonic()
+            r = lc.on_tick()
+            dt = _time.monotonic() - t0
+            check("提交成功", r["submitted"], r)
+            check(f"**提交本身立刻返回**({dt*1000:.0f}ms)", dt < 0.3, dt)
+        finally:
+            lc.wait_idle(10)
+            lc.shutdown(wait=True)
+
+
+def test_scheduler_uses_on_tick_not_step():
+    """scheduler **只能**调 `on_tick` —— 调 `step` 就是同步跑 LLM。
+
+    这条是防回归的硬断言: 把 `step` 的名字改回调度路径会立刻变红。
+    """
+    print("\n[H3-D] 装配层: scheduler 调的是 on_tick")
+    import threading as _th
+    import inspect
+    from director import Director
+    src = inspect.getsource(Director._scheduler)
+    check("**scheduler 里有 on_tick**", "on_tick" in src)
+    check("**scheduler 里没有 lazy_curator.step**",
+          "_lazy_curator.step" not in src, src[:200])
+
+    with tmpdir() as d:
+        cfg = _cfg_for_director(d)
+        dr = Director(cfg)
+        calls = {"tick": 0, "step": 0}
+
+        class _Rec:
+            def on_tick(self, **kw):
+                calls["tick"] += 1
+                return {"submitted": False, "reason": ""}
+
+            def step(self, **kw):
+                calls["step"] += 1
+                return {}
+
+            def status(self):
+                return {"candidates": 0, "decided": 0, "accepted": 0,
+                        "rejected": 0, "stock": 0, "playable": 0,
+                        "target": 10, "min": 4, "refilling": False,
+                        "tried": 0}
+
+            def shutdown(self, **kw):
+                pass
+
+        dr._lazy_curator = _Rec()
+        orig_wait = dr._stop.wait
+
+        def _wait_once(timeout=None):
+            dr._stop.set()
+            return True
+
+        dr._stop.wait = _wait_once
+        try:
+            dr._scheduler()
+        finally:
+            dr._stop.wait = orig_wait
+        check("**每拍调 on_tick**", calls["tick"] >= 1, calls)
+        check("**一次都没调 step**", calls["step"] == 0, calls)
+
+
+def test_director_curator_off_scheduler_has_no_thread_leak():
+    """`on_tick` 提交的 worker 是**有界**的(最多一个)。
+
+    反复 on_tick 之后线程数不能无限涨 —— §一 明确"不要建无界线程"。
+    """
+    print("\n[H3-D] worker 线程有界")
+    import threading as _th
+    import time as _time
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+
+        class _Slow:
+            def __init__(self):
+                self.entered = _th.Event()
+                self.n = 0
+
+            def compile_one(self, rec, **kw):
+                self.n += 1
+                self.entered.set()
+                _time.sleep(0.4)
+                return None, {"external_id": "x", "accepted": False,
+                              "stage": "ai_gate", "reject_reasons": ["x"]}
+
+        comp = _Slow()
+        lc = _mk(cfg, pool, comp, [mk_rec(eid=f"pse:q:{i}") for i in range(30)],
+                 led, lambda: dict(FREE))
+        before = _th.active_count()
+        try:
+            lc.on_tick()
+            comp.entered.wait(5)
+            for _ in range(20):
+                lc.on_tick()
+            after = _th.active_count()
+            check(f"**线程数没失控**(+{after - before})", after - before <= 2,
+                  (before, after))
+            check("**只跑了一个 job**(没有并发编译)", comp.n <= 2, comp.n)
+        finally:
+            lc.wait_idle(10)
+            lc.shutdown(wait=True)
+
+
+def _cfg_for_director(tmp):
+    """装配层测试用的 Config: **所有路径都在临时目录**。
+
+    复制 `test_pool.mkcfg` 的关键隔离项 —— 不隔离的话, 这些用例的
+    结果会取决于本机 `data/` 下有没有真实文件(同一份代码两种结果)。
+    `curated_background_enabled=False` 让 Director 建不出真 curator,
+    装配层测试自己塞假的进去。
+    """
+    from story.config import Config
+    return Config(
+        sim_path="x", no_llm=True,
+        pool_enabled=True,
+        pool_path=os.path.join(tmp, "pool.jsonl"),
+        pool_used_path=os.path.join(tmp, "used.jsonl"),
+        curated_pool_path=os.path.join(tmp, "curated.jsonl"),
+        curated_used_path=os.path.join(tmp, "curated_used.jsonl"),
+        prefer_curated=False,
+        #: Director 侧不建真 curator(装配层测试自己塞假的)。
+        #: ⚠️ 但 `LazyCurator` 自己会读这个开关 —— 塞进去的那个实例
+        #: 必须**再打开**它, 否则 `should_start` 会一直说"已关闭"。
+        curated_background_enabled=False,
+        out_path=os.path.join(tmp, "out.jsonl"),
+        puzzle_out_path=os.path.join(tmp, "puzzle.jsonl"),
+    )
+
+
+# ======================================================================
 def main():
     tests = [
         test_no_start_when_human_pending,
@@ -820,6 +1713,32 @@ def main():
         test_engine_pressure_exposes_ai_player,
         test_engine_pressure_ai_field_is_bool_and_no_secrets,
         test_engine_pressure_ai_field_tracks_reservation,
+        # ---- H3-D ----
+        test_forbidden_phases_never_start,
+        test_setting_with_riddle_inflight_never_starts,
+        test_qa_and_revealed_are_allowed,
+        test_phase_accepts_enum_object_too,
+        test_pressure_has_riddle_inflight_bool,
+        test_refill_cycle_goes_all_the_way_to_target,
+        test_playable_below_min_enters_refill_cycle,
+        test_max_size_is_a_hard_cap_even_while_refilling,
+        test_live_pressure_does_not_clear_refill_intent,
+        test_on_tick_returns_fast_while_worker_blocks,
+        test_on_tick_drops_submit_when_busy,
+        test_worker_survives_compiler_exception,
+        test_step_is_still_synchronous_for_cli,
+        test_tried_is_shared_across_ticks,
+        test_status_exposes_refilling,
+        test_pool_write_failure_leaves_no_accepted_row_in_history,
+        test_attribution_write_failure_leaves_no_accepted_and_no_live_item,
+        test_retry_after_partial_failure_no_duplicates,
+        test_accepted_decision_is_written_after_side_effects,
+        test_only_accepted_requires_side_effects,
+        test_prewarm_stock_uses_live_policy_eligibility,
+        # ---- H3-D 装配层 ----
+        test_scheduler_does_not_block_on_curator,
+        test_scheduler_uses_on_tick_not_step,
+        test_director_curator_off_scheduler_has_no_thread_leak,
     ]
     for t in tests:
         try:

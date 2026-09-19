@@ -724,6 +724,41 @@ def _curated_spec(**kw):
     return s
 
 
+def _mk_curated_dec_rec(spec):
+    """给 `DecisionLedger` 用的最小记录(只要有 external_id 就能定 key)。
+
+    ledger 的判定键含 `content_hash`(surface+bottom), 而 `PuzzleSpec`
+    上叫 `puzzle`/`answer` —— 这里做个桥接。生产里这个记录是
+    `RawCuratedPuzzle`(候选), 不是 spec。
+    """
+    from tools.curated_common import RawCuratedPuzzle
+    return RawCuratedPuzzle(
+        external_id=spec.external_id, source=spec.external_source,
+        source_url=spec.source_url, source_kind="stackexchange",
+        question_author="Q", answer_author="A",
+        question_license=spec.license, answer_license=spec.answer_license,
+        question_license_inference="api", answer_license_inference="api",
+        title=spec.title or "", surface=spec.puzzle, bottom=spec.answer,
+        language="en", original_language="en", tags=[])
+
+
+def _accept_curated(spec, d):
+    """把一道 curated 题登记成"已提交"。
+
+    H3-D §四 起, curated 题可播需要**两件事**: 池行 + 一条 accepted
+    决策(账本是最终 commit marker)。任何在池里放 curated 题的测试都
+    必须同时做这两步 —— 与 `LazyCurator._commit` 的顺序一致。
+    """
+    from story.pool import set_curated_decisions_path
+    from tools.curated_ledger import ACCEPTED, DecisionLedger
+    from tools.curated_compiler import CURATED_POLICY_VERSION
+    dpath = os.path.join(d, "curated_decisions.jsonl")
+    set_curated_decisions_path(dpath)
+    DecisionLedger(dpath).record(
+        _mk_curated_dec_rec(spec), decision=ACCEPTED,
+        policy_version=CURATED_POLICY_VERSION)
+
+
 def test_curated_pool_created_with_separate_paths():
     """H2-F: curated 用**独立文件 + 独立账本**。"""
     print("\n[H2-F] curated 池独立于 AI 池")
@@ -762,7 +797,14 @@ def test_curated_served_before_ai_pool():
         # fair_clues 是照默认谜面写死的, 换谜面会让 quote 对不上而
         # 被准入门拒掉(测试就成了在测错误的东西)。
         cp = PuzzlePool.open_curated(cfg)
-        check("curated 入池成功", cp.add(_curated_spec()))
+        # ⚠️ H3-D §四: curated 题**必须**有一条 accepted 决策才可播 ——
+        # 池行只是"落盘", 决策账本才是**最终 commit marker**。所以这里
+        # 要同时写账本, 否则 `add()` 会被准入门的"没有 accepted 决策"
+        # 挡下。这不是测试凑数: 生产里这两件事**就是**一起发生的
+        # (见 `LazyCurator._commit` 的顺序)。
+        _spec_cur = _curated_spec()
+        _accept_curated(_spec_cur, d)
+        check("curated 入池成功", cp.add(_spec_cur))
         ap = PuzzlePool.open(cfg)
         check("AI 池入池成功", ap.add(good_spec()))
         dr = Director(cfg)

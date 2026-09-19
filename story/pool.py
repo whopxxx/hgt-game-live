@@ -130,6 +130,57 @@ def spec_key(spec: PuzzleSpec) -> str:
 #: key 允许的字符集。`spec_key` 的输出恒为小写 hex。
 _HEX = frozenset("0123456789abcdef")
 
+#: curated 决策账本路径。**只读**用 —— 池子绝不写它(写者是
+#: `LazyCurator`/预热 CLI)。测试可以改它来指向临时文件。
+_CURATED_DECISIONS_PATH = os.path.join("data", "curated_decisions.jsonl")
+
+
+def set_curated_decisions_path(path: str) -> None:
+    """改决策账本路径(**只给测试/装配用**)。
+
+    为什么需要一个模块级可变路径而不是每次新建一个 ledger: 准入门是
+    `@staticmethod`, 拿不到装配层的对象。与其把 ledger 一路透传进
+    `pop_next` / `stock_count` 的签名(那几个函数的调用点很多, 而且
+    每加一个参数都要改测试), 不如让这一个路径成为**唯一**的注入口。
+    """
+    global _CURATED_DECISIONS_PATH
+    _CURATED_DECISIONS_PATH = str(path or "")
+
+
+def _curated_decision_ok(external_id: str, policy_version: str) -> tuple:
+    """这道 curated 题在账本里有没有 `accepted`?
+
+    返回 `(ok, why)`。**fail closed**: 读不出账本就当作"没有 accepted"
+    —— 宁可少播一道题, 不可播一道账本不认的题(那意味着它会重复入池)。
+
+    为什么按 `external_id` 而不是完整三元组: 池行里存的是 `to_archive()`
+    的快照, 没有 `surface`/`bottom` 原文, 算不出 `content_hash`。而
+    `external_id` 在同 policy 下是唯一的 —— 一道题被作者编辑后内容变了,
+    会以同一个 external_id 重新编译; 那时**要的正是**"用新的 accepted
+    决策认可新内容", 而新的 accepted 行会覆盖旧的(账本 last-wins)。
+    """
+    eid = str(external_id or "")
+    if not eid:
+        return False, "curated 题缺 external_id(无法与决策账本对上)"
+    try:
+        from tools.curated_ledger import ACCEPTED, DecisionLedger
+        led = DecisionLedger(_CURATED_DECISIONS_PATH)
+        for row in reversed(led.rows):
+            if str(row.get("external_id") or "") != eid:
+                continue
+            if str(row.get("policy_version") or "") != str(policy_version):
+                continue
+            # 同一 key 的最后一条为准 —— `rows` 是写入顺序, 倒着扫
+            # 就是"最新的那条"。
+            if row.get("decision") == ACCEPTED:
+                return True, ""
+            return False, (f"curated 题没有 accepted 决策(最后一条是 "
+                           f"{row.get('decision')!r}) —— 属于未提交的半状态")
+    except Exception:                           # noqa: BLE001
+        log.exception("读 curated 决策账本失败 -> 该题按不可播处理")
+        return False, "curated 决策账本读不出(fail closed)"
+    return False, "curated 决策账本里查不到这道题(未提交)"
+
 
 def _valid_used_record(rec: Any) -> bool:
     """这条 JSON 是不是一条**能解释**的 used 账本记录?
@@ -343,8 +394,13 @@ class PuzzlePool:
             self._keys = set()
             # 池子是缓存: 坏行跳过, 好题照用。
             pool_recs, _ = _read_jsonl(self.pool_path, strict=False)
-            for rec in pool_recs:
-                spec = self._spec_from_record(rec)
+            # 墓碑要**先收齐**再读行 —— 否则同一道题的孤儿行会先被读成
+            # 合法 spec, 而作废它的墓碑在它后面。见 `_voided_keys`。
+            voided = self._voided_keys(pool_recs)
+            if voided:
+                log.info("池内有 %d 个被墓碑作废的 pool_key", len(voided))
+            for i, rec in enumerate(pool_recs):
+                spec = self._spec_from_record(rec, voided, i)
                 if spec is None:
                     continue
                 k = spec_key(spec)
@@ -386,10 +442,71 @@ class PuzzlePool:
             return len(self._items)
 
     @staticmethod
-    def _spec_from_record(rec: Any) -> Optional[PuzzleSpec]:
-        """池记录 -> PuzzleSpec。不合规就返回 None(跳过)。"""
+    def _voided_keys(rows: list) -> set:
+        """收集被墓碑作废的 `pool_key` —— **只作废墓碑之前**的那些行。
+
+        ## 墓碑为什么必须指名 key, 又为什么必须看**位置**
+
+        curated 入池是"先落池/署名, 最后写 accepted 决策"。署名写不下
+        去时无法删除已经追加的那一行(append-only), 于是追加一条墓碑。
+
+        早先的实现只写 `void: True` **不带**指向, 而读侧见到 void 行就
+        整行跳过 —— 那看起来能用, 其实是错的:
+
+            同一道题重试成功后, 池里会有**两行** `pool_key` 相同的记录
+            (孤儿 + 新的那行)。孤儿那行**没有** void 标记, 所以它仍然
+            会被读成一个合法 spec -> 同一道题进池两次。
+
+        所以墓碑必须**指名** key。但光指名还不够 —— 还必须**只看它之前**
+        的行, 否则会把重试写下的新行一起作废:
+
+            第 N 行   孤儿(无 void)      <- 应作废
+            第 N+1 行 墓碑(指名该 key)    <- 分界线
+            第 N+2 行 重试成功的新行      <- **不该**作废
+
+        注意"新行的 key 与孤儿不同"**不能**作为理由: 重试可能产出**内容
+        完全相同**的 spec(`spec_key` 是内容哈希), 那时两行 key 一模一样。
+        位置是唯一可靠的区分。
+
+        所以返回的是"每个被墓碑指名的 key 的**最早墓碑行号**" —— 读侧
+        据此只作废该行号**之前**的同 key 行。
+        """
+        first_tombstone: dict = {}
+        for i, r in enumerate(rows or []):
+            if isinstance(r, dict) and r.get("void") and r.get("pool_key"):
+                k = str(r["pool_key"])
+                if k not in first_tombstone:
+                    first_tombstone[k] = i
+        return first_tombstone
+
+    @staticmethod
+    def _spec_from_record(rec: Any, voided: Optional[dict] = None,
+                          index: int = -1) -> Optional[PuzzleSpec]:
+        """池记录 -> PuzzleSpec。不合规就返回 None(跳过)。
+
+        ## `void: True` 的墓碑行(H3-D §四)
+
+        墓碑作废的是**它之前**的同 `pool_key` 行(见 `_voided_keys`)。
+        调用方必须把墓碑收齐、并把行的**序号**一起传进来, 否则同一道题
+        会既留下孤儿行又留下新行 —— 那就重复了。
+
+        `voided=None` 退化成"只跳过墓碑行本身", 那只对"没有重试"的场景
+        成立; 生产路径(load / 预热 CLI)一律传。
+        """
         if not isinstance(rec, dict):
             return None
+        if rec.get("void"):
+            log.info("池记录被作废(墓碑): pool_key=%s reason=%s",
+                     rec.get("pool_key"), rec.get("void_reason"))
+            return None
+        if voided:
+            key = str(rec.get("pool_key") or "")
+            tomb = voided.get(key)
+            # 只作废**墓碑之前**的行 —— 之后的同 key 行是重试的产物。
+            if tomb is not None and 0 <= index < tomb:
+                log.info("池记录因墓碑作废(第 %d 行, 墓碑在第 %d 行): %s",
+                         index, tomb, key)
+                return None
         if rec.get("pool_version") not in (None, POOL_VERSION):
             # 未来的格式版本: 不认识就跳过, 不要瞎猜字段含义。
             log.warning("池记录的 pool_version=%s 不认识, 已跳过",
@@ -755,6 +872,27 @@ class PuzzlePool:
             if cpv != CURATED_POLICY_VERSION:
                 return False, (f"curated 政策不兼容(spec={cpv!r}, "
                                f"current={CURATED_POLICY_VERSION!r})")
+            # ---- §四: 没有 accepted 决策的 curated 题不可播 ----
+            #
+            # 决策账本是**最终 commit marker**。生成链先落池/署名, 最后
+            # 才写 accepted —— 所以"池里有行但账本没有 accepted"是一个
+            # **正常会出现的中间状态**(写 accepted 前进程被杀)。
+            #
+            # 这一条就是把那个中间状态挡住的地方。没有它的话:
+            #
+            #     落池 -> 署名 -> [这里被杀] -> 下次启动
+            #     -> 池里那行看起来完全合法 -> 播出去
+            #     -> 而账本认为它从未被接受, 下次还会重新审、重新写
+            #     -> 同一道题进池两次
+            #
+            # 不变量(§四):
+            #     playable curated item => attribution 存在 => accepted 决策存在
+            #     accepted 决策         => active pool item 存在 => attribution 存在
+            # 前半条由这里保证; 后半条由 `LazyCurator._commit` 的顺序保证。
+            ok_dec, why_dec = _curated_decision_ok(
+                getattr(spec, "external_id", ""), cpv)
+            if not ok_dec:
+                return False, why_dec
 
         try:
             vr = validate_spec(spec)

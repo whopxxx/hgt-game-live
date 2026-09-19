@@ -313,6 +313,19 @@ class _FakePoolForPrewarm:
     为什么不直接用 `PuzzlePool.open(cfg)`: 那会把池的**账本**一起打开,
     而预热是离线的(没有直播在跑), 让离线脚本去碰直播的 used 账本是
     不必要的风险。这里只需要 pool_path / stock_count / playable_count。
+
+    ## H3-D §八: 库存必须按 **live 的 policy eligibility** 数
+
+    早先的实现是 `len(self._rows())` —— 池文件里有多少行就算多少。
+    policy bump 之后这**立刻是错的**:
+
+        文件里有 10 条 curated-v2 + 2 条 curated-v3, 当前 policy=v3
+        live 真正能播的只有 2 条
+        而 CLI 报 stock=10 -> 认为库存充足 -> 一道都不预热
+
+    结果是"预热跑完了, 直播一看库存还是空的"。所以这里复用**同一个**
+    准入门(`PuzzlePool._validate_pool_spec`)—— 它正是 live 侧决定
+    "能不能播"的那一扇。只读, 不碰 used 账本。
     """
 
     def __init__(self, path):
@@ -320,16 +333,34 @@ class _FakePoolForPrewarm:
         self.used_path = path + ".used"
         self._path = path
 
-    def _rows(self):
-        return read_jsonl(self._path) if os.path.exists(self._path) else []
+    def _eligible(self) -> list:
+        """过得了 live 准入门的 spec。**这是唯一的计数口径。**"""
+        from story.pool import PuzzlePool
+        rows = read_jsonl(self._path) if os.path.exists(self._path) else []
+        voided = PuzzlePool._voided_keys(rows)
+        out = []
+        for i, row in enumerate(rows):
+            spec = PuzzlePool._spec_from_record(row, voided, i)
+            if spec is None:
+                continue
+            try:
+                ok, _why = PuzzlePool._validate_pool_spec(spec)
+            except Exception:                   # noqa: BLE001
+                continue
+            if ok:
+                out.append(spec)
+        return out
 
     def stock_count(self, limit=None):
-        # 预热进程里"库存"= 池文件里的条目数(v2 政策门由写入端保证)
-        n = len(self._rows())
+        n = len(self._eligible())
         return n if limit is None else min(n, limit)
 
     def playable_count(self, *a, **k):
-        return len(self._rows())
+        # 预热进程里没有 recent 窗口, 所以"可播"== "过准入门"。
+        # 这正是直播侧 `stock_count` 的语义, 而不是 `playable_count`
+        # 那条更严的(它还要过 cross_puzzle_gate)。预热刻意用宽的
+        # 那个: 窗口是**运行时**的, 离线不该假装知道。
+        return len(self._eligible())
 
 
 def _wrap_attempts(compiler, max_attempts: int) -> None:

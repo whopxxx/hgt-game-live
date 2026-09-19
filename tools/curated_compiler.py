@@ -83,7 +83,27 @@ CURATED_PROMPT_VERSION = "curated-v1"
 #:     -> 过不了题池准入门 -> 不计库存 / 播不出
 #: 于是 H2 那批按 v1 收的题(含 q10000 那种)会**自动**失去 live
 #: eligibility, 不需要任何人手工删文件。
-CURATED_POLICY_VERSION = "curated-v2"
+#:
+#: ## v3: 外部知识依赖(§五/§六)
+#:
+#: v2 的三条(story_reconstruction / multi_step_deduction / single_trick)
+#: 把"卡车烧油"那一类挡掉了, 但**实测还有三类漏网**:
+#:
+#:     turtlebench:7c53678ff933  十八楼按不到按钮        <- 经典脑筋急转弯
+#:     pse:q:106200              吉普车泥泞车辙          <- 纯物理单机制
+#:     pse:q:103926              2<3 看成心形            <- 平台/渲染冷知识
+#:
+#: 三个的共同点不是"物理"或"电梯", 而是:
+#:
+#:     谜底依赖一个**普通观众不知道的外部知识点**才有机会解出
+#:
+#: 产品要求(已冻结): 观众必须能只靠 谜面 + 是/否问答 + **普通生活常识**
+#: 逐步恢复故事。知道某个外部知识点才有机会解出的题**不适合直播**。
+#:
+#: 所以 v3 加一条正交判据 `no_external_knowledge_dependency`, 而**不是**
+#: 给 elevator/physics/jeep/render 写关键词黑名单 —— 黑名单挡不住下一个
+#: 没被想起来的词, 而且会误伤真故事(一道关于电梯的**身份**题是好的)。
+CURATED_POLICY_VERSION = "curated-v3"
 
 
 # ======================================================================
@@ -128,17 +148,17 @@ CURATED_COMPILE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用�
 8. `no_external_media` 是否**不需要**看图片 / 表格 / 附件就能玩?
 9. `livestream_safe` 内容是否适合公开直播展示?
 
-**九条必须全部为 true 才能 accepted=true。** 有一条不满足就 reject ——
+**以上九条必须全部为 true。** 有一条不满足就该考虑 reject ——
 "逻辑成立但没意思"的题不值得占一个直播位。
 
-═══ 三条新增判据(v2, **这是本版的重点**) ═══
+═══ 十条: 故事性判据(**本版的重点, 比上面九条更硬**) ═══
 
-上面九条里, 6/7 两条我们**实测判得太松**: 一道"卡车烧油变轻"的物理
-脑筋急转弯, 也能被论证成"有因果反转"(因果 = 烧油导致变轻), 于是混了
-进来。问题不在模型不听话, 而在**这两条问的是"有没有反转", 而不是
-"这是不是一个故事"**。
+上面 6/7 两条我们**实测判得太松**: 一道"卡车烧油变轻"的物理脑筋急转弯
+也能被论证成"有因果反转"(因果 = 烧油导致变轻), 于是混了进来。问题不在
+模型不听话, 而在**那两条问的是"有没有反转", 而不是"这是不是一个故事"**。
 
-所以 v2 补三条**正交**的判据。它们问的是完全不同的问题:
+所以补下面四条**正交**的判据。它们问的是完全不同的问题, 而且
+**有一条不满足就必须 reject** —— 这四条不是加分项, 是准入门。
 
 10. `story_reconstruction` —— 玩家最后是在**重建一个故事模型**吗?
 
@@ -180,21 +200,46 @@ CURATED_COMPILE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用�
     ⚠️ 注意 direction: 这条是**反向**的, true = 坏。很多"脑筋急转弯"
     都在这条上是 true。
 
+13. `no_external_knowledge_dependency` —— 观众**只靠谜面 + 是/否问答 +
+    **普通生活常识**, 有没有机会解出来?
+
+    以下任一作为**核心解法**都算依赖外部知识 -> false:
+      - 专业知识(法律/医学/工程/化学…的具体条文或数值)
+      - 物理冷知识(浮力/压强/热胀冷缩/相对速度的定量关系)
+      - 职业规定或行业惯例
+      - 机构制度、办事流程
+      - 某个设备的**特殊功能**(绝大多数人没见过它怎么用)
+      - 平台/软件的渲染或行为规则
+      - 文字游戏(字形 / 谐音 / 双关 —— 换个语言就不成立)
+      - 单一机关的用途(知道那个零件叫什么才想得到)
+
+    **普通生活常识不算外部知识**: 人会饿、会累、会怕、会撒谎、
+    东西会坏、时间会过去、钱要还、孩子会长大 —— 这些都可以。
+
+    判据(自问): "一个**没读过任何科普、没干过那个职业**的普通观众,
+    能不能靠问是/否问题把故事推出来?" 不能 -> false。
+
+    ⚠️ 这一条**不是**"不能涉及专业知识": 题里出现医生、出现物理现象
+    都没问题。不合格的是**解题必须知道那个知识点**。
+
 **硬门(代码强制, 不是建议):**
 
-    story_reconstruction == true
-    multi_step_deduction == true
-    single_trick         == false
+    story_reconstruction            == true
+    multi_step_deduction            == true
+    single_trick                    == false
+    no_external_knowledge_dependency == true
 
 有一条不满足 -> accepted 必须是 false。**不要**因为"这题别的方面都
-很好"而放宽这三条 —— 放过一道卡车烧油, 整批的可信度就没了。
+很好"而放宽这四条 —— 放过一道卡车烧油, 整批的可信度就没了。
 
 ⚠️ 常见的错误判断(请自查):
   - "谜底挺巧妙的" -> 巧妙 != 是故事。物理/数学技巧同样巧妙。
-  - "有反转" -> 见上, 6 条判得不严, 用 10/11/12 重新验。
+  - "有反转" -> 见上, 6 条判得不严, 用 10~13 重新验。
   - "观众会问问题" -> 能问答 != 是海龟汤。物理题也能问答。
   - "这是 situation tag 的题" -> tag 是来源侧标的, 不可信(SE 上
     `lateral-thinking` 混着大量数学/物理/字谜)。只看内容本身。
+  - "现实里确实有这样的设备规定" -> 成立 != 公平。冷知识题在直播里
+    **猜不出来**, 那才是问题。
 
 ═══ 翻译(C 部分) ═══
 
@@ -231,7 +276,9 @@ CURATED_COMPILE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用�
 ═══ 必须回传 observed_signature 与 quality_checks ═══
 
 `observed_signature` 要**如实**反映这道题, 不是照抄某个目标。
-`quality_checks` 里九项判据逐条填 true/false。
+`quality_checks` 里**十三条**判据逐条填 true/false(1~9 之外还有
+10~13 四条故事性/公平性判据, 见上)。**十三条缺一不可** —— 代码
+按 fail closed 判: 少填一项等于该项不合格。
 """
 
 _TOOL_CURATED = {
@@ -242,7 +289,8 @@ _TOOL_CURATED = {
         "properties": {
             "accepted": {
                 "type": "boolean",
-                "description": "九条判据全为 true 才填 true; 否则 false",
+                "description": ("**十三条判据全部为 true** 才填 true; "
+                                "否则 false"),
             },
             "reject_reasons": {
                 "type": "array", "items": {"type": "string"},
@@ -250,7 +298,8 @@ _TOOL_CURATED = {
                                 "language_dependent / not_a_story / "
                                 "no_reversal / depends_on_obscure_system / "
                                 "needs_external_media / unsafe / "
-                                "no_unique_explanation / ambiguous"),
+                                "no_unique_explanation / ambiguous / "
+                                "external_knowledge_dependency"),
             },
             "quality_checks": {
                 "type": "object",
@@ -287,6 +336,20 @@ _TOOL_CURATED = {
                             "一个知识点 / 知道一个小技巧就结束 / 只有"
                             "一条规则 -> true。好的海龟汤这里应填 false。"),
                     },
+                    "no_external_knowledge_dependency": {
+                        "type": "boolean",
+                        "description": (
+                            "普通观众**只靠谜面 + 是/否问答 + 普通生活"
+                            "常识**有没有机会解出来?\n"
+                            "核心解法依赖以下任一 -> false: 专业知识 / "
+                            "物理冷知识 / 职业规定 / 机构制度 / 设备特殊"
+                            "功能 / 平台或软件规则 / 文字游戏 / 单一机关"
+                            "用途。\n"
+                            "普通生活常识(会饿、会累、会撒谎、东西会坏、"
+                            "时间会过去)不算外部知识。\n"
+                            "自问: 一个没读过科普、没干过那个职业的普通"
+                            "观众, 能不能靠问是/否问题推出来?"),
+                    },
                 },
                 "required": ["clear_anomaly", "unique_explanation",
                              "yes_no_progress", "no_obscure_system",
@@ -294,7 +357,8 @@ _TOOL_CURATED = {
                              "detail_recontextualized", "no_external_media",
                              "livestream_safe",
                              "story_reconstruction", "multi_step_deduction",
-                             "single_trick"],
+                             "single_trick",
+                             "no_external_knowledge_dependency"],
             },
             "content_style": {
                 "type": "array", "items": {"type": "string"},
@@ -454,12 +518,70 @@ CURATED_CHECKS_V2 = CURATED_CHECKS + (
     "story_reconstruction", "multi_step_deduction", "single_trick",
 )
 
+#: v3 全量判据 = v2 那十二条 + `no_external_knowledge_dependency`。
+#:
+#: 为什么它是**独立**一条而不是"把 no_obscure_system 判严一点":
+#: `no_obscure_system`(H2 第 4 条)问的是"要不要查冷门职业制度", 而它
+#: **实测判得太松** —— 十八楼那道题在它下面是 true(按钮高度不算"职业
+#: 制度"), 于是漏了进来。真正要问的是一个更宽的问题:
+#:
+#:     这道题的**核心解法**是不是依赖一个外部知识点?
+#:
+#: 物理冷知识、平台渲染规则、单一机关用途、文字游戏 … 全都属于"外部
+#: 知识点", 但它们各自都不像"冷门职业制度"。所以这条把范围写全。
+CURATED_CHECKS_V3 = CURATED_CHECKS_V2 + ("no_external_knowledge_dependency",)
+
 #: `single_trick` 是**反向**判据(true = 坏), 其余全是 true = 好。
 #: 混在一起遍历会写错方向, 所以显式列出来。
 _INVERTED_CHECKS = ("single_trick",)
 
+#: 故事硬门的四条 —— prompt 与代码都按这份清单判。**唯一定义处**:
+#: Reviewer 的独立复核(`curated_story_review`)也读它, 免得两处漂移。
+STORY_GATE_FIELDS = ("story_reconstruction", "multi_step_deduction",
+                     "single_trick", "no_external_knowledge_dependency")
 
-def check_tool_result(d: dict, *, checks: tuple = CURATED_CHECKS_V2) -> tuple:
+
+def story_gate_from_review(rev: Optional[dict]) -> list:
+    """把 **Reviewer 的独立复核**结果翻成不通过原因列表。
+
+    ## 为什么需要第二双眼睛(§六)
+
+    `story_gate_reasons()` 读的是**第一次 compile** 时模型自己填的
+    `quality_checks`。它有一个结构性弱点: 模型一旦自信地判错
+    (`single_trick=false`), 代码层**无法知道它错了** —— 这正是
+    `turtlebench:7c53678ff933`(十八楼按不到按钮)漏网的原因: 编译
+    模型认为"物品用途反转"是真反转, 于是十三条全填 true。
+
+    解法不是加第四个审核 LLM(任务书明确禁止), 而是**让现有的
+    Reviewer 顺手回答同一组问题**。Reviewer 是**独立的一次调用**,
+    读过同一道题但任务不同(它审的是"这稿能不能用"), 所以它的判断
+    与编译模型的判断**互相独立** —— 两个独立判断都说没问题才算过。
+
+    这是 defense in depth 的**串联**, 不是投票: 任意一边说不合格就
+    reject。宁可少收一道题, 不可放过一道脑筋急转弯。
+
+    返回 [] 表示复核通过(或 Reviewer 没有给这一项 —— 见下)。
+
+    ⚠️ **缺失 = 不合格**(fail closed), 与 `check_tool_result` 同一条
+    原则: 一条没说自己是故事题的题, 凭什么信它? 唯一的例外见
+    `curated_story_review` 的 `required=False` 说明。
+    """
+    if not isinstance(rev, dict):
+        return ["story_review_missing"]
+    out: list = []
+    if rev.get("single_trick") is not False:
+        out.append("single_trick")
+    if rev.get("story_reconstruction") is not True:
+        out.append("not_story_reconstruction")
+    if rev.get("multi_step_deduction") is not True:
+        out.append("no_multi_step_deduction")
+    if rev.get("no_external_knowledge_dependency") is not True:
+        out.append("external_knowledge_dependency")
+    return out
+
+
+
+def check_tool_result(d: dict, *, checks: tuple = CURATED_CHECKS_V3) -> tuple:
     """判"这道题能不能收"。返回 `(ok, reasons)`。
 
     ## 为什么先判 `accepted` 再判其它
@@ -509,14 +631,18 @@ def check_tool_result(d: dict, *, checks: tuple = CURATED_CHECKS_V2) -> tuple:
 
 
 def story_gate_reasons(d: dict) -> list:
-    """v2 硬门的**独立**判定, 返回不通过的原因(通过则空列表)。
+    """v3 硬门的**独立**判定, 返回不通过的原因(通过则空列表)。
 
-    与 `check_tool_result` 分开刻意为之: 那个函数管"九条 + 三条全部
-    为 true", 这个只管**三条里最要害的部分**, 好让拒绝原因能带上
-    精准的标签(`single_trick` / `not_story_reconstruction` /
-    `no_multi_step_deduction`) —— 验收报告要按原因分类, 而
+    与 `check_tool_result` 分开刻意为之: 那个函数管"十三条全部为 true",
+    这个只管**四条故事性里最要害的部分**, 好让拒绝原因能带上精准的标签
+    (`single_trick` / `not_story_reconstruction` / `no_multi_step_deduction`
+    / `external_knowledge_dependency`) —— 验收报告要按原因分类, 而
     "quality_checks 未全过: story_reconstruction" 这种串既难统计
     也看不出是哪一类问题。
+
+    `story_reconstruction` / `multi_step_deduction` /
+    `no_external_knowledge_dependency` 是 true = 好;
+    `single_trick` 是**反向**(false = 好)。
     """
     qc = d.get("quality_checks") if isinstance(d.get("quality_checks"),
                                                dict) else {}
@@ -527,6 +653,8 @@ def story_gate_reasons(d: dict) -> list:
         out.append("not_story_reconstruction")
     if qc.get("multi_step_deduction") is not True:
         out.append("no_multi_step_deduction")
+    if qc.get("no_external_knowledge_dependency") is not True:
+        out.append("external_knowledge_dependency")
     return out
 
 
@@ -699,6 +827,54 @@ class CuratedCompiler:
         self.writer = writer
 
     # ------------------------------------------------------------------
+    def story_review(self, spec: PuzzleSpec) -> Optional[dict]:
+        """**独立复核**"这到底是不是海龟汤"。返回 dict 或 None。
+
+        ## 为什么不是第四个审核 LLM
+
+        任务书明确禁止"再加一个内容审核 LLM"。这里复用的是**同一个
+        client、同一个模型、同一份 system prompt 家族** —— 差别只在
+        **问的问题**。这不是新的审核层, 是把已有的审核能力用在一个
+        它本来就该回答的问题上。
+
+        与 `_review_spec` 的分工:
+            `_review_spec`   "这一稿能不能用"(结构 / 真实性 / 好不好玩)
+            本函数           "这**是不是**海龟汤"(题型)
+        两者都对同一道题作答, 但视角不同 —— 这正是"独立"的含义。
+        如果把它们并成一次调用, 模型会在一个上下文里同时权衡"结构不错"
+        和"题型不对", 然后倾向于和稀泥通过。
+
+        ## 失败一律返回 None
+
+        None 会被 `story_gate_from_review` 判成 `story_review_missing`
+        (= 不合格)。这是 fail closed: 复核调不动时**不放过**那一稿。
+        代价是网关抖动会丢掉一些本来合格的题 —— 而那些题会走
+        `technical_defer` 下次再来, 不是 rejected, 所以不会永久损失。
+        """
+        try:
+            from story.llm import STORY_REVIEW_SYSTEM, _TOOL_STORY_REVIEW
+            from story.llm import story_review_user
+        except Exception:                       # noqa: BLE001
+            log.exception("复核提示词不可用 -> 该稿按复核缺失处理")
+            return None
+        client = getattr(self.writer, "client", None)
+        if client is None:
+            return None
+        try:
+            res = client.messages(
+                STORY_REVIEW_SYSTEM, story_review_user(spec),
+                max_tokens=800, tool=_TOOL_STORY_REVIEW,
+                temperature=0.0)
+        except Exception:                       # noqa: BLE001
+            log.exception("故事复核调用异常 -> 按复核缺失处理(下次重试)")
+            return None
+        ti = getattr(res, "tool_input", None)
+        if not isinstance(ti, dict):
+            log.warning("故事复核没有 tool_input(不放过这一稿)")
+            return None
+        return _unwrap(ti)
+
+    # ------------------------------------------------------------------
     def compile_one(self, rec, *, recent: Optional[list] = None,
                     blueprint: Optional[PuzzleBlueprint] = None,
                     max_attempts: int = 2,
@@ -819,28 +995,22 @@ class CuratedCompiler:
                 _bump(info, "ai_gate")
                 continue
 
-            # ---- ①b v2 硬门: 三条都对但我想再确认一次 ----
+            # ---- ①b v3 硬门(独立于 check_tool_result 再判一次) ----
             #
-            # 走到这里说明 `check_tool_result` 已经过了(十二条全合格),
+            # 走到这里说明 `check_tool_result` 已经过了(十三条全合格),
             # 所以这道门通常**不会**触发。留着是为了 defense in depth:
             # 将来若有人把 `check_tool_result` 的 checks 参数收窄(比如
             # 只传 H2 的九条), 故事门仍然独立生效。
+            #
+            # ⚠️ 这一段曾经**重复了三遍**(H3-A 的编辑事故)。它现在只判
+            # 一次 —— 三份同样的判定里只要有一份被将来改坏, 行为就开始
+            # 取决于"走到哪一份", 而那是无法从日志里看出来的。
             sgr = story_gate_reasons(d)
             if sgr:
                 info["story_gate"] = sgr
                 info["reject_reasons"] = sgr
                 info["stage"] = "story_gate"
-                log.info("v2 故事门拒收 %s: %s",
-                         info["external_id"], ", ".join(sgr))
-                # 结构性判定, 重试不会变好 -> 不重试。
-                return None, info
-            # **明确**的表态。
-            sgr = story_gate_reasons(d)
-            if sgr:
-                info["story_gate"] = sgr
-                info["reject_reasons"] = sgr
-                info["stage"] = "story_gate"
-                log.info("v2 故事门拒收 %s: %s",
+                log.info("v3 故事门拒收 %s: %s",
                          info["external_id"], ", ".join(sgr))
                 # 结构性判定, 重试不会变好 -> 不重试。
                 return None, info
@@ -871,11 +1041,38 @@ class CuratedCompiler:
             # ---- 让路检查 ②: 编译过了, 审稿之前 ----
             if _live_busy():
                 return None, _mark_interrupted(info, "before_review")
+
+            # ---- ③b 故事门的**独立复核**(§六) ----
+            #
+            # 为什么不能只信 `story_gate_reasons`: 它读的是**编译模型
+            # 自己填的** quality_checks。模型一旦自信地判错(十八楼那道
+            # 题在它眼里是"物品用途反转"), 代码层无从知道。
+            #
+            # 所以让**独立的第二次调用**回答同一组问题。它与编译不是
+            # 同一个上下文、任务也不同(它只判题型, 不判结构), 因此它
+            # 的判断是独立证据。两边**串行**: 任意一边说不合格 -> reject。
+            #
+            # 位置刻意放在审稿**之前**: 复核不过的题没必要再花一次审稿
+            # 的钱。也不放在最前面 —— 那样会把 d 的解析路径与故事门
+            # 混在一起, 而故事门(Schema 层)与复核(LLM 层)是两件事。
+            srev = self.story_review(spec)
+            sgr2 = story_gate_from_review(srev)
+            if sgr2:
+                info["story_gate"] = sgr2
+                info["reject_reasons"] = sgr2
+                info["stage"] = "story_review"
+                log.info("v3 故事复核拒收 %s: %s",
+                         info["external_id"], ", ".join(sgr2))
+                # 复核判的是**题型的本质**, 与 `single_trick` 同理:
+                # 再审十次, 它还是同一类题。不重试。
+                return None, info
+
             # ---- ④ Reviewer(**复用现有审稿人**) ----
             reviewed, why, need_rewrite, technical = (
                 self.writer._review_spec_with_retry(
                     spec, spec.blueprint, must_fix=vr.must_fix(),
-                    own_fix_focus=list(vr.fixable)))
+                    own_fix_focus=list(vr.fixable),
+                    should_continue=should_continue))
             if reviewed is None:
                 last_err = why
                 st = "review_technical" if technical else "review"

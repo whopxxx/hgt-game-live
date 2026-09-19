@@ -1193,25 +1193,32 @@ class Director:
                 # `on_tick` 契约上绝不抛 —— 补池不能影响直播主循环。
                 if self._prefetcher is not None:
                     self._prefetcher.on_tick()
-                # ---- H3-B: Lazy Curator ----
+                # ---- H3-D: Lazy Curator(**非阻塞**) ----
                 #
-                # 与补池并列, 但在**同一拍里只跑一个 candidate**。
+                # ⚠️ 这里**绝不能**直接调 `step()`。
                 #
-                # 为什么不给它单独线程: 它会调 LLM(十几到几十秒), 而
-                # 本循环是 4Hz 的心跳。放这里意味着"这一拍会慢" —— 所以
-                # `step()` 内部**第一件事**就是查压力, 忙就立刻返回。
-                # 真正跑起来时 live 出题会被推迟到下一拍, 而下一拍会先
-                # 看到"忙"并让路。这与 `_deferred_riddle` 的机制一致。
+                # H3-B 第一版就是这么写的, 而本循环是**唯一驱动
+                # `engine.tick()` 的线程**。`step()` 会同步跑完
+                # compile_one(LLM 编译 + 审稿 + 审计, 十几到几十秒),
+                # 期间 tick 定时、hint deadline、reveal deadline、
+                # 下一题 deadline、push **全部被拖住** —— 那不是"这一拍
+                # 慢一点", 是**心跳停了**。
                 #
-                # ⚠️ `step(max_candidates=1)`: 一次一拍最多审一条。审完
-                # 立刻回到循环顶部重新评估压力 —— 而不是连着审三条。
+                # 现在 `on_tick()` 只做两件事: 判断该不该开始 + 非阻塞
+                # 提交一个 job —— 契约上**立刻返回**。真正跑 LLM 的是
+                # LazyCurator 自己的单线程 worker。single-flight 仍然成立
+                # (已有活在跑时提交会被直接丢弃, 不排队)。
+                #
+                # `max_candidates=1` 在这里的语义是"这一拍要不要开一条"
+                # (不是"开几条"): 每拍重新评估一次压力, 用的是**当下**
+                # 的状态, 而不是几十秒前排的队。
                 if self._lazy_curator is not None:
                     try:
-                        self._lazy_curator.step(max_candidates=1)
+                        self._lazy_curator.on_tick(max_candidates=1)
                     except Exception:           # noqa: BLE001
-                        # `step` 契约上绝不抛, 但这里再兜一层: 直播主
+                        # `on_tick` 契约上绝不抛, 但这里再兜一层: 直播主
                         # 循环**永远**不能因为后台审题而中断。
-                        log.exception("lazy curator 异常(已忽略)")
+                        log.exception("lazy curator 调度异常(已忽略)")
                 self.push()
                 pushes_since += 1
                 if self.engine.should_stop():
