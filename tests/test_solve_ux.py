@@ -344,18 +344,26 @@ _FACTS = [{"id": "f1", "text": "门外女人是父亲的亲生女儿", "kind": "
 
 
 def test_case_g_v5_no_final_judge():
-    print("\n[Case G] v5 不调 Final Judge")
-    fc = FakeClient([_verdict(established=["f1"], cand=True)])
+    print("\n[Case G] v5 有合同不调 Final Judge(A1: completion 走复核)")
+    fc = FakeClient([
+        _verdict(established=["f1"], cand=True),
+        _completion_match(["f1"]),
+    ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "她是姐姐",
                         facts=_FACTS, completion_fact_ids=["f1"])
-    check("只调一次 client", len(fc.calls) == 1, len(fc.calls))
-    check("绝不 emit_judgement",
+    check("调了两次(verdict + completion 复核)", len(fc.calls) == 2,
+          len(fc.calls))
+    check("**绝不 emit_judgement**",
           all(c["tool"]["name"] != "emit_judgement" for c in fc.calls),
           [c["tool"]["name"] for c in fc.calls])
+    check("第二次是 emit_completion_match",
+          fc.calls[1]["tool"]["name"] == "emit_completion_match",
+          fc.calls[1]["tool"]["name"])
     check("不产生 P.SOLVE", out and out[0].verdict != "揭晓",
           out[0].verdict if out else None)
-    check("established 原样带回", out and out[0].established_fact_ids == ["f1"],
+    check("established 经复核确认后带回",
+          out and out[0].established_fact_ids == ["f1"],
           out[0].established_fact_ids if out else None)
 
 
@@ -1013,8 +1021,8 @@ def test_v6_versions_bumped():
           RIDDLE_PROMPT_VERSION == "riddle-v6", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v6",
           CHECK_PROMPT_VERSION == "check-v6", CHECK_PROMPT_VERSION)
-    check("ANSWER_PROMPT_VERSION == answer-v5",
-          ANSWER_PROMPT_VERSION == "answer-v5", ANSWER_PROMPT_VERSION)
+    check("ANSWER_PROMPT_VERSION == answer-v6",
+          ANSWER_PROMPT_VERSION == "answer-v6", ANSWER_PROMPT_VERSION)
     # spec_version 这次**不动** —— v6 没有改 PuzzleSpec schema。
     from story.puzzle import PuzzleSpec
     check("spec_version 仍是 3",
@@ -1368,11 +1376,18 @@ def test_v6_case8_verifier_cannot_solve_by_itself():
 
 
 def test_v6_case9_trigger_matrix():
-    """Case 9: 复核的触发条件必须**恰好**是那五条 —— 不多不少。
+    """Case 9 / A1: 复核的触发条件。
 
-    多调 = 每条普通问答都白烧一次 LLM; 少调 = 强候选被漏掉。
+    多调 = 普通问答白烧一次 LLM; 少调 = 自报的 completion 直接通关。
+
+    **A1 起判据变了**: 不再要求 `verdict=是 + candidate`。现在只要
+
+        missing 非空 AND ( direct_completion 非空 OR candidate=True )
+
+    因为 completion fact **不能只靠第一层自报** —— 哪怕是「不是」裁决,
+    只要第一层自报建立了某条 completion, 也必须复核(否则那个洞还在)。
     """
-    print("\n[v6 Case 9] 复核触发矩阵")
+    print("\n[v6 Case 9 / A1] 复核触发矩阵")
     def run(text="他自己拍高", est=None, cand=True, verdict="是",
             room=None, contract=None):
         fc = FakeClient([_verdict(established=est or [], cand=cand,
@@ -1389,19 +1404,35 @@ def test_v6_case9_trigger_matrix():
         return len(fc.calls), out
 
     n, _ = run()
-    check("是 + candidate -> 调复核(2 次)", n == 2, n)
+    check("candidate=True -> 调复核(2 次)", n == 2, n)
     n, _ = run(cand=False)
-    check("candidate=False -> 不调(1 次)", n == 1, n)
-    n, _ = run(verdict="不是")
-    check("verdict=不是 -> 不调(1 次)", n == 1, n)
-    n, _ = run(verdict="无关")
-    check("verdict=无关 -> 不调(1 次)", n == 1, n)
+    check("**candidate=False 且没自报 completion -> 不调(1 次)**", n == 1, n)
+    # ---- A1 新增: 自报 completion 就必须复核, 不看 verdict ----
+    n, _ = run(cand=False, est=["f2"])
+    check("**candidate=False 但自报 f2 -> 也要复核(2 次)**", n == 2, n)
+    n, _ = run(verdict="不是", est=["f2"])
+    check("**「不是」+ 自报 f2 -> 仍复核(2 次)**", n == 2, n)
+    n, _ = run(verdict="不是", cand=False)
+    check("「不是」+ candidate=False + 无自报 -> 不调(1 次)", n == 1, n)
+    n, _ = run(verdict="无关", cand=False)
+    check("「无关」+ candidate=False + 无自报 -> 不调(1 次)", n == 1, n)
     n, out = run(est=["f1"])
     check("第一层已补 f1 -> 仍调, 只缺 f2", n == 2, n)
-    n, _ = run(est=["f1", "f2"])
-    check("合同已被第一层覆盖 -> 不调(1 次)", n == 1, n)
-    n, _ = run(room=["f1", "f2"])
-    check("合同已被房间覆盖 -> 不调(1 次)", n == 1, n)
+    # ⚠️ A1: 第一层**自报**了 f1+f2 也要复核 —— 那正是"自报不能直接通关"
+    # 这条规则本身。复核回 ["f2"], 所以最终 established 只留 direct 里
+    # 非 completion 的部分 + 被确认的 f2。
+    n, out = run(est=["f1", "f2"])
+    check("**第一层自报满合同 -> 仍要复核(2 次, 自报不是通关)**", n == 2, n)
+    check("复核只认 f2 -> 最终 established 不含被否决的 f1",
+          out and out[0].established_fact_ids == ["f2"],
+          out[0].established_fact_ids if out else None)
+    n, out = run(room=["f1", "f2"])
+    check("合同已被**房间**覆盖 + candidate -> 不调(1 次)", n == 1, n)
+    check("被房间覆盖时第一层的自报 completion 也不留下",
+          out and out[0].established_fact_ids == [],
+          out[0].established_fact_ids if out else None)
+    n, _ = run(room=["f1", "f2"], cand=False)
+    check("合同已被房间覆盖 + 无候选 -> 不调(1 次)", n == 1, n)
     # 无合同时 candidate 走的是 legacy 分支 -> 旧 Judge, **不会**调复核。
     # 这里显式给两层 canned: 第一层裁决 + 一个旧 judge 返回。如果代码
     # 误把复核插进来, 工具序列就会变。
@@ -2205,6 +2236,250 @@ def test_r1_n_non_qa_rows_are_filtered():
           all(x["qid"] >= 0 for x in c), c)
 
 
+# ======================================================================
+# A1: completion fact 必须经语义复核(自报不算通关)
+# ======================================================================
+def frame_spec():
+    """实播"画框有问题吗"那道题的等价 fixture。
+
+    completion f2 的**核心机制**是"画框内部藏着报警感应结构" —— 观众
+    只说"画框有问题"时, 公开信息只有"画框存在某种问题", 不足以建立
+    报警结构。这正是 A1 要挡住的东西。
+    """
+    return PuzzleSpec(
+        id="ux-frame", title="画框",
+        puzzle="博物馆一幅名画在闭馆后触发了警报, 但画本身完好无损。"
+               "为什么?",
+        answer="画框内部藏着报警感应结构, 有人试图把画取下来时触发了它。",
+        core_answer="画框内部藏着报警感应结构。",
+        completion_fact_ids=["f2"],
+        facts=[
+            PuzzleFact(id="f2", text="画框内部藏着报警感应结构",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f4", text="画本身没有被损坏", kind="support",
+                       visibility="hidden"),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="key",
+                      text="画框里藏着感应结构", fact_ids=["f2"]),
+        ],
+        fair_clues=[FairClue(quote="画本身完好无损", supports_atoms=["a1"])],
+        hints=["注意不是画本身", "想想画框"],
+        prompt_version="riddle-v7", quality_policy_version="quality-v7")
+
+
+def test_a1_r1_broad_question_cannot_complete():
+    """**Live-R1**: 宽泛问题不能完成具体事实(实播那个洞)。
+
+    第一层答"是"并自报 `established=["f2"]`, 但复核回空 ——
+    最终 established **不含 f2**, Engine 因此不揭晓。
+    """
+    print("\n[A1-R1] 宽泛问题不能完成具体事实")
+    spec = frame_spec()
+    fc = FakeClient([
+        _verdict(established=["f2"], cand=False),      # 第一层自报 f2
+        _completion_match([]),                          # 复核否决
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "画框有问题吗？",
+                        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("**复核被调用了(candidate=False 但自报了 completion)**",
+          len(fc.calls) == 2, len(fc.calls))
+    check("verdict 保留(是)", out and out[0].verdict == "是",
+          out[0].verdict if out else None)
+    check("**最终 established 不含 f2**",
+          out and out[0].established_fact_ids == [],
+          out[0].established_fact_ids if out else None)
+    check("**不产生 P.SOLVE**", out and out[0].verdict != "揭晓",
+          out[0].verdict if out else None)
+
+
+def test_a1_r2_specific_mechanism_can_complete():
+    """**Live-R2**: 说出具体机制 -> 复核确认 -> 允许建立。"""
+    print("\n[A1-R2] 具体机制可以建立")
+    spec = frame_spec()
+    fc = FakeClient([
+        _verdict(established=["f2"], cand=False),
+        _completion_match(["f2"]),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲",
+                        "画框里面是不是藏着报警感应线？",
+                        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("复核确认 f2", out and out[0].established_fact_ids == ["f2"],
+          out[0].established_fact_ids if out else None)
+    check("completion_verified_fact_ids 记录了它",
+          out and getattr(out[0], "completion_verified_fact_ids", None)
+          == ["f2"],
+          getattr(out[0], "completion_verified_fact_ids", None)
+          if out else None)
+
+
+def test_a1_fail_closed_on_verifier_technical_failure():
+    """**复核技术失败 -> completion 一条都不推进**(mandatory verify 不能是假门)。
+
+    否则复核挂了, 第一层自报的 completion 照样通关 —— 那道门就是假的。
+    但 verdict 与**非** completion 的 established 必须保留
+    (fail-open for conversation, fail-closed for victory state)。
+    """
+    print("\n[A1-failclosed] 复核超时/空返回 -> completion 不推进")
+    spec = frame_spec()
+    for label, bad in (("空 tool input", LLMResult(tool_input=None, model="m")),
+                       ("超时", LLMResult(error="timeout", model="m")),
+                       ("schema 不符",
+                        LLMResult(tool_input={"wrong": 1}, model="m"))):
+        fc = FakeClient([
+            _verdict(established=["f2", "f4"], cand=False),
+            bad,
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "画框有问题吗？",
+                            spec=spec,
+                            completion_fact_ids=spec.completion_fact_ids,
+                            core_answer=spec.core_answer,
+                            room_established_fact_ids=[])
+        check(f"{label}: **verdict 保留**", out and out[0].verdict == "是",
+              out[0].verdict if out else None)
+        check(f"{label}: **completion f2 不推进**",
+              out and "f2" not in out[0].established_fact_ids,
+              out[0].established_fact_ids if out else None)
+        check(f"{label}: 非 completion 的 f4 保留",
+              out and "f4" in out[0].established_fact_ids,
+              out[0].established_fact_ids if out else None)
+
+
+def test_a1_self_report_alone_never_completes():
+    """**自报不能通关** —— 哪怕第一层把整个合同都自报了。
+
+    `candidate=False` 且复核一次都没成功时, completion **一条都不留**。
+    """
+    print("\n[A1-selfreport] 第一层自报满合同仍不算通关")
+    spec = frame_spec()
+    fc = FakeClient([
+        _verdict(established=["f2"], cand=False),
+        _completion_match([]),                 # 复核一条都不认
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "画框有问题吗？",
+                        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("**established 里没有 f2**",
+          out and out[0].established_fact_ids == [],
+          out[0].established_fact_ids if out else None)
+
+
+def test_a1_non_candidate_verifier_cannot_widen():
+    """**非候选模式下复核不得超出第一层自报的范围。**
+
+    candidate=False 时只把 `direct_completion` 给复核看。若复核顺手回一条
+    观众**没说过的** missing fact, 必须被过滤掉 —— 否则复核自己变成了
+    第二条通关入口, 而且完全绕开"观众得说出来"这件事。
+    """
+    print("\n[A1-nowiden] 非候选复核不能借机扩宽")
+    spec = PuzzleSpec(
+        id="ux-two", title="两事实",
+        puzzle="甲乙两件事同时发生, 为什么?", answer="因为丙。",
+        core_answer="因为丙。",
+        completion_fact_ids=["f1", "f2"],
+        facts=[
+            PuzzleFact(id="f1", text="第一件事成立", kind="core"),
+            PuzzleFact(id="f2", text="第二件事成立", kind="core"),
+        ],
+        solve_atoms=[SolveAtom(id="a1", role="key", text="丙",
+                               fact_ids=["f1", "f2"])],
+        fair_clues=[FairClue(quote="同时发生", supports_atoms=["a1"])],
+        hints=["h"], prompt_version="riddle-v7",
+        quality_policy_version="quality-v7")
+    # 复核回 f1(第一层自报的那条) + f2(观众**没**说过的那条)。
+    fc = FakeClient([
+        _verdict(established=["f1"], cand=False),
+        _completion_match(["f1", "f2"]),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "第一件事成立吗？",
+                        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("**只能确认第一层自报的 f1**",
+          out and out[0].established_fact_ids == ["f1"],
+          out[0].established_fact_ids if out else None)
+    check("**f2 被过滤掉(观众没说过)**",
+          out and "f2" not in out[0].established_fact_ids,
+          out[0].established_fact_ids if out else None)
+    # 反过来: 复核只回 f1(自报的那条) -> 正常确认
+    fc2 = FakeClient([
+        _verdict(established=["f1"], cand=False),
+        _completion_match(["f1"]),
+    ])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    out2, _ = w2.answer(spec.puzzle, spec.answer, [], 1, "甲", "第一件事成立吗？",
+                        spec=spec,
+                        completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("复核确认自报的那条 -> 留下",
+          out2 and out2[0].established_fact_ids == ["f1"],
+          out2[0].established_fact_ids if out2 else None)
+
+
+def test_a1_candidate_mode_can_rescue_missing():
+    """**完整答案候选可以 rescue 全部 missing**(它本来就是干这个的)。"""
+    print("\n[A1-rescue] candidate 模式可 rescue 未自报的 missing")
+    spec = frame_spec()
+    fc = FakeClient([
+        _verdict(established=[], cand=True),        # 第一层什么都没自报
+        _completion_match(["f2"]),                  # 复核 rescue
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲",
+                        "画框里面藏着报警感应结构, 所以有人碰它就响了",
+                        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+                        core_answer=spec.core_answer,
+                        room_established_fact_ids=[])
+    check("**复核 rescue 成功**",
+          out and out[0].established_fact_ids == ["f2"],
+          out[0].established_fact_ids if out else None)
+
+
+def test_a1_completion_verify_prompt_has_specificity_rule():
+    """prompt 里必须有"不是判相关性, 是判观众是否已经知道完整命题"。"""
+    print("\n[A1-prompt] 复核 prompt 的特异性硬规则")
+    from story.llm import COMPLETION_VERIFY_SYSTEM as S
+    check("明确否定'判相关性'", "不是" in S and "有没有关系" in S, S[:200])
+    check("有'画框有问题'反例", "画框有问题" in S, "缺具体反例")
+    check("有'报警感应结构'", "报警感应结构" in S)
+    check("有'飞机没有机械故障'正例", "机械故障" in S)
+    check("要求拿不准时不建立", "不要建立" in S)
+
+
+def test_a1_ordering_is_stable_and_reference_ordered():
+    """顺序稳定: 按第一层原始顺序保留, 被否决的**绝不**留下。
+
+    这条直接对着开发中踩到的 bug: `_stable_ids` 把 reference 当成
+    "也加进来"的第二个 group, 于是被复核否决的 completion id 又回来了
+    (`['f2','f1']`)。
+    """
+    print("\n[A1-order] 顺序稳定 + 被否决的不留")
+    from story.llm import PuzzleWriter as _W
+    check("keep 决定留下谁",
+          _W._stable_ids({"f3"}, reference=["f1", "f3", "f2"]) == ["f3"],
+          _W._stable_ids({"f3"}, reference=["f1", "f3", "f2"]))
+    check("**reference 里但不在 keep 的绝不出现**",
+          _W._stable_ids({"f3"}, reference=["f1", "f3"]) == ["f3"],
+          _W._stable_ids({"f3"}, reference=["f1", "f3"]))
+    check("顺序跟 reference 走",
+          _W._stable_ids({"f2", "f1"}, reference=["f1", "f2"]) == ["f1", "f2"],
+          _W._stable_ids({"f2", "f1"}, reference=["f1", "f2"]))
+    check("extra 追加在最后",
+          _W._stable_ids({"f1"}, reference=["f1"], extra=["f9"]) == ["f1", "f9"],
+          _W._stable_ids({"f1"}, reference=["f1"], extra=["f9"]))
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -2277,6 +2552,15 @@ def main():
         test_r1_l_one_qa_covering_both_is_single_row,
         test_r1_m_archive_boundary,
         test_r1_n_non_qa_rows_are_filtered,
+        # ---- A1: completion fact 必须经语义复核 ----
+        test_a1_r1_broad_question_cannot_complete,
+        test_a1_r2_specific_mechanism_can_complete,
+        test_a1_fail_closed_on_verifier_technical_failure,
+        test_a1_self_report_alone_never_completes,
+        test_a1_non_candidate_verifier_cannot_widen,
+        test_a1_candidate_mode_can_rescue_missing,
+        test_a1_completion_verify_prompt_has_specificity_rule,
+        test_a1_ordering_is_stable_and_reference_ordered,
     ]
     for t in tests:
         t()

@@ -256,32 +256,80 @@ def _verdict_tool(established=None, touched=None, cand=False):
     }]}, model="m")
 
 
+def _completion_tool(ids=None):
+    """completion 复核的返回(A1 的第二次调用)。"""
+    return LLMResult(
+        tool_input={"matched_completion_fact_ids": list(ids or [])},
+        model="m")
+
+
+def _verdict_tool_no(established=None, touched=None, cand=False):
+    """同 `_verdict_tool`, 但裁决是「不是」(Truth/边界用)。"""
+    r = _verdict_tool(established, touched, cand)
+    r.tool_input["answers"][0]["verdict"] = "不是"
+    return r
+
+
+def _verdict_tool_irrelevant(cand=True):
+    """candidate=True 却判「无关」—— 自相矛盾结果(A2 的原料)。"""
+    return LLMResult(tool_input={"answers": [{
+        "id": 1, "verdict": "无关", "comment": "发个 是/不是 的猜测",
+        "solution_candidate": cand,
+        "touched_fact_ids": [], "established_fact_ids": [],
+    }]}, model="m")
+
+
 def test_ux_g_v5_skips_final_judge():
     """Case G: 有通关合同 -> 只调**一次** client, 绝不调 emit_judgement。
 
     若这里仍调 Final Judge, 就又多了一条绕开合同的通关路径: 观众说中
     一条 support 剧情也可能被裁判判"猜中", 于是合同形同虚设。
     """
-    print("\n[UX-G] v5 不调 Final Judge")
-    # 队列里**只准备一次** Answer 返回。若代码偷偷调裁判, FakeClient
-    # 会吐出 "no more canned results" 错误 —— 断言的就是"没调"。
-    fc = FakeClient([_verdict_tool(established=["f1"], cand=True)])
+    print("\n[UX-G] v5 有合同不调 Final Judge(completion 要复核)")
+    # A1 起有**两次**调用: verdict + completion 复核。断言的是
+    # **没有 emit_judgement** —— 那才是"不调 Final Judge"的意思。
+    fc = FakeClient([
+        _verdict_tool(established=["f1"], cand=True),
+        _completion_tool(["f1"]),
+    ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "她是姐姐",
                         facts=riddle()["facts"],
                         completion_fact_ids=["f1"])
-    check("只调了一次 client", len(fc.calls) == 1, len(fc.calls))
-    check("那一次是 emit_verdict",
+    check("调了两次(verdict + completion 复核)", len(fc.calls) == 2,
+          len(fc.calls))
+    check("第一次是 emit_verdict",
           fc.calls[0]["tool"]["name"] == "emit_verdict",
           fc.calls[0]["tool"].get("name"))
-    check("没有 emit_judgement 调用",
+    check("**没有 emit_judgement 调用**",
           all(c["tool"] and c["tool"]["name"] != "emit_judgement"
               for c in fc.calls), [c["tool"] for c in fc.calls])
     check("返回了一条结果", len(out) == 1, out)
-    check("established 被带回", out and out[0].established_fact_ids == ["f1"],
+    check("established 被复核确认后带回",
+          out and out[0].established_fact_ids == ["f1"],
           out[0].established_fact_ids if out else None)
     check("**没有**被标成 P.SOLVE", out and out[0].verdict != "揭晓",
           out[0].verdict if out else None)
+
+
+def test_ux_g2_plain_qa_is_still_one_call():
+    """**普通事实问答仍然恰好 1 次 LLM。**
+
+    completion 复核是有条件的(第一层自报了 completion / 是完整答案
+    候选), 不该把所有 QA 都变成双调用 —— 那是时延灾难。
+    """
+    print("\n[UX-G2] 普通 QA 仍 1 次 LLM")
+    # 队列里只放一次。若代码偷偷调复核, FakeClient 会吐
+    # "no more canned results"。断言的就是"没调"。
+    fc = FakeClient([_verdict_tool(established=["f3"])])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "有人死吗",
+                        facts=riddle()["facts"],
+                        completion_fact_ids=["f1"])
+    check("**只调了一次 client**", len(fc.calls) == 1, len(fc.calls))
+    check("普通 fact 的 established 直接带回",
+          out and out[0].established_fact_ids == ["f3"],
+          out[0].established_fact_ids if out else None)
 
 
 def test_ux_h_legacy_still_judges():

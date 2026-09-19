@@ -815,7 +815,7 @@ class AnthropicMessagesClient:
 # ======================================================================
 RIDDLE_PROMPT_VERSION = "riddle-v6"
 CHECK_PROMPT_VERSION = "check-v6"
-ANSWER_PROMPT_VERSION = "answer-v5"
+ANSWER_PROMPT_VERSION = "answer-v6"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
 REVEAL_PROMPT_VERSION = "reveal-v2"
@@ -1034,9 +1034,15 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
 
 **"是"不等于 established; "不是"也不等于不能 established。**
 
-标 `[通关核心]` 的那几条是**房间真正缺的东西**, 判它们时尤其要按
-**核心语义**判 —— 观众用普通话说出同一个机制, 就应该建立, 不要因为
-措辞和事实表不一样而留空。
+⚠️ **标 `[通关核心]` 的那几条, 你填的 `established_fact_ids` 只是"提议"。**
+
+系统会**另外**派一个复核员确认它们, 你没通过复核的那几条不会推进通关。
+所以你**不要**因为"反正系统会复核"就随手标 —— 标错的提议只会浪费一次
+复核, 并让日志里出现一条被否决的记录。
+
+判它们时按**核心语义**判: 观众用普通话说出**同一个机制**, 就应该建立。
+但**只有方向、只有上位词**(比如说了"有问题""有机关""不正常")而没说
+出**具体机制**时, **不要**建立 —— 那正是被复核否决的那一类。
 
 拿不准是否只是"沾边"时**不要**建立; 但如果普通观众已经能从这句公开
 话语里复述出**同一个核心命题**, 就应当 established, 不要因为措辞不同
@@ -1921,22 +1927,61 @@ _TOOL_JUDGE = {
 # 复用会让 v6 悄悄退回旧语义。
 COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**。
 
+## 你要回答的问题(先看清, 别答错题)
+
+**不是**"这个问题和这条 fact 有没有关系"。
+
+**而是**: 这次公开对话结束之后, **一个普通观众**是否已经知道该 fact
+的**完整核心命题**。
+
+这是本任务唯一的判据。判"有关联"会让我们把还没被说出来的机制当作
+已经建立 —— 那等于白送通关, 是这套系统最严重的错误。
+
 房间里已经有一批"尚未建立"的通关事实。你要判断: 结合**房间此前已经
-确认过的内容**与**当前这位观众刚刚说出的话**, 其中哪几条的核心语义
+确认过的内容**与**当前这位观众刚刚说出的话**, 其中哪几条的核心命题
 **实际上已经被公开建立**了。
 
 你不是裁判, 不判断"这题解出来了没有"。你只回答上面那一个问题。
 
-【判据】看的是 fact 的**核心命题**是否已被公开表达, 不是措辞是否一致。
+## 特异性硬规则(最重要)
+
+观众公开说出的信息**必须自己就足够推出那条 fact 的核心机制**。
+
+**绝不允许**根据你看到的 hidden fact 去"补全"观众那句更笼统的话。
+你看得见 fact, 观众看不见 —— 只有**观众那一边**拿到的信息才算数。
+
+❌ 不建立:
+    completion  f2 = 画框内部有报警感应结构
+    观众         "画框有问题吗？"
+    Host         "是"
+    -> 公开信息只有"画框存在某种问题"。报警感应结构是**你从 hidden
+       fact 里读到的**, 观众并不知道。**不建立 f2。**
+
+✅ 建立:
+    观众         "画框里面是不是藏着报警感应线？"
+    Host         "是"
+    -> 观众自己说出了"画框内部 + 报警/感应结构"。**建立 f2。**
+
+✅ 建立(答"不是"同样可以建立):
+    completion  f1 = 飞机没有机械故障
+    观众         "飞机有机械故障吗？"
+    Host         "不是"
+    -> 这个"不是"已经完整公开确认了 canonical fact。
+
+同理, 观众说"这里有机关吗？"答"是" —— 只建立了"有某种机关", 具体是
+什么机关没说, 除非 fact 的核心命题本身就是这样一句笼统的话。
+
+## 一般的判据
 
 算建立:
 - 同义词 / 口语化
 - 语序变化
 - 省略不影响核心意思的修饰
-- 用更普通的话表达同一个机制
+- 用更普通的话表达**同一个机制**(机制本身被说出来, 只是换了说法)
 
 不算建立:
 - 只是沾边、只说题材、只说一个模糊方向
+- 只说了 fact 的**上位概念**(机关 / 有问题 / 不正常 / 有猫腻)
 - 需要你按隐藏谜底补一大步才能成立
 
 ⚠️ 若某条 fact 本身**含比【核心答案】更细的修饰**(那是不该出现的边界
@@ -1946,6 +1991,11 @@ COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**�
 - 因果方向
 - 目的
 - 核心机制
+
+## 拿不准时
+
+**不要建立。** 少建立一条只是让观众再多说一句; 多建立一条会让这题
+提前结束、而且是以"没人真正想明白"的方式结束。
 
 【输出】只输出**匹配上的 fact id**。没匹配上就留空数组。
 不要输出解释, 不要输出 solved, 不要输出任何其它字段。"""
@@ -2827,20 +2877,39 @@ class PuzzleWriter:
         `completion_fact_ids` 为空时(老 archive / fallback / 题池老题)
         **完全保持旧行为** —— 它们不该因为这次改动突然失去通关能力。
 
-        ## v6: 强候选的 completion 语义复核
+        ## v6/A1: completion fact 的**强制**语义复核
 
-        v5 在真实直播里暴露出一个缺口: 第一层 Answer 措辞过于保守, 房间
-        明明已经用普通话说出核心机制, 它却回 `established=[]` —— 于是
-        合同永远覆盖不满, 连续十几个「是」也不揭晓。
+        v5 在真实直播里暴露出两个方向的缺口:
 
-        所以 v6 在**强候选**上补一次复核(`_completion_verify`)。它:
+        **(a) 第一层太保守** —— 房间明明已经用普通话说出核心机制, 它却回
+        `established=[]`, 于是合同永远覆盖不满, 连续十几个「是」也不揭晓。
 
-        - 只在 `有合同 + status=ok + verdict=是 + candidate=True +
-          合同尚未覆盖` 时触发 —— 普通问答**绝不多调一次 LLM**;
-        - **只回 completion fact IDs**, 且严格过滤(不存在的 / support /
-          已建立的 / 非合同的 一律丢弃);
-        - 补进 `r0.established_fact_ids`, **绝不**改 verdict、绝不产生
-          P.SOLVE。
+        **(b) 第一层太宽** —— 更严重。它可以直接回
+        `established_fact_ids=["f2"]` 而 Engine 照单全收, 于是:
+
+            观众 "画框有问题吗？" -> 是 -> established=["f2"]
+            而 f2 实际是"画框内藏报警/感应结构"
+
+        "画框有问题"显然不能公开建立这么具体的机制。
+
+        **A1 的原则**:
+
+            **任何 completion fact 都不能只靠第一层 Answer 自报建立。**
+
+        实现见 `_completion_verify` 的拆分:
+
+            direct_noncompletion -> 直接进最终 established
+            direct_completion    -> 必须复核确认
+            final = direct_noncompletion ∪ verified_completion
+
+        未被确认的 completion ID 一律删除。**复核技术失败也不例外** ——
+        否则 mandatory verify 就是假门(fail-open for conversation,
+        fail-closed for victory state)。
+
+        触发条件(见 `_completion_verify`): 有合同 + status=ok + missing
+        非空 + (第一层自报了 completion 或 solution_candidate=True)。
+        所以普通事实问答**仍然恰好 1 次 LLM**; 只有真的牵扯通关时才多
+        一次复核(最多 2 次)。
 
         ⚠️ 胜负入口仍然只有 Engine 的合同覆盖判定 —— 见
         `RoundEngine.submit_qa`。这里没有第二条路。
@@ -2971,13 +3040,31 @@ class PuzzleWriter:
         # `solution_candidate` 保留下来, 但只作为分析指标(复盘时看
         # 有多少人在尝试完整解谜), 不再是通关闸门。
         #
-        # v6 额外: 强候选 + 合同未覆盖时, 补一次 **completion 语义复核**。
-        # 它只补 established_fact_ids, 不碰 verdict —— 见 `_completion_verify`。
+        # ---- v6/A1: 有通关合同 -> **绝不**调 Final Judge ----
+        #
+        # 这不是"省一次调用"的优化, 是**语义**要求: v5 起的胜负由 Engine
+        # 对 established facts 做集合覆盖判定。若这里仍调 Judge 并把
+        # P.SOLVE 写回去, 就又有了一条绕开合同的通关路径 ——
+        # 观众说中一条 support 剧情也可能被判"猜中"。
+        #
+        # `solution_candidate` 保留下来, 但只作为分析指标(复盘时看
+        # 有多少人在尝试完整解谜), 不再是通关闸门。
+        #
+        # ---- A1: completion fact **不能**只靠第一层自报 ----
+        #
+        # 第一层可以直接建立**普通 fact**(support/exclusion): 它判的是
+        # "这条 public 问答有没有确认这条 fact", 语义范围小。
+        #
+        # 但 completion fact 是**胜负合同**, 第一层自报 established=f2 会
+        # 直接导致揭晓。实播里出现过:
+        #
+        #     观众 "画框有问题吗？" -> 是 -> established=["f2"]
+        #     而 f2 实际是"画框内藏报警/感应结构"
+        #
+        # 所以 completion fact 一律拆出来, 只有 `_completion_verify`
+        # 确认过才回到最终 established。见下面的 direct_completion /
+        # direct_noncompletion 拆分。
         if has_contract:
-            if not r0.solution_candidate:
-                return results, res.error
-            _detail("v6 有通关合同 -> 不调 Final Judge(候选走合同复核): %r",
-                    text[:40])
             self._completion_verify(
                 r0, spec=spec, completion_fact_ids=completion_fact_ids,
                 room_established_fact_ids=room_established_fact_ids,
@@ -3024,35 +3111,61 @@ class PuzzleWriter:
                            user_name: str, text: str,
                            timeout: Optional[float] = None,
                            max_retries: Optional[int] = None) -> None:
-        """v6 强候选的 completion 语义复核。**就地**补 r0.established_fact_ids。
+        """completion fact 的**强制**语义复核。**就地**重写
+        `r0.established_fact_ids`。
 
-        ⚠️ 这个函数**只能**写 `r0.established_fact_ids`。它不得改
-        `r0.verdict`、不得产生 `P.SOLVE`、不得碰 Engine —— 一旦它能让
-        自己判 solved, 就产生了**第二条胜负入口**, 那条路会绕开
-        `_record_human_established_locked` 的 human-only 边界。胜负
-        永远只有一条:
+        ⚠️ 这个函数**只能**写 `r0.established_fact_ids`(以及只读的
+        `completion_verified_fact_ids`)。它不得改 `r0.verdict`、不得产生
+        `P.SOLVE`、不得碰 Engine —— 一旦它能让自己判 solved, 就产生了
+        **第二条胜负入口**, 那条路会绕开 `_record_human_established_locked`
+        的 human-only 边界。胜负永远只有一条:
 
             RoundEngine.submit_qa -> 累计 established -> 合同 ⊆ established
 
-        触发条件(全部满足, 否则**一次 LLM 都不调**):
+        ## A1: 这是**门**, 不是"锦上添花"
+
+        v6 时它只在"强候选 + 第一层已经答是"时跑, 失败就保留第一层的
+        established —— 那时它确实是锦上添花。A1 起语义变了:
+
+            **任何 completion fact 都不能只靠第一层 Answer 自报建立。**
+
+        第一层可以提议("我认为 f2 已建立"), 但必须由这里确认。所以现在:
+
+            拆分:  direct_noncompletion -> 直接进最终 established
+                   direct_completion    -> 交给复核
+            合并:  final = direct_noncompletion ∪ verified_completion
+
+        **未被确认的 completion ID 一律删除**(包括复核技术失败时)。
+        否则 mandatory verify 就是假门 —— 复核挂了, 第一层自报的
+        completion 照样推进通关。
+
+        ## 触发条件
 
             has_contract
             AND r0.status == "ok"
-            AND r0.verdict == P.YES
-            AND r0.solution_candidate is True
             AND missing 非空
+            AND ( direct_completion 非空  OR  r0.solution_candidate is True )
 
-        技术失败(timeout / 空 tool input / 解析失败)时
-        **fail-open-for-gameplay, fail-closed-for-state**:
+        `direct_completion` 非空也要复核, 哪怕 candidate=False —— 那正是
+        "画框有问题吗 -> 是 -> 自报 f2" 那个场景, 而它不是完整答案候选。
 
-            保留第一层"是/不是/无关"
-            不新增 established
-            不报"未判定"
+        ## 两种模式
+
+        - **普通事实问答**(candidate=False, 但第一层自报了某条 completion):
+          只把 `direct_completion` 给复核看。**不暴露全部 missing** ——
+          那等于让复核顺着 missing 列表去"找"观众没说过的东西。
+        - **完整答案候选**(candidate=True): 可以看 `missing`。它承担
+          rescue 作用(房间已经用普通话说出机制, 第一层没认出来)。
+
+        ## 技术失败(timeout / 空 tool input / 解析失败)
+
+        **fail-open for conversation, fail-closed for victory state**:
+
+            保留第一层 verdict(是/不是/无关)
+            保留 direct_noncompletion
+            completion **一条都不推进**
             不 solved
             只打 warning
-
-        因为第一层回答已经成功 —— 复核只是锦上添花, 不该把成功的裁决
-        拖垮。反过来, 复核失败也绝不允许"顺手"给一个 established。
         """
         completion = {str(x) for x in (completion_fact_ids or [])
                       if str(x).strip()}
@@ -3062,21 +3175,47 @@ class PuzzleWriter:
         # fail-closed 推理 —— "没标"不等于"没问题"。
         if str(getattr(r0, "status", "") or "") != "ok":
             return
-        if r0.verdict != P.YES:
-            return
-        if not r0.solution_candidate:
-            return
+
         room = {str(x) for x in (room_established_fact_ids or [])
                 if str(x).strip()}
         direct = {str(x) for x in (r0.established_fact_ids or [])
                   if str(x).strip()}
-        missing = completion - room - direct
-        if not missing:
-            return                       # 第一层已经补齐 -> 不必复核
+
+        # ---- ① 拆分 ----
+        missing = completion - room
+        direct_completion = direct & missing
+        direct_noncompletion = direct - completion
+
+        # ---- ② 本轮能被复核确认的候选集 ----
+        # 普通问答只暴露"第一层自己声称建立了的那几条"; 完整答案候选才
+        # 能看到全部 missing(rescue 语义)。见 docstring。
+        if r0.solution_candidate:
+            verifiable = set(missing)
+        else:
+            verifiable = set(direct_completion)
+
+        # ---- ③ 触发条件 ----
+        should_verify = (
+            str(getattr(r0, "status", "") or "") == "ok"
+            and bool(missing)
+            and (bool(direct_completion) or r0.solution_candidate is True)
+        )
+
+        # ---- ④ 没有可确认的东西: 也必须先清掉自报的 completion ----
+        # 例: candidate=False 且 direct_completion 为空 -> 第一层没自报
+        # completion 也没有候选, 什么都不用做, 但**绝不能**把第一层
+        # 自报的 completion 留在最终结果里 —— 上面已由拆分保证。
+        if not should_verify or not verifiable:
+            r0.established_fact_ids = self._stable_ids(
+                direct_noncompletion, reference=direct)
+            if direct_completion:
+                log.info("completion 自报但无可复核路径, 不推进: %s (%.30r)",
+                         sorted(direct_completion), text)
+            return
 
         by_id = {f.id: f for f in (spec.facts or [])}
         miss_txt = "\n".join(
-            f"- {fid} {by_id[fid].text}" for fid in sorted(missing)
+            f"- {fid} {by_id[fid].text}" for fid in sorted(verifiable)
             if fid in by_id) or "(无)"
         room_txt = "\n".join(
             f"- {fid} {by_id[fid].text}" for fid in sorted(room)
@@ -3098,31 +3237,63 @@ class PuzzleWriter:
         ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
         raw_ids = ti.get("matched_completion_fact_ids")
         if not isinstance(raw_ids, list):
-            # 技术失败(空 tool input / 超时 / 解析不动)。
-            log.warning("completion 复核无有效返回, 保留第一层裁决 %s: %r",
-                        r0.verdict, text[:30])
+            # 技术失败 —— **completion 一条都不推进**, 但 verdict 与
+            # direct_noncompletion 保留(fail-open for conversation)。
+            r0.established_fact_ids = self._stable_ids(
+                direct_noncompletion, reference=direct)
+            log.warning(
+                "completion 复核无有效返回, 保留裁决 %s 但不推进 completion "
+                "%s: %.30r", r0.verdict, sorted(direct_completion), text)
             return
-        # ---- 严格过滤: 只接受**仍在 missing 里的** completion id ----
+        # ---- 严格过滤: 只接受**在 verifiable 里的** id ----
         # 任何 f999 / support fact / 已建立的 id / 非 completion id 全部丢弃。
+        # 非候选模式下 `verifiable` 就是 direct_completion, 所以复核也
+        # 不能借机把观众没说过的 fact 塞进来。
         verified = []
         for x in raw_ids:
             fid = str(x).strip()
-            if fid and fid in missing and fid not in verified:
+            if fid and fid in verifiable and fid not in verified:
                 verified.append(fid)
         if len(verified) != len([x for x in raw_ids if str(x).strip()]):
             log.debug("completion 复核返回了非法 id, 已过滤: %r -> %r",
                       raw_ids, verified)
-        if not verified:
-            _detail("completion 复核无新增: %r", text[:40])
-            return
-        # 就地补进第一层结果。stable_union: 保持既有顺序 + 追加新 id。
-        merged = list(r0.established_fact_ids or [])
-        for fid in verified:
-            if fid not in merged:
-                merged.append(fid)
-        r0.established_fact_ids = merged
+        # ---- 最终 established = direct_noncompletion ∪ verified ----
+        r0.established_fact_ids = self._stable_ids(
+            direct_noncompletion, reference=direct, extra=verified)
         r0.completion_verified_fact_ids = list(verified)
-        log.info("completion 复核补入 %s: %r", verified, text[:30])
+        if verified:
+            log.info("completion 复核确认 %s: %.30r", verified, text)
+        elif direct_completion:
+            log.info("completion 自报被复核否决, 不推进: %s (%.30r)",
+                     sorted(direct_completion), text)
+
+    @staticmethod
+    def _stable_ids(keep, reference=(), extra=()) -> list:
+        """拼一组 fact id, 按 `reference` 的顺序保留 `keep`, 再追加 `extra`。
+
+        `keep` 常是 set(集合运算的结果), 而 set 的顺序随解释器实现变 ——
+        但 `established_fact_ids` 的顺序在 `completion_contribution_fact_ids`
+        与 reveal 贡献链里是**可观察**的。所以顺序统一由 `reference`
+        (第一层原始的、有序的列表)决定。
+
+        ⚠️ `reference` **只用来排序**, 不是"也加进来" —— 早先把它当成
+        第二个 group 传, 于是被复核否决的 completion id 又被原样加回
+        (`['f2','f1']` 那个 bug)。`keep` 才是"留下哪些"。
+        """
+        keep = {str(x).strip() for x in (keep or []) if str(x).strip()}
+        out: list = []
+        for x in (reference or []):
+            fid = str(x).strip()
+            if fid in keep and fid not in out:
+                out.append(fid)
+        # reference 里没覆盖到的(理论上不该有)按 sorted 兜底, 保证确定性。
+        for fid in sorted(keep - set(out)):
+            out.append(fid)
+        for x in (extra or []):
+            fid = str(x).strip()
+            if fid and fid not in out:
+                out.append(fid)
+        return out
 
     @staticmethod
     def _clean_fact_ids(raw, spec: "PuzzleSpec") -> list:
