@@ -815,7 +815,7 @@ class AnthropicMessagesClient:
 # ======================================================================
 RIDDLE_PROMPT_VERSION = "riddle-v7"
 CHECK_PROMPT_VERSION = "check-v7"
-ANSWER_PROMPT_VERSION = "answer-v6"
+ANSWER_PROMPT_VERSION = "answer-v7"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
 REVEAL_PROMPT_VERSION = "reveal-v2"
@@ -1996,25 +1996,7 @@ _TOOL_JUDGE = {
 # cause/mechanism 裁判, 判的是"是否说中谜底核心真相"。这道题问的是
 # 一个**弱得多**的问题("这条 fact 的核心语义是否已被公开说出")。
 # 复用会让 v6 悄悄退回旧语义。
-COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**。
-
-## 你要回答的问题(先看清, 别答错题)
-
-**不是**"这个问题和这条 fact 有没有关系"。
-
-**而是**: 这次公开对话结束之后, **一个普通观众**是否已经知道该 fact
-的**完整核心命题**。
-
-这是本任务唯一的判据。判"有关联"会让我们把还没被说出来的机制当作
-已经建立 —— 那等于白送通关, 是这套系统最严重的错误。
-
-房间里已经有一批"尚未建立"的通关事实。你要判断: 结合**房间此前已经
-确认过的内容**与**当前这位观众刚刚说出的话**, 其中哪几条的核心命题
-**实际上已经被公开建立**了。
-
-你不是裁判, 不判断"这题解出来了没有"。你只回答上面那一个问题。
-
-## 特异性硬规则(最重要)
+COMPLETION_SPECIFICITY_RULES = """## 特异性硬规则(最重要)
 
 观众公开说出的信息**必须自己就足够推出那条 fact 的核心机制**。
 
@@ -2066,7 +2048,33 @@ COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**�
 ## 拿不准时
 
 **不要建立。** 少建立一条只是让观众再多说一句; 多建立一条会让这题
-提前结束、而且是以"没人真正想明白"的方式结束。
+提前结束、而且是以"没人真正想明白"的方式结束。"""
+
+
+# 为什么把上面这段**抽出来共享**: A2 的 `_candidate_recheck` 也承担
+# completion 语义确认(它不再把这件事转交 `_completion_verify`, 否则
+# 那条异常路径就是 3 次 LLM)。两处各写一遍"什么叫建立 fact"必然
+# 漂移 —— 漂移的那一天, 同一句话在两条路径上会得到不同结论, 而
+# 其中一条直接决定胜负。
+COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**。
+
+## 你要回答的问题(先看清, 别答错题)
+
+**不是**"这个问题和这条 fact 有没有关系"。
+
+**而是**: 这次公开对话结束之后, **一个普通观众**是否已经知道该 fact
+的**完整核心命题**。
+
+这是本任务唯一的判据。判"有关联"会让我们把还没被说出来的机制当作
+已经建立 —— 那等于白送通关, 是这套系统最严重的错误。
+
+房间里已经有一批"尚未建立"的通关事实。你要判断: 结合**房间此前已经
+确认过的内容**与**当前这位观众刚刚说出的话**, 其中哪几条的核心命题
+**实际上已经被公开建立**了。
+
+你不是裁判, 不判断"这题解出来了没有"。你只回答上面那一个问题。
+
+""" + COMPLETION_SPECIFICITY_RULES + """
 
 【输出】只输出**匹配上的 fact id**。没匹配上就留空数组。
 不要输出解释, 不要输出 solved, 不要输出任何其它字段。"""
@@ -2128,41 +2136,80 @@ CANDIDATE_RECHECK_SYSTEM = """你是海龟汤直播的裁决机。上一步出�
 - 「无关」只留给**没有可判定剧情命题**的输入(闲聊、灌水、索取答案、
   与故事无关)。
 
-所以你要**重新判一次**这句话, 只在 是 / 不是 里选。
+## 矛盾可能来自两侧 —— 你要判的是**哪一侧错了**
+
+    A. verdict 错了   -> 它其实是个具体命题, 应改成 是 / 不是
+    B. solution_candidate 错了
+                      -> 它其实是闲聊, 应保持 无关 且 candidate=false
+
+**不要**默认往 A 走。第一层把闲聊/灌水误标成"完整解候选"是同样常见的
+错误, 而硬把它改成「不是」会给观众一条**错误信息**(它根本不是命题,
+谈不上"不是")。
+
+所以你的输出里 `verdict` 与 `solution_candidate` **必须自洽**:
+
+    verdict = 无关          -> solution_candidate 必须 false
+                               verified_completion_fact_ids 必须空
+    solution_candidate=true -> verdict 必须是 是 / 不是
 
 【判据】仍然以【事实表】为唯一依据。
 
 - 「是」: 这句话说出的 proposition 在 canonical world 中成立。
   **即使只说对了一部分、还不足以通关、只命中 support, 也仍是「是」。**
 - 「不是」: 这句话提出了一个具体剧情判断, 但事实表否定它。
+- 「无关」: 这句话**没有**提出任何可判定的剧情命题(闲聊、灌水、
+  索取答案、与故事无关)。
 
-【顺便做第二件事】
+## 顺带做第二件事: completion 语义确认
+
 如果这句话**确实**公开建立了【仍缺的通关事实】里的某几条, 一并回传
-它们的 id。判据与平时一致: 观众**自己说出**了那条 fact 的核心机制 ——
-不能因为你看得见 hidden fact 就替观众补全。
+它们的 id 到 `verified_completion_fact_ids`。
 
-【输出】只输出 verdict 与(可选的)matched_completion_fact_ids。
+⚠️ 这一步的判据与**通关事实复核员完全一致** —— 观众**自己说出**了那条
+fact 的核心机制, 不能因为你看得见 hidden fact 就替观众补全。下面这套
+规则与复核员用的是同一份(不是各写一遍):
+
+""" + COMPLETION_SPECIFICITY_RULES + """
+
+【输出】只输出 verdict / solution_candidate / verified_completion_fact_ids。
 **没有 solved 字段** —— 通关由系统按合同覆盖判定, 不归你负责。"""
 
 _TOOL_CANDIDATE_RECHECK = {
     "name": "emit_candidate_recheck",
-    "description": "把一条自相矛盾(候选却判无关)的发言重新判成 是/不是",
+    "description": ("把一条自相矛盾(候选却判无关)的发言重新裁决: "
+                    "verdict + solution_candidate + 已确认的通关事实"),
     "input_schema": {
         "type": "object",
         "properties": {
             "verdict": {
-                "type": "string", "enum": ["是", "不是"],
-                "description": ("重新裁决。**只能是 是 或 不是** —— "
-                                "「无关」在这种输入上不成立。"),
+                "type": "string", "enum": ["是", "不是", "无关"],
+                "description": (
+                    "重新裁决。**可以是「无关」** —— 若第一层错的是"
+                    "`solution_candidate`(把闲聊标成了完整解候选), 那么"
+                    "正确答案就是「无关」, 此时 solution_candidate 必须为 "
+                    "false。只有当这句话确实提出了一个可判定的剧情命题时, "
+                    "才可以在 是/不是 里选。"),
             },
-            "matched_completion_fact_ids": {
+            "solution_candidate": {
+                "type": "boolean",
+                "description": (
+                    "这句话是否真的在**尝试完整解释谜底**。"
+                    "verdict=无关 时必须为 false; "
+                    "verdict 是 是/不是 时通常为 true, 但只说出一个零散"
+                    "事实(而非在解释整条谜底)也可以为 false。"),
+            },
+            "verified_completion_fact_ids": {
                 "type": "array", "items": {"type": "string"},
                 "description": (
-                    "这条发言**自己**公开建立了哪些通关事实(只填"
-                    "【仍缺的通关事实】里列出的 id)。没有就留空数组。"),
+                    "这句话**自己**公开建立了哪些【仍缺的通关事实】。"
+                    "判据与通关事实复核员**完全一致**(见特异性硬规则): "
+                    "观众必须自己说出了那条 fact 的核心机制, 不能因为你看得见 "
+                    "hidden fact 就替观众补全。\n"
+                    "verdict=无关 时必须留空数组。\n"
+                    "这里**没有** solved 字段 —— 通关由系统按合同覆盖判定。"),
             },
         },
-        "required": ["verdict"],
+        "required": ["verdict", "solution_candidate"],
     },
 }
 
@@ -3355,25 +3402,43 @@ class PuzzleWriter:
         # 的判据是"如果成立 -> 是, 如果不成立 -> 不是", 它永远不该叫无关。
         #
         # 为什么不做成"无关 -> 是"或"无关 -> 不是"的映射: 那是**猜**,
-        # 猜错方向会把观众思路直接带反。
+        # 猜错方向会把观众思路直接带反。矛盾**可能来自两侧** ——
+        # verdict 错了, 或者 `solution_candidate` 错了(把闲聊标成了
+        # 完整解候选)。后者恰恰要求答案是「无关 + candidate=False」。
         #
         # 为什么不是整条重跑 Answer: 那就是 3 次 LLM, 而
-        # qa_answer_timeout=8s / qa_inflight_timeout=25s 撑不住。
-        # `_candidate_recheck` 用一个窄工具在一次调用里同时做两件事
-        # (重判 + 可选 completion match), 所以时延上限仍然是
-        # **第一层 Answer + 最多一次附加调用**。
+        # qa_answer_timeout=8s / qa_inflight_timeout=25s 撑不住
+        # (8s x 3 = 24s, 贴着 25s 上限, 正确答案会被 Engine 判成超时)。
+        #
+        # **C0 冻结: 这条路径总共最多 2 次调用。** 重判自己承担 completion
+        # 语义确认(用与 `_completion_verify` 同一份特异性规则), 成功后就
+        # **不再**进入 `_completion_verify` —— 否则就是第 3 次。
         #
         # 只有真的自相矛盾才触发: status=ok + candidate=True + verdict=无关。
         # 普通问答一次都不多调。
         if (str(getattr(r0, "status", "") or "") == "ok"
                 and r0.solution_candidate is True
                 and r0.verdict == P.IRRELEVANT):
-            self._candidate_recheck(
+            done = self._candidate_recheck(
                 r0, spec=spec, completion_fact_ids=completion_fact_ids,
                 room_established_fact_ids=room_established_fact_ids,
                 core_answer=core_answer, transcript=transcript,
                 user_name=user_name, text=text,
                 timeout=timeout, max_retries=max_retries)
+            # 重判**已经**做完 completion 语义确认(它自己就是这条异常路径
+            # 的专门 verifier)。成功即**终局** —— 直接 return:
+            #
+            #   - 有合同: 否则会再进 `_completion_verify`(第 3 次串行 LLM);
+            #   - 无合同: 否则会掉进下面的 legacy Final Judge —— 重判刚把
+            #     `solution_candidate` 判成 true, 正好满足它的入口条件,
+            #     于是又是一次调用。这条路径同样必须止步。
+            #
+            # 失败(返回 False)时不 return: 那时 verdict 已改成"未判定",
+            # `solution_candidate` 保持不变, 下面的分支会照常按未判定处理
+            # (legacy 分支要求 verdict 非空才继续, 而"未判定"会被
+            # `_fill_coverage` 那条路兜住)。
+            if done:
+                return results, res.error
 
         # ---- v5/v6/A1: 有通关合同 -> **绝不**调 Final Judge ----
         #
@@ -3445,8 +3510,12 @@ class PuzzleWriter:
                            core_answer: str, transcript: list,
                            user_name: str, text: str,
                            timeout: Optional[float] = None,
-                           max_retries: Optional[int] = None) -> None:
-        """A2: `candidate=True` 却判「无关」时的**定向重判**。就地改 r0。
+                           max_retries: Optional[int] = None) -> bool:
+        """A2/C0: `candidate=True` 却判「无关」时的**定向重判**。就地改 r0。
+
+        返回 `True` 表示"这次调用**成功且已终局**" —— 调用方据此跳过
+        `_completion_verify`(否则就是第 3 次 LLM)。返回 `False` 表示
+        技术失败(已改判"未判定"), 调用方也不该再往下走完成复核。
 
         ## 为什么必须重判
 
@@ -3454,19 +3523,39 @@ class PuzzleWriter:
         "这句跟谜底没有可判定的关系"。两者不可能同时成立。原样交给观众
         就是给了一条**错误信息**。
 
-        ## 它做什么 / 不做什么
+        ## 矛盾可能来自两侧(C0 修正)
 
-        **做**: 把这条 concrete explanation 重新判成 是 / 不是; 若它真的
-        建立了 missing completion, 顺便回传那些 id(交给随后的
-        `_completion_verify` 走同一套确认 —— 这里**不**直接写 established)。
+        早先这里假定"一定是 verdict 错了", 于是把 enum 锁成 是/不是,
+        逼着模型二选一。但 `solution_candidate` 同样可能是错的 —— 第一层
+        把一句闲聊/灌水标成了"完整解候选"。硬判成「不是」会给观众
+        另一条错误信息(它根本不是命题, 谈不上"不是")。
 
-        **不做**: 不产生 `P.SOLVE`(胜负永远只在 Engine 的合同覆盖判定);
-        不把「无关」简单映射成某一侧(那是猜, 猜错会把观众带反)。
+        所以现在两个字段一起重判, 并强制自洽:
+
+            verdict=无关           -> solution_candidate=false, verified 空
+            solution_candidate=true -> verdict ∈ {是, 不是}
+
+        ## 它自己承担 completion 语义确认(C0)
+
+        **做**: 重判 verdict 与 candidate; 若这句话真的公开建立了 missing
+        completion, 用与 `_completion_verify` **同一份**特异性规则确认,
+        并把结果写进 `r0.completion_verified_fact_ids` / `established_fact_ids`。
+
+        **不做**: 不产生 `P.SOLVE`(胜负永远只在 Engine 的合同覆盖判定,
+        见 `_record_human_established_locked` 的 human-only 边界)。
+
+        ## 为什么不继承第一层的 established
+
+        第一层既然输出了"候选却无关"这种自相矛盾的结果, 它这一份输出
+        **整体语义不可靠** —— 不能一边说它错、一边又采信它自报的
+        established。所以这条路径下 established **只**等于本次确认过的
+        completion ids。`touched_fact_ids` 保留作探索诊断(它本来就没有
+        胜负权)。
 
         ## 失败时的处置
 
-        timeout / 空 tool / verdict 不合法 -> 保留原「无关」**不能要**, 因为
-        系统已经知道它是自相矛盾的结果。改成:
+        timeout / 空 tool / verdict 不合法 / 返回自相矛盾 -> 保留原「无关」
+        **不能要**, 因为系统已经知道它是自相矛盾的结果。改成:
 
             verdict = 未判定(P.UNAVAILABLE)
             status  = "unavailable"
@@ -3496,6 +3585,7 @@ class PuzzleWriter:
                 f"【之前公开问答】\n{tr}\n\n"
                 f"【当前真人发言】\n{user_name}：{text}\n\n"
                 f"【上一层的矛盾结果】\nverdict=无关, 但被标为完整答案候选。"
+                f"\n请判**哪一侧**错了(verdict 还是 solution_candidate)。"
             )
             res = self.client.messages(CANDIDATE_RECHECK_SYSTEM, user,
                                        max_tokens=300,
@@ -3506,42 +3596,72 @@ class PuzzleWriter:
             ti = (_unwrap_tool_input(res.tool_input) if res.tool_input
                   else {})
             v = str(ti.get("verdict", "") or "").strip()
-            if v not in (P.YES, P.NO):
-                # tool 不可用 / 空返回 / 回了 无关(不在 enum 里)。
+            if v not in (P.YES, P.NO, P.IRRELEVANT):
+                # tool 不可用 / 空返回 / verdict 不在 enum 里。
                 self._recheck_failed(r0, text,
                                      f"verdict={v!r}" if v else "无有效返回")
-                return
-            r0.verdict = v
-            # ---- 可选: 它自己建立了哪几条 missing completion ----
-            # 只当**记录**, 不直接写 established —— 那一步交给
-            # `_completion_verify` 走同一套确认。这样"谁能推进通关"仍然
-            # 只有一条路径。
-            raw_ids = ti.get("matched_completion_fact_ids")
-            if isinstance(raw_ids, list) and missing:
-                seeded = []
+                return False
+            # solution_candidate 必须显式给出 —— 缺失/类型不对按失败处理,
+            # 不猜(猜错方向正是这个函数要修的病)。
+            cand = ti.get("solution_candidate")
+            if not isinstance(cand, bool):
+                self._recheck_failed(r0, text, f"candidate={cand!r}")
+                return False
+            # ---- 自洽硬门: 不合法组合一律 fail closed ----
+            if v == P.IRRELEVANT and cand:
+                self._recheck_failed(r0, text, "无关 + candidate=True")
+                return False
+            if v in (P.YES, P.NO) and not cand:
+                # 是/不是 说明它是个命题 —— 但 candidate=false 意味着
+                # "不是完整解候选"。这两者可以共存(说中一条零散 fact),
+                # 所以只接受, 不报错。
+                pass
+
+            # ---- 确认 completion(自己就是 verifier, 不再转交) ----
+            verified: list = []
+            if v != P.IRRELEVANT and missing:
+                raw_ids = ti.get("verified_completion_fact_ids")
+                if raw_ids is None:
+                    raw_ids = []
+                if not isinstance(raw_ids, list):
+                    self._recheck_failed(r0, text,
+                                         "verified_completion_fact_ids 类型不对")
+                    return False
                 for x in raw_ids:
                     fid = str(x).strip()
-                    if fid and fid in missing and fid not in seeded:
-                        seeded.append(fid)
-                if seeded:
-                    # 记为第一层"提议建立"的完成事实, 让随后的
-                    # `_completion_verify` 有东西可验(它只验
-                    # direct_completion ∪ missing)。
-                    r0.established_fact_ids = self._stable_ids(
-                        seeded, reference=r0.established_fact_ids or [])
-                    log.info("候选重判补入提议 %s: %.30r", seeded, text)
+                    # 只接受 missing 里的真实 id —— 与 `_completion_verify`
+                    # 同一套过滤: 不许借机把观众没说过的 fact 塞进来。
+                    if fid and fid in missing and fid not in verified:
+                        verified.append(fid)
+                if len(verified) != len([x for x in raw_ids
+                                         if str(x).strip()]):
+                    log.debug("重判返回了非法 completion id, 已过滤: %r -> %r",
+                              raw_ids, verified)
+
+            r0.verdict = v
+            r0.solution_candidate = cand
+            # ---- 这条路径下 established **只**来自本次确认 ----
+            # 第一层的自报整体不可信(它自相矛盾), 不能又采信它的
+            # established —— 那等于让"候选却无关"这份输出部分生效。
+            r0.established_fact_ids = list(verified)
+            r0.completion_verified_fact_ids = list(verified)
+            if verified:
+                log.info("候选重判确认 completion %s: %.30r", verified, text)
             # comment 也要换掉 —— 原来的多半是"发个 是/不是 的猜测",
-            # 而现在已经判成 是/不是 了, 留着会前后矛盾。
+            # 而现在已经重判过了, 留着会前后矛盾。
             if _leaks_answer(r0.comment, spec.answer or ""):
                 r0.comment = ""
             elif not r0.comment or r0.comment.startswith("发个"):
                 r0.comment = ""
-            log.info("候选重判: 无关 -> %s: %.30r", r0.verdict, text)
+            log.info("候选重判: 无关 -> %s (candidate=%s): %.30r",
+                     r0.verdict, cand, text)
+            return True
         except Exception:                       # noqa: BLE001
             # 这个函数的任何异常都不能把一条已经成功的裁决拖垮, 也不能
             # 让自相矛盾的「无关」漏出去。统一走失败处置。
             log.exception("候选重判异常, 按未判定处理")
             self._recheck_failed(r0, text, "异常")
+            return False
 
     @staticmethod
     def _recheck_failed(r0: "QAResult", text: str, why: str) -> None:
