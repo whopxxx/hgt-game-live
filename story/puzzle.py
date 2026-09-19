@@ -626,6 +626,24 @@ class PuzzleSpec:
     #: AI 审题时打的风格标签(identity_flip / perspective_flip …)。
     #: 验收要按它统计"认知反转占比 >= 70%"。
     style_tags: list = field(default_factory=list)
+    #: **内容风格**标签(H3-A): 悬疑 / 细思极恐 / 反差 / 意外 / 情感 …
+    #: 与 `style_tags` 的分工: 那个描述**结构**(反转类型), 这个描述
+    #: **观感**(看完什么感觉)。验收要按观感统计, 所以要分开存 ——
+    #: 混进 style_tags 会让"identity_flip"和"细思极恐"并列, 统计时
+    #: 没法区分"结构反转占比"和"审美类型占比"这两个不同的指标。
+    content_style: list = field(default_factory=list)
+    #: **curated 准入政策**版本(H3-A)。只有 `source_type == "curated"`
+    #: 的题才有意义。
+    #:
+    #: 它是一条**独立**的 live eligibility 开关(与
+    #: `quality_policy_version` 并列, 不是它的别名):
+    #: 题池准入门要求它等于 `curated_compiler.CURATED_POLICY_VERSION`,
+    #: 否则隔离。于是收紧题型定义(如 v1 -> v2)时, 旧池里按旧标准收的
+    #: 题会**自动**失去播放资格 —— 不需要任何人手工删文件, 也不可能
+    #: 因为"忘了清理"而把 q10000 那种题播出去。
+    #:
+    #: 空串 = 不是 curated 题(或来自没有版本概念的旧代码)。
+    curated_policy_version: str = ""
 
     # ------------------------------------------------------------------
     # 便捷访问 —— engine / llm 需要"原子事实的文本列表"这类视图
@@ -708,6 +726,12 @@ class PuzzleSpec:
             "answer_license": self.answer_license,
             "attribution": dict(self.attribution or {}),
             "style_tags": list(self.style_tags or []),
+            # ---- H3-A: 内容风格 + curated 准入政策版本 ----
+            # `curated_policy_version` 必须随 archive 走: 它是题池准入门的
+            # 判据之一。不落盘 -> 读回来是空串 -> 一道合格的 v2 题会被
+            # 自己的池当成"没有政策版本"隔离掉。
+            "content_style": list(self.content_style or []),
+            "curated_policy_version": self.curated_policy_version,
             # ---- 生成溯源(见 _PROVENANCE_KEYS 的说明) ----
             "usage": self.usage,
             "model": self.model,
@@ -777,6 +801,14 @@ class PuzzleSpec:
                          if isinstance(d.get("attribution"), dict) else {}),
             style_tags=[str(x).strip() for x in (d.get("style_tags") or [])
                         if str(x).strip()],
+            # ---- H3-A: 老 archive 没有这两把键 -> 空。空 curated_policy_version
+            # 表示"不是 curated 题(或 v2 之前的产物)", 于是被题池隔离 ——
+            # 这正是我们要的: H2 按 v1 收的那批不该自动获得 v2 的播放资格。
+            content_style=[str(x).strip()
+                           for x in (d.get("content_style") or [])
+                           if str(x).strip()],
+            curated_policy_version=str(
+                d.get("curated_policy_version", "") or ""),
             # ---- 生成溯源 ----
             # 用 `.get()` 而不是 `d[...]`: 现存 archive 里绝大多数
             # (实测 data/puzzle.jsonl 105 条中 103 条)是这四把键出现

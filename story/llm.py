@@ -4089,6 +4089,13 @@ class PuzzleWriter:
             answer_license=spec.answer_license,
             attribution=dict(spec.attribution or {}),
             style_tags=list(spec.style_tags or []),
+            # ---- H3-A: 内容风格 + curated 准入政策版本 ----
+            # 与上面 8 个溯源字段同一个理由: `_apply_review` 会**重建**
+            # spec, 只有显式列出的字段能活下来。漏掉 curated_policy_version
+            # 的后果特别隐蔽 —— 题本身还是好的, 但它落盘后再也过不了题池
+            # 的准入政策门, 表现为"编译成功了却播不出来"。
+            content_style=list(spec.content_style or []),
+            curated_policy_version=spec.curated_policy_version,
             metrics=dict(spec.metrics or {}),
             usage=spec.usage, model=spec.model), ""
 
