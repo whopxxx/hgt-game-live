@@ -30,7 +30,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "vendor" / "douyin_fetcher"))
 
 from ws_cookie import (                                    # noqa: E402
-    BASE_WS_COOKIE_NAMES,
+    ANONYMOUS_WS_COOKIE_NAMES,
+    AUTHENTICATED_WS_COOKIE_NAMES,
     WS_AUTH_ANONYMOUS,
     WS_AUTH_AUTHENTICATED,
     build_ws_cookie_header,
@@ -66,8 +67,12 @@ def _names(header: str) -> list:
     return out
 
 
-_BASE = {"ttwid": "ANON_TTWID", "__ac_nonce": "NONCE1",
-         "__ac_signature": "SIG1"}
+#: 匿名真实 base —— 只有 ttwid(见 liveMan._build_ws_cookie_header)。
+_BASE = {"ttwid": "ANON_TTWID"}
+
+#: authenticated 增强链的 base(才有 nonce/signature)。
+_BASE_AUTH = {"ttwid": "ANON_TTWID", "__ac_nonce": "NONCE1",
+              "__ac_signature": "SIG1"}
 
 
 # ======================================================================
@@ -75,8 +80,8 @@ def test_anonymous_header():
     """A. 匿名态: 基础链在, 无登录 token。"""
     print("\n[WC-1] 匿名态 header")
     h = build_ws_cookie_header(_BASE, None)
-    check("基础身份 cookie 都在",
-          all(n in _names(h) for n in BASE_WS_COOKIE_NAMES), h)
+    check("anonymous 只有 ttwid(历史握手)",
+          _names(h) == list(ANONYMOUS_WS_COOKIE_NAMES), h)
     check("没有重复 name", len(_names(h)) == len(set(_names(h))), h)
     check("不含哨兵", SENTINEL not in h)
     check("空 login 等价于 None",
@@ -90,7 +95,7 @@ def test_authenticated_header():
     """B. 登录态: 合并 + 同名覆盖 + 无重复。"""
     print("\n[WC-2] 登录态 header")
     login = f"sessionid={SENTINEL}; sid_tt={SENTINEL}_TT; ttwid=LOGGED_TTWID"
-    h = build_ws_cookie_header(_BASE, login)
+    h = build_ws_cookie_header(_BASE_AUTH, login)
     names = _names(h)
     check("登录字段被保留", "sessionid" in names and "sid_tt" in names, h)
     check("没有重复 name", len(names) == len(set(names)), h)
@@ -109,7 +114,7 @@ def test_no_duplicate_names_ever():
     """同名覆盖的对称性: 换个顺序/多个同名, 仍然不重复。"""
     print("\n[WC-3] 重复 name 的边界")
     # login 里自己就带了两次 ttwid
-    h = build_ws_cookie_header(_BASE, "ttwid=A; ttwid=B")
+    h = build_ws_cookie_header(_BASE_AUTH, "ttwid=A; ttwid=B")
     names = _names(h)
     check("login 内部重复也被收敛", names.count("ttwid") == 1, h)
     check("胜出的是最后一个", "ttwid=B" in h, h)
@@ -230,7 +235,7 @@ def test_sentinel_never_leaks():
 
     # (e) 合并结果里哨兵**应该**在(它是凭据, 本来就该进 header) ——
     #     这条是反向验证, 证明确实是"只在该去的地方出现"。
-    hdr = build_ws_cookie_header(_BASE, f"sessionid={SENTINEL}")
+    hdr = build_ws_cookie_header(_BASE_AUTH, f"sessionid={SENTINEL}")
     check("哨兵在 header 里(证明上面不是空断言)", SENTINEL in hdr)
 
 
@@ -287,8 +292,8 @@ def test_transport_cookie_header_uses_login():
     f._login_cookie = None
     h2 = f._build_ws_cookie_header()
     check("匿名 -> 无 sessionid", "sessionid" not in h2, h2)
-    check("匿名 -> 基础链在",
-          all(n in _names(h2) for n in BASE_WS_COOKIE_NAMES), h2)
+    check("匿名 -> 只有 ttwid",
+          _names(h2) == list(ANONYMOUS_WS_COOKIE_NAMES), h2)
 
 
 def test_user_unique_id_refactor_is_value_preserving():
@@ -332,6 +337,128 @@ def test_forbidden_surfaces_untouched():
           summ.is_file())
 
 
+def test_anonymous_is_exact_historical_handshake():
+    """WC-10. 匿名态必须**逐字**等价于历史握手: ttwid only.
+
+    历史(上游未改动前)handshake 就是:
+        "cookie": f"ttwid={self.ttwid}"
+    所以匿名 arm 的输出必须恰好是 "ttwid=<v>",
+    **不能**多出 __ac_nonce / __ac_signature。
+    """
+    print("\n[WC-10] 匿名态 == 历史握手(逐字)")
+    from liveMan import DouyinLiveWebFetcher
+
+    f = DouyinLiveWebFetcher.__new__(DouyinLiveWebFetcher)
+    f._login_cookie = None
+    f._ws_ac_nonce = None
+    f._ws_ac_signature = None
+    f.__dict__["_DouyinLiveWebFetcher__ttwid"] = "ANON_TTWID"
+
+    h = f._build_ws_cookie_header()
+    check("anonymous header 恰好是 ttwid=ANON_TTWID",
+          h == "ttwid=ANON_TTWID", repr(h))
+    check("anonymous header 不含 __ac_nonce",
+          "__ac_nonce" not in h, repr(h))
+    check("anonymous header 不含 __ac_signature",
+          "__ac_signature" not in h, repr(h))
+
+
+def test_anonymous_never_touches_ac_endpoints():
+    """WC-11. 匿名态**禁止**调用 get_ac_nonce/get_ac_signature.
+
+    这是关键 mutation: 把两个方法换成一调就 raise,
+    匿名路径仍然必须通过。
+
+    理由: 它们不是白拿的(一个发 HTTP, 一个跑 JS 签名)。
+    给匿名臂加上它们 = 匿名臂也变了, 于是
+        A: ttwid
+        B: ttwid + nonce + signature + login cookies
+    就再也说不清 B 成功到底是谁起作用。
+    """
+    print("\n[WC-11] 匿名态不碰 ac 端点(调用次数 == 0)")
+    from liveMan import DouyinLiveWebFetcher
+
+    calls = {"nonce": 0, "sig": 0}
+
+    f = DouyinLiveWebFetcher.__new__(DouyinLiveWebFetcher)
+    f._login_cookie = None
+    f._ws_ac_nonce = None
+    f._ws_ac_signature = None
+    f.__dict__["_DouyinLiveWebFetcher__ttwid"] = "ANON_TTWID"
+
+    def _boom_nonce(*_a, **_k):
+        calls["nonce"] += 1
+        raise AssertionError(
+            "anonymous 绝不允许调用 get_ac_nonce()")
+
+    def _boom_sig(*_a, **_k):
+        calls["sig"] += 1
+        raise AssertionError(
+            "anonymous 绝不允许调用 get_ac_signature()")
+
+    f.get_ac_nonce = _boom_nonce
+    f.get_ac_signature = _boom_sig
+
+    cap = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(cap), \
+                contextlib.redirect_stderr(cap):
+            h = f._build_ws_cookie_header()
+        err = ""
+    except Exception as e:                              # noqa: BLE001
+        h, err = "", f"{type(e).__name__}: {e}"
+
+    check("anonymous 不抛(不碰 ac 端点)", err == "", err)
+    check("get_ac_nonce 调用次数 == 0", calls["nonce"] == 0,
+          calls)
+    check("get_ac_signature 调用次数 == 0", calls["sig"] == 0,
+          calls)
+    check("anonymous header 仍然只有 ttwid",
+          h == "ttwid=ANON_TTWID", repr(h))
+
+
+def test_authenticated_does_fetch_ac_fields():
+    """WC-12. 只有 authenticated 才取 nonce/signature(反向验证)."""
+    print("\n[WC-12] authenticated 才取 ac 字段")
+    from liveMan import DouyinLiveWebFetcher
+
+    calls = {"nonce": 0, "sig": 0}
+
+    f = DouyinLiveWebFetcher.__new__(DouyinLiveWebFetcher)
+    f._login_cookie = "sessionid=SESS; ttwid=LOGIN_TTWID"
+    f._ws_ac_nonce = None
+    f._ws_ac_signature = None
+    f.__dict__["_DouyinLiveWebFetcher__ttwid"] = "ANON_TTWID"
+
+    def _nonce(*_a, **_k):
+        calls["nonce"] += 1
+        return "NONCE_FAKE"
+
+    def _sig(*_a, **_k):
+        calls["sig"] += 1
+        return "SIG_FAKE"
+
+    f.get_ac_nonce = _nonce
+    f.get_ac_signature = _sig
+
+    h = f._build_ws_cookie_header()
+    names = _names(h)
+    check("authenticated 取了 nonce", calls["nonce"] == 1, calls)
+    check("authenticated 取了 signature", calls["sig"] == 1, calls)
+    check("ac 字段在 header 里",
+          "__ac_nonce=NONCE_FAKE" in h and "__ac_signature=SIG_FAKE" in h, h)
+    check("login ttwid 覆盖匿名值",
+          names.count("ttwid") == 1 and "ttwid=LOGIN_TTWID" in h
+          and "ANON_TTWID" not in h, h)
+    check("sessionid 保留", "sessionid=SESS" in h, h)
+    check("无重复 name", len(names) == len(set(names)), h)
+
+    # 第二次调用应命中缓存, 不重复取
+    h2 = f._build_ws_cookie_header()
+    check("缓存: 第二次不再取 nonce", calls["nonce"] == 1, calls)
+    check("缓存: 第二次输出相同", h2 == h, h2)
+
+
 def main():
     tests = [
         test_anonymous_header,
@@ -341,6 +468,9 @@ def main():
         test_sentinel_never_leaks,
         test_plumbing_reaches_transport,
         test_transport_cookie_header_uses_login,
+        test_anonymous_is_exact_historical_handshake,
+        test_anonymous_never_touches_ac_endpoints,
+        test_authenticated_does_fetch_ac_fields,
         test_user_unique_id_refactor_is_value_preserving,
         test_forbidden_surfaces_untouched,
     ]

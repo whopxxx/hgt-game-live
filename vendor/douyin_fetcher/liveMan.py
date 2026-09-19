@@ -406,17 +406,37 @@ class DouyinLiveWebFetcher:
         为什么放在传输层: 这是**认证职责**。Engine / Director 不该知道
         "cookie 长什么样", 它们只负责把"有没有登录态"传下来。
 
-        匿名链保留 ttwid / __ac_nonce / __ac_signature —— 这三个是服务端
-        认身份用的字段。登录态存在时, 登录 cookie 里的同名项**优先**
-        (例如登录 cookie 自带 ttwid 时, 用登录的那个, 不产生重复 name)。
+        ⚠️ **两条分支的握手必须严格区分** —— 这是本函数的全部要点:
 
-        `__ac_nonce` / `__ac_signature` 是**惰性**取的: 只在还没取过时现取
-        一次并缓存。取失败静默降级(少这两个字段), 不让连接构建抛异常 ——
-        否则一个签名端点抽风就能让整场直播连不上, 比"认证不完整"糟得多。
+        anonymous(无登录 Cookie):
+            保持**历史握手**, 只带 `ttwid`。上游改动前就是
+            `f"ttwid={self.ttwid}"`, 我们必须逐字等价。
+
+            为什么不能"顺手把 nonce/signature 也补上": 它们不是白拿的 ——
+            `get_ac_nonce()` 要发 HTTP, `get_ac_signature()` 要跑 JS 签名。
+            给匿名臂加上它们 = 匿名臂也变了, 于是 A/B 的差异变成
+            "ttwid" vs "ttwid + nonce + signature + login cookies",
+            届时**说不清是登录态起作用还是那两个字段起作用**。
+            更实际的是: 我们此前"确认送礼但 Gift-family=0"的样本全是在
+            旧握手(ttwid only)下采的, 匿名臂一变, 那些样本就不再可比。
+
+        authenticated(有登录 Cookie):
+            增强身份链 ttwid + __ac_nonce + __ac_signature, 再叠加登录
+            Cookie(同名由登录值覆盖, 见 `ws_cookie.merge_cookie_header`)。
+
+        获取失败时静默降级(字段留空), 不让一个签名端点抽风就把整场直播
+        变成连不上 —— 那比"认证不完整"糟得多。
 
         ⚠️ 返回值是凭据, 只交给 WebSocketApp; 不要打日志/进异常/落库。
         """
         from ws_cookie import build_ws_cookie_header
+
+        if not self._login_cookie:
+            # ===== 历史匿名握手, 逐字等价 =====
+            # 不取 nonce/signature —— 见上面 docstring 的理由。
+            return build_ws_cookie_header({"ttwid": self.ttwid}, None)
+
+        # ===== authenticated: 增强身份链 + 登录 Cookie 覆盖 =====
         if self._ws_ac_nonce is None:
             try:
                 self._ws_ac_nonce = self.get_ac_nonce()

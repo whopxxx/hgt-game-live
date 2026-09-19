@@ -8,9 +8,24 @@
 `WebcastGiftMessage = 0`**(即使确认观众真的送了礼)。多个公开实现报告
 Gift 需要**登录态 Cookie**。
 
-本模块只做一件事: 把"基础身份 cookie"与"登录态 cookie"**按 cookie name
+本模块只做一件事: 把"base cookie 映射"与"登录态 cookie"**按 cookie name
 合并**成一个 header 值。它是纯函数, 不碰网络、不碰 Config、不读环境变量
 —— 那些由调用方注入, 于是测试可以完全确定性地验证合并语义。
+
+## 两条分支的握手**必须严格区分**(否则 A/B 无法归因)
+
+    anonymous   : ttwid only —— 历史握手, 逐字保持
+    authenticated: ttwid + __ac_nonce + __ac_signature, 再叠加 login cookie
+
+`__ac_nonce` 要发 HTTP, `__ac_signature` 要跑 JS 签名 —— 都**有副作用**。
+把它们加进匿名臂, 差异就变成
+
+    A: ttwid
+    B: ttwid + nonce + signature + login cookies
+
+于是 B 即使成功也说不出"是登录态起作用"还是"那两个字段起作用"。
+所以匿名臂**不取、不带**这两个字段; 调用方(`_build_ws_cookie_header`)
+负责按有无 login cookie 分支。
 
 ## 为什么不是字符串拼接
 
@@ -45,12 +60,16 @@ from typing import Mapping, Optional
 WS_AUTH_ANONYMOUS = "anonymous"
 WS_AUTH_AUTHENTICATED = "authenticated"
 
-#: 匿名模式必须保留的基础身份 cookie 链。
+#: anonymous 分支**只用**这一个字段 —— 历史握手就是 `ttwid={...}`, 逐字保持。
 #:
-#: ⚠️ 这三个是**给服务端看的身份字段**, 不是凭据。它们本来就已经写死在
-#: 上游 `liveMan.py` 的 handshake 里(`ttwid={self.ttwid}`), 本模块只是
-#: 把 `__ac_nonce` / `__ac_signature` 也纳入同一套组装, 免得两处各拼一次。
-BASE_WS_COOKIE_NAMES = ("ttwid", "__ac_nonce", "__ac_signature")
+#: ⚠️ 不要往这里加 `__ac_nonce` / `__ac_signature`。它们需要额外的
+#: HTTP + JS 签名, 加进匿名臂就等于改变了 A/B 的 baseline, 让"登录态是否
+#: 让 Gift 出现"这个结论不再可归因(见 `_build_ws_cookie_header`)。
+ANONYMOUS_WS_COOKIE_NAMES = ("ttwid",)
+
+#: authenticated 分支的增强身份链 —— 叠加登录 Cookie 之前的 base。
+#: `__ac_nonce` 在匿名态**不取**; 只有登录态才构造这条链。
+AUTHENTICATED_WS_COOKIE_NAMES = ("ttwid", "__ac_nonce", "__ac_signature")
 
 
 def describe_ws_auth(login_cookie: Optional[str]) -> str:
@@ -114,12 +133,18 @@ def merge_cookie_header(base: Optional[Mapping], login: Optional[Mapping]) -> st
 
 def build_ws_cookie_header(base: Optional[Mapping],
                            login_cookie: Optional[str] = None) -> str:
-    """匿名 / 登录两态的统一入口。
+    """Merge base cookies with the login cookie into one header value.
 
-    - `login_cookie` 为空 -> 纯基础链(与上游原行为等价);
-    - 非空 -> 解析后覆盖合并。
+    - login_cookie empty  -> base only (identical to the upstream original);
+    - non-empty           -> parse, then overlay on top of base.
 
-    ⚠️ 返回值**是凭据**, 只能交给 `websocket.WebSocketApp(header=...)`。
-    不要打日志、不要放进异常、不要落库。
+    NOTE: this function does NOT decide which fields belong in `base`.
+    That is the caller's branch responsibility:
+
+        anonymous      -> pass {"ttwid": ...} only
+        authenticated  -> pass the enhanced chain (ttwid/nonce/signature)
+
+    Defaulting extra fields in here would silently widen the anonymous arm,
+    which is exactly the regression that breaks the Auth A/B experiment.
     """
     return merge_cookie_header(base, parse_cookie_header(login_cookie))
