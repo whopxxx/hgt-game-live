@@ -4075,6 +4075,20 @@ class PuzzleWriter:
             # 不改"这题是怎么来的" —— 早先这里重建 spec 时漏掉它们,
             # 于是过审的题 provenance 全变 False(和 P0-5 同一类错)。
             blueprint_specified=spec.blueprint_specified,
+            # ---- H2-F: curated 溯源也必须原样带过 ----
+            # 同一类错误的第二次: `_apply_review` 是**重建** spec, 任何
+            # 没显式列出的字段都会静默回到默认值。curated 的 provenance
+            # 一旦在这里丢掉, 后果比 blueprint_specified 更重 ——
+            # `validate_curated` 会因 source_type 为空而拒稿(题白编译一次),
+            # 而且**版权署名整批消失**, 那是法律层面的问题, 不只是数据问题。
+            source_type=spec.source_type,
+            external_source=spec.external_source,
+            external_id=spec.external_id,
+            source_url=spec.source_url,
+            license=spec.license,
+            answer_license=spec.answer_license,
+            attribution=dict(spec.attribution or {}),
+            style_tags=list(spec.style_tags or []),
             metrics=dict(spec.metrics or {}),
             usage=spec.usage, model=spec.model), ""
 
