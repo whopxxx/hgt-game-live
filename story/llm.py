@@ -813,8 +813,8 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v6"
-CHECK_PROMPT_VERSION = "check-v6"
+RIDDLE_PROMPT_VERSION = "riddle-v7"
+CHECK_PROMPT_VERSION = "check-v7"
 ANSWER_PROMPT_VERSION = "answer-v6"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
@@ -956,6 +956,31 @@ clues "只在退潮的那几个小时亮" → a1 / "涨潮后反而熄掉" → a
 
 第三人称; 反常点要具体到能追问; 谜底要正面解释它。
 自己编新题, 不要写"海龟汤""葬礼上杀姐姐"这类流传很广的老题。
+
+═══ v7: 少用绝对断言制造悬念(叙事真实性)═══
+
+**谜面里由叙述者直接断言的事实, 谜底必须字面成立。** 反转应当来自
+"重新理解", 不该来自"把叙述者说过的话推翻"。
+
+所以: **少用 `没有 / 绝不 / 从未 / 唯一 / 一直 / 始终 / 从来` 这类
+绝对断言去制造悬念。** 一旦用了, 你就把自己的退路堵死了 —— 谜底必须
+在那句话**字面为真**的前提下仍然成立。
+
+  ✗ 谜面 "司机并没有掉头"   谜底 "他其实在对岸掉过头"
+    -> 这不是反转, 是**前后矛盾**。观众按谜面推理, 结果被告知谜面说错了。
+  ✓ 谜面 "监控里没看到车掉头"  谜底 "他掉头的位置不在监控范围内"
+    -> 断言的是"监控没拍到", 谜底补上"为什么没拍到", 谜面**仍然为真**。
+
+允许**有归属**的陈述 —— 那是角色的看法, 谜底可以说它错了:
+  ✓ "在他看来, 司机没有掉头" / "家里人都以为……" / "交警确信……"
+
+允许**弱断言**造成的误导:
+  ✓ 谜面 "锅还温着"   谜底 "早已关火, 只是还在焐"
+    -> "温着"并没有排除"关火了但焐着"。
+  ✗ 谜面 "锅底仍开着小火"  谜底 "其实早已关火"
+    -> "仍开着"**排除**了"已关火", 这就是矛盾。
+
+自检: 谜面那句话**是否已经排除了谜底那个可能**? 排除了就不能写。
 
 按工具字段填: title / puzzle / answer / core_answer / facts /
 completion_fact_ids / solve_atoms / fair_clues / hints / signature。"""
@@ -1449,7 +1474,7 @@ _TOOL_ANSWER = {
                                 "普通事实提问('他是医生吗'/'死人了么')一律 false。\n"
                                 "触发什么取决于本题:\n"
                                 "  legacy(无通关合同): 可能触发旧 Final Judge。\n"
-                                "  quality-v6(有通关合同): 若合同尚未被房间"
+                                "  v6/v7(有通关合同): 若合同尚未被房间"
                                 "覆盖, 只会触发 **completion semantic"
                                 " verifier** —— 它**只能补 established fact"
                                 " IDs, 不能直接判 solved**, 胜负仍由系统按合同"
@@ -1832,6 +1857,23 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
 会被**整稿拒收** —— 因为那意味着"你知道有问题却选了放行"。
 
 **1. narrator_truthful —— 谜底没有推翻谜面中无归属的事实陈述**
+
+**先做这一步, 再读别的。** 逐句扫过谜面, 把每一处**无归属的断言**抄出来,
+然后逐条和 `answer` / `core_answer` 对照:
+
+  ① 先扫描所有**绝对否定 / 唯一性 / 动作顺序**的词:
+       没有 / 并没有 / 从未 / 从来没 / 绝不 / 一直 / 始终 / 只 / 唯一 /
+       同一个 / 从不 / 已经 / 还没有
+  ② 再扫描所有关于**身份 / 动作 / 方向 / 前后顺序 / 时间 / 数量 / 地点**
+     的无归属断言。
+  ③ **逐条**问: 谜底那句是否**排除了**谜面这句?
+
+不做的后果很具体 —— 这个案子真的漏过去过:
+
+  ✗ 谜面 "司机并没有掉头"
+    谜底 "司机到对岸正常调头后又驶回桥上"
+     -> false。这不是隐瞒, 是**字面矛盾**。
+
 谜面里由**全知叙述者直接说**的事实, 必须在 canonical world 里字面为真。
 允许隐瞒、省略、双关、角色误解; 允许**有归属**的陈述
 ("在他看来……" / "他确信……" / "家里人一直以为……")。
@@ -2126,6 +2168,146 @@ _TOOL_CANDIDATE_RECHECK = {
 
 
 # ======================================================================
+# Q1: 独立的 narrator truth audit(quality-v7)
+# ======================================================================
+# 为什么**另起**一个调用, 而不是把规则再写一遍进 CHECK_SYSTEM:
+# CHECK_SYSTEM 要同时管 facts 引用、clue 原文、atoms 覆盖、blueprint
+# 执行、配额、人称/问句格式…… 一个综合 Reviewer 在长任务里必然会把
+# 注意力摊薄。实播证据:
+#
+#     谜面: 司机并没有掉头
+#     谜底: 在对岸正常调头后又驶回桥上
+#
+# CHECK_SYSTEM 里**已经**明确写着"谜面直接说 A, 谜底不能说其实不是 A",
+# 但仍然放过了。所以这一件事需要**自己的调用**, 输入只有三样:
+# puzzle / core_answer / answer —— 不给 recent / quota / blueprint。
+TRUTH_AUDIT_SYSTEM = """你是海龟汤谜题的**叙事真实性审计员**。
+
+## 你的唯一任务
+
+判断这道题的**谜面**与**谜底**在字面上是否自相矛盾。
+
+只看三样东西: 谜面 / 核心答案 / 完整谜底。**不要**考虑题目好不好玩、
+结构是否符合什么模板、配额够不够 —— 那不是你的事。
+
+## 判据
+
+谜面里由**全知叙述者直接断言**的事实, 必须在 canonical world 里
+**字面为真**。谜底可以隐瞒、可以补全、可以揭示读者没想到的一层,
+但**不能推翻**叙述者已经断言过的话。
+
+允许的:
+- 隐瞒 / 省略(谜面没说的事, 谜底可以说)
+- 双关 / 换义(同一个词在谜底里是另一层意思)
+- **有归属**的陈述 —— 那是角色以为的, 不是事实:
+    "在他看来, 司机没有掉头"
+    "家里人一直以为……"
+    "交警确信……"
+  谜底可以说这些**以为**是错的。这不是 narrator 在断言。
+
+禁止的:
+- 谜面直接说 A, 谜底说其实不是 A。
+
+## 必须逐句扫描的**绝对断言**
+
+谜面里出现下面这些词时, **每一处**都要单独和谜底对照:
+
+   没有 / 并没有 / 从未 / 从来没 / 绝不 / 一直 / 始终 / 只 / 唯一 /
+   同一个 / 从不 / 已经 / 还没有
+
+以及任何关于下面这些维度的**无归属**断言:
+
+   身份 / 动作 / 方向 / 前后顺序 / 时间 / 数量 / 地点
+
+## 对照例
+
+✗ **不过(典型)**:
+    谜面  "司机并没有掉头"
+    谜底  "司机到对岸正常调头后又驶回桥上"
+    -> narrator_truthful = false。谜面用无归属的绝对否定断言了"没掉头",
+       而谜底要求"掉过头"。这不是隐瞒, 是**字面矛盾**。
+
+✓ **可以过(有归属)**:
+    谜面  "在他看来, 司机没有掉头"
+    谜底  司机实际上在对岸掉过头
+    -> narrator_truthful = true。"在他看来" 把这句话降级成角色信念。
+
+✗ **不过(绝对时间断言)**:
+    谜面  "此刻锅底仍开着小火"
+    谜底  "其实早已关火, 只是在焐"
+    -> false。谜面断言了**当下**的火还在烧。
+
+✓ **可以过(弱断言)**:
+    谜面  "锅还温着"
+    谜底  "早已关火, 正在焐"
+    -> true。"温着"与"关火了但焐着"完全相容 —— 这是**允许的误导**。
+
+判断分界: 谜面那句话**是否已经排除了谜底那个可能**?
+"仍开着小火"排除了"已关火"; "还温着"没有排除任何东西。
+
+## mechanism_consistent
+
+谜底依赖的方向 / 时区早晚 / 前后顺序 / 数量累计 / 速度距离 / 简单物理
+是否真的成立?**实际在脑子里走一遍**, 不要凭印象。
+
+不需要专业知识, 只要求基本因果与符号方向**不自相矛盾**。
+
+## 输出
+
+- `narrator_truthful`: 谜底没有推翻谜面的无归属断言 -> true。
+- `mechanism_consistent`: 核心物理/时间/方向/数量/因果真的成立 -> true。
+- `conflicts`: 每一处矛盾一条, 写清"谜面那句断言" / "谜底那句推翻" /
+  "为什么"。没有矛盾就留空数组。
+
+⚠️ 拿不准时**不要**放过 —— 矛盾的题在直播里会变成"观众按谜面推理,
+结果系统说他错了"。填 false 并写清在哪一句。"""
+
+_TOOL_TRUTH_AUDIT = {
+    "name": "emit_truth_audit",
+    "description": "回传叙事真实性审计结果(谜面与谜底是否字面矛盾)",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "narrator_truthful": {
+                "type": "boolean",
+                "description": ("谜底**没有**推翻谜面里无归属的断言 -> "
+                                "true。有归属的陈述(在他看来/家里人以"
+                                "为)不算断言。"),
+            },
+            "mechanism_consistent": {
+                "type": "boolean",
+                "description": "核心方向/时间/顺序/数量/因果自洽 -> true。",
+            },
+            "conflicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "puzzle_claim": {
+                            "type": "string",
+                            "description": "谜面那一句无归属断言(原文)",
+                        },
+                        "answer_claim": {
+                            "type": "string",
+                            "description": "谜底推翻它的那一句(原文)",
+                        },
+                        "why": {
+                            "type": "string",
+                            "description": "为什么这两句不能同时为真",
+                        },
+                    },
+                    "required": ["puzzle_claim", "answer_claim", "why"],
+                },
+                "description": "每一处矛盾一条。没有矛盾就留空数组。",
+            },
+        },
+        "required": ["narrator_truthful", "mechanism_consistent",
+                     "conflicts"],
+    },
+}
+
+
+# ======================================================================
 @dataclass
 class RiddleResult:
     puzzle: Optional[str] = None
@@ -2341,6 +2523,38 @@ class PuzzleWriter:
                     bad.append(spec.puzzle)
                     last = spec
                     last.error = "reveal 未执行调度目标: " + "; ".join(ra)
+                    continue
+            # ---- ④b truth audit(Q1: 独立叙事真实性审计) ----
+            #
+            # 位置: **Reviewer 之后, 跨题门之前**。只对 reviewer 已经产出
+            # 的可接受 candidate 做 —— 给一稿已经被否的题再烧一次 audit
+            # 是纯粹的浪费。
+            #
+            # 为什么光靠 Reviewer 的 `narrator_truthful` 不够: 它已经明确
+            # 要求"谜面直接说 A, 谜底不能说其实不是 A", 但实播仍放过了
+            #
+            #     谜面: 司机并没有掉头
+            #     谜底: 在对岸正常调头后又驶回桥上
+            #
+            # —— 一个**综合** Reviewer 在长任务里仍会漏这一项(它的注意力
+            # 被 facts/atoms/blueprint/配额的检查占满了)。所以把这一件事
+            # 单独抽成一个**只看三样东西**的调用: puzzle / core_answer /
+            # answer。不给 recent window / quota / blueprint —— 它只做
+            # 单题逻辑一致性, 输入越窄越不容易分心。
+            ta = self.audit_truthfulness(spec)
+            if ta is not None:
+                m["truth_audit_calls"] = m.get("truth_audit_calls", 0) + 1
+                m["truth_audit_ok"] = bool(ta.get("narrator_truthful")
+                                           and ta.get("mechanism_consistent"))
+                if not m["truth_audit_ok"]:
+                    why = ta.get("why") or "叙事真实性审计不过"
+                    m["truth_audit_issues"] = list(ta.get("conflicts") or [])
+                    log.info("出题第 %d 稿 truth audit 不过: %s",
+                             attempts, str(why)[:120])
+                    _remember(seen_why, "叙事真实性: " + str(why)[:120])
+                    bad.append(spec.puzzle)
+                    last = spec
+                    last.error = "叙事真实性审计不过: " + str(why)[:120]
                     continue
             # ---- ⑤ 跨题门(全局分布, 方案 §20) ----
             # quota 必须从 **runtime Config** 读。早先读的是 LLMConfig,
@@ -3528,6 +3742,98 @@ class PuzzleWriter:
             if fid and fid not in out:
                 out.append(fid)
         return out
+
+    # ------------------------------------------------------------------
+    def audit_truthfulness(self, spec: Optional[PuzzleSpec] = None, *,
+                           puzzle: str = "", core_answer: str = "",
+                           answer: str = "", timeout: Optional[float] = None,
+                           max_retries: Optional[int] = None
+                           ) -> Optional[dict]:
+        """Q1: 独立的叙事真实性审计。返回审计结果 dict, 或 None。
+
+        ## 它只输入三样东西
+
+            puzzle / core_answer / answer
+
+        **不给** recent window / quota / blueprint / facts / atoms —— 那些
+        是别的门的职责。输入越窄, 这个调用越不容易被别的东西分心, 而那
+        正是它存在的理由(见 `TRUTH_AUDIT_SYSTEM` 的注释)。
+
+        ## 返回值
+
+            {"narrator_truthful": bool,
+             "mechanism_consistent": bool,
+             "conflicts": [{puzzle_claim, answer_claim, why}, ...]}
+
+        审计**技术失败**时返回:
+
+            {"narrator_truthful": False, "mechanism_consistent": False,
+             "conflicts": [], "why": "<技术原因>"}
+
+        —— **fail closed**。绝不返回 None 来表示"通过": 调用方看到 None
+        只能理解为"没跑", 而"没跑"在质量链里和"不过"是两件事。这里选择
+        把技术失败也表达成"不过", 因为它是一条**硬门** —— 与
+        `_apply_review` 的 `quality_checks` fail-closed 同一套推理
+        ("你知道有问题却选了放行"是不允许的; 那"你不知道有没有问题"
+        同样不该放行)。
+
+        `None` 只在**输入本身为空**(没有谜面/谜底)时返回 —— 那种情况
+        上游的硬校验已经拒了。
+
+        不抛异常。
+        """
+        if spec is not None:
+            puzzle = puzzle or (spec.puzzle or "")
+            core_answer = core_answer or (spec.core_answer or "")
+            answer = answer or (spec.answer or "")
+        if not (puzzle or "").strip() or not (answer or "").strip():
+            return None
+        user = (
+            f"【谜面】\n{puzzle}\n\n"
+            f"【核心答案】\n{core_answer or '(未记录)'}\n\n"
+            f"【完整谜底】\n{answer}"
+        )
+        try:
+            res = self.client.messages(
+                TRUTH_AUDIT_SYSTEM, user, max_tokens=800,
+                tool=_TOOL_TRUTH_AUDIT,
+                temperature=0,
+                timeout=timeout, max_retries=max_retries)
+        except Exception as e:                  # noqa: BLE001
+            log.exception("truth audit 调用异常")
+            return self._audit_failed(f"调用异常: {e}")
+        ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
+        nt = ti.get("narrator_truthful")
+        mc = ti.get("mechanism_consistent")
+        cf = ti.get("conflicts")
+        # ---- fail closed: 三项类型/取值都必须真的对 ----
+        # `tool_input` 缺失、字段类型不对、conflicts 不是 list —— 全部
+        # 按"不过"处理。**不能** `bool(None)` 糊过去(那是 False, 看着
+        # 像"判了 false", 实际上根本没判)。
+        if not isinstance(nt, bool) or not isinstance(mc, bool) \
+                or not isinstance(cf, list):
+            log.warning("truth audit 返回不合法, 按不过处理: %r",
+                        str(res.tool_input)[:120])
+            return self._audit_failed(
+                f"返回不合法(narrator_truthful={nt!r}, "
+                f"mechanism_consistent={mc!r}, conflicts={type(cf).__name__})")
+        out = {"narrator_truthful": nt, "mechanism_consistent": mc,
+               "conflicts": [c for c in cf if isinstance(c, dict)]}
+        # conflicts 非空 -> 一律算不过。即使模型把两个 bool 都填了 true:
+        # 那是它自己前后矛盾, 而按"不过"处理是安全方向。
+        if out["conflicts"]:
+            out["narrator_truthful"] = False
+            out["why"] = "conflicts 非空"
+        if not (out["narrator_truthful"] and out["mechanism_consistent"]):
+            out.setdefault("why", "叙事真实性/机制一致性不过")
+        return out
+
+    @staticmethod
+    def _audit_failed(why: str) -> dict:
+        """审计技术失败 -> fail closed 的结果(不是 None)。"""
+        log.warning("truth audit 失败(%s), 按不过处理(fail closed)", why)
+        return {"narrator_truthful": False, "mechanism_consistent": False,
+                "conflicts": [], "why": why}
 
     @staticmethod
     def _clean_fact_ids(raw, spec: "PuzzleSpec") -> list:

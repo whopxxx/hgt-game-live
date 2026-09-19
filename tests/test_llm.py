@@ -26,7 +26,21 @@ def check(name, cond, extra=""):
 
 
 class FakeClient:
-    """按顺序吐预设的 LLMResult, 并记录收到的 tool 参数。"""
+    """按顺序吐预设的 LLMResult, 并记录收到的 tool 参数。
+
+    ## Q1 起: truth audit 有**默认通过**的自动应答
+
+    出题链里多了一道 `emit_truth_audit`。若让每条出题用例都在队列里
+    手动补一条, 几十条用例会全部变成"我在测队列长度" —— 而它们真正想
+    测的是 facts 解析 / 硬校验 / 审稿合并。
+
+    所以: **队列耗尽且这次调用是 truth audit 时**, 自动回一个"通过"。
+    队列耗尽且是**别的**工具时, 仍然回 `no more canned results` ——
+    那才是"代码偷偷多调了一次"的信号(UX-G2 就靠它)。
+
+    要测 audit 本身(拒稿 / 技术失败)的用例, 显式在队列里放一条
+    `_truth_tool(...)`, 它会**先**被取走。
+    """
 
     def __init__(self, results, cfg=None):
         self._results = list(results)
@@ -44,6 +58,23 @@ class FakeClient:
         self.calls.append({"system": system, "user": user, "tool": tool,
                            "temperature": temperature,
                            "timeout": timeout, "max_retries": max_retries})
+        name = (tool or {}).get("name")
+        if name == "emit_truth_audit":
+            # truth audit **不参与队列轮转**: 队列里只有测试**显式**放的
+            # audit 结果才用它, 否则一律自动回"通过"。
+            #
+            # 为什么不能让它按位置取: 出题链是
+            #     出题 -> 审稿 -> audit -> (可能重出) -> 审稿 -> audit
+            # audit 出现的位置随重试次数变, 按位置取就会**吃掉**本该给
+            # 下一次出题/审稿的那一条, 于是后面全线错位。用显式标记取,
+            # 队列语义就与"调用顺序"解耦了。
+            for i, r in enumerate(self._results):
+                if (r.tool_input or {}).get("__truth_audit__"):
+                    self._results.pop(i)
+                    ti = dict(r.tool_input)
+                    ti.pop("__truth_audit__", None)
+                    return LLMResult(tool_input=ti, model=r.model)
+            return _truth_tool()
         if not self._results:
             return LLMResult(error="no more canned results")
         return self._results.pop(0)
@@ -190,6 +221,42 @@ def qc_ok(**kw):
          "core_answer_direct": True, "completion_contract_minimal": True}
     d.update(kw)
     return d
+
+
+def _truth_tool(truthful=True, consistent=True, conflicts=None):
+    """Q1 `emit_truth_audit` 的 canned 返回。
+
+    `__truth_audit__` 这个标记让 `FakeClient` 认出"这条是给 audit 的",
+    从队列里**按标记**取而不是按位置 —— 见 `FakeClient.messages` 的说明。
+    """
+    return LLMResult(tool_input={
+        "__truth_audit__": True,
+        "narrator_truthful": truthful,
+        "mechanism_consistent": consistent,
+        "conflicts": list(conflicts or []),
+    }, model="m")
+
+
+def gen_calls(fc):
+    """出题链上的调用**去掉 truth audit** 之后还剩几条。
+
+    Q1 之后每条出题用例的调用数都多一次 audit。那些用例想数的是
+    "出题/审稿/重出" 各几次 —— 把 audit 算进去只会让每个数字 +1,
+    而它们真正要守的性质(重出一稿 = 多一轮)完全没变。
+
+    ⚠️ 这是**过滤**, 不是"允许任意多调" —— 过滤后的数字仍然是精确断言,
+    而 audit 本身由 `test_truth_audit_*` 专门测。
+    """
+    return [c for c in fc.calls
+            if (c["tool"] or {}).get("name") != "emit_truth_audit"]
+
+
+#: 一条"谜面 vs 谜底字面矛盾"的冲突记录(桥题那个真实案例的形状)。
+BRIDGE_CONFLICT = {
+    "puzzle_claim": "司机并没有掉头",
+    "answer_claim": "司机到对岸正常调头后又驶回桥上",
+    "why": "谜面用无归属的绝对否定断言了'没掉头', 谜底要求'掉过头'",
+}
 
 
 def review_ok(puzzle=None, **kw):
@@ -506,7 +573,7 @@ def test_reviewer_fixes_in_place():
     # 审稿人就地改好 -> 硬校验过 -> 采用, 共 2 次调用。
     # (不需要"再审" —— 代码的硬校验比再问一次模型更可靠)
     check("共 2 次调用(出题 + 审稿)",
-          len(fc.calls) == 2, len(fc.calls))
+          len(gen_calls(fc)) == 2, len(gen_calls(fc)))
 
 
 def test_hard_rule_asks_reviewer_to_fix():
@@ -540,7 +607,7 @@ def test_reviewer_no_fix_falls_back_to_regen():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("退回重出后采用新稿", r.puzzle and "鸡蛋" in r.puzzle, r)
-    check("共 4 次调用(出题/审稿/重出/审稿)", len(fc.calls) == 4, len(fc.calls))
+    check("共 4 次调用(出题/审稿/重出/审稿)", len(gen_calls(fc)) == 4, len(gen_calls(fc)))
 
 
 def test_riddle_check_retries_empty_tool_use():
@@ -560,7 +627,7 @@ def test_riddle_check_retries_empty_tool_use():
     r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("空 tool_input 不算通过, 重出后成功",
           r.puzzle is not None and "二稿" in r.puzzle, r)
-    check("共 4 次调用(生成/质检/生成/质检)", len(fc.calls) == 4, len(fc.calls))
+    check("共 4 次调用(生成/质检/生成/质检)", len(gen_calls(fc)) == 4, len(gen_calls(fc)))
     check("第 2 次调用确实是审稿",
           fc.calls[1]["tool"]["name"] == "emit_review",
           fc.calls[1]["tool"]["name"])
@@ -612,7 +679,7 @@ def test_no_repeat_puzzles():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(avoid=[a], blueprint=fc.default_blueprint)
     check("太像的那稿被弃用, 采用新题", r.puzzle == c, r.puzzle)
-    check("共 4 次调用(出题/审稿/重出/审稿)", len(fc.calls) == 4, len(fc.calls))
+    check("共 4 次调用(出题/审稿/重出/审稿)", len(gen_calls(fc)) == 4, len(gen_calls(fc)))
 
 
 def test_english_riddle_rejected_on_text_path():
@@ -823,7 +890,7 @@ def test_hint_not_repeated():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     h, _ = w.hint("谜面", "谜底", 2, given=["注意汤的味道"])
     check("重复的被打回, 采用新的", h == "想想他以前经历过什么", h)
-    check("确实重出过", len(fc.calls) == 2, len(fc.calls))
+    check("确实重出过", len(gen_calls(fc)) == 2, len(gen_calls(fc)))
 
 
 def test_hint_and_reveal():
@@ -951,8 +1018,8 @@ def test_bad_draft_does_not_consume_attempt():
     r = w.gen_riddle(blueprint=fc.default_blueprint)
     check("两次废稿后仍能出题成功",
           r.puzzle is not None and "擦那扇窗" in r.puzzle, r)
-    check("废稿没有消耗重试次数(共 4 次调用)", len(fc.calls) == 4,
-          len(fc.calls))
+    check("废稿没有消耗重试次数(共 4 次调用)", len(gen_calls(fc)) == 4,
+          len(gen_calls(fc)))
 
 
 def test_wrapped_tool_input_unwrapped():
@@ -1332,10 +1399,10 @@ def test_v4_prompt_versions_bumped():
     """Step 04: prompt 版本必须真的升到 v4(否则档案无法区分两代题)。"""
     print("\n[V4-1] riddle/check prompt 版本")
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
-    check("RIDDLE_PROMPT_VERSION == riddle-v6",
-          RIDDLE_PROMPT_VERSION == "riddle-v6", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v6",
-          CHECK_PROMPT_VERSION == "check-v6", CHECK_PROMPT_VERSION)
+    check("RIDDLE_PROMPT_VERSION == riddle-v7",
+          RIDDLE_PROMPT_VERSION == "riddle-v7", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v7",
+          CHECK_PROMPT_VERSION == "check-v7", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1498,8 +1565,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v6",
-          QUALITY_POLICY_VERSION == "quality-v6", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v7",
+          QUALITY_POLICY_VERSION == "quality-v7", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -1743,7 +1810,7 @@ def test_fixable_format_goes_to_reviewer_not_rejected():
     r2 = w.gen_riddle(blueprint=fc.default_blueprint)
     check("第一人称稿被审稿人改好并采用",
           r2.puzzle and r2.puzzle.startswith("他每晚"), r2)
-    check("只用了 2 次调用(出题 + 审稿)", len(fc.calls) == 2, len(fc.calls))
+    check("只用了 2 次调用(出题 + 审稿)", len(gen_calls(fc)) == 2, len(gen_calls(fc)))
     check("审稿请求点名了人称问题",
           "第一人称" in fc.calls[1]["user"], fc.calls[1]["user"][-400:])
 
@@ -1970,12 +2037,13 @@ def test_review_decision_rewrite_regenerates():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     spec = w.gen_spec(blueprint=fc.default_blueprint)
     check("采用了重出的新题", spec.puzzle == P2, spec.puzzle)
-    names = [c["tool"]["name"] for c in fc.calls]
+    names = [c["tool"]["name"] for c in gen_calls(fc)]
     check("rewrite 后走的是**重新出题**而不是修补",
           names == ["emit_riddle", "emit_review", "emit_riddle", "emit_review"],
           names)
-    # 重出请求里应带上 rewrite 的理由
-    gen2 = fc.calls[2]["user"]
+    # 重出请求里应带上 rewrite 的理由。索引按**过滤后**的序列取 ——
+    # audit 会插在 review 之后, 直接 `fc.calls[2]` 会指到 audit 那条。
+    gen2 = gen_calls(fc)[2]["user"]
     check("重出请求带上 rewrite 理由", "私人往事" in gen2, gen2[-400:])
 
 
@@ -2324,7 +2392,7 @@ def test_hint_rejects_leaked_fact():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     h, err = w.hint("谜面", "谜底", 1, [], spec=sp)
     check("泄漏的那条被换掉", h != leak, h)
-    check("重出过一次", len(fc.calls) == 2, len(fc.calls))
+    check("重出过一次", len(gen_calls(fc)) == 2, len(gen_calls(fc)))
     check("最终给的是干净的那条", "退潮" in (h or ""), h)
 
 
@@ -2420,7 +2488,7 @@ def test_hint_never_returns_leaking_hint_when_exhausted():
     h, err = w.hint("谜面", "谜底", 1, [], spec=sp)
     check("三次全泄底 -> 不给提示", h is None, h)
     check("给出原因", bool(err) and "泄底" in err, err)
-    check("三次都试过了", len(fc.calls) == 3, len(fc.calls))
+    check("三次都试过了", len(gen_calls(fc)) == 3, len(gen_calls(fc)))
 
 
 def test_hint_uses_last_safe_when_only_repeated():
@@ -2652,6 +2720,257 @@ def test_qa_budget_reaches_final_judge():
           got3)
 
 
+# ======================================================================
+# Q1: narrator truth audit(独立的单题逻辑一致性调用)
+# ======================================================================
+def _bridge_riddle():
+    """桥题: 谜面用无归属的绝对否定断言 "司机并没有掉头"。
+
+    谜底却要求司机掉过头。这是实播真的漏过去的那一类。
+    """
+    return riddle(
+        puzzle="司机把车开过桥, 但监控里并没有看到他掉头, 他却又回到了"
+               "出发那侧。为什么?",
+        answer="他开过桥之后在对岸正常调头, 又驶回桥上, 所以同一段路"
+               "他走了两次。")
+
+
+def test_truth1_bridge_contradiction_rejected():
+    """**Truth-1**: "没有掉头" vs "对岸调头" -> 拒稿。"""
+    print("\n[Q1-Truth-1] 桥题矛盾必须拒稿")
+    fc = FakeClient([
+        LLMResult(tool_input=_bridge_riddle(), model="m"),
+        LLMResult(tool_input=review_ok(puzzle=_bridge_riddle()["puzzle"])),
+        _truth_tool(truthful=False, consistent=True,
+                    conflicts=[BRIDGE_CONFLICT]),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint,
+                      max_attempts=1, budget_s=5)
+    check("**拒稿(没有谜面可用)**", not spec.puzzle, spec.puzzle)
+    check("错误里点名叙事真实性",
+          "叙事真实性" in (spec.error or ""), spec.error)
+    check("审计真的被调了",
+          any((c["tool"] or {}).get("name") == "emit_truth_audit"
+              for c in fc.calls), [c["tool"] for c in fc.calls])
+
+
+def test_truth2_literal_contradiction_rejected_but_weak_ok():
+    """**Truth-2**: 字面矛盾 vs 允许误导的边界。
+
+      "此刻仍开着小火" + "早已关火"   -> 拒(谜面**排除**了那个可能)
+      "锅还温着"       + "早已关火焐着" -> 过(没排除任何东西)
+    """
+    print("\n[Q1-Truth-2] 字面矛盾拒 / 弱断言误导过")
+    P_BAD = "锅底仍开着小火, 孩子却掀开锅盖就哭了。为什么?"
+    fc_bad = FakeClient([
+        LLMResult(tool_input=riddle(puzzle=P_BAD), model="m"),
+        LLMResult(tool_input=review_ok(puzzle=P_BAD)),
+        _truth_tool(truthful=False, consistent=False, conflicts=[{
+            "puzzle_claim": "锅底仍开着小火",
+            "answer_claim": "其实早已关火, 只是在焐",
+            "why": "谜面断言当下火还在烧, 排除了已关火",
+        }]),
+    ])
+    wb = PuzzleWriter(client=fc_bad, runtime_cfg=fc_bad.runtime_cfg)
+    sb = wb.gen_spec(blueprint=fc_bad.default_blueprint,
+                     max_attempts=1, budget_s=5)
+    check("**强断言矛盾 -> 拒稿**", not sb.puzzle, sb.puzzle)
+
+    # 弱断言 — 审计放行
+    P_OK = "锅还温着, 孩子却掀开锅盖就哭了。为什么?"
+    fc_ok = FakeClient([
+        LLMResult(tool_input=riddle(puzzle=P_OK), model="m"),
+        LLMResult(tool_input=review_ok(puzzle=P_OK)),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    wo = PuzzleWriter(client=fc_ok, runtime_cfg=fc_ok.runtime_cfg)
+    so = wo.gen_spec(blueprint=fc_ok.default_blueprint)
+    check("**弱断言(允许的误导) -> 过**", so.puzzle == P_OK, so.puzzle)
+
+
+def test_truth3_attributed_belief_passes():
+    """**Truth-3**: 有归属的陈述(在他看来) -> 谜底可以推翻它。"""
+    print("\n[Q1-Truth-3] 有归属陈述可以通过")
+    P = "在他看来, 司机没有掉头。可他自己也说不清怎么回事。为什么?"
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(puzzle=P), model="m"),
+        LLMResult(tool_input=review_ok(puzzle=P)),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("**有归属 -> 通过**", spec.puzzle == P, spec.puzzle)
+
+
+def test_truth4_audit_technical_failure_rejects():
+    """**Truth-4**: audit 空返回 / malformed -> 拒稿, **不能假绿**。"""
+    print("\n[Q1-Truth-4] audit 技术失败 -> 拒稿")
+    def _bad_audit(ti):
+        """给这一条打上 audit 标记(否则 FakeClient 会当它是给别的工具的)。"""
+        d = dict(ti or {})
+        d["__truth_audit__"] = True
+        return LLMResult(tool_input=d, model="m")
+
+    for label, bad in (
+            ("空 tool input", _bad_audit({})),
+            ("缺字段", _bad_audit({"narrator_truthful": True})),
+            ("类型不对", _bad_audit({"narrator_truthful": "yes",
+                                    "mechanism_consistent": True,
+                                    "conflicts": []})),
+            ("conflicts 不是 list", _bad_audit({"narrator_truthful": True,
+                                                "mechanism_consistent": True,
+                                                "conflicts": "none"})),
+            ("超时", _bad_audit({}))):
+        fc = FakeClient([
+            LLMResult(tool_input=riddle(), model="m"),
+            LLMResult(tool_input=review_ok()),
+            bad,
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        spec = w.gen_spec(blueprint=fc.default_blueprint,
+                          max_attempts=1, budget_s=5)
+        check(f"{label}: **拒稿(fail closed)**", not spec.puzzle, spec.puzzle)
+
+    # "超时"这条要单独走: error 而不是 tool_input。
+    # ⚠️ `error` 型的结果**没法带标记**, 所以让它排在队首 —— 队列里第
+    # 三条位置上的东西会被下一次**非 audit** 调用(也就是没有下一次)取走,
+    # 而 audit 只会从标记里取。放队首则第一次 audit 调用就会遇到它。
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(), model="m"),
+        LLMResult(tool_input=review_ok()),
+    ])
+    # 直接把 audit 打桩成"抛异常", 模拟网关侧的硬故障
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    _real = fc.messages
+
+    def _boom(system, user, **kw):
+        if (kw.get("tool") or {}).get("name") == "emit_truth_audit":
+            raise TimeoutError("timed out")
+        return _real(system, user, **kw)
+
+    fc.messages = _boom
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=1,
+                      budget_s=5)
+    check("audit 抛异常: **拒稿(fail closed)**", not spec.puzzle, spec.puzzle)
+
+    # 直接测 audit_truthfulness 的 fail-closed 契约
+    fc2 = FakeClient([])
+
+    def _boom2(system, user, **kw):
+        raise TimeoutError("timed out")
+
+    fc2.messages = _boom2
+    from story.llm import PuzzleWriter as _W
+    w2 = _W(client=fc2, runtime_cfg=runtime_cfg())
+    r = w2.audit_truthfulness(puzzle="谜面?", core_answer="c", answer="a")
+    check("audit 返回 dict 而不是 None(才可能 fail closed)",
+          isinstance(r, dict), r)
+    check("**技术失败 -> narrator_truthful=False**",
+          r and r.get("narrator_truthful") is False, r)
+    check("有 why 说明", bool(r.get("why")), r)
+    # 输入为空 -> None(与"没跑"区分开: 那是上游硬校验的职责)
+    fc3 = FakeClient([])
+    w3 = _W(client=fc3, runtime_cfg=runtime_cfg())
+    check("空输入 -> None(不冒充通过)",
+          w3.audit_truthfulness(puzzle="", answer="") is None)
+
+
+def test_truth4b_conflicts_nonempty_forces_reject():
+    """两个 bool 都 true 但 conflicts 非空 -> 仍算不过(模型自相矛盾)。"""
+    print("\n[Q1-Truth-4b] conflicts 非空 -> 一律不过")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(), model="m"),
+        LLMResult(tool_input=review_ok()),
+        _truth_tool(truthful=True, consistent=True,
+                    conflicts=[BRIDGE_CONFLICT]),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint,
+                      max_attempts=1, budget_s=5)
+    check("**拒稿**", not spec.puzzle, spec.puzzle)
+
+
+def test_truth5_v6_pool_quarantined_but_v7_eligible():
+    """**Truth-5**: 旧 quality-v6 库存被隔离; v7 正常 eligible。"""
+    print("\n[Q1-Truth-5] v6 quarantine / v7 eligible")
+    import os
+    import json
+    import tempfile
+    from story.config import Config
+    from story.pool import PuzzlePool, spec_key
+    from story.quality import QUALITY_POLICY_VERSION
+    # `good_spec` 在 test_pool 里 —— 直接 import 兄弟测试模块会踩
+    # "tests 不是包"的问题, 所以按路径加载(与这两个套件的关系是
+    # "共用同一份合格 spec 夹具", 不是互相依赖)。
+    import importlib.util as _ilu
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "test_pool.py")
+    _spec = _ilu.spec_from_file_location("_tp_for_q1", _p)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _pool_good_spec = _mod.good_spec
+    check("当前政策是 v7", QUALITY_POLICY_VERSION == "quality-v7",
+          QUALITY_POLICY_VERSION)
+    d = tempfile.mkdtemp(prefix="q1pool_")
+    cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
+                 pool_path=os.path.join(d, "p.jsonl"),
+                 pool_used_path=os.path.join(d, "u.jsonl"))
+    old = _pool_good_spec()
+    old.quality_policy_version = "quality-v6"
+    with open(cfg.pool_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"pool_version": 1, "pool_key": spec_key(old),
+                            "added_at": 0.0, "added_by": "legacy",
+                            "spec": old.to_archive()},
+                           ensure_ascii=False) + "\n")
+    pool = PuzzlePool.open(cfg)
+    check("**v6: stock_count 不算它**", pool.stock_count() == 0,
+          pool.stock_count())
+    check("**v6: pop_next 不返回**",
+          pool.pop_next(recent_signatures=[]) is None)
+    check("**v6: playable_count 也不算**", pool.playable_count([]) == 0,
+          pool.playable_count([]))
+    # v7 新题。**必须换谜面** —— `good_spec()` 的内容哈希与上面那条 v6
+    # 完全一样, 而池内去重是按内容哈希的, 同一道题会被正确地拒。
+    new = _pool_good_spec(
+        puzzle="钟楼的守夜人每晚敲钟, 但只在涨潮的那几个小时敲。为什么?",
+        fair_clues=[_mod.FairClue(quote="只在涨潮的那几个小时敲",
+                                  supports_atoms=["a1"]),
+                    _mod.FairClue(quote="每晚敲钟", supports_atoms=["a2"])])
+    check("**v7: 正常 eligible**", pool.add(new) is True)
+    check("v7 入池后 stock=1", pool.stock_count() == 1, pool.stock_count())
+    check("v7 能 pop 出来", pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_truth_prompt_has_scanning_rules():
+    """audit prompt 必须点名那批绝对断言词与归属例外。"""
+    print("\n[Q1-prompt] audit prompt 的扫描清单")
+    from story.llm import TRUTH_AUDIT_SYSTEM as S
+    for w in ("并没有", "从未", "绝不", "唯一", "同一个", "还没有"):
+        check(f"扫描词 {w}", w in S, "缺")
+    for d in ("身份", "动作", "方向", "前后顺序", "时间", "数量", "地点"):
+        check(f"维度 {d}", d in S, "缺")
+    check("有归属例外(在他看来)", "在他看来" in S)
+    check("桥题反例在 prompt 里", "并没有掉头" in S)
+    check("要求拿不准时不放过", "不要" in S and "false" in S)
+
+
+def test_truth_prompt_hardened_in_riddle_and_check():
+    """RIDDLE/CHECK prompt 也要加硬规则(不只靠 audit 兜底)。"""
+    print("\n[Q1-prompt2] RIDDLE/CHECK 各加一条硬规则")
+    from story.llm import RIDDLE_SYSTEM, CHECK_SYSTEM
+    check("RIDDLE 提醒少用绝对断言制造悬念",
+          "绝对断言" in RIDDLE_SYSTEM and "少用" in RIDDLE_SYSTEM,
+          RIDDLE_SYSTEM[-400:])
+    check("RIDDLE 给了'没排除才算允许'的判据",
+          "排除" in RIDDLE_SYSTEM, "")
+    check("CHECK 要求**先**做逐句扫描",
+          "先扫描" in CHECK_SYSTEM or "逐句扫" in CHECK_SYSTEM,
+          CHECK_SYSTEM[:600])
+    check("CHECK 扫描清单含绝对否定/唯一性/动作顺序",
+          "绝对否定" in CHECK_SYSTEM, "")
+
+
 def main():
     for t in (test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
@@ -2760,7 +3079,16 @@ def main():
               test_closeout_incomplete_observed_signature_is_rejected,
               test_closeout_incomplete_obs_never_lands_in_signature,
               test_closeout_complete_observed_signature_is_accepted,
-              test_closeout_absent_observed_signature_on_pass_is_rejected):
+              test_closeout_absent_observed_signature_on_pass_is_rejected,
+              # ---- Q1: narrator truth audit ----
+              test_truth1_bridge_contradiction_rejected,
+              test_truth2_literal_contradiction_rejected_but_weak_ok,
+              test_truth3_attributed_belief_passes,
+              test_truth4_audit_technical_failure_rejects,
+              test_truth4b_conflicts_nonempty_forces_reject,
+              test_truth5_v6_pool_quarantined_but_v7_eligible,
+              test_truth_prompt_has_scanning_rules,
+              test_truth_prompt_hardened_in_riddle_and_check):
         t()
     print()
     if FAIL[0]:

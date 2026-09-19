@@ -2114,7 +2114,7 @@ def test_reveal_contributors_reach_archive():
         answer="门外女人是父亲的亲生女儿, 她昨晚才与父亲同桌吃饭相认。",
         core_answer="门外女人是父亲的亲生女儿。",
         completion_fact_ids=["f1", "f2"],
-        prompt_version="riddle-v6", quality_policy_version="quality-v6",
+        prompt_version="riddle-v7", quality_policy_version="quality-v7",
         facts=[
             PuzzleFact(id="f1", text="她是父亲的亲生女儿", kind="core",
                        visibility="hidden"),
@@ -2583,7 +2583,7 @@ def _v5_spec(completion, core_answer="这是核心答案。",
         facts=facts, solve_atoms=atoms,
         fair_clues=[FairClue(quote=puzzle[:6], supports_atoms=["a1"])],
         hints=["注意她是谁", "注意昨晚", "注意饭桌"],
-        prompt_version="riddle-v6", quality_policy_version="quality-v6")
+        prompt_version="riddle-v7", quality_policy_version="quality-v7")
 
 
 def boot_v5(cfg=None, completion=("f1", "f2"), **spec_kw):
@@ -2657,7 +2657,7 @@ def test_ux_b_second_fact_completes():
                                fact_ids=["f2"])],
         fair_clues=[FairClue(quote="乘客却在鼓掌", supports_atoms=["a1"])],
         hints=["注意掌声", "注意民航流程", "注意考核"],
-        prompt_version="riddle-v6", quality_policy_version="quality-v6")
+        prompt_version="riddle-v7", quality_policy_version="quality-v7")
     clk = FakeClock()
     eng = RoundEngine(mkcfg(), clock=clk)
     eng.start()

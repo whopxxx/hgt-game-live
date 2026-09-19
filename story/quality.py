@@ -81,7 +81,7 @@ from .puzzle import (
 #: 为什么必须 bump 政策版本而不是兼容 v5: 盘上已经存在按 quality-v5
 #: Reviewer 生成的题, 它们正是这次真实故障的来源。不 bump 的话修完
 #: prompt 旧题仍然能进直播 —— 所以 v5 一律 quarantine, 不迁移、不猜。
-QUALITY_POLICY_VERSION = "quality-v6"
+QUALITY_POLICY_VERSION = "quality-v7"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -226,10 +226,10 @@ def validate_spec(spec: PuzzleSpec,
     is_v5 = str(spec.quality_policy_version or "") == QUALITY_POLICY_VERSION
     if is_v5:
         if not spec.completion_fact_ids:
-            r.fail("当前政策(quality-v6) spec 缺 completion_fact_ids"
-                   "(v5 标签不能配 legacy 通关语义)")
+            r.fail(f"当前政策({QUALITY_POLICY_VERSION}) spec 缺 "
+                   f"completion_fact_ids(v5 标签不能配 legacy 通关语义)")
         if not (spec.core_answer or "").strip():
-            r.fail("当前政策(quality-v6) spec 缺 core_answer")
+            r.fail(f"当前政策({QUALITY_POLICY_VERSION}) spec 缺 core_answer")
 
     # ---- 通关合同(v5) 与 atom 要求 ----
     #
