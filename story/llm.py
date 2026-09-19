@@ -4276,6 +4276,16 @@ class PuzzleWriter:
             # 的准入政策门, 表现为"编译成功了却播不出来"。
             content_style=list(spec.content_style or []),
             curated_policy_version=spec.curated_policy_version,
+            # ---- H3-D3: 内容哈希也必须带过 ----
+            # **同一类错误的第三次**。`_apply_review` 重建 spec, 没显式
+            # 列出的字段静默回默认值。这次漏的是 `curated_content_hash`,
+            # 而它正是题池准入门查账本用的第三元: 丢了它, 池门算出的 key
+            # 在账本里永远查不到 -> **整批 curated 题"编译成功却播不出来"**,
+            # 而且日志上只会说"缺 curated_content_hash"。
+            #
+            # (实测: 一次 20 道的小样本跑完, 4 道 accepted 全部带着空
+            # hash 落盘。这条注释是那次踩坑留下的。)
+            curated_content_hash=spec.curated_content_hash,
             metrics=dict(spec.metrics or {}),
             usage=spec.usage, model=spec.model), ""
 

@@ -761,7 +761,8 @@ def test_provenance_survives_reviewer_for_new_fields():
     """`_apply_review` 会**重建** spec —— 新字段漏了就会静默丢失。
 
     这是 H2 踩过的同一个坑(`_apply_review` 曾把 8 个溯源字段全丢了)。
-    content_style / curated_policy_version 同属"只有显式列出才能活下来"。
+    content_style / curated_policy_version / curated_content_hash 同属
+    "只有显式列出才能活下来"。
     """
     print("\n[H3-A] 新字段熬过 _apply_review 重建")
     import inspect
@@ -770,6 +771,36 @@ def test_provenance_survives_reviewer_for_new_fields():
     check("**curated_policy_version 被带过**",
           "curated_policy_version" in src)
     check("**content_style 被带过**", "content_style" in src)
+    # H3-D3 §一-4: **第三次**踩同一个坑。实测 20 道小样本跑完, 4 道
+    # accepted 全部带着**空** curated_content_hash 落盘 —— 那意味着题池
+    # 准入门算出的 key 在账本里永远查不到, 整批题"编译成功却播不出来"。
+    check("**curated_content_hash 被带过**",
+          "curated_content_hash" in src,
+          "它一丢, 池门就查不到账本 -> 整批 curated 题不可播")
+
+
+def test_content_hash_round_trips_and_survives_rebuild():
+    """H3-D3 §一-4: 内容哈希要能存档往返, 且过审后仍在。
+
+    两段都要守:
+      ① `to_archive()` / `from_dict()` 往返 —— 落盘再读回不能变空;
+      ② `_apply_review` 重建 —— 审稿改稿后不能变空。
+    任一处丢了, 表现都是"编译成功了却播不出来"。
+    """
+    print("\n[H3-D3] content hash 存档往返 + 过审存活")
+    from story.puzzle import PuzzleSpec
+    from tests.test_pool import _curated_spec
+    s = _curated_spec()
+    check("fixture 带非空 hash", bool(s.curated_content_hash),
+          s.curated_content_hash)
+    d = s.to_archive()
+    check("archive 里有 curated_content_hash",
+          d.get("curated_content_hash") == s.curated_content_hash,
+          d.get("curated_content_hash"))
+    back = PuzzleSpec.from_dict(d)
+    check("**读回后 hash 不变**",
+          back.curated_content_hash == s.curated_content_hash,
+          back.curated_content_hash)
 
 
 def test_new_fields_not_in_snapshot_repr():
@@ -927,6 +958,7 @@ def main():
         test_void_tombstone_row_is_skipped,
         test_curated_policy_version_round_trips,
         test_provenance_survives_reviewer_for_new_fields,
+        test_content_hash_round_trips_and_survives_rebuild,
         test_new_fields_not_in_snapshot_repr,
         test_story_gate_stage_depth,
         test_prompt_declares_v3_rules,
