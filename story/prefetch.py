@@ -24,13 +24,17 @@ tick 线程)和一整套状态机, 值得单独一个文件级 docstring; 而且
 ## 状态机(契约)
 
     IDLE
-      ↓ 库存 < 低水位
+      ↓ 库存 < 低水位 **或** 下一题此刻没得播(且未到硬上限)
     REFILL_ACTIVE
       ↓ 满足低压力条件且无在途任务
     GENERATING_ONE
       ↓ add 成功
     REFILL_ACTIVE
-      ↓ 库存 >= 高水位
+      ↓ 库存 >= 高水位 **且** 下一题有得播
+    IDLE
+
+    库存 >= 硬上限(pool_max_size)
+      ↓ **无条件**停下(即使 playable 仍为 0, 只 warning) —— 见下
     IDLE
 
     任何生成/add 失败
@@ -39,17 +43,35 @@ tick 线程)和一整套状态机, 值得单独一个文件级 docstring; 而且
       ↓ 到期
     REFILL_ACTIVE
 
-## 三条设计要点
+## 四条设计要点
 
 1. **min/target 是真正的滞回(latch)**。每拍判一次 `stock < min` 是错的:
    1 补成 2 就停了, `pool_target_size` 永远没有意义。
 
-2. **单飞靠 `self._future`, 不靠 `max_workers=1`**。后者只保证"同时执行
+2. **滞回看两个量: stock 与 playable**。`stock_count()` 是长期库存,
+   `playable_count()` 是"下一题此刻能不能播"。实播踩过的坑: 6 道候选
+   全被当前窗口挡住 -> 回落现场生成、观众干等, 而 stock=6 让补池
+   认为健康, 一道都不补。所以启动/停止都同时看这两个(见 `_on_tick_locked_ish`)。
+
+3. **硬上限兜底**。`playable=0` 也可能是"被某个窗口条件整体挡住",
+   此时补进来的新题会被同一条件挡住 —— 没有上限就是无限烧配额而
+   playable 一动不动。到 `pool_max_size` 就停, 只 warning。
+
+4. **单飞靠 `self._future`, 不靠 `max_workers=1`**。后者只保证"同时执行
    一个", 挡不住 tick 往队列里排 30 个任务。
 
-3. **一次只生成一道**。直播突然忙起来时, 最多只有一道已经发出的生成
+5. **一次只生成一道**。直播突然忙起来时, 最多只有一道已经发出的生成
    请求无法取消; 不会有 3–4 道连着打完。下一道必须等新的 tick 重新
    确认(QA + 零压力 + 无在途 + latch 仍 active)—— 这才叫低优先级。
+
+## 允许补池的相位
+
+    QA        严格: pending/inflight 为 0 且无 hint/reveal 在途
+    REVEALED  允许: pending/inflight 为 0, 不看 hint_inflight
+
+REVEALED 的 30 秒展示窗是**最好的**生成时机 —— 引擎完全空闲, 而且
+有很大概率赶在下一题就位之前完成, 下一题于是直接 pop 池子瞬时切题。
+SETTING(直播自己在出题)与 REVEALING(揭晓可能仍在生成)**明确禁止**。
 
 ## 为什么用轮询 future.done() 而不是 add_done_callback
 
@@ -112,6 +134,13 @@ class PoolPrefetcher:
 
         self._min_size = max(0, int(getattr(cfg, "pool_min_size", 2) or 0))
         self._target_size = max(0, int(getattr(cfg, "pool_target_size", 5) or 0))
+        #: "下一题此刻能播"的最低要求。0 = 关掉这个触发条件。
+        self._playable_min = max(
+            0, int(getattr(cfg, "pool_playable_min", 1) or 0))
+        #: 硬上限。到这儿就停, **即使 playable 还是 0** —— 见 `on_tick`。
+        #: 兜底取 target: max 没配时不该比 target 更小(那会让滞回失效)。
+        self._max_size = max(
+            self._target_size, int(getattr(cfg, "pool_max_size", 10) or 0))
         self._backoff_s = float(getattr(cfg, "pool_prefetch_backoff_s", 30.0) or 30.0)
 
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
@@ -133,6 +162,10 @@ class PoolPrefetcher:
         self._retry_at = 0.0               # 退避到期时刻(monotonic)
         self._pending_result = None        # worker 的终局结果, 由 tick 取走
         self._last_fail = ""
+        #: 硬上限 warning 的节流时刻(monotonic)。tick 4Hz, 不节流会把
+        #: "到顶了但还是没得播"刷成日志洪水。
+        self._max_warn_at = 0.0
+        self._max_warn_s = 60.0
         # ---- 计数(全部由 tick 线程单写) ----
         # 拆得比"一个 fail_count"细, 因为后续排查时**故障发生在哪个
         # 阶段**是最有价值的信息: 生成失败是出题质量问题, add 失败是
@@ -213,36 +246,80 @@ class PoolPrefetcher:
             if not self._ledger_ok():
                 return
 
-            # ---- ⑤ 库存(latch 只需要三种区分, 数到 target 就够) ----
+            # ---- ⑤ 取快照(库存与"能不能播"必须看同一刻) ----
+            # 只取一次: `playable_count` 与随后的 `_generate_one` 用**同一份**
+            # recent/avoid。若 probe 用快照 A 判"还够播"、而生成时又读快照 B,
+            # 两拍的窗口差异会让补池照着一个过期判断跑。
+            inputs = self._generation_inputs()
+
+            # ---- ⑥ 库存 / 可播数 ----
             stock = self._stock()
             if stock is None:
                 return
+            playable = self._playable(inputs)
 
-            # ---- ⑥ latch(滞回) ----
-            if not self._refill_active and stock < self._min_size:
+            # ---- ⑦ 硬上限(先于 latch 判) ----
+            # 到顶就彻底停, 即使 playable 仍是 0。理由见 config 里
+            # `pool_max_size` 的说明: 若这批题是被某个窗口条件整体挡住,
+            # 新补的题会被同一条件挡住 —— 无上限就是无限烧配额而
+            # playable 一动不动。这里只 warning, 让运维看得见"补了没用"。
+            if stock >= self._max_size:
+                if self._refill_active:
+                    self._refill_active = False
+                if playable < self._playable_min:
+                    if now >= self._max_warn_at:
+                        # 节流: tick 是 4Hz, 不节流会把这行刷成日志洪水。
+                        self._max_warn_at = now + self._max_warn_s
+                        log.warning(
+                            "题池达到硬上限(%d)但当前仍无可播题"
+                            "(stock=%d playable=%d) —— 停下, 不再生成。"
+                            "多半是当前窗口把所有候选都挡住了, "
+                            "继续补也补不出去。", self._max_size, stock, playable)
+                else:
+                    log.info("补池周期结束: 库存 %d >= 硬上限 %d",
+                             stock, self._max_size)
+                return
+
+            # ---- ⑧ latch(滞回) ----
+            # 启动条件: 长期库存见底 **或** 下一题此刻没得播。
+            # 停止条件: 库存到高水位 **且** 下一题有得播。
+            #
+            # 为什么停止要 `and` 而不是 `or`: 只满足一个就停, 会在
+            # "库存够但全被当前窗口挡住"时提前收工 —— 那正是实播里
+            # "6 道候选全被挡、回落现场生成"的场景。反过来, 只按
+            # playable 判启动会让窗口拥挤时狂补(盘上其实堆满了),
+            # 所以启动也保留 stock < min 这条腿。
+            need = (stock < self._min_size
+                    or (playable < self._playable_min
+                        and stock < self._max_size))
+            if not self._refill_active and need:
                 self._refill_active = True
-                log.info("补池周期启动: 库存 %d < 低水位 %d", stock, self._min_size)
-            elif self._refill_active and stock >= self._target_size:
+                log.info("补池周期启动: 库存 %d < 低水位 %d, 或 可播 %d < %d",
+                         stock, self._min_size, playable, self._playable_min)
+            elif self._refill_active and (
+                    stock >= self._target_size
+                    and playable >= self._playable_min):
                 self._refill_active = False
-                log.info("补池周期结束: 库存 %d >= 高水位 %d",
-                         stock, self._target_size)
+                log.info("补池周期结束: 库存 %d >= 高水位 %d 且 可播 %d >= %d",
+                         stock, self._target_size, playable, self._playable_min)
                 return
             if not self._refill_active:
                 self.skip_count += 1
                 return
 
-            # ---- ⑦ 单飞 ----
+            # ---- ⑨ 单飞 ----
             if self._future is not None:
                 return
 
-            # ---- ⑧ 低压力门 ----
+            # ---- ⑩ 低压力门 ----
             if not self._low_pressure():
                 return
 
-            # ---- ⑨ 取快照 + 占住"在途"标记 ----
-            # 快照在**提交时**取, 与"任务是在低压力下起的"是同一时刻。
-            # 标记必须先占: 否则出锁到真提交之间若有第二拍进来, 会重复起任务。
-            to_submit = self._generation_inputs()
+            # ---- ⑪ 占住"在途"标记 ----
+            # 快照在 ⑤ 已经取好了 —— 与"这道题是不是真的缺"是同一份
+            # recent/avoid。这里只占标记: 否则出锁到真提交之间若有第二拍
+            # 进来, 会重复起任务。
+            to_submit = inputs
             self._future = _PENDING
 
         # ---- 锁外真正提交 ----
@@ -320,19 +397,69 @@ class PoolPrefetcher:
 
     def _stock(self) -> Optional[int]:
         try:
-            # limit=target: 数够高水位就早退, 把 tick 线程上的开销封顶。
-            return self.pool.stock_count(limit=self._target_size)
+            # limit=max_size(不是 target): 硬上限那条判断需要看得到
+            # `stock >= max_size`, 数到 target 就早退会让它永远看不见
+            # —— 那正是 L1-C 里"到顶了还在补"的 bug。max_size >= target
+            # 恒成立(config 有告警兜底), 所以这个上界比原来宽, 但 latch
+            # 需要的三种区分("<min" / ">=target" / 都不是)照旧够用。
+            return self.pool.stock_count(limit=self._max_size)
         except Exception:                       # noqa: BLE001
             log.exception("读库存异常, 本次不补池")
             return None
 
-    def _low_pressure(self) -> bool:
-        """低压力门: **严格零**。
+    def _playable(self, inputs: dict) -> int:
+        """**下一题此刻能播几道** —— 与 `_stock()` 是两个不同的指标。
 
-        phase == QA 且 pending/inflight 都为 0 且没有 hint/reveal 在途。
-        为什么要求 QA: 出题在途时 phase 是 SETTING, 补池会和它抢;
-        REVEALING/REVEALED 同理。为什么要求严格零: 房间忙的时候补池
-        本来就没必要(池子里的存量够用), 而判定边界越清晰越好推理。
+        `stock` 是长期库存(与窗口无关), playable 依赖当下的
+        recent/avoid。实播踩的坑正是两者的差: stock=6 但 6 道候选
+        全被当前窗口挡住, 于是回落现场生成 —— 而补池只看 stock,
+        认为健康, 一道都不补。
+
+        用**同一份** `inputs` 去 probe 和生成(见 `_on_tick_locked_ish`
+        的 ⑤)。`limit=playable_min` 早退: 只需要知道"够不够最低要求"。
+
+        读不到就当 fail **closed**(返回 0 = 缺货): 此时若误判成"够",
+        补池会停, 而实际可能一道都播不出来; 反过来误判成"缺"最多是
+        多生成一道, 代价小得多。
+        """
+        if self._playable_min <= 0:
+            # 关掉了这个触发条件 —— 返回一个"永远够"的哨兵值, 让
+            # latch 只由 stock 决定(与 Q9 原行为逐位相同)。
+            return self._playable_min
+        try:
+            n = self.pool.playable_count(
+                inputs.get("recent_signatures"), inputs.get("avoid"),
+                limit=self._playable_min)
+            return int(n or 0)
+        except Exception:                       # noqa: BLE001
+            log.exception("读可播数异常, 按 0(缺货)处理")
+            return 0
+
+    def _low_pressure(self) -> bool:
+        """低压力门: 允许补池的相位与"零在途"要求。
+
+        ## QA —— 严格零
+
+        `pending == 0 and inflight == 0 and not hint_inflight and
+        not reveal_inflight`。房间忙时补池本来就没必要(存量够用),
+        而且出题会和观众的提问抢同一个网关配额。
+
+        ## REVEALED —— 允许(这是**最好的**生成窗口)
+
+        REVEALED 是"谜底已公布、等 30 秒展示"的那一段。原来把它排除
+        掉是纯粹的浪费: 那 30 秒里没有任何 LLM 工作, 观众在看揭晓,
+        引擎完全空闲。补池在这里生成一道, 有很大概率赶在下一题就位
+        之前完成 —— 于是下一题直接 pop 池子、瞬时切题, 不必现场等
+        10–40 秒。仍要求零在途, 但不看 hint_inflight: REVEALED 期间
+        引擎自己可能还在收尾提示, 那不是"抢配额"的对手。
+
+        ## 明确**不**允许 SETTING / REVEALING
+
+        出题在途时 phase 是 SETTING, 补池会和**直播自己的出题**抢网关
+        —— 那是最该避让的一刻。REVEALING 期间可能还有揭晓生成的工作
+        在飞, 同理不抢。这两个相位保持禁止。
+
+        返回 False 只表示"这一拍不补", 不是错误 —— 下拍再看。
         """
         try:
             p = self._probe()
@@ -344,13 +471,19 @@ class PoolPrefetcher:
         if p.get("stopped"):
             return False
         from .state import Phase
-        if p.get("phase") != Phase.QA:
-            return False
         if p.get("pending") or p.get("inflight"):
             return False
-        if p.get("hint_inflight") or p.get("reveal_inflight"):
-            return False
-        return True
+        phase = p.get("phase")
+        if phase == Phase.QA:
+            # QA 期间 hint/reveal 都可能正在生成 —— 让路。
+            if p.get("hint_inflight") or p.get("reveal_inflight"):
+                return False
+            return True
+        if phase == Phase.REVEALED:
+            if p.get("reveal_inflight"):
+                return False
+            return True
+        return False
 
     def _generation_inputs(self) -> dict:
         try:
@@ -489,6 +622,12 @@ class PoolPrefetcher:
                 # `_PENDING` 也算在途(已决定提交、还没拿到 Future)。
                 "in_flight": f is not None,
                 "backoff_until": self._retry_at,
+                # 滞回的两个输入。只看 stock 的话, "stock=5 playable=0"
+                # (候选全被当前窗口挡住)这种现场指纹在计数里完全看不见。
+                "stock": self._stock(),
+                "playable": self._playable(self._generation_inputs()),
+                "playable_min": self._playable_min,
+                "max_size": self._max_size,
 
                 "added": self.added_count,
                 "generation_fail": self.generation_fail_count,

@@ -446,6 +446,113 @@ class PuzzlePool:
                     n += 1
             return n
 
+    def _candidate_block_reason_locked(self, spec: PuzzleSpec,
+                                       recent: Optional[list],
+                                       avoid: Optional[list],
+                                       quotas: "Quotas",
+                                       used_texts: list) -> str:
+        """这道候选**此刻**能不能播? 返回阻塞原因, 空串 = 能播。
+
+        ## 为什么必须抽出来
+
+        这是 `pop_next()` 与 `playable_count()` **共用**的那扇动态门。
+        两处各写一遍的后果是很具体的: 补池按 `playable_count()` 判断
+        "还有一道能播"于是不补, 而 `pop_next()` 多一道门把它挡了 ——
+        直播现场直接回落现场生成, 而补池全程以为自己很健康。门一旦
+        分成两套就会漂, 所以这里**只有**一份。
+
+        查两件事, 顺序与 `pop_next` 一致:
+          ② `cross_puzzle_gate` —— 与**当前** recent 窗口的分布冲突?
+          ③ `too_similar`       —— 谜面与最近出过的太像?
+
+        ① (`_validate_pool_spec`) 与 ②③ 的**调用时机不同**: 前者是静态
+        准入(与窗口无关, 所以 `stock_count` 也跑它), 后两者依赖当下窗口。
+        调用方负责先跑 ①, 因为它要区分"这道题根本不合格"和"这道题只是
+        此刻被窗口挡住"—— 两种情况下 `blocked` 的日志/语义不同。
+
+        ⚠️ `used_texts` 由调用方算好传进来(`avoid + self._avoid_extra`),
+        不在这里读 `self._avoid_extra` —— `playable_count()` 要在同一把
+        锁里对 N 道候选复用同一份, 每次重算就是 O(N·池大小)。
+        """
+        # ② 与当前分布冲突?
+        bad = cross_puzzle_gate(spec, recent, quotas, spec.blueprint)
+        if bad:
+            return bad[0]
+        # ③ 谜面与最近出过的太像?
+        if too_similar(spec.puzzle, used_texts):
+            return "与已出过的太像"
+        return ""
+
+    # ------------------------------------------------------------------
+    def playable_count(self,
+                       recent_signatures: Optional[list] = None,
+                       avoid: Optional[list] = None,
+                       limit: Optional[int] = None) -> int:
+        """**此刻**调用 `pop_next(recent, avoid)` 能实际交付几道题。
+
+        ## 与 `stock_count()` 的分工(两个指标, 不要合并)
+
+            stock_count    = 长期有效库存   —— 与时间窗口无关
+            playable_count = 下一题此刻能播 —— 依赖当下 recent/avoid
+
+        实播踩到的正是两者的差: 池里 6 道候选**全部**被当前窗口挡住,
+        于是回落现场生成(观众干等 10–40 秒), 而 `stock_count()==6`
+        让补池认为库存健康, 一道都不补。补池要看的是这个数。
+
+        `stock_count` 的语义**刻意不变**: 它回答"库存有没有", 而
+        "被当前窗口挡住"的题**仍然是库存**(等最近 N 题滚过去就能用)。
+        把 dynamic 门扣进 stock 会让补池在窗口拥挤时狂补 —— 那时盘上
+        其实已经堆满了。所以是**新增一个指标**, 不是改老的那个。
+
+        ## 纯只读
+
+        绝不 `_persist_used` / 绝不改 `_used` / 绝不 `shuffle` / 绝不
+        `mark_used`。它会被 4Hz 的 tick 调用, 任何写都会污染 used ledger
+        —— 而 used 是"重启后已播的题不复活"唯一的账本(见模块 docstring)。
+        为此它**不**复用 `_pop_next_locked()`(那个交付时会写 used),
+        而是与它共享上面那扇 `_candidate_block_reason_locked()`。
+
+        `limit`: 数够就早退(同 `stock_count`), 补池只需要判断
+        ">= playable_min", 不需要精确值。
+
+        不抛异常(与本模块其他公开方法一致)。
+        """
+        try:
+            return self._playable_count_locked(
+                recent_signatures, avoid, limit)
+        except Exception:                       # noqa: BLE001
+            log.exception("playable_count 异常, 按 0 处理")
+            return 0
+
+    def _playable_count_locked(self, recent: Optional[list],
+                               avoid: Optional[list],
+                               limit: Optional[int]) -> int:
+        with self._lock:
+            # fail closed: 账本不可信时 pop_next 一道都不交付, 所以此刻
+            # 能播的就是 0。若这里返回非零, 补池会以为"还有得播"而
+            # 停止补池 —— 而实际一道都交付不出去。
+            if not self._used_trustworthy:
+                return 0
+            quotas = Quotas.from_config(self.cfg)
+            used_texts = list(avoid or []) + self._avoid_extra
+            n = 0
+            for s in self._items:
+                if limit is not None and n >= limit:
+                    break
+                if spec_key(s) in self._used:
+                    continue
+                # ① 静态准入 —— **与 stock_count 同一扇门**, 所以
+                #    quality policy 隔离的题在这里同样不计入。
+                ok, _ = self._validate_pool_spec(s)
+                if not ok:
+                    continue
+                # ②③ 动态门 —— 与 pop_next 同一份实现。
+                if self._candidate_block_reason_locked(
+                        s, recent, avoid, quotas, used_texts):
+                    continue
+                n += 1
+            return n
+
     # ------------------------------------------------------------------
     @staticmethod
     def _validate_pool_spec(spec: PuzzleSpec) -> tuple:
@@ -649,6 +756,10 @@ class PuzzlePool:
             # 打散, 免得每次总是同一道被先试(池内顺序会随 add 固定)
             self._rng.shuffle(cands)
             quotas = Quotas.from_config(self.cfg)
+            # "该避开的谜面": 调用方给的 avoid(当前窗口) + 池子自己记的
+            # (跨进程/跨场次存活, 见 `remember_avoid`)。**算一次** ——
+            # 它的内容在循环里不变, 而 `too_similar` 是 O(池大小 × 历史)。
+            used_texts = list(avoid or []) + self._avoid_extra
             blocked: list[str] = []
             for spec in cands:
                 # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
@@ -661,16 +772,13 @@ class PuzzlePool:
                 if not ok:
                     blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
                     continue
-                # ② 与当前分布冲突?
-                bad = cross_puzzle_gate(spec, recent, quotas, spec.blueprint)
+                # ②③ 动态门 —— **与 `playable_count()` 共用一份实现**。
+                #     分成两套的话, 补池会按其中一个数判断"还够播"而
+                #     另一个数把它挡住, 两边永远对不上。
+                bad = self._candidate_block_reason_locked(
+                    spec, recent, avoid, quotas, used_texts)
                 if bad:
-                    blocked.append(f"{spec.puzzle[:20]}…: {bad[0][:60]}")
-                    continue
-                # ③ 谜面与最近出过的太像?
-                used_texts = list(avoid or []) + self._avoid_extra
-                dup = too_similar(spec.puzzle, used_texts)
-                if dup:
-                    blocked.append(f"{spec.puzzle[:20]}…: 与已出过的太像")
+                    blocked.append(f"{spec.puzzle[:20]}…: {bad[:60]}")
                     continue
                 # ---- 先落盘再交付(见模块 docstring 的不变式) ----
                 if not self._persist_used(spec, aired=False):
@@ -745,6 +853,13 @@ class PuzzlePool:
                 # 的差就是"盘上有、但其实播不出来"的题数 —— banner 里
                 # 两个都打, 免得"库存 5 却一道都取不出来"没法解释。
                 "stock": self.stock_count(),
+                "playable": self.playable_count(),
+                # 上面那个是**长期库存**; 这个是**此刻能不能交付**。
+                # 两个都打: `stock=5 playable=0` 正是那场"候选全被挡、
+                # 回落现场生成、观众干等"的现场指纹, 只打 stock 看不出来。
+                # 这里**不带** recent/avoid(拿不到当前窗口), 所以它是
+                # "池子自身 + 账本"下的可播数, 是 `playable_count` 的
+                # 上界; 补池走的是带窗口的那个重载。
                 "used": len(self._used),
                 "aired": len(self._aired),
                 "trustworthy": self._used_trustworthy,

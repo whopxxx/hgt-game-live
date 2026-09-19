@@ -1118,8 +1118,24 @@ class RoundEngine:
         `avoid`+`recent_signatures`, 于是**只要发生一次外层 retry 就能
         绕过整个 Q4**。字段定义写两遍, 迟早再漂一次。
         """
+        # 最近出过的谜面。留一格给"当前这道" —— 见下。
+        avoid = list(self._used_titles[-7:])
+        # **当前正在玩的这道也要避开**。`_used_titles` 只在揭晓时才追加
+        # (见 `_reveal_locked`), 所以从"第 N 题就位"到"第 N 题揭晓"这段
+        # 时间里, 当前谜面**不在** avoid 里 —— 而 Q9 的补池恰恰是在
+        # QA/REVEALED 期间跑的(现在 REVEALED 也允许了, 窗口更大)。
+        # 于是后台可能生成一道和**观众此刻正看着的**那道极像的题, 下一题
+        # 就位时直接撞衫。
+        #
+        # 截 60 字与 `_used_titles` 的写法一致(那里也是 `strip()[:60]`),
+        # 否则同一个谜面会在两个列表里以不同长度出现, `too_similar` 的
+        # n-gram 相似度也会因为尾部不同而略变。
+        if self._puzzle:
+            cur = self._puzzle.strip()[:60]
+            if cur and cur not in avoid:
+                avoid.append(cur)
         return {
-            "avoid": list(self._used_titles[-8:]),
+            "avoid": avoid,
             # **转成 dict** —— 这些会经 director 传给 quality 层, 而
             # payload 是"可序列化的动作描述", 不该塞自定义对象进去
             # (测试里 `.get()` 会直接炸)。

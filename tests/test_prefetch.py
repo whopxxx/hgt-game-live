@@ -464,7 +464,7 @@ class _Clock:
 
 
 def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
-         **cfgkw):
+         probe_inputs=None, **cfgkw):
     """建一个 PoolPrefetcher, 协作者默认都是"最宽松"的假件。"""
     from story.prefetch import PoolPrefetcher
     cfgkw.setdefault("pool_min_size", 2)
@@ -478,9 +478,11 @@ def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
         probe = lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
                          "hint_inflight": False, "reveal_inflight": False,
                          "stopped": False}
+    if probe_inputs is None:
+        probe_inputs = lambda: {"avoid": [], "recent_signatures": []}
     pf = PoolPrefetcher(
         cfg=cfg, pool=pool, writer=writer, probe=probe,
-        probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+        probe_inputs=probe_inputs,
         pick_blueprint=lambda recent, rng=None: None,
         clock=clock or _Clock(), executor=executor or _SyncExecutor())
     return pf
@@ -1295,6 +1297,409 @@ def test_shutdown_docstring_is_honest():
           "cancel_futures" in doc or "解释器" in doc or "atexit" in doc)
 
 
+# ======================================================================
+# E. L1 —— playable_count / 可播库存触发 / REVEALED 窗口 / 当前题 avoid
+# ======================================================================
+def _blocked_pool(d, n=5):
+    """一个 stock=n 但 playable=0 的池子 —— "6 道候选全被挡"的复刻。
+
+    怎么造出来的: 池子里每道题都是**同一个 signature**。`stock_count()`
+    **刻意不扣** dynamic gate(被窗口挡住的题仍然是库存), 所以它数到 n;
+    而 `pop_next`/`playable_count` 要过 `cross_puzzle_gate` —— 同一
+    mechanism+solution_shape 连着 10 道会撞 `same_mechanism` 配额,
+    于是一道都交付不出去。
+
+    这正是实播里那个现场: `stock=5` / `playable=0` / 观众等出题。
+
+    用 `variant(i)` 而不是 `good_spec(...)`: 后者改谜面必须**同时**改
+    fair_clues 的 quote(校验会比对原文), 而 `variant()` 的文本整组是
+    自洽的。signature 再统一覆盖成同一个, 才撞得出配额。
+
+    返回值带一个 `wall`: 被当前窗口挡住**需要那个窗口真的存在** ——
+    `cross_puzzle_gate(spec, recent, ...)` 是拿 `spec` 和 `recent` 比
+    配额, 空窗口下什么都不冲突。所以调用方要把 `wall` 当 recent 传进
+    去, 才复现得出 `playable=0`(见 `_BlockedPool`)。
+    """
+    cfg = mkcfg(d)
+    pool = PuzzlePool.open(cfg)
+    for i in range(n):
+        s = variant(i)
+        # 同一个 signature -> 撞 same_mechanism / same_solution_shape
+        s.signature = PuzzleSignature(
+            mechanism_family="hidden_function",
+            solution_shape="hidden_function_explains_behavior",
+            domain="maritime", emotion_mode="neutral",
+            relation="stranger", time_shape="habitual",
+            reveal_mode="meaning_flip")
+        assert pool.add(s), "前置构造失败: variant(%d) 没能入池" % i
+    # 最近 10 题全是这个 signature -> 池里每一道都被配额挡住。
+    wall = [pool._items[0].signature.to_dict()] * 10
+    return _BlockedPool(cfg, pool, wall)
+
+
+class _BlockedPool:
+    """`_blocked_pool` 的返回值: 池子 + 那个"把候选全挡住"的窗口。
+
+    补池的 `probe_inputs` 必须回这个 window, 否则 `playable_count` 在
+    空窗口下看得见全部候选 —— 那是**正常**行为(池子确实有 5 道还没用过
+    的题), 只是复现不出"现场一道都播不出来"。
+    """
+    def __init__(self, cfg, pool, wall):
+        self.cfg = cfg
+        self.pool = pool
+        self.wall = wall
+
+    def inputs(self, avoid=None):
+        return {"avoid": list(avoid or []),
+                "recent_signatures": [dict(x) for x in self.wall]}
+
+
+def test_playable_count_is_readonly():
+    """**L1-D**: playable_count 与 pop_next 判定一致, 而它自己绝不写账本。
+
+    补池会 4Hz 调它。任何一次 `_persist_used` / `_used.add` 都会污染
+    used ledger —— 那是"重启后已播的题不复活"唯一的账本。
+    """
+    print("\n[L1-D] playable_count 与 pop_next 同门, 且纯只读")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        for i in range(3):
+            pool.add(variant(i))
+        sig = pool._items[0].signature.to_dict()
+        wall = [sig] * 10
+
+        # ---- 一致: 被窗口挡住时两者都判 0 / None ----
+        check("**窗口挡住 -> playable=0**",
+              pool.playable_count(recent_signatures=wall) == 0,
+              pool.playable_count(recent_signatures=wall))
+        check("**同一个窗口 -> pop_next 也是 None**",
+              pool.pop_next(recent_signatures=wall) is None)
+        # ---- 一致: 没被挡住时两者都放行 ----
+        check("空窗口 -> playable=3",
+              pool.playable_count(recent_signatures=[]) == 3,
+              pool.playable_count(recent_signatures=[]))
+
+        # ---- 纯只读 ----
+        before_used = pool.used_count()
+        before_stock = pool.stock_count()
+        used_file = open(cfg.pool_used_path, "rb").read() \
+            if os.path.exists(cfg.pool_used_path) else b""
+        for _ in range(5):
+            pool.playable_count(recent_signatures=[])
+            pool.playable_count(recent_signatures=wall)
+        check("**_used 不变**", pool.used_count() == before_used,
+              pool.used_count())
+        check("**used jsonl 逐字节不变**",
+              (open(cfg.pool_used_path, "rb").read()
+               if os.path.exists(cfg.pool_used_path) else b"") == used_file)
+        check("stock 也不变", pool.stock_count() == before_stock)
+        check("**probe 之后那道题仍能交付**",
+              pool.pop_next(recent_signatures=[]) is not None)
+
+
+def test_playable_count_respects_policy_gate():
+    """L1-D 续: 静态门与 `stock_count` 必须同一扇。
+
+    旧 policy 隔离题对两者都不可见 —— 若 playable 漏掉这一门, 补池会
+    以为"还有得播"而不补新题, 而实际 pop 一道都交付不出来。
+    """
+    print("\n[L1-D2] playable_count 同样扣 policy 隔离")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        old = variant(200)
+        old.quality_policy_version = "quality-v1"
+        _write_raw(cfg.pool_path, [json.dumps(
+            {"pool_version": 1, "pool_key": spec_key(old),
+             "added_at": 0.0, "added_by": "legacy",
+             "spec": old.to_archive()}, ensure_ascii=False)])
+        pool = PuzzlePool.open(cfg)
+        check("stock=0", pool.stock_count() == 0, pool.stock_count())
+        check("**playable=0(与 stock 同一扇门)**",
+              pool.playable_count(recent_signatures=[]) == 0,
+              pool.playable_count(recent_signatures=[]))
+
+
+def test_playable_count_fail_closed_on_bad_ledger():
+    """账本不可信 -> pop_next 一道都不交付 -> playable 必须是 0。
+
+    若这里返回非零, 补池会认为"还有得播"而停止补池, 而实际一道都交
+    不出去 —— 观众干等, 补池全程以为健康。
+    """
+    print("\n[L1-D3] 账本坏 -> playable=0(fail closed)")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        PuzzlePool.open(cfg).add(good_spec())
+        _write_raw(cfg.pool_used_path, ["null"])
+        pool = PuzzlePool.open(cfg)
+        check("账本不可信", pool.ledger_trustworthy is False)
+        check("**playable=0**", pool.playable_count(recent_signatures=[]) == 0,
+              pool.playable_count(recent_signatures=[]))
+
+
+def test_prefetch_l1_a_stock_ok_but_playable_zero():
+    """**L1-A**: stock=5 但 playable=0 -> refill 必须启动。
+
+    这就是"6 道候选全被挡"那一场。修之前: 补池只看 stock, 认为健康,
+    一道都不补, 下一题照旧现场生成。
+    """
+    print("\n[L1-A] stock=5 / playable=0 -> 补池启动")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        bp = _blocked_pool(d, 5)
+        pf = mkpf(d, pool=bp.pool, executor=ex,
+                  probe_inputs=lambda: bp.inputs())
+        check("前置: stock=5", bp.pool.stock_count() == 5,
+              bp.pool.stock_count())
+        check("前置: **playable=0**",
+              bp.pool.playable_count(bp.wall) == 0,
+              bp.pool.playable_count(bp.wall))
+        pf.on_tick()
+        check("**缺口触发 latch**", pf._refill_active is True)
+        check("**真的提交了一次生成**", ex.total == 1, ex.total)
+
+
+def test_prefetch_l1_b_stock_ok_playable_ok_no_refill():
+    """**L1-B**: stock=5 且 playable>=1 -> 不因动态缺货而补池。
+
+    反方向必须守住: 否则只要 playable 波动一次就狂补, 而盘上其实堆满了。
+    """
+    print("\n[L1-B] stock=5 / playable=1 -> 不补")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        pf = mkpf(d, pool=pool, executor=ex)
+        fill(pool, 5)
+        p = pool.playable_count([])
+        check("前置: stock=5", pool.stock_count() == 5)
+        check("前置: playable>=1", p >= 1, p)
+        for _ in range(4):
+            pf.on_tick()
+        check("**latch 没启动**", pf._refill_active is False)
+        check("**零提交**", ex.total == 0, ex.total)
+
+
+def test_prefetch_l1_c_max_size_stops_generation():
+    """**L1-C**: stock 到硬上限且 playable=0 -> 停下, 不再无限生成。
+
+    到顶只 warning —— 这是"被某个窗口条件整体挡住"时的兜底, 防止
+    无限烧网关配额而 playable 一动不动。
+    """
+    print("\n[L1-C] stock=10(max) / playable=0 -> 不再生成")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        bp = _blocked_pool(d, 10)
+        pf = mkpf(d, pool=bp.pool, executor=ex, pool_max_size=10,
+                  pool_target_size=5, pool_min_size=2,
+                  probe_inputs=lambda: bp.inputs())
+        check("前置: stock=10", bp.pool.stock_count() == 10,
+              bp.pool.stock_count())
+        check("前置: playable=0", bp.pool.playable_count(bp.wall) == 0)
+        for _ in range(5):
+            pf.on_tick()
+        check("**零提交(到顶了)**", ex.total == 0, ex.total)
+        check("latch 也没启动", pf._refill_active is False)
+        # 但**不能**静默 —— 运维必须看得见"补了也没用"
+        import io as _io
+        import logging as _log
+        buf = _io.StringIO()
+        h = _log.StreamHandler(buf)
+        lg = _log.getLogger("story.prefetch")
+        old = lg.level
+        lg.setLevel(_log.WARNING)
+        lg.addHandler(h)
+        pf._max_warn_at = 0.0          # 解掉节流, 逼它这一次真的打
+        pf.on_tick()
+        lg.removeHandler(h)
+        lg.setLevel(old)
+        out = buf.getvalue()
+        check("**有 warning(不是静默空转)**",
+              "硬上限" in out and "无可播" in out, out[:200])
+
+
+def test_prefetch_l1_e_revealed_window():
+    """**L1-E**: REVEALED 允许补池; REVEALING / SETTING 禁止; QA busy 禁止。
+
+    REVEALED 那 30 秒是**最好的**生成窗口 —— 引擎完全空闲, 而且有很大
+    概率赶在下一题就位之前完成(下一题于是直接 pop 池子瞬时切题)。
+    """
+    print("\n[L1-E] REVEALED 允许补池, REVEALING/SETTING 禁止")
+    with tmpdir() as d:
+        def probe_for(phase, pending=0, inflight=0, hi=False, ri=False):
+            return lambda: {"phase": phase, "pending": pending,
+                            "inflight": inflight, "hint_inflight": hi,
+                            "reveal_inflight": ri, "stopped": False}
+
+        # REVEALED + 空闲 -> 允许
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+                  probe=probe_for(Phase.REVEALED))
+        fill(pf.pool, 0)
+        pf.on_tick()
+        check("**REVEALED 空闲 -> 允许(prefetch 已提交)**",
+              ex.total == 1, ex.total)
+
+        # REVEALED 但仍有人在途 -> 禁止
+        ex2 = _ManualExecutor()
+        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d, pool_path=os.path.join(d, "p2.jsonl"),
+                                                pool_used_path=os.path.join(d, "u2.jsonl"))),
+                   executor=ex2, probe=probe_for(Phase.REVEALED, pending=1))
+        pf2.on_tick()
+        check("REVEALED 但 pending>0 -> 禁止", ex2.total == 0, ex2.total)
+
+        # REVEALING -> 禁止(揭晓可能仍在生成, 不抢)
+        for i, ph in enumerate((Phase.REVEALING, Phase.SETTING)):
+            exi = _ManualExecutor()
+            pfi = mkpf(d, pool=PuzzlePool.open(mkcfg(
+                d, pool_path=os.path.join(d, f"p{i}.jsonl"),
+                pool_used_path=os.path.join(d, f"u{i}.jsonl"))),
+                executor=exi, probe=probe_for(ph))
+            pfi.on_tick()
+            check(f"**{ph} -> 禁止**", exi.total == 0, exi.total)
+
+        # QA busy -> 禁止
+        exq = _ManualExecutor()
+        pfq = mkpf(d, pool=PuzzlePool.open(mkcfg(
+            d, pool_path=os.path.join(d, "pq.jsonl"),
+            pool_used_path=os.path.join(d, "uq.jsonl"))),
+            executor=exq, probe=probe_for(Phase.QA, pending=2))
+        pfq.on_tick()
+        check("QA busy -> 禁止", exq.total == 0, exq.total)
+
+        # QA idle -> 允许(原有行为不许被改坏)
+        exi2 = _ManualExecutor()
+        pfi2 = mkpf(d, pool=PuzzlePool.open(mkcfg(
+            d, pool_path=os.path.join(d, "pq2.jsonl"),
+            pool_used_path=os.path.join(d, "uq2.jsonl"))),
+            executor=exi2, probe=probe_for(Phase.QA))
+        pfi2.on_tick()
+        check("**QA idle -> 允许**", exi2.total == 1, exi2.total)
+
+        # QA + hint 在途 -> 禁止(hint 可能与出题抢配额)
+        exh = _ManualExecutor()
+        pfh = mkpf(d, pool=PuzzlePool.open(mkcfg(
+            d, pool_path=os.path.join(d, "ph.jsonl"),
+            pool_used_path=os.path.join(d, "uh.jsonl"))),
+            executor=exh, probe=probe_for(Phase.QA, hi=True))
+        pfh.on_tick()
+        check("QA + hint 在途 -> 禁止", exh.total == 0, exh.total)
+
+
+def test_prefetch_l1_f_current_puzzle_in_avoid():
+    """**L1-F**: 当前正在玩的谜面必须进 prefetch 的 avoid。
+
+    `_used_titles` 只在**揭晓时**追加, 所以在"第 N 题就位"到"第 N 题
+    揭晓"这段时间里当前谜面不在 avoid 里 —— 而补池恰好在这段时间跑。
+    少了这一条, 后台可能生成一道和观众此刻正看着的那道极像的题。
+    """
+    print("\n[L1-F] 当前谜面进 avoid")
+    cfg = mkcfg(tempfile.mkdtemp())
+    e = RoundEngine(cfg)
+    with e._lock:
+        e._used_titles = ["旧题A"]
+        e._puzzle = "  守塔人只在退潮时亮灯, 涨潮就熄灯, 为什么?  "
+    gi = e.snapshot_generation_inputs()
+    cur = e._puzzle.strip()[:60]
+    check("**当前谜面在 avoid 里**", cur in gi["avoid"], gi["avoid"])
+    check("旧题仍在(没被顶掉)", "旧题A" in gi["avoid"], gi["avoid"])
+    check("仍然截到 60 字(与 _used_titles 同口径)",
+          all(len(x) <= 60 for x in gi["avoid"]), gi["avoid"])
+    # 揭晓路径写的是 `strip()[:60]`, 两处必须逐字节相等 —— 否则同一个
+    # 谜面会在两个列表里以不同长度出现, too_similar 的 n-gram 会略漂。
+    with e._lock:
+        e._used_titles.append(e._puzzle.strip()[:60])
+    gi2 = e.snapshot_generation_inputs()
+    check("**与 _used_titles 的写法逐字节一致(不重复出现)**",
+          gi2["avoid"].count(cur) == 1, gi2["avoid"])
+
+    # 还没有当前题时不该凭空加空串
+    e2 = RoundEngine(mkcfg(tempfile.mkdtemp()))
+    with e2._lock:
+        e2._used_titles = ["旧题A"]
+        e2._puzzle = ""
+    check("空谜面不产生空串条目",
+          e2.snapshot_generation_inputs()["avoid"] == ["旧题A"],
+          e2.snapshot_generation_inputs()["avoid"])
+
+
+def test_prefetch_probe_and_generate_share_one_snapshot():
+    """**probe 与生成必须用同一份 snapshot。**
+
+    否则 probe 按快照 A 判"还够播"、生成时按快照 B 出题, 两拍的窗口
+    差异会让补池照着一个过期判断跑。
+    """
+    print("\n[L1-G] probe / 生成共用同一份 recent+avoid 快照")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        w = _FakeWriter()
+        cur = {"recent": ["旧快照"], "avoid": ["旧谜面"]}
+        pool = PuzzlePool.open(mkcfg(d))      # 空池 -> stock=0 -> latch 启动
+        from story.prefetch import PoolPrefetcher
+        pf = PoolPrefetcher(
+            cfg=mkcfg(d, pool_min_size=2, pool_target_size=5),
+            pool=pool, writer=w,
+            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
+                           "hint_inflight": False, "reveal_inflight": False,
+                           "stopped": False},
+            probe_inputs=lambda: {"avoid": list(cur["avoid"]),
+                                  "recent_signatures": list(cur["recent"])},
+            pick_blueprint=lambda recent, rng=None: None,
+            clock=_Clock(), executor=ex)
+        pf.on_tick()
+        check("提交了", ex.total == 1)
+        # 提交之后立刻换掉"当前快照" —— worker 执行时必须看到旧的那份
+        cur["recent"] = ["新快照"]
+        cur["avoid"] = ["新谜面"]
+        ex.run_next()
+        check("**worker 看到的是提交那一刻的快照**",
+              w.calls[0]["recent"] == ["旧快照"], w.calls[0]["recent"])
+        check("avoid 同理", w.calls[0]["avoid"] == ["旧谜面"],
+              w.calls[0]["avoid"])
+
+
+def test_prefetch_stats_exposes_playable():
+    """stats 必须能区分 stock 与 playable —— 那是现场指纹。"""
+    print("\n[L1-H] prefetch.stats 暴露 stock/playable")
+    with tmpdir() as d:
+        bp = _blocked_pool(d, 3)
+        pf = mkpf(d, pool=bp.pool, probe_inputs=lambda: bp.inputs())
+        st = pf.stats()
+        check("有 stock", st.get("stock") == 3, st.get("stock"))
+        check("**有 playable 且为 0**", st.get("playable") == 0,
+              st.get("playable"))
+        check("有 playable_min", st.get("playable_min") == 1,
+              st.get("playable_min"))
+        check("有 max_size", st.get("max_size") == 10, st.get("max_size"))
+
+
+def test_playable_min_zero_restores_q9_behavior():
+    """`pool_playable_min=0` = 关掉动态缺货触发 —— 退回 Q9 原行为。
+
+    与 `enforce_blueprint` 那次教训同一条纪律: "关掉"必须是真的关掉,
+    不能表面关掉、底下还留一条隐式触发。
+    """
+    print("\n[L1-I] playable_min=0 -> 只看 stock(退回 Q9)")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        bp = _blocked_pool(d, 5)
+        pf = mkpf(d, pool=bp.pool, executor=ex, pool_playable_min=0,
+                  probe_inputs=lambda: bp.inputs())
+        for _ in range(4):
+            pf.on_tick()
+        check("stock=5 且关了动态触发 -> 不补",
+              pf._refill_active is False and ex.total == 0, ex.total)
+
+
+def test_max_size_below_target_is_flagged():
+    print("\n[L1-J] Config 抓 max < target")
+    w = Config(sim_path="x", pool_target_size=5, pool_max_size=3).validate()
+    check("max<target 有告警", any("硬上限" in x for x in w), w)
+    w2 = Config(sim_path="x", pool_target_size=5, pool_max_size=10).validate()
+    check("正常配置无此告警", not any("硬上限" in x for x in w2), w2)
+    w3 = Config(sim_path="x", pool_playable_min=-1).validate()
+    check("playable_min 为负有告警", any("playable_min" in x for x in w3), w3)
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -1342,6 +1747,19 @@ def main():
         test_director_prefetch_has_own_writer,
         test_prefetch_writer_none_when_no_client,
         test_shutdown_docstring_is_honest,
+        # E. L1 —— playable 库存 / REVEALED 窗口 / 当前题 avoid
+        test_playable_count_is_readonly,
+        test_playable_count_respects_policy_gate,
+        test_playable_count_fail_closed_on_bad_ledger,
+        test_prefetch_l1_a_stock_ok_but_playable_zero,
+        test_prefetch_l1_b_stock_ok_playable_ok_no_refill,
+        test_prefetch_l1_c_max_size_stops_generation,
+        test_prefetch_l1_e_revealed_window,
+        test_prefetch_l1_f_current_puzzle_in_avoid,
+        test_prefetch_probe_and_generate_share_one_snapshot,
+        test_prefetch_stats_exposes_playable,
+        test_playable_min_zero_restores_q9_behavior,
+        test_max_size_below_target_is_flagged,
     ]
     for t in tests:
         t()

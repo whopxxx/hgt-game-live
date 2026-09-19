@@ -229,6 +229,18 @@ class Config:
     # 否则 1 补成 2 就停了, pool_target_size 永远没有意义。
     pool_target_size: int = 5
     pool_min_size: int = 2
+    # 下一题**此刻能不能播**的最低要求(与长期库存分开, 见 pool.py)。
+    # 实播踩到的坑: 池里 6 道候选全被当前窗口挡住 -> 回落现场生成,
+    # 观众干等 10–40 秒; 而 stock=6 让补池认为健康, 一道都不补。
+    # 所以补池要同时看 playable —— `stock >= target` 但 `playable <
+    # playable_min` 时**仍然**补。
+    pool_playable_min: int = 1
+    # 补池的硬上限: 库存到这儿就停, **即使 playable 仍然是 0**。
+    # 为什么必须有: 若那批题是被"某个窗口条件"整体挡住的(比如最近
+    # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
+    # 没有上限就是无限生成 + 无限烧网关配额, 而 playable 永远不动。
+    # 到顶只 warning, 让运维看见"补了但没用", 不是静默空转。
+    pool_max_size: int = 10
     # 补池总开关。**与 pool_enabled 解耦**: 关掉它 = 不后台生成, 但
     # 手工/脚本灌进池子的存量题**照常用**。网关故障时就是靠这一条
     # 停掉后台生成、同时继续播已有的题(pool_enabled=False 做不到 ——
@@ -356,6 +368,20 @@ class Config:
             )
         if self.pool_min_size < 0:
             warns.append(f"pool_min_size({self.pool_min_size}) 为负, 已按 0 处理。")
+        # 硬上限低于高水位 -> "补到 target 就停"与"最多到 max"互相矛盾,
+        # max 会先触发, target 永远达不到, 滞回退化成"补到 max 为止"。
+        # 与 target < min 一样是必然的误配置, 不是风格问题。
+        if self.pool_max_size < self.pool_target_size:
+            warns.append(
+                f"pool_max_size({self.pool_max_size}) < "
+                f"pool_target_size({self.pool_target_size}): 硬上限低于高水位, "
+                f"补池会卡在 max 上, 永远补不到 target。要让 max >= target。"
+            )
+        if self.pool_playable_min < 0:
+            warns.append(
+                f"pool_playable_min({self.pool_playable_min}) 为负, 已按 0 处理"
+                f"(0 = 关掉\"下一题缺货\"这个触发条件, 只看长期库存)。"
+            )
         if self.pool_prefetch_backoff_s <= 0:
             warns.append(
                 f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "

@@ -1339,6 +1339,197 @@ def test_quarantine_is_not_deletion():
         check("规格仍在(物理保留)", pool.size() == 1, pool.size())
 
 
+# ======================================================================
+# L1: playable_count —— "下一题此刻能不能播"
+# ======================================================================
+def _twin(spec, puzzle, **kw):
+    """同 signature、不同谜面的题(撞配额的原料)。
+
+    `good_spec` 的 fair_clues 引用的是**默认谜面原文**, 所以换谜面必须
+    连 quote 一起换 —— 否则 `_validate_pool_spec` 会正确地拒掉它
+    (`fair_clue 的 quote 不在谜面里`)。这里用谜面里真实存在的短语。
+    """
+    s = good_spec(puzzle=puzzle, fair_clues=[
+        FairClue(quote="只在退潮时亮", supports_atoms=["a1"]),
+        FairClue(quote="涨潮后反倒熄灯", supports_atoms=["a2"]),
+    ], **kw)
+    s.signature = spec.signature
+    return s
+
+
+def test_playable_count_is_not_stock_count():
+    """**两个指标, 不是同一个量的两种写法。**
+
+    `stock_count` = 长期库存(刻意不扣 dynamic gate)
+    `playable_count` = 此刻能交付几道(扣 cross_puzzle_gate / too_similar)
+
+    被当前窗口挡住的题**仍然是库存** —— 等最近 N 题滚过去它就能用。
+    合并成一个数会让补池在窗口拥挤时狂补, 而盘上其实已经堆满了。
+    """
+    print("\n[L1-1] playable_count != stock_count")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        base = good_spec()
+        check("base 入池", pool.add(base) is True)
+        tw = _twin(base, "海角那座灯塔只在退潮时亮, 涨潮后反倒熄灯。为什么?")
+        check("twin 入池", pool.add(tw) is True)
+        check("stock=2", pool.stock_count() == 2, pool.stock_count())
+        check("空窗口下 playable 也是 2(还没冲突)",
+              pool.playable_count([]) == 2, pool.playable_count([]))
+        wall = [base.signature.to_dict()] * 10
+        check("**窗口拥挤 -> stock 仍是 2(不被扣)**",
+              pool.stock_count() == 2, pool.stock_count())
+        check("**但 playable=0**", pool.playable_count(wall) == 0,
+              pool.playable_count(wall))
+        # pop 与它同门
+        check("pop_next 同样返回 None", pool.pop_next(wall) is None)
+
+
+def test_playable_count_matches_pop_next_on_every_gate():
+    """三关(静态门 / cross_puzzle_gate / too_similar)逐个对齐。
+
+    只对一部分会让补池按一个数判断"还够播", 而另一个数把它挡住 ——
+    两边永远对不上, 而那正是"stock=5 playable=0"没被发现的成因。
+    """
+    print("\n[L1-2] playable_count 与 pop_next 三关逐个一致")
+    with tmpdir() as d:
+        # ① 静态门: 磁盘改坏 signature -> 两者都不能给
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        recs = [json.loads(l) for l in
+                open(cfg.pool_path, encoding="utf-8") if l.strip()]
+        recs[0]["spec"]["signature"]["domain"] = "乱写的值"
+        _write_raw(cfg.pool_path,
+                   [json.dumps(r, ensure_ascii=False) for r in recs])
+        p2 = PuzzlePool.open(cfg)
+        check("① stock 不计它", p2.stock_count() == 0, p2.stock_count())
+        check("① playable 也不计它", p2.playable_count([]) == 0,
+              p2.playable_count([]))
+        check("① pop 也返回 None", p2.pop_next([]) is None)
+
+        # ② cross_puzzle_gate
+        with tmpdir() as d2:
+            p3 = PuzzlePool.open(mkcfg(d2))
+            s = good_spec()
+            p3.add(s)
+            sig = s.signature.to_dict()
+            check("② 空窗口 -> playable=1", p3.playable_count([]) == 1)
+            check("② 满窗口 -> playable=0",
+                  p3.playable_count([sig] * 10) == 0,
+                  p3.playable_count([sig] * 10))
+            # 同一份窗口下 pop 也必须拒 —— 而且**不写 used**
+            check("② pop 同窗口返 None", p3.pop_next([sig] * 10) is None)
+            check("② 被挡住不算交付", p3.used_count() == 0, p3.used_count())
+
+        # ③ too_similar
+        with tmpdir() as d3:
+            p4 = PuzzlePool.open(mkcfg(d3))
+            s = good_spec()
+            p4.add(s)
+            check("③ avoid 命中 -> playable=0",
+                  p4.playable_count([], avoid=[s.puzzle]) == 0,
+                  p4.playable_count([], avoid=[s.puzzle]))
+            check("③ pop 同 avoid 也 None",
+                  p4.pop_next([], avoid=[s.puzzle]) is None)
+            check("③ 换个 avoid -> 又能播",
+                  p4.playable_count([], avoid=["完全无关的一句"]) == 1)
+
+
+def test_playable_count_never_writes_used():
+    """**纯只读 probe**。它会被 4Hz 的 tick 调用。
+
+    任何一次 `_persist_used` / `_used.add` 都会污染 used ledger —— 那是
+    "重启后已播的题不复活"唯一的账本(Q8 验收点 4)。
+    """
+    print("\n[L1-3] playable_count 绝不写 used")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        pool.add(good_spec())
+        before = pool.used_count()
+        raw_before = (open(cfg.pool_used_path, "rb").read()
+                      if os.path.exists(cfg.pool_used_path) else b"")
+        for _ in range(10):
+            pool.playable_count([])
+            pool.playable_count([good_spec().signature.to_dict()] * 10)
+        check("_used 不变", pool.used_count() == before, pool.used_count())
+        raw_after = (open(cfg.pool_used_path, "rb").read()
+                     if os.path.exists(cfg.pool_used_path) else b"")
+        check("**used jsonl 逐字节不变**", raw_after == raw_before)
+        check("题仍能交付", pool.pop_next([]) is not None)
+        check("交付之后才写进 used", pool.used_count() == before + 1,
+              pool.used_count())
+
+
+def test_playable_count_fail_closed():
+    """账本不可信 -> pop 一道都不交付 -> playable 必须 0。
+
+    返回非零会让补池以为"还有得播"而停工, 而实际一道都交不出去。
+    """
+    print("\n[L1-4] playable_count 在坏账本下 fail closed")
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        PuzzlePool.open(cfg).add(good_spec())
+        _write_raw(cfg.pool_used_path, ["null"])
+        pool = PuzzlePool.open(cfg)
+        check("账本不可信", pool.ledger_trustworthy is False)
+        check("stock 仍是 1(它不看账本)", pool.stock_count() == 1,
+              pool.stock_count())
+        check("**playable=0**", pool.playable_count([]) == 0,
+              pool.playable_count([]))
+        check("pop 也是 None", pool.pop_next([]) is None)
+
+
+def test_playable_count_limit_early_exit():
+    print("\n[L1-5] playable_count(limit) 早退")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        base = good_spec()
+        # 不同谜面但同 signature 会撞配额; 要造 N 道可播就得让 signature 不同。
+        # 用 domain 区分(同一 mechanism/solution_shape 但 domain 不同),
+        # 配额 same_domain=3 所以 3 道以内都放行。
+        for i, dm in enumerate(("maritime", "nature", "daily")):
+            s = good_spec(
+                puzzle=f"第{i}座灯塔只在退潮时亮, 涨潮后反倒熄灯。为什么?",
+                fair_clues=[
+                    FairClue(quote="只在退潮时亮", supports_atoms=["a1"]),
+                    FairClue(quote="涨潮后反倒熄灯", supports_atoms=["a2"]),
+                ])
+            # 换 domain 就必须放掉 blueprint 硬比对 —— `good_spec` 的
+            # blueprint 写着 domain="maritime", 而 `blueprint_specified=True`
+            # 时 `_validate_pool_spec` 会拿它和 signature 逐字段比。
+            # 这里要的是"三道 signature 互不相同的可播题", 不是 blueprint 覆盖。
+            s.signature = PuzzleSignature(
+                mechanism_family="hidden_function",
+                solution_shape="hidden_function_explains_behavior",
+                domain=dm, emotion_mode="neutral", relation="stranger",
+                time_shape="habitual", reveal_mode="meaning_flip")
+            s.blueprint_specified = False
+            check(f"add {i}", pool.add(s) is True)
+        check("playable=3", pool.playable_count([]) == 3,
+              pool.playable_count([]))
+        check("limit=1 -> 1", pool.playable_count([], limit=1) == 1,
+              pool.playable_count([], limit=1))
+        check("limit=99 -> 3", pool.playable_count([], limit=99) == 3)
+
+
+def test_playable_count_never_raises():
+    """与本模块其他公开方法一致: 任何意外退化成 0, 不抛。"""
+    print("\n[L1-6] playable_count 绝不抛")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(good_spec())
+        try:
+            # recent 传垃圾 -> cross_puzzle_gate 内部可能炸
+            n = pool.playable_count([{"乱": "写"}])
+            ok = isinstance(n, int)
+        except Exception as e:                  # noqa: BLE001
+            ok = False
+            print("     抛了:", e)
+        check("**垃圾 recent 返回 int 而不是抛**", ok)
+
+
 def main():
     tests = [
         # 验收点 1
@@ -1398,6 +1589,13 @@ def main():
         test_closeout_adherence_blocks_pool_admission,
         test_real_v3_to_v4_quarantine,
         test_quarantine_is_not_deletion,
+        # ---- L1: playable_count ----
+        test_playable_count_is_not_stock_count,
+        test_playable_count_matches_pop_next_on_every_gate,
+        test_playable_count_never_writes_used,
+        test_playable_count_fail_closed,
+        test_playable_count_limit_early_exit,
+        test_playable_count_never_raises,
     ]
     for t in tests:
         t()
