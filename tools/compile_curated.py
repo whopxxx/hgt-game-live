@@ -254,7 +254,25 @@ def main(argv=None) -> int:
 
     if a.budget_seconds is not None:
         cfg.curated_budget_seconds = float(a.budget_seconds)
-    lc = build_lazy_curator(cfg, pool, writer, lambda: {},
+    # ---- 预热是**离线批处理**, 没有直播可以让路 ----
+    #
+    # 探针必须显式声明"我在跑离线任务", 而不是返回一个空 dict。
+    #
+    # ⚠️ 这个坑是实测踩到的: H3-D 给 `should_start` 加了 phase 白名单
+    # 之后, 空探针(没有 `phase` 键)会被判成"不在允许的 phase" →
+    # **整个预热一条都不审**, 报告里只留一句
+    # `stop_reason: phase=None 不允许后台审题`。而 `--show-samples`
+    # 照样打印(它读的是池文件里**上一轮**的旧样本), 所以表面上像是
+    # "跑完了", 实际上一次 LLM 都没调。
+    #
+    # 语义上这是对的: `phase` 是**直播场景**的让路判据, 离线预热里
+    # 根本没有直播。所以这里用一个明确的"离线空闲"探针, 而不是让
+    # 白名单去猜。
+    offline_free = {"phase": "qa", "pending": 0, "inflight": 0,
+                    "hint_inflight": False, "reveal_inflight": False,
+                    "ai_player_in_flight": False, "riddle_inflight": False,
+                    "stopped": False, "reveal_remaining_seconds": None}
+    lc = build_lazy_curator(cfg, pool, writer, lambda: dict(offline_free),
                             corpus_path=a.corpus, ledger_path=a.decisions)
     if lc is None:
         log.error("无法装配 LazyCurator(语料为空或已关闭)。")

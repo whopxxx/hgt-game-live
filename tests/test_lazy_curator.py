@@ -1378,6 +1378,78 @@ def test_only_accepted_requires_side_effects():
 # ======================================================================
 # 12. H3-D: CLI eligibility(§八)
 # ======================================================================
+def test_prewarm_probe_declares_offline_phase():
+    """§八/§二: 预热的压力探针**必须**声明一个允许的 phase。
+
+    ⚠️ 这个坑是实测踩到的: H3-D 给 `should_start` 加了 phase 白名单
+    之后, 预热里那个 `lambda: {}` 探针(没有 `phase` 键)会被判成
+    "不在允许的 phase" -> **整个预热一条都不审**, 报告里只留一句
+    `stop_reason: phase=None 不允许后台审题`。
+
+    最坏的地方在于它**看起来像跑完了**: `--show-samples` 照样打印
+    (读的是池文件里上一轮的旧样本), 而 `llm_calls` 是 0。没有这条
+    测试, 一次"预热成功"的报告可能对应零次调用。
+
+    这里直接驱动 CLI 的 `main()`, 用假 client 断言它真的处理了候选。
+    """
+    print("\n[H3-D] 预热探针声明 phase(否则整轮空跑)")
+    import inspect
+    from tools import compile_curated as PRE
+    src = inspect.getsource(PRE.main)
+    check("**探针显式给了 phase**",
+          '"phase"' in src or "'phase'" in src, "探针里没有 phase")
+    check("**不是空 dict 探针**", "lambda: {}" not in src)
+
+    # 端到端: 跑一次真的 main(), 断言它**真的处理了**候选。
+    import json as _json
+    from tests.test_curated_compile import FakeClient, _compile_tool
+    from story.llm import LLMResult
+
+    with tmpdir() as d:
+        corpus = os.path.join(d, "corpus.jsonl")
+        rec0 = mk_rec(eid="pse:q:1")
+        with open(corpus, "w", encoding="utf-8") as f:
+            f.write(_json.dumps({
+                "external_id": rec0.external_id, "source": rec0.source,
+                "source_url": rec0.source_url,
+                "source_kind": rec0.source_kind,
+                "question_author": "Q", "answer_author": "A",
+                "question_license": "CC BY-SA 4.0",
+                "answer_license": "CC BY-SA 4.0",
+                "question_license_inference": "api",
+                "answer_license_inference": "api",
+                "title": rec0.title, "surface": rec0.surface,
+                "bottom": rec0.bottom, "language": "en",
+                "original_language": "en", "tags": [],
+            }, ensure_ascii=False) + "\n")
+
+        # 假 client: 编译 -> 复核 -> 审稿, 全按"合格"回。
+        from tests.test_curated_compile import _review_pass
+        fc = FakeClient([LLMResult(tool_input=_compile_tool(), model="m"),
+                         _review_pass()])
+
+        orig_make = PRE._make_writer
+
+        def _fake_writer(cfg):
+            from story.llm import PuzzleWriter
+            return PuzzleWriter(client=fc, runtime_cfg=cfg)
+
+        PRE._make_writer = _fake_writer
+        try:
+            rc = PRE.main([
+                "--corpus", corpus,
+                "--pool-out", os.path.join(d, "pool.jsonl"),
+                "--attributions", os.path.join(d, "ATTR.jsonl"),
+                "--decisions", os.path.join(d, "dec.jsonl"),
+                "--target-stock", "3",
+                "--max-candidates", "1",
+            ])
+        finally:
+            PRE._make_writer = orig_make
+        check("CLI 正常退出", rc == 0, rc)
+        check("**真的调了 LLM**(不是空跑)", len(fc.calls) > 0, len(fc.calls))
+
+
 def test_prewarm_stock_uses_live_policy_eligibility():
     """§八: 池里 10 条 v2 + 2 条 v3, 当前 policy=v3 -> stock 必须是 **2**。
 
@@ -1734,6 +1806,7 @@ def main():
         test_retry_after_partial_failure_no_duplicates,
         test_accepted_decision_is_written_after_side_effects,
         test_only_accepted_requires_side_effects,
+        test_prewarm_probe_declares_offline_phase,
         test_prewarm_stock_uses_live_policy_eligibility,
         # ---- H3-D 装配层 ----
         test_scheduler_does_not_block_on_curator,
