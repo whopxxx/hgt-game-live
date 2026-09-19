@@ -281,11 +281,22 @@ def validate_spec(spec: PuzzleSpec,
                        f"{CORE_ANSWER_MAX_LEN} 字上限(要一句话, 不要一段话)")
             if "\n" in spec.core_answer or "\r" in spec.core_answer:
                 r.fail("core_answer 不能换行(揭晓时会原样念给观众)")
-        # (b) 条数 1~2: **不放宽成 4、5 条**。压不进 2 条说明题太绕,
-        #     正确处置是 rewrite, 不是把门槛降低。
+        # (b) 条数 1~2: **不放宽成 4、5 条**。
+        #
+        # ⚠️ C6-B: 这里的文案会**原样进 `seen_why`**, 下一稿收到的是
+        # "【上一稿不合格的地方】结构问题: ..."。旧文案写的是"超过说明这题
+        # 太绕, 应重出" —— 它把 `completion_fact_ids`(**什么时候算解出**)
+        # 说成了**整道题的复杂度上限**, 于是模型一边收到 v8 prompt 的
+        # "题目允许有层次", 一边收到"这题太绕, 应重出", 重新把题写简单。
+        # 那正是 Q2 想消灭的行为, 从 deterministic validator 的反馈链
+        # 又钻了回来。
+        #
+        # 硬拒照旧, 只改**为什么拒、下一稿该怎么修**。
         if not (1 <= len(comp) <= MAX_COMPLETION_FACTS):
             r.fail(f"completion_fact_ids 有 {len(comp)} 条, 应为 1~"
-                   f"{MAX_COMPLETION_FACTS} 条(超过说明这题太绕, 应重出)")
+                   f"{MAX_COMPLETION_FACTS} 条。通关合同写得过细: 请收窄为 "
+                   f"core_answer 的最小 1~{MAX_COMPLETION_FACTS} 条核心语义; "
+                   f"不要因此简化谜题本身, 也不要删除有效的 discovery_beats。")
         seen_c: set = set()
         for fid in comp:
             if fid in seen_c:

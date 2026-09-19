@@ -329,7 +329,15 @@ def test_case_f_completion_capped():
     sp.completion_fact_ids = ["f1", "f2", "f5"]
     vr = validate_spec(sp)
     check("3 条 -> 拒", not vr.ok, vr.why())
-    check("提示应重出而不是放宽", "重出" in vr.why(), vr.why())
+    # ---- C6-B: 反馈必须是"收窄合同", 不是"重出/简化" ----
+    #
+    # 旧断言写的是 `"重出" in vr.why()` —— 它冻结的正是 Q2 想消灭的
+    # 那条指令("这题太绕, 应重出")。硬拒不变, 但**下一稿该往哪修**
+    # 变了: 收窄完成合同, 保住谜题本身与 discovery_beats。
+    check("**提示是收窄合同, 不是重出/简化**",
+          "收窄" in vr.why() and "重出" not in vr.why(), vr.why())
+    check("  **且明确保住 discovery_beats**",
+          "discovery_beats" in vr.why(), vr.why())
 
 
 # ----------------------------------------------------------------------
@@ -875,6 +883,97 @@ def test_closeout_p1_legacy_reviewer_unchanged():
     check("**legacy: 漏回 beats -> 仍放行(旧政策没这个概念)**",
           not (merged2 is None and "discovery_beats" in (why2 or "")),
           (merged2, why2))
+
+
+def test_c6b_completion_over_limit_feedback_does_not_simplify():
+    """**C6-B**: `completion > 2` 的**反馈文案**不得再把题往简单里带。
+
+    背景: v8 把产品规则写成了"题目允许有层次, 通关必须简单", 但
+    `validate_spec()` 对 3 条 completion 的真实错误文案仍是
+    "超过说明这题太绕, 应重出"。这**不只是日志** —— `gen_spec()` 会把它
+    记进 `seen_why`, 下一稿的 prompt 里真的会收到:
+
+        【上一稿不合格的地方】
+        结构问题: ...超过说明这题太绕, 应重出
+
+    于是模型一边收到 v8 的"题目允许有层次", 一边收到"这题太绕, 应重出",
+    重新把题写简单 —— 那正是 Q2 想消灭的行为, 从 deterministic validator
+    的反馈链又钻了回来。
+
+    硬拒**不变**, 只改"为什么拒、下一稿该怎么修"。这条测试就是冻结
+    "反馈链里不得再出现把题写简单的指令"。
+    """
+    print("\n[C6-B] completion 超限的反馈不得再让模型简化整题")
+    from story.quality import validate_spec, MAX_COMPLETION_FACTS
+
+    spec = ident_spec()
+    # 造 3 条 completion(超上限)—— 指向真实存在的 fact
+    spec.completion_fact_ids = ["f1", "f2", "f3"]
+    r = validate_spec(spec)
+    check("completion 超限 -> 仍然硬拒(放宽这件事没变)",
+          not r.ok, r.ok)
+    joined = " ".join(list(r.errors) + list(r.fixable))
+    check("  确实是因为条数被拒",
+          any("completion_fact_ids" in e for e in r.errors), r.errors)
+    # ---- 冻结: 不得再出现"简化整题"类指令 ----
+    #
+    # ⚠️ 判据是"**命令**模型去简化", 不是字面出现"简化"二字 ——
+    # 正确文案本身就写着"**不要**因此简化谜题本身", 用裸串匹配会把
+    # 正确实现判红(实测踩到)。
+    for bad_phrase in ("太绕", "应重出", "换一个更简单", "把整道题改简单",
+                       "换骨架", "请换一个更简单的骨架"):
+        check(f"  **反馈里不得出现 {bad_phrase!r}**",
+              bad_phrase not in joined, joined)
+    check("  **不得把'简化'当动作下发给模型**",
+          "不要因此简化" in joined, joined)
+    # ---- 必须给出正确方向: 收窄**合同**, 保住题与 beats ----
+    check("  **必须告诉模型收窄通关合同**",
+          "收窄" in joined and "合同" in joined, joined)
+    check("  **必须明确不要简化谜题本身**",
+          "简化谜题" in joined or "不要把题" in joined
+          or "不要因此简化" in joined, joined)
+    check("  **必须明确保住 discovery_beats**",
+          "discovery_beats" in joined, joined)
+    check("  上限写的是 1~MAX_COMPLETION_FACTS",
+          str(MAX_COMPLETION_FACTS) in joined, joined)
+
+
+def test_c6b_current_policy_field_lists_all_include_beats():
+    """**C6-B**: 生成器与审稿人的**当前政策字段清单**都必须含 beats。
+
+    代码已经 fail-closed, 所以这些遗漏不会把坏题放进直播 —— 但它会让模型
+    更容易漏字段, 然后: Reviewer 漏 beats -> 代码拒稿 -> 再生成/再审 ->
+    **出题时间变长**。正好和"出题慢"是同一条成本链。
+
+    冻结四处(缺一处就会在某一轮把模型引回漏字段):
+      1. `RIDDLE_SYSTEM` 末尾的"按工具字段填"清单
+      2. `_TOOL_CHECK.description` 的"必须一起重出"清单
+      3. `CHECK_SYSTEM` 的"改了核心就必须重出整套"清单(且条数要对)
+      4. `CHECK_SYSTEM` 的 `quality_checks` 项数标题
+    """
+    print("\n[C6-B] 生成/审稿字段清单都含 discovery_beats")
+    from story import llm as _llm
+
+    check("RIDDLE_SYSTEM 字段清单含 discovery_beats",
+          "discovery_beats" in _llm.RIDDLE_SYSTEM)
+    check("_TOOL_CHECK.description 含 discovery_beats",
+          "discovery_beats" in _llm._TOOL_CHECK["description"])
+    check("CHECK_SYSTEM 的同步合同清单含 discovery_beats",
+          "discovery_beats" in _llm.CHECK_SYSTEM)
+    # "六样"是写死的条数: beats 补进去之后必须是七样, 否则模型会按六样凑
+    check("**CHECK_SYSTEM 不再写'六样'(已是七样)**",
+          "六样" not in _llm.CHECK_SYSTEM)
+    check("CHECK_SYSTEM 写的是七样", "七样" in _llm.CHECK_SYSTEM)
+    check("**quality_checks 标题写八项(不是四项)**",
+          "八项" in _llm.CHECK_SYSTEM and "四项**" not in _llm.CHECK_SYSTEM)
+    # _QUALITY_CHECK_FIELDS 必须真的是八项 —— 标题与实现不能各说各话
+    check("_QUALITY_CHECK_FIELDS 确实是 8 项",
+          len(_llm._QUALITY_CHECK_FIELDS) == 8,
+          _llm._QUALITY_CHECK_FIELDS)
+    # 工具 schema 的 required 必须含 beats(模型最直接遵守的那一层)
+    check("_TOOL_RIDDLE.required 含 discovery_beats",
+          "discovery_beats" in _llm._TOOL_RIDDLE["input_schema"]["required"],
+          _llm._TOOL_RIDDLE["input_schema"]["required"])
 
 
 def test_final_closeout_v5_empty_values_rejected():
@@ -3081,6 +3180,8 @@ def main():
         test_closeout_b4_clue_must_reach_completion,
         test_closeout_p1_reviewer_sync_fail_closed,
         test_closeout_p1_legacy_reviewer_unchanged,
+        test_c6b_completion_over_limit_feedback_does_not_simplify,
+        test_c6b_current_policy_field_lists_all_include_beats,
         # ---- Final closeout ----
         test_final_closeout_v5_empty_values_rejected,
         test_final_closeout_legacy_fallback_still_works,

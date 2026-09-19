@@ -1082,7 +1082,8 @@ clues "只在退潮的那几个小时亮" → a1 / "涨潮后反而熄掉" → a
 自检: 谜面那句话**是否已经排除了谜底那个可能**? 排除了就不能写。
 
 按工具字段填: title / puzzle / answer / core_answer / facts /
-completion_fact_ids / solve_atoms / fair_clues / hints / signature。"""
+completion_fact_ids / solve_atoms / fair_clues / discovery_beats /
+hints / signature。"""
 
 
 ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提问。
@@ -1295,7 +1296,7 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 #: nested required 和 `_apply_review` 的 fail-closed 检查覆盖, 否则新
 #: 维度会重演"缺字段 -> from_dict 静默补默认值 -> 配额被绕过"的老问题。
 #: 显式写出来, 加字段的人就会看到它。
-#: Reviewer 的 `quality_checks` 契约字段。四项必须全 true 代码才收稿。
+#: Reviewer 的 `quality_checks` 契约字段。**八项**必须全 true 代码才收稿。
 #: 与 `_TOOL_CHECK` 的 nested required **两层都要** —— schema 由模型遵守,
 #: 不能把正确性押在它身上(与 `_OBSERVED_SIGNATURE_FIELDS` 同一套推理)。
 _QUALITY_CHECK_FIELDS = (
@@ -1652,8 +1653,9 @@ _TOOL_CHECK = {
         "审阅这个谜题, 并给出 **pass / fix / rewrite** 三选一的决定。"
         "改动核心机制时, 必须把 puzzle / answer / core_answer / "
         "completion_fact_ids / facts / solve_atoms / fair_clues / "
-        "observed_signature / quality_checks **一起重出** —— 它们是一套, "
-        "不能只改谜底。**pass/fix 时以上字段一律必须显式回传**, "
+        "discovery_beats / observed_signature / quality_checks "
+        "**一起重出** —— 它们是一套, 不能只改谜底。"
+        "**pass/fix 时以上字段一律必须显式回传**, "
         "代码不会「没回就沿用旧值」。"),
     "input_schema": {
         "type": "object",
@@ -1994,9 +1996,9 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix 
 
 选 rewrite 时填 `rewrite_reason`, **不要**给 puzzle/answer。
 
-═══ 改了核心就必须重出整套(v5 起是六样) ═══
+═══ 改了核心就必须重出整套(v5 起是七样) ═══
 `facts` / `core_answer` / `completion_fact_ids` / `solve_atoms` /
-`fair_clues` / `observed_signature` 是**一套**。
+`fair_clues` / `discovery_beats` / `observed_signature` 是**一套**。
 只要你改动了 answer 或核心机制:
 - `facts` 必须重出 —— 它是**正式 Q&A 的判定依据**。留着旧事实表
   会让主持人依据**过期事实**回答观众, 比以前更危险, 因为现在很自信。
@@ -2006,10 +2008,14 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix 
   要建立的还是旧题的事实, 而题已经变了。
 - `solve_atoms` 必须重出, 且 fact_ids 要指向**新的** fact id。
 - `fair_clues` 的 quote 必须**逐字**出自**改后的**谜面(代码会验)。
+- `discovery_beats` 必须重出或**原样带回** —— 它是观众正常推理会经过
+  的 2~4 个发现阶段。改了谜底却留着旧 beats, 结果是"新谜底 + 旧推理
+  层次"的混合稿: 代码查不出(fact id 往往没变), 但观众看到的推理
+  路径已经和谜底对不上了。**当前政策下漏回会被拒稿。**
 - `observed_signature` 必须**如实重新判断** —— 你把题改成了什么形状
   就写什么。**不要照抄原稿**, 那是给跨题配额用的, 报假的会污染全局分布。
 
-⚠ **只要谜面或谜底有任何一个字变了, 上面六样就必须全部给出。**
+⚠ **只要谜面或谜底有任何一个字变了, 上面七样就必须全部给出。**
 少给一样, 代码会**整稿拒掉**(不会退回旧值替你补)。
 
 没动核心就原样回传它们(含 id 与 fact_ids)。
@@ -2045,7 +2051,7 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
    规定 / 必须遵守的流程 / 仪式规矩)。**普通的生活常识与物理规律不算。**
    把结论填进 `observed_signature.procedural_rule_dependency`。
 
-═══ v5: `quality_checks` 四项 —— **必须全部为 true 代码才收稿** ═══
+═══ v5: `quality_checks` 八项 —— **必须全部为 true 代码才收稿** ═══
 这是一个结构化字段, 不是让你写感想。任一项 false 而 decision 写 pass,
 会被**整稿拒收** —— 因为那意味着"你知道有问题却选了放行"。
 
@@ -3390,9 +3396,10 @@ class PuzzleWriter:
         # 旧政策/legacy 仍允许没有 beats(那时没这个概念), 由
         # `_review_beats` 内部按 `current_policy` 区分。
         #
-        # ⚠️ 必须在下面那个 `if bad:` **之前**追加 —— 那里是唯一的
+        # ⚠️ 必须在上面那个 `if bad:` **之前**追加 —— 那里是唯一的
         # 拒稿出口, 加在它后面等于没加(beats 缺了也会照常返回一个
-        # 混合版本稿)。
+        # 混合版本稿)。C6-B 顺手删掉了这里原本**重复的第二份**:
+        # 它在 `return None, ...` 之后, 永远执行不到, 是死代码。
         beats = _review_beats(ti, spec, is_v5_review)
         if is_v5_review and not beats:
             bad.append("discovery_beats")
@@ -3400,7 +3407,7 @@ class PuzzleWriter:
         if bad:
             # 文案要能区分两类拒稿原因, 否则看日志会误以为是改了没同步:
             #   - 同步类: facts / atoms / clues / core_answer / completion
-            #   - 质量类: quality_checks 四项未全过 / observed_signature 缺字段
+            #   - 质量类: quality_checks 八项未全过 / observed_signature 缺字段
             # 两类混在同一句里会让人按错误的方向去修生成器。
             _sync = [b for b in bad if not b.startswith(("quality_checks",
                                                          "observed_signature"))]
@@ -3432,23 +3439,6 @@ class PuzzleWriter:
                     if fid not in ids:
                         return None, (f"审稿给的 solve_atom({a.id}) 引用了"
                                       f"不存在的 fact {fid!r}")
-
-        # ---- C5: discovery_beats 在当前政策下**同级同步** ----
-        #
-        # 与 facts / solve_atoms / fair_clues 同一条规则: 当前政策
-        # (quality-v8+) 要求 Reviewer **显式回传非空**, 缺/空/解析不出
-        # 一律拒稿 —— 不能"没回就沿用旧的"。
-        #
-        # 拒绝的理由不是洁癖, 而是**混合版本无法被结构校验抓到**:
-        # Reviewer 改了谜底与 facts 却漏回 beats 时, beats 引用的 fact id
-        # 往往还存在(改稿常保留原 id), validate_spec 完全合法, 但语义
-        # 已经过期 —— 观众看到的是"新谜底 + 旧推理层次"。
-        #
-        # 旧政策/legacy 仍允许没有 beats(那时没这个概念), 由
-        # `_review_beats` 内部按 `current_policy` 区分。
-        beats = _review_beats(ti, spec, is_v5_review)
-        if is_v5_review and not beats:
-            bad.append("discovery_beats")
 
         return PuzzleSpec(
             id=spec.id, title=spec.title, puzzle=new_puzzle, answer=new_answer,
