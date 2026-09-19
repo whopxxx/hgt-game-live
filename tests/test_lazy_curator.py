@@ -24,6 +24,7 @@ Batch H3-B/C 的离线回归: **Lazy Curator** —— 后台按需审题 + 直�
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -1485,7 +1486,10 @@ def test_prewarm_stock_uses_live_policy_eligibility():
                 s.curated_policy_version = CC.CURATED_POLICY_VERSION
                 rows.append({"pool_version": 1, "pool_key": f"k_new_{i}",
                              "added_at": 0, "spec": s.to_archive()})
-                led.record(mk_rec(external_id=f"new:{i}"),
+                # H3-D3 §一-4: 账本判据是三元素 —— 必须用**这道 spec 自己**
+                # 的内容登记, 否则 content_hash 对不上, 池门查不到它。
+                from tests.test_pool import _mk_curated_dec_rec
+                led.record(_mk_curated_dec_rec(s),
                            decision=CL.ACCEPTED,
                            policy_version=CC.CURATED_POLICY_VERSION)
             with open(p, "w", encoding="utf-8") as f:
@@ -1754,8 +1758,306 @@ def _cfg_for_director(tmp):
 
 
 # ======================================================================
+# H3-D3: 交易缺口回归
+# ======================================================================
+def test_accepted_item_is_immediately_visible_in_live_pool():
+    """§一-1: accepted 之后 **本场直播立刻看得见**, 不需要重启。
+
+    这是 H3-D 漏掉的那一环: 落池 + 署名 + accepted 都在盘上成立了,
+    但 `PuzzlePool._items` 是启动时的快照 -> `stock_count` 不变,
+    `pop_next` 取不到。离线预热把这个洞掩盖了(跑完就退, 下次启动
+    自然读得到), 直播里它就是"补了等于没补"。
+
+    这条测试用**真的** `PuzzlePool`(不是替身) 驱动, 否则验的还是假的。
+    """
+    print("\n[H3-D3] accepted -> 本场内存池立即可见")
+    from story.pool import PuzzlePool, set_curated_decisions_path
+    from tests.test_pool import _curated_spec
+    with tmpdir() as d:
+        dpath = os.path.join(d, "dec.jsonl")
+        ppath = os.path.join(d, "curated.jsonl")
+        upath = ppath + ".used"
+        set_curated_decisions_path(dpath)
+        try:
+            cfg = _cfg(curated_min_size=100)
+            cfg.pool_path = ppath
+            cfg.pool_used_path = upath
+            cfg.curated_pool_path = ppath
+            cfg.curated_used_path = upath
+            cfg.pool_enabled = True
+            cfg.curated_pool_enabled = True
+            pool = PuzzlePool.open_curated(cfg)
+            check("起始库存 0", pool.stock_count() == 0, pool.stock_count())
+
+            spec = _curated_spec()
+            led = CL.DecisionLedger(dpath)
+            # 走**生产顺序**: 落池行 -> 署名 -> accepted -> 激活
+            from tools.curated_ledger import content_hash_of
+            from tests.test_pool import _mk_curated_dec_rec
+            rec = _mk_curated_dec_rec(spec)
+            spec.curated_content_hash = content_hash_of(rec)
+            with open(ppath, "w", encoding="utf-8") as f:
+                f.write(json.dumps(
+                    {"pool_version": 1, "pool_key": "k1", "added_at": 0,
+                     "spec": spec.to_archive()}, ensure_ascii=False) + "\n")
+            led.record(rec, decision=CL.ACCEPTED,
+                       policy_version=CC.CURATED_POLICY_VERSION)
+
+            check("**没激活之前: 内存池仍然看不见**",
+                  pool.stock_count() == 0, pool.stock_count())
+
+            check("**activate_committed 返回 True**",
+                  pool.activate_committed(spec) is True)
+            check("**激活之后 stock 变成 1**", pool.stock_count() == 1,
+                  pool.stock_count())
+            got = pool.pop_next(recent_signatures=[], avoid=[])
+            check("**pop_next 真的能取到**", got is not None,
+                  "取不到 -> 那道题本场不可播")
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+def test_activate_committed_rejects_spec_that_fails_gate():
+    """§一-1: 激活**必须**走准入门 —— 不许把不合格的题塞进内存池。
+
+    这是"不要直接从 LazyCurator 改 `_items`"那条禁令的守卫。绕过门
+    直接 append 会造出一道"播得出来但过不了门"的题。
+    """
+    print("\n[H3-D3] activate 拒绝过不了准入门的题")
+    from story.pool import PuzzlePool, set_curated_decisions_path
+    from tests.test_pool import _curated_spec
+    with tmpdir() as d:
+        set_curated_decisions_path(os.path.join(d, "dec.jsonl"))
+        try:
+            cfg = _cfg(curated_min_size=100)
+            cfg.pool_path = os.path.join(d, "c.jsonl")
+            cfg.pool_used_path = cfg.pool_path + ".used"
+            cfg.curated_pool_path = cfg.pool_path
+            cfg.curated_used_path = cfg.pool_used_path
+            cfg.pool_enabled = True
+            cfg.curated_pool_enabled = True
+            pool = PuzzlePool.open_curated(cfg)
+            bad = _curated_spec()
+            bad.curated_policy_version = ""      # 明确过不了门
+            check("**拒绝激活**", pool.activate_committed(bad) is False)
+            check("内存池仍是空的", pool.stock_count() == 0,
+                  pool.stock_count())
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+def test_single_flight_reserved_before_submit():
+    """§一-6: `_busy` 必须在 submit **之前**占住。
+
+    竞态窗口(早先的真实漏洞):
+
+        tick #1: should_start()->True, submit(A); worker 还没起来
+        tick #2: should_start()->True(它看到 _busy 仍是 False)
+                 submit(B)
+        -> 两个 job 排在同一个单线程池里, 各自选候选、各自打 LLM
+
+    模拟手法: 把 `submit` 换成"只记录、不真跑", 于是 worker 永远不会
+    把 `_busy` 置起来 —— 那正是竞态窗口里发生的事。第二次 `on_tick`
+    必须被拒。
+    """
+    print("\n[H3-D3] single-flight: submit 前占位")
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        comp = _FakeCompiler([("accept", "")])
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+
+        class _DeadExec:
+            """接受 submit 但**永不执行** —— 精确模拟"worker 还没起来"。"""
+
+            def __init__(self):
+                self.n = 0
+
+            def submit(self, fn, *a, **kw):
+                self.n += 1
+
+            def shutdown(self, wait=False):
+                pass
+
+        lc._exec = _DeadExec()
+        lc._worker_enabled = True
+        r1 = lc.on_tick()
+        check("第一次提交成功", r1["submitted"] is True, r1)
+        r2 = lc.on_tick()
+        check("**第二次被拒(占位已生效)**", r2["submitted"] is False, r2)
+        check("原因点名在途", "在途" in r2["reason"], r2["reason"])
+        check("**submit 只被调了一次**", lc._exec.n == 1, lc._exec.n)
+        check("**没有真的编译**(worker 从未跑)",
+              len(comp.calls) == 0, comp.calls)
+
+
+# ======================================================================
+# H3-D3: 交易缺口回归
+# ======================================================================
+def test_reviewer_technical_failure_is_defer_not_reject():
+    """§一-3: 审稿**技术失败** -> technical_defer(可重试), 绝非 rejected。
+
+    技术失败的定义很窄: timeout / 网关错 / 空 tool_input / schema 坏掉。
+    它们的共同点是"**这次没审成**", 不是"这道题不行"。
+
+    记成 rejected 的后果是**永久吃掉一道可能的好题**, 而且没有任何
+    地方会显示丢了 —— 那正是 ledger 四种结论存在的主要理由。
+    """
+    print("\n[H3-D3] 审稿技术失败 -> defer(可重试)")
+    for stage in ("review_technical", "compile_call", "truth_audit_technical"):
+        with tmpdir() as d:
+            cfg = _cfg(curated_min_size=100)
+            pool = _FakePool(os.path.join(d, "p.jsonl"))
+            comp = _FakeCompiler([("defer", stage)])
+            led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+            lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+            r = lc.step()
+            check(f"{stage} -> technical_defer", r["technical_defer"] == 1, r)
+            check(f"{stage} **不是 rejected**", r["rejected"] == 0, r)
+            check(f"{stage} 下次仍是候选",
+                  select_candidate([mk_rec()], led,
+                                   CC.CURATED_POLICY_VERSION) is not None)
+
+    # 而**明确的**内容拒绝仍必须是 rejected(终态)。
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool = _FakePool(os.path.join(d, "p.jsonl"))
+        comp = _FakeCompiler([("reject", "ai_gate")])
+        led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+        lc = _mk(cfg, pool, comp, [mk_rec()], led, lambda: dict(FREE))
+        r = lc.step()
+        check("内容拒绝 -> rejected", r["rejected"] == 1, r)
+        check("内容拒绝 -> 下次不再是候选",
+              select_candidate([mk_rec()], led,
+                               CC.CURATED_POLICY_VERSION) is None)
+
+
+def test_accepted_ledger_write_failure_is_retryable_single_active():
+    """§一-5: 池/署名都成功、**accepted 决策写盘失败** 的故障注入。
+
+    要求(逐条):
+        本轮 accepted = 0    —— 没写下去的 accepted 不算数
+        不可播               —— 池里那行没有 accepted 决策, 过不了准入门
+        可重试               —— 记 defer, 下次仍是候选
+        重试后只有 1 个逻辑 active item
+        只有 1 份 active provenance
+        只有 1 个 accepted transaction
+
+    append-only 的历史里可以留孤儿行(不能删), 但它们必须**不可播**。
+
+    ⚠️ 用 `_curated_spec()`(真的能过准入门的题)而不是 `_mk_spec` 那个
+    最小 stub —— 后者连 `validate_spec` 都过不了, 那样这条测试会因为
+    "题本身不合格"而变绿, 而我们想验的是**写盘顺序**。
+    """
+    print("\n[H3-D3] accepted 写盘失败 -> 可重试且不重复")
+    from story.pool import PuzzlePool, set_curated_decisions_path
+    from tests.test_pool import _curated_spec, _mk_curated_dec_rec
+    with tmpdir() as d:
+        cfg = _cfg(curated_min_size=100)
+        pool_path = os.path.join(d, "curated.jsonl")
+        cfg.attributions_path = os.path.join(d, "ATTR.jsonl")
+        set_curated_decisions_path(os.path.join(d, "dec.jsonl"))
+        try:
+            pool = _FakePool(pool_path)
+            led = CL.DecisionLedger(os.path.join(d, "dec.jsonl"))
+            rec = _mk_curated_dec_rec(_curated_spec())
+
+            class _Comp:
+                """返回一道**真的**能过池准入门的 spec。"""
+
+                def __init__(self):
+                    self.calls = []
+
+                def compile_one(self, r, **kw):
+                    self.calls.append(getattr(r, "external_id", ""))
+                    return _curated_spec(), {
+                        "external_id": getattr(r, "external_id", ""),
+                        "accepted": True, "stage": "accepted",
+                        "style_tags": [], "reject_reasons": []}
+
+            # 第一次: 让 accepted 那一行**写不下去**。
+            real_record = led.record
+            state = {"fail": True}
+
+            def flaky(r, *, decision, policy_version, stage="", reasons=None,
+                      style_tags=None):
+                if decision == CL.ACCEPTED and state["fail"]:
+                    state["fail"] = False
+                    return False             # 注入: 只失败这一次
+                return real_record(r, decision=decision,
+                                   policy_version=policy_version,
+                                   stage=stage, reasons=reasons,
+                                   style_tags=style_tags)
+
+            led.record = flaky
+            lc = _mk(cfg, pool, _Comp(), [rec], led, lambda: dict(FREE))
+            r1 = lc.step()
+            check("**本轮 accepted = 0**", r1["accepted"] == 0, r1)
+            check("记成 technical_defer", r1["technical_defer"] == 1, r1)
+            hist = _hist(led, rec, CC.CURATED_POLICY_VERSION)
+            check("**历史里没有 accepted 行**",
+                  all(h.get("decision") != CL.ACCEPTED for h in hist), hist)
+            check("**下次仍是候选(可重试)**",
+                  select_candidate([rec], led,
+                                   CC.CURATED_POLICY_VERSION) is not None)
+
+            def _live():
+                rows = read_jsonl(pool_path) if os.path.exists(pool_path) else []
+                voided = PuzzlePool._voided_keys(rows)
+                out = []
+                for i, row in enumerate(rows):
+                    sp = PuzzlePool._spec_from_record(row, voided, i)
+                    if sp is None:
+                        continue
+                    ok, _why = PuzzlePool._validate_pool_spec(sp)
+                    if ok:
+                        out.append(sp)
+                return out
+
+            check("**写 accepted 前: 盘上没有任何可播的题**",
+                  _live() == [], _live())
+
+            # 第二次(重试): accepted 这次能写下去。
+            #
+            # ⚠️ 必须**新建一个 curator** 再重试, 不能复用 `lc` ——
+            # `_tried` 是**实例**状态, 同一次运行内 defer 过的题不再回头
+            # (见 `step` 的说明: defer 的语义是"**下次**再试")。生产里的
+            # "下次"就是下一次运行, 所以这里也照那个语义来。
+            led.record = real_record
+            lc2 = _mk(cfg, pool, _Comp(), [rec], led, lambda: dict(FREE))
+            r2 = lc2.step()
+            check("重试后 accepted = 1", r2["accepted"] == 1, r2)
+
+            check("**重试后只有 1 个逻辑 active item**", len(_live()) == 1,
+                  len(_live()))
+            check("**只有 1 个 accepted transaction**",
+                  sum(1 for h in led.rows
+                      if h.get("decision") == CL.ACCEPTED) == 1,
+                  [h.get("decision") for h in led.rows])
+            # 署名只有一份 active。第一次署名**成功**了(失败的是 accepted),
+            # 所以重试会再写一份 —— 重复的署名不是"错", 但它必须是
+            # **同一份内容**(同名同源), 不能出现两个不同的 active 版本。
+            attrs = [a for a in read_jsonl(cfg.attributions_path)
+                     if a.get("external_id") == rec.external_id]
+            check("**署名内容一致(没有两个不同的 active 版本)**",
+                  len({json.dumps(a, sort_keys=True) for a in attrs}) == 1,
+                  attrs)
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
+# ======================================================================
 def main():
     tests = [
+        test_accepted_item_is_immediately_visible_in_live_pool,
+        test_activate_committed_rejects_spec_that_fails_gate,
+        test_single_flight_reserved_before_submit,
+        test_reviewer_technical_failure_is_defer_not_reject,
+        test_accepted_ledger_write_failure_is_retryable_single_active,
         test_no_start_when_human_pending,
         test_no_start_when_ai_player_in_flight,
         test_no_start_on_hint_or_reveal_inflight,

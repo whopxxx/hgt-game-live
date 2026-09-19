@@ -721,6 +721,16 @@ def _curated_spec(**kw):
     # 缺了它, 一道编译成功的 curated 题会表现为"播不出来"。
     from tools.curated_compiler import CURATED_POLICY_VERSION
     s.curated_policy_version = CURATED_POLICY_VERSION
+    # ---- H3-D3 §一-4: 内容哈希 ----
+    # 题池准入门要求 `(external_id, content_hash, policy)` **三元组**都能
+    # 对上一条 accepted 决策。所以 fixture 必须带上它**自己那份内容**的
+    # 哈希 —— 而且要与 `_mk_curated_dec_rec` 算出来的**逐字一致**, 否则
+    # 池门在账本里永远查不到, 整批 curated 题表现为"播不出来"。
+    #
+    # 两边都用 `curated_ledger.content_hash_of`(它读 `.surface`/`.bottom`)
+    # —— 所以这里也得走同一个函数, 不能自己拼 surface/bottom。
+    from tools.curated_ledger import content_hash_of
+    s.curated_content_hash = content_hash_of(_mk_curated_dec_rec(s))
     return s
 
 

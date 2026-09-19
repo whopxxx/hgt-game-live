@@ -144,9 +144,6 @@ class FakeClient:
         self._results = list(results)
         self.calls = []
         self.cfg = type("C", (), {"model": "fake"})()
-        #: 显式的复核结果(见 `messages` 里 review_story_gate 那一支)。
-        #: None = 用默认"通过"。
-        self.story_review = None
 
     def messages(self, system, user, max_tokens=None, tool=None,
                  temperature=None, timeout=None, max_retries=None):
@@ -158,25 +155,6 @@ class FakeClient:
             return LLMResult(tool_input={
                 "__truth_audit__": True, "narrator_truthful": True,
                 "mechanism_consistent": True, "conflicts": []}, model="m")
-        if name == "review_story_gate":
-            # H3-D §六: 故事门的**独立复核**。默认"通过" ——
-            # 与 `emit_truth_audit` 同一个约定: 这个假客户端模拟的是
-            # **一个行为正常的网关**, 而不是"每个 mock 都要显式脚本化"。
-            #
-            # 为什么必须在这里给默认值而不是让各测试自己去脚本化:
-            # 复核是 **compile_one 必经的一步**(它排在审稿之前), 所以
-            # 每个走到那一步的测试都会撞上它。不给默认值的话, 那些
-            # 测试会因为"复核没话说 -> fail closed"而全部变成 story_review
-            # 拒稿 —— 看起来像"编译器坏了", 而真正被测的那道门根本没走到。
-            #
-            # ⚠️ 只想让**复核**拒稿的测试请用 `_review_reject()`, 它会
-            # 把这一项排到队列**最前面**(见那里的说明)。
-            if self.story_review is not None:
-                return self.story_review
-            return LLMResult(tool_input={
-                "story_reconstruction": True, "multi_step_deduction": True,
-                "single_trick": False,
-                "no_external_knowledge_dependency": True}, model="m")
         if not self._results:
             return LLMResult(error="no more canned results")
         return self._results.pop(0)
@@ -196,18 +174,26 @@ def _writer(results, **kw):
 
 
 def _qc_v8(**kw):
-    """`_apply_review` 要求的 v8 八项(与 curated 的九条是**两套**) 。
+    """`_apply_review` 要求的十二项(curated 走过的门)。
 
-    注意这两套判据是**不同**的:
-        curated 九条  -> H2-B 的"这题适不适合搬进直播"(ACCEPT/REJECT)
-        v8 八项       -> `_apply_review` 对**任何** spec 的交付门
-                          (narrator_truthful / mechanism_consistent / …)
+    注意有两层判据, 是**不同**的:
+        curated 十三条  -> H2-B/H3 的"这题适不适合搬进直播"(编译期 ACCEPT/REJECT)
+        十二项          -> `_apply_review` 对**任何** spec 的交付门
+                            (narrator_truthful / … / 题型四问)
     curated 题同样要过后者 —— 它复用同一套审稿人, 不是旁路。
+
+    ⚠️ H3-D3 起, 后四项(题型四问)也在 `_apply_review` 的 fail-closed
+    清单里 —— 因为 `story_review` 那次**独立调用已被并进审稿**(§一-2)。
+    所以这里的默认必须带上它们, 否则每一稿都会卡在
+    "quality_checks 未全过(story_reconstruction, …)"。
     """
     d = {"narrator_truthful": True, "mechanism_consistent": True,
          "core_answer_direct": True, "completion_contract_minimal": True,
          "concrete_anomaly": True, "clue_recontextualized": True,
-         "dramatic_payoff": True, "reasoning_beats_nonredundant": True}
+         "dramatic_payoff": True, "reasoning_beats_nonredundant": True,
+         # H3-D3: 题型四问(同一次审稿回复里的附带字段)。
+         "story_reconstruction": True, "multi_step_deduction": True,
+         "single_trick": False, "no_external_knowledge_dependency": True}
     d.update(kw)
     return d
 
@@ -221,24 +207,27 @@ def _sig_with_observed(**kw):
     return d
 
 
-def _review_pass():
-    """审稿 pass —— 原样回传整套 bundle(与 `_apply_review` 的要求一致)。"""
-    d = _compile_tool()
-    d.update({"decision": "pass", "observed_signature": _sig_with_observed(),
-              "quality_checks": _qc_v8()})
-    return LLMResult(tool_input=d, model="m")
+def _review_pass(**kw):
+    """审稿 pass —— 原样回传整套 bundle(与 `_apply_review` 的要求一致)。
 
-
-def _story_review_reject(**kw):
-    """复核**拒稿**: 十八楼/吉普车那类。
-
-    编译侧十三条全填"没问题"(模型被骗过去了), 只有这次独立复核
-    看得出来它是 single_trick。这就是 §六 要拦的那条路。
+    `quality_checks=...` 可以整体替换那十二项(测题型四问时用)。
     """
-    d = {"story_reconstruction": True, "multi_step_deduction": False,
-         "single_trick": True, "no_external_knowledge_dependency": True}
+    d = _compile_tool()
+    qc = kw.pop("quality_checks", None) or _qc_v8()
+    d.update({"decision": "pass", "observed_signature": _sig_with_observed(),
+              "quality_checks": qc})
     d.update(kw)
     return LLMResult(tool_input=d, model="m")
+
+
+def _review_with_story_gate(**story_kw):
+    """审稿回复: **结构全过, 但题型四问按给定值**。
+
+    H3-D3 起题型问就藏在这份 `quality_checks` 里, 所以"复核拒稿"必须
+    由审稿**那一次**答复表达。十八楼/吉普车那类题的真实形态正是这样:
+    编译侧十三条全填"没问题", 只有这四项看得出它是 single_trick。
+    """
+    return _review_pass(quality_checks=_qc_v8(**story_kw))
 
 
 # ======================================================================
@@ -258,9 +247,14 @@ def test_story_review_rejection_blocks_compilation():
          不同的门, 报告要分得开)
     """
     print("\n[H3-D] 复核拒稿 -> 编译不出 spec")
+    # H3-D3: 复核不再是**独立的一次调用** —— 它就藏在审稿那次回复的
+    # `quality_checks` 后四项里。所以这里构造一份"审稿判定:
+    # 结构都过、但题型不合格"的回复。
     w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
-                     _review_pass()])
-    fc.story_review = _story_review_reject()
+                     _review_with_story_gate(
+                         story_reconstruction=True,
+                         multi_step_deduction=False,
+                         single_trick=True)])
     from tools.curated_compiler import CuratedCompiler
     spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
     check("**没有 spec**", spec is None, info)
@@ -269,21 +263,29 @@ def test_story_review_rejection_blocks_compilation():
     check("原因点名 single_trick",
           "single_trick" in (info.get("reject_reasons") or []), info)
     names = [(c["tool"] or {}).get("name") for c in fc.calls]
-    check("**复核真的被调过**", "review_story_gate" in names, names)
-    check("**没有走到审稿**(复核在审稿之前)",
-          "emit_review" not in names, names)
+    check("**没有第四次 LLM**(题型问在审稿里)",
+          names.count("emit_review") == 1, names)
+    check("**没有任何独立的复核调用**",
+          "review_story_gate" not in names, names)
 
 
-def test_story_review_missing_blocks_compilation():
-    """复核**没有回话** -> 也不放过(fail closed)。
+def test_review_missing_story_fields_blocks_compilation():
+    """审稿回复里**没有**题型四问 -> fail closed(不放过)。
 
-    网关抖一下的代价是"这道题下次再审"(technical_defer), 不是
-    "让它进池"。
+    这正是 §一-2 合并之后要守住的那条: 复核并进审稿**不等于**取消
+    复核。审稿没回答这四个问题, 与"复核调用失败"是同一种情况 ——
+    都不能让它进池。
+
+    而且它必须落成 `technical_defer`(可重试), **不是** `rejected`
+    (终态) —— 见 §一-3: 网关抖一下不该永久吃掉一道题。
     """
-    print("\n[H3-D] 复核缺失 -> fail closed")
+    print("\n[H3-D3] 审稿缺题型四问 -> fail closed + technical_defer")
+    qc = _qc_v8()
+    for k in ("story_reconstruction", "multi_step_deduction",
+              "single_trick", "no_external_knowledge_dependency"):
+        qc.pop(k)
     w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
-                     _review_pass()])
-    fc.story_review = LLMResult(error="gateway hiccup", model="m")
+                     _review_pass(quality_checks=qc)])
     from tools.curated_compiler import CuratedCompiler
     spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
     check("**没有 spec**", spec is None, info)
@@ -291,6 +293,14 @@ def test_story_review_missing_blocks_compilation():
           info.get("stage") == "story_review", info.get("stage"))
     check("原因点名复核缺失",
           "story_review_missing" in (info.get("reject_reasons") or []), info)
+    # 这条最要紧: 缺失 == 技术失败 == 可重试。
+    from tools.curated_ledger import TECHNICAL_DEFER
+    from story.lazy_curator import LazyCurator
+    _c = LazyCurator.__new__(LazyCurator)
+    _c._budget = 999.0
+    d, st, rs = _c._classify(None, info, 1.0)
+    check("**判成 technical_defer(可重试)**", d == TECHNICAL_DEFER,
+          (d, st, rs))
 
 
 # ======================================================================
@@ -314,6 +324,37 @@ def test_never_calls_emit_riddle():
     check("用的是 emit_curated", "emit_curated" in names, names)
     check("编译成功", spec is not None, info)
     check("info 标 accepted", info.get("accepted") is True, info)
+
+
+def test_accepted_path_is_exactly_three_llm_calls():
+    """§一-2: 一条 accepted 路径**恰好 3 次** LLM 调用。
+
+        1. emit_curated    (编译)
+        2. emit_review     (审稿 —— 题型四问**并进这一次**)
+        3. emit_truth_audit(审计)
+
+    ## 这条守的是什么
+
+    H3-D 里"故事复核"是**独立的一次调用**, 于是变成 4 次。任务书
+    H3-D3 §一-2 明确要求降到 3 次。这条测试把次数**钉死**:
+    将来谁再加一次调用, 它立刻变红。
+
+    ⚠️ 也顺手断言"没有任何独立的复核工具" —— 复核并进来之后,
+    `review_story_gate` 这个名字不该再出现在工具调用里。
+    """
+    print("\n[H3-D3] accepted 路径恰好 3 次 LLM 调用")
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    from tools.curated_compiler import CuratedCompiler
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
+    check("编译成功", spec is not None, info)
+    names = [(c["tool"] or {}).get("name") for c in fc.calls]
+    check("**恰好 3 次调用**", len(names) == 3, names)
+    check("**顺序是 compile -> review -> audit**",
+          names == ["emit_curated", "emit_review", "emit_truth_audit"],
+          names)
+    check("**没有独立的复核调用**",
+          "review_story_gate" not in names, names)
 
 
 def test_prompt_carries_canonical_source():
@@ -757,7 +798,8 @@ def main():
         test_never_calls_emit_riddle,
         # H3-D §六: 复核
         test_story_review_rejection_blocks_compilation,
-        test_story_review_missing_blocks_compilation,
+        test_review_missing_story_fields_blocks_compilation,
+        test_accepted_path_is_exactly_three_llm_calls,
         test_prompt_carries_canonical_source,
         test_english_flagged_for_translation,
         test_chinese_source_not_told_to_translate,

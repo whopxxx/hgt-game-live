@@ -1073,10 +1073,20 @@ def test_c6b_current_policy_field_lists_all_include_beats():
     check("CHECK_SYSTEM 写的是七样", "七样" in _llm.CHECK_SYSTEM)
     check("**quality_checks 标题写八项(不是四项)**",
           "八项" in _llm.CHECK_SYSTEM and "四项**" not in _llm.CHECK_SYSTEM)
-    # _QUALITY_CHECK_FIELDS 必须真的是八项 —— 标题与实现不能各说各话
-    check("_QUALITY_CHECK_FIELDS 确实是 8 项",
-          len(_llm._QUALITY_CHECK_FIELDS) == 8,
+    # _QUALITY_CHECK_FIELDS 必须真的是十二项 —— 标题与实现不能各说各话。
+    #
+    # H3-D3: 契约清单是**十二项**(v8 八项 + 题型四问), 但题型四问只对
+    # curated 题生效 —— 见 `_quality_check_contract`。自由生成链仍是
+    # 八项, 所以这里断言的是"清单有十二项", 而不是"每次都查十二项"。
+    check("_QUALITY_CHECK_FIELDS 确实是 12 项",
+          len(_llm._QUALITY_CHECK_FIELDS) == 12,
           _llm._QUALITY_CHECK_FIELDS)
+    check("**自由生成链只查前 8 项**(题型四问不适用于它)",
+          len(_llm._quality_check_contract(
+              type("S", (), {"source_type": ""})())) == 8)
+    check("curated 链查 12 项",
+          len(_llm._quality_check_contract(
+              type("S", (), {"source_type": "curated"})())) == 12)
     # 工具 schema 的 required 必须含 beats(模型最直接遵守的那一层)
     check("_TOOL_RIDDLE.required 含 discovery_beats",
           "discovery_beats" in _llm._TOOL_RIDDLE["input_schema"]["required"],
@@ -1391,11 +1401,18 @@ def test_v6_reviewer_has_minimality_rule():
            ["required"])
     # v8: 从四项扩到八项(后四项查"好不好玩"), 仍是**全部** required ——
     # fail-closed 的语义没变: 任一项不是 True 就整稿拒收。
-    check("八项仍全部 required",
+    # fail-closed 必须还在: 十二项仍全部 required。
+    #
+    # H3-D3: 题型四问并进了这次审稿调用(不再有独立的复核调用), 所以
+    # required 从八项扩到十二项。**全部 required** 的语义没变: 任一项
+    # 取值不对就整稿拒收。
+    check("十二项仍全部 required",
           set(req) == {"narrator_truthful", "mechanism_consistent",
                        "core_answer_direct", "completion_contract_minimal",
                        "concrete_anomaly", "clue_recontextualized",
-                       "dramatic_payoff", "reasoning_beats_nonredundant"},
+                       "dramatic_payoff", "reasoning_beats_nonredundant",
+                       "story_reconstruction", "multi_step_deduction",
+                       "single_trick", "no_external_knowledge_dependency"},
           req)
 
 

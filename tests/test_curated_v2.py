@@ -623,8 +623,12 @@ def test_old_curated_policy_is_quarantined():
         try:
             led = CL.DecisionLedger(dpath)
             s_cur = _curated_spec()
-            rec = mk_truck_rec(external_id=s_cur.external_id)
-            led.record(rec, decision=CL.ACCEPTED,
+            # ⚠️ H3-D3 §一-4: 账本判据是 `(external_id, content_hash,
+            # policy)` **三元组**。登记 accepted 必须用**这道 spec 自己的
+            # 内容**当记录 —— 拿另一道题的 rec 登记(哪怕 external_id
+            # 相同)会得到不同的 content_hash, 于是池门查不到它。
+            from tests.test_pool import _mk_curated_dec_rec
+            led.record(_mk_curated_dec_rec(s_cur), decision=CL.ACCEPTED,
                        policy_version=CC.CURATED_POLICY_VERSION)
 
             check("当前题带当前 policy",
@@ -688,7 +692,10 @@ def test_curated_without_accepted_decision_is_not_playable():
 
             # 写一条 defer(不是 accepted)-> 仍然不可播
             led = CL.DecisionLedger(dpath)
-            rec = mk_truck_rec(external_id=spec.external_id)
+            # H3-D3 §一-4: 用**这道 spec 自己**的内容登记, 否则
+            # content_hash 对不上, 账本里永远查不到它。
+            from tests.test_pool import _mk_curated_dec_rec
+            rec = _mk_curated_dec_rec(spec)
             led.record(rec, decision=CL.TECHNICAL_DEFER,
                        policy_version=CC.CURATED_POLICY_VERSION)
             ok1, why1 = PuzzlePool._validate_pool_spec(spec)
@@ -830,6 +837,58 @@ def test_checks_v3_is_superset_of_v2():
     check("STORY_GATE_FIELDS 是四条", len(CC.STORY_GATE_FIELDS) == 4)
 
 
+def test_accepted_binds_content_hash_not_just_external_id():
+    """§一-4: accepted 必须绑定**内容**哈希, 不能只按 external_id。
+
+    ## 这条守的是一个真实漏洞
+
+    账本的判据键一直是 `(external_id, content_hash, policy)` 三元组
+    —— 因为 SE 帖子**可以被编辑**而问题号不变。但题池准入门早先只按
+    `external_id + policy` 查, 于是:
+
+        q123 内容 A 被 accepted -> A 可播
+        作者把 q123 编辑成内容 B
+        重审 B, 这次被判 rejected
+        -> 只按 id 查: 命中 A 的 accepted 行 -> **B 被错放行**
+
+    正确地绑定内容之后, 同 external_id 的**旧内容** accepted 不得
+    授权新内容。
+    """
+    print("\n[H3-D3] accepted 绑定内容哈希")
+    from story.pool import PuzzlePool, set_curated_decisions_path
+    from tests.test_pool import _curated_spec, _mk_curated_dec_rec
+    with tmpdir() as d:
+        dpath = os.path.join(d, "dec.jsonl")
+        set_curated_decisions_path(dpath)
+        try:
+            led = CL.DecisionLedger(dpath)
+            a = _curated_spec()
+            a.external_id = "edit:1"
+            # 内容 A 被 accepted
+            led.record(_mk_curated_dec_rec(a), decision=CL.ACCEPTED,
+                       policy_version=CC.CURATED_POLICY_VERSION)
+            oka, whya = PuzzlePool._validate_pool_spec(a)
+            check("**内容 A: 可播**", oka, whya)
+
+            # 同一个 external_id, **内容变了**
+            b = _curated_spec()
+            b.external_id = "edit:1"
+            b.answer = (b.answer or "") + " 后来作者补充了一句。"
+            from tools.curated_ledger import content_hash_of
+            b.curated_content_hash = content_hash_of(_mk_curated_dec_rec(b))
+            check("两份内容的哈希确实不同",
+                  a.curated_content_hash != b.curated_content_hash,
+                  (a.curated_content_hash, b.curated_content_hash))
+            okb, whyb = PuzzlePool._validate_pool_spec(b)
+            check("**内容 B: 不可播(A 的 accepted 不授权新内容)**",
+                  not okb, whyb)
+            check("理由是查不到这份内容",
+                  "查不到" in whyb or "未提交" in whyb, whyb)
+        finally:
+            set_curated_decisions_path(
+                os.path.join("data", "curated_decisions.jsonl"))
+
+
 def test_policy_version_is_v3():
     """§七: 本次实质改变了题型定义 -> 必须 bump。"""
     print("\n[H3-D] policy 已 bump 到 curated-v3")
@@ -872,6 +931,7 @@ def main():
         test_story_gate_stage_depth,
         test_prompt_declares_v3_rules,
         test_checks_v3_is_superset_of_v2,
+        test_accepted_binds_content_hash_not_just_external_id,
         test_policy_version_is_v3,
     ]
     for t in tests:

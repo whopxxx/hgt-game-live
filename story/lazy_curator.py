@@ -77,7 +77,6 @@ from tools.curated_compiler import CURATED_POLICY_VERSION, CuratedCompiler
 from tools.curated_ledger import (
     ACCEPTED, INTERRUPTED, REJECTED, TECHNICAL_DEFER, DecisionLedger,
 )
-
 log = logging.getLogger("hgt.lazycurator")
 
 
@@ -550,9 +549,18 @@ class LazyCurator:
                                           policy_version=CURATED_POLICY_VERSION,
                                           stage="accepted", reasons=[],
                                           style_tags=style_tags):
-                    # accepted 写不下去 -> 本次**不算成功**。池里那行
-                    # 因为没有对应的 accepted 决策而不可播(见 eligibility),
-                    # 所以不存在"播得出来但账本不认"的情况。
+                    # accepted 写不下去 -> 本次**不算成功**。
+                    #
+                    # ⚠️ 光靠"没有 accepted 决策 -> 不可播"这条**不够**:
+                    # 下次重试会走到这里再写一行池记录, 于是盘上留下
+                    # **两份**同样的题(孤儿 + 新的), 而重试那条 accepted
+                    # 决策会让**两行都**通过准入门(准入门按内容查账本,
+                    # 不看是哪一行写的)-> 同一道题进池两次。
+                    #
+                    # 所以必须像署名失败那样**把孤儿行作废掉**。墓碑按
+                    # `pool_key` + **位置**(见 `_voided_keys`)作废它之前的
+                    # 同 key 行 —— 重试写下的新行在墓碑之后, 不受影响。
+                    self._void_pool_row(spec, "accepted_ledger_write_failed")
                     self.ledger.record(rec, decision=TECHNICAL_DEFER,
                                        policy_version=CURATED_POLICY_VERSION,
                                        stage="ledger_write",
@@ -561,6 +569,18 @@ class LazyCurator:
                     log.error("accepted 决策写盘失败(该题不可播, 下次重试): %s",
                               eid)
                     return {"decision": TECHNICAL_DEFER}
+                # ---- §一-1: 让**本场直播**立刻看见这道题 ----
+                #
+                # 落盘与写决策都不足以让它可播: `PuzzlePool` 是启动时
+                # load 到内存的快照, 不重新 load 就看不见新行 —— 于是
+                # "补了一道题, 但下一题还是要现场生成"。
+                #
+                # 这里**必须**走池的正式激活 API, 不许直接改 `_items`
+                # (那会绕过准入门), 也不许再调 `add()`(那会写第二行)。
+                #
+                # ⚠️ 失败**不算** accepted 失败: 盘上的一切都成立,
+                # 下次启动照样读得到。这里只影响"本场立即可播"。
+                self._activate(spec)
                 stock, playable = self._stock()
                 log.info("curated accepted: %s stock=%d playable=%d",
                          eid, stock, playable)
@@ -645,11 +665,6 @@ class LazyCurator:
         if int(max_candidates) <= 0:
             out["reason"] = "max_candidates=0"
             return out
-        # `_busy` 是"有没有活在跑"的权威。它由 worker 自己置位, 所以
-        # 这里读到 True 就意味着不必再提交 —— 也**不会**因此等锁。
-        if self._busy:
-            out["reason"] = "已有 worker 在途"
-            return out
         ok, why = self.should_start()
         if not ok:
             out["reason"] = why
@@ -658,11 +673,41 @@ class LazyCurator:
         if self._exec is None:
             out["reason"] = "worker 不可用"
             return out
+        # ---- §一-6: 必须在 submit **之前**原子地占住 `_busy` ----
+        #
+        # 早先是"先 submit, 再让 worker 去置 `_busy`"。那有一个真实的
+        # 竞态窗口:
+        #
+        #     tick #1: should_start() -> True, submit(job A)
+        #              worker 还没被调度起来, _busy 仍是 False
+        #     tick #2: should_start() -> True(它看到的是 False!)
+        #              submit(job B)
+        #     -> 两个 job 在同一个 max_workers=1 的池里**排队**
+        #     -> 两个 worker 各自选候选、各自打 LLM
+        #
+        # 后果正是 single-flight 要防的两件事: 选中同一道题白烧一次, 以及
+        # 同时压在网关上抢直播的配额。
+        #
+        # `ThreadPoolExecutor.submit()` 本身**不阻塞**, 所以这段临界区
+        # 极短; 但它必须与 `should_start` 里的那次读取互斥。
+        #
+        # 用 `_busy_lock` 而不是无锁 CAS: 这个锁在 `step()` 的收尾路径上
+        # 也要拿, 两处必须用**同一把**(否则占位与释放会互相看不见)。
+        with self._busy_lock:
+            if self._busy:
+                # 另一拍已经抢先占位 —— 丢弃本次提交(不是排队)。
+                out["reason"] = "已有 worker 在途"
+                return out
+            self._busy = True
         try:
             self._exec.submit(self._worker_main, int(max_candidates))
             out["submitted"] = True
         except Exception:                       # noqa: BLE001
-            # 线程池满了 / 已关闭 —— 都不是直播该关心的事。
+            # 线程池满了 / 已关闭 —— 都不是直播该关心的事。**但占位
+            # 必须放掉**, 否则 curator 从此再也提交不了(fail closed
+            # 变成了"永久停机")。
+            with self._busy_lock:
+                self._busy = False
             log.warning("提交 curator job 失败(已忽略)", exc_info=True)
             out["reason"] = "submit 失败"
         return out
@@ -738,15 +783,32 @@ class LazyCurator:
             return INTERRUPTED, str(info.get("interrupt_at") or stage), reasons
         if spec is not None:
             return ACCEPTED, "accepted", reasons
+        # ---- §一-3: 技术失败一律 technical_defer, 绝不是 rejected ----
+        #
+        # 这条**必须**排在所有内容判定之前。技术失败的定义很窄:
+        #
+        #     timeout / 网关错 / 空 tool_input / schema 坏掉 / 预算超了
+        #
+        # 它们的共同点是"**这次没审成**", 而不是"这道题不行"。记成
+        # rejected 会让那道题永久消失 —— 而且没有任何地方会显示丢了。
+        if info.get("technical") or stage.endswith("_technical"):
+            return TECHNICAL_DEFER, stage or "technical", reasons or ["technical"]
         if elapsed > self._budget:
             # 超预算说明这一条特别慢(网关慢 / 重试多)。把它当成
             # 内容问题是不公平的 —— 换一次网络它可能就过了。
             return TECHNICAL_DEFER, "budget", ["budget_exceeded"]
-        # stage 标技术问题的也走 defer
-        if stage.endswith("_technical") or stage == "compile_call":
+        if stage == "compile_call":
             return TECHNICAL_DEFER, stage, reasons or ["technical"]
         if stage in ("exception", "pool_write"):
             return TECHNICAL_DEFER, stage, reasons or [stage]
+        # ---- 复核**缺失**同样是技术失败, 不是内容拒绝 ----
+        #
+        # `story_review_missing` 出现在两处: 编译期拿不到 Reviewer 的
+        # 答复, 或答复里没有那四个字段。两种都是"没审成", 换一次网络
+        # 可能就好了。记成 rejected 会永久吃掉一道题 —— 那正是 §一-3
+        # 要禁止的。
+        if "story_review_missing" in reasons:
+            return TECHNICAL_DEFER, stage or "story_review", reasons
         return REJECTED, stage or "unknown", reasons
 
     # ------------------------------------------------------------------
@@ -796,27 +858,80 @@ class LazyCurator:
                 return False, "pool_write"
             attr = self._attr_record(spec)
             if not _append_jsonl(self._attr_path(), attr):
-                # 池里已经有行了 -> 追加墓碑让它不可播。墓碑本身写失败
-                # 时不额外降级: 孤儿判定(见 pool 的 eligibility)会在
-                # 读侧挡住它 —— 两道防线, 不依赖其中任何一道成功。
-                if not _append_jsonl(self._pool_path(),
-                                     {"pool_version": 1,
-                                      "pool_key": pool_key,
-                                      "void": True,
-                                      "void_reason": "attribution_failed",
-                                      "added_at": time.time()}):
-                    # ⚠️ 两条路都断了。这**不是**可以静默的情况:
-                    # 池里那行既没有署名也没有墓碑, 而孤儿判定要求
-                    # "没有对应 accepted 决策 -> 不可播" —— 这正好
-                    # 兜住它(本次不会写 accepted)。但仍然要吵一声,
-                    # 因为盘上多了一行需要人工看一眼的东西。
-                    log.error("池行无法作废且署名未写:%s —— 该行没有 "
-                              "accepted 决策, 因此不可播", pool_key)
+                # 池里已经有行了 -> 追加墓碑让它不可播。
+                self._void_pool_row(spec, "attribution_failed")
                 return False, "attribution_write"
             return True, ""
         except Exception:                       # noqa: BLE001
             log.exception("入池异常")
             return False, "pool_exception"
+
+    def _void_pool_row(self, spec: Any, reason: str) -> bool:
+        """给刚写下的池行追加一条**墓碑**, 让它立刻不可播。
+
+        ## 两条失败路径共用它
+
+            _commit:    署名写失败        -> 作废池行
+            _curate_one: accepted 写失败   -> 作废池行
+
+        后者是 H3-D3 §一-5 补上的: 早先只靠"没有 accepted 决策不可播"
+        兜底, 那**不够** —— 下次重试写的新行会让那条 accepted 决策同时
+        授权**两行**, 于是同一道题进池两次。墓碑按位置作废它之前的行,
+        重试的新行不受影响(见 `PuzzlePool._voided_keys`)。
+
+        ## 墓碑自己写失败时**不额外降级**
+
+        孤儿判定(池准入门里那条 accepted-decision 检查)会在读侧挡住它
+        —— 两道防线, 不依赖其中任何一道成功。但仍然要吵一声, 因为盘上
+        多了一行需要人工看一眼的东西。
+        """
+        try:
+            pool_key = _spec_key(spec)
+            if not _append_jsonl(self._pool_path(),
+                                 {"pool_version": 1,
+                                  "pool_key": pool_key,
+                                  "void": True,
+                                  "void_reason": reason,
+                                  "added_at": time.time()}):
+                log.error("池行无法作废(%s): %s —— 该行没有 accepted 决策时"
+                          "不可播; 但**重试会产生第二行**, 值得人工看一眼",
+                          reason, pool_key)
+                return False
+            return True
+        except Exception:                       # noqa: BLE001
+            log.exception("写墓碑异常(%s)", reason)
+            return False
+
+    def _activate(self, spec: Any) -> bool:
+        """让**当前内存池**立刻看见这道已提交的题(§一-1)。
+
+        ## 为什么不是直接 `self.pool._items.append(...)`
+
+        那会绕过 `_validate_pool_spec` —— 池内"每一道都过得了准入门"这条
+        不变量会当场破掉, 而且**只在**这一条路径上破(重启 load 之后又
+        好了)。那种 bug 极难复现: 它只在"本场刚审进来的那道题"上出现。
+
+        所以走池的正式 API。池若没有这个 API(老版本 / 测试替身), 就
+        **什么都不做**并如实记账 —— 不能假装挂上了, 也不能因此让
+        accepted 失败(盘上的一切都成立, 只是本场看不见)。
+
+        返回是否真的挂进了内存池。
+        """
+        fn = getattr(self.pool, "activate_committed", None)
+        if fn is None:
+            # 池替身(离线预热)没有内存池的概念 —— 它每次 `_eligible()`
+            # 都重读文件, 所以"本场可见"对它是自动成立的。
+            log.debug("池没有 activate_committed(离线替身?), 跳过激活")
+            return False
+        try:
+            ok = bool(fn(spec))
+            if not ok:
+                log.warning("activate_committed 未生效: 该题本场不可播, "
+                            "但盘上已提交(下次启动可见)")
+            return ok
+        except Exception:                       # noqa: BLE001
+            log.exception("activate_committed 抛异常(该题本场不生效)")
+            return False
 
     def _attr_record(self, spec: Any) -> dict:
         """署名的**唯一**构造处。

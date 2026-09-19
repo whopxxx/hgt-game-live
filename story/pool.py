@@ -147,21 +147,46 @@ def set_curated_decisions_path(path: str) -> None:
     _CURATED_DECISIONS_PATH = str(path or "")
 
 
-def _curated_decision_ok(external_id: str, policy_version: str) -> tuple:
-    """这道 curated 题在账本里有没有 `accepted`?
+def _curated_decision_ok(external_id: str, policy_version: str,
+                         content_hash: str = "") -> tuple:
+    """这道 curated 题在账本里有没有**针对这份内容**的 `accepted`?
 
     返回 `(ok, why)`。**fail closed**: 读不出账本就当作"没有 accepted"
     —— 宁可少播一道题, 不可播一道账本不认的题(那意味着它会重复入池)。
 
-    为什么按 `external_id` 而不是完整三元组: 池行里存的是 `to_archive()`
-    的快照, 没有 `surface`/`bottom` 原文, 算不出 `content_hash`。而
-    `external_id` 在同 policy 下是唯一的 —— 一道题被作者编辑后内容变了,
-    会以同一个 external_id 重新编译; 那时**要的正是**"用新的 accepted
-    决策认可新内容", 而新的 accepted 行会覆盖旧的(账本 last-wins)。
+    ## 为什么必须是 `(external_id, content_hash, policy)` **三元组**
+
+    H3-D3 §一-4。早先这里只按 `external_id + policy` 倒扫, 理由写的是
+    "池行里没有 surface/bottom 原文, 算不出 content_hash"。那个理由
+    **不再成立**: 池行现在自带 `curated_content_hash`(见 `PuzzleSpec`)。
+
+    只按 id 查有一个真实漏洞: SE 帖子可以被编辑而问题号不变。
+
+        q123 内容 A accepted -> 池里放 A(账本里 A 的 accepted 行留着)
+        作者把 q123 改成内容 B
+        重审 B, 这次被判 rejected
+        -> 只按 id 查: 命中 A 的 accepted 行 -> **B 被错放行**
+
+    反过来同样错: A 被 rejected, B 被 accepted, 只按 id 查会先看到
+    (倒序的)某一条 —— 结论取决于写入顺序, 那不是一个判据。
+
+    所以必须**三元组全同**才算"这份内容被接受过"。同 external_id 的
+    旧内容 accepted, 不得授权新内容。
+
+    ## 空 content_hash: 老 archive -> 不可播
+
+    老池行没有这把键(空串), 而账本里的行**一定**有 content_hash(它是
+    `make_decision` 无条件写的)。所以空串**永远匹配不到**任何一行 ->
+    自动返回 False -> 按"未提交"处理。这正是我们要的: 老库存自动失去
+    eligibility, 不需要人工清理(与 curated_policy_version 缺失同一条)。
     """
     eid = str(external_id or "")
     if not eid:
         return False, "curated 题缺 external_id(无法与决策账本对上)"
+    ch = str(content_hash or "")
+    if not ch:
+        return False, ("curated 题缺 curated_content_hash(老 archive 没有"
+                       "内容绑定) —— 按不可播处理")
     try:
         from tools.curated_ledger import ACCEPTED, DecisionLedger
         led = DecisionLedger(_CURATED_DECISIONS_PATH)
@@ -170,16 +195,19 @@ def _curated_decision_ok(external_id: str, policy_version: str) -> tuple:
                 continue
             if str(row.get("policy_version") or "") != str(policy_version):
                 continue
-            # 同一 key 的最后一条为准 —— `rows` 是写入顺序, 倒着扫
-            # 就是"最新的那条"。
+            if str(row.get("content_hash") or "") != ch:
+                # 同一个 id 的**别的内容**的决策 —— 与本行无关, 继续往前
+                # 找。**不能**在这里下结论: 这个 id 可能有多份内容的记录。
+                continue
+            # 三元组全同 -> 这一行就是本内容的最后一条决策。
             if row.get("decision") == ACCEPTED:
                 return True, ""
-            return False, (f"curated 题没有 accepted 决策(最后一条是 "
+            return False, (f"这份内容没有 accepted 决策(最后一条是 "
                            f"{row.get('decision')!r}) —— 属于未提交的半状态")
     except Exception:                           # noqa: BLE001
         log.exception("读 curated 决策账本失败 -> 该题按不可播处理")
         return False, "curated 决策账本读不出(fail closed)"
-    return False, "curated 决策账本里查不到这道题(未提交)"
+    return False, "curated 决策账本里查不到这份内容(未提交)"
 
 
 def _valid_used_record(rec: Any) -> bool:
@@ -890,7 +918,8 @@ class PuzzlePool:
             #     accepted 决策         => active pool item 存在 => attribution 存在
             # 前半条由这里保证; 后半条由 `LazyCurator._commit` 的顺序保证。
             ok_dec, why_dec = _curated_decision_ok(
-                getattr(spec, "external_id", ""), cpv)
+                getattr(spec, "external_id", ""), cpv,
+                getattr(spec, "curated_content_hash", ""))
             if not ok_dec:
                 return False, why_dec
 
@@ -947,6 +976,69 @@ class PuzzlePool:
             if ra:
                 return False, f"reveal 未执行调度目标({'; '.join(ra)[:120]})"
         return True, ""
+
+    # ------------------------------------------------------------------
+    def activate_committed(self, spec: PuzzleSpec) -> bool:
+        """把一道**已经落盘并被 accepted** 的 curated 题挂进**当前内存池**。
+
+        ## 为什么必须有这个 API(H3-D3 §一-1)
+
+        Lazy Curator 的提交序列是:
+
+            落池行 -> 落署名 -> 写 accepted 决策
+
+        但 `PuzzlePool` 是**启动时 load 到内存**的(`_items` 是那一刻的
+        快照)。于是在写盘成功之后, 当前这场直播的内存池**看不见**那道题:
+        `stock_count` 不变, `pop_next` 取不到 —— 一道刚被接受的好题要等
+        **下次重启**才生效。离线预热时这个问题被掩盖了(预热跑完就退,
+        下次启动自然读得到), 但直播里它是"补了等于没补"。
+
+        ## 它凭什么能直接挂, 而不必再写一次盘
+
+        调用方(`LazyCurator._commit`)已经**写完池行了**, 所以这里**不能**
+        再走 `add()` —— 那会写第二行, 同一个 `pool_key` 在文件里出现两次
+        (读侧虽然会去重, 但那是靠 `load()` 的 `_keys` 兜的, 属于"错得
+        不严重", 不是"对")。
+
+        所以本方法只做**内存侧**的挂载:
+
+            ① 重跑 `_validate_pool_spec`(**不是**信任调用方)
+            ② 去重(池内已有 / 已用过 -> 拒绝)
+            ③ 追加 `_items` / `_keys`
+
+        第 ① 步不能省: 它是"池内每一道都过得了准入门"这条不变量的**唯一**
+        维护点。绕过它直接 append `_items` 会造出一道**播得出来但过不了
+        门**的题 —— 那正是 §一-1 明确禁止的写法("不要直接从 LazyCurator
+        改 `_items`")。
+
+        ## 返回
+
+        True = 现在就能被 `pop_next` 取到。False = 没挂上(原因已 log)。
+
+        **不抛**: 它是提交路径的一环, 抛出去会打断 curator 的收尾。
+        """
+        try:
+            ok, why = self._validate_pool_spec(spec)
+            if not ok:
+                log.warning("activate_committed 拒绝(准入门不过): %s", why)
+                return False
+            with self._lock:
+                k = spec_key(spec)
+                if k in self._keys:
+                    # 已经在内存里 —— 幂等成功(重试路径会走到这里)。
+                    log.info("activate_committed: 内存池已有同一道题, 跳过")
+                    return True
+                if k in self._used:
+                    log.warning("activate_committed 拒绝: 这道题已经用过了")
+                    return False
+                self._items.append(spec)
+                self._keys.add(k)
+                log.info("activate_committed: 本场立即可播 -> %s…",
+                         str(spec.puzzle)[:30])
+                return True
+        except Exception:                       # noqa: BLE001
+            log.exception("activate_committed 异常(该题本场不生效)")
+            return False
 
     # ------------------------------------------------------------------
     def add(self, spec: PuzzleSpec, source: str = "manual") -> bool:

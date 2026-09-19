@@ -535,6 +535,29 @@ CURATED_CHECKS_V3 = CURATED_CHECKS_V2 + ("no_external_knowledge_dependency",)
 #: 混在一起遍历会写错方向, 所以显式列出来。
 _INVERTED_CHECKS = ("single_trick",)
 
+
+def check_value_ok(name: str, value: Any) -> bool:
+    """一条 `quality_checks` 的值**取对了方向**吗?
+
+    这是判据方向的**唯一定义处**。审稿链的 fail-closed 门
+    (`story.llm._apply_review`) 与编译期的 `check_tool_result` 都读它。
+
+    ## 为什么必须抽出来
+
+    早先 `_apply_review` 写的是 `qc.get(n) is not True` —— 那对
+    **反向**判据(`single_trick`: true = 坏)是错的: 一道好题会填
+    `single_trick=False`, 于是被判成"未全过" -> **每一道题都被拒**。
+
+    而且症状极具误导性: 日志里只有一句"quality_checks 未全过
+    (single_trick)", 看起来像模型答错了, 实际是代码读反了方向。
+
+    所以两处**必须**用同一个函数, 不能各写一份 —— 各写一份就是
+    "两份判据迟早漂移"的老问题, 而这里的漂移代价是整条链全灭。
+    """
+    if name in _INVERTED_CHECKS:
+        return value is False          # 反向: 必须**明确**是 False
+    return value is True               # 正向: 必须**明确**是 True
+
 #: 故事硬门的四条 —— prompt 与代码都按这份清单判。**唯一定义处**:
 #: Reviewer 的独立复核(`curated_story_review`)也读它, 免得两处漂移。
 STORY_GATE_FIELDS = ("story_reconstruction", "multi_step_deduction",
@@ -616,14 +639,11 @@ def check_tool_result(d: dict, *, checks: tuple = CURATED_CHECKS_V3) -> tuple:
     bad = []
     for k in checks:
         v = qc.get(k)
-        if k in _INVERTED_CHECKS:
-            # 反向: 必须**明确**为 false。"没说"也算不合格 ——
-            # 一条没说自己是 single_trick 的题, 凭什么信它?
-            if v is not False:
-                bad.append(f"{k}(应 false, 实为 {v!r})")
-        else:
-            if v is not True:
-                bad.append(k)
+        # 方向由 `check_value_ok` 统一裁定(反向判据必须**明确**为 false
+        # —— "没说"也算不合格: 一条没说自己是 single_trick 的题, 凭什么信它?)
+        if not check_value_ok(k, v):
+            bad.append(k if k not in _INVERTED_CHECKS
+                       else f"{k}(应 false, 实为 {v!r})")
     if bad:
         reasons.append("quality_checks 未全过: " + ", ".join(bad))
         return False, reasons
@@ -775,6 +795,19 @@ def spec_from_tool(d: dict, rec, bp: Optional[PuzzleBlueprint]
     # CURATED_POLICY_VERSION。H2 那批(v1, 含 q10000)落盘时没有这把键
     # -> 读出来是空串 -> 自动失去 live eligibility, 不需要手工清理。
     spec.curated_policy_version = CURATED_POLICY_VERSION      # type: ignore[attr-defined]
+    # ---- H3-D3 §一-4: accepted 必须绑定**内容**哈希 ----
+    #
+    # 账本的判据键是 `(external_id, content_hash, policy)` 三元组。早先
+    # 池的准入门只按 `external_id + policy` 查 —— 于是同一 external_id
+    # 的**旧内容**被 accepted, 会给**新内容**发通行证(SE 帖子可以被
+    # 编辑, 内容变了而问题号不变)。
+    #
+    # 这里把来源侧 `surface + bottom` 的哈希写进 spec。算法必须与
+    # `curated_ledger.content_hash_of(rec)` **逐字一致** —— 用同一个函数
+    # 而不是各写一份, 否则池门算出的 key 在账本里永远查不到, 整批题
+    # 会被静默判成"未提交"。
+    from tools.curated_ledger import content_hash_of
+    spec.curated_content_hash = content_hash_of(rec)          # type: ignore[attr-defined]
     return spec
 
 
@@ -825,54 +858,6 @@ class CuratedCompiler:
 
     def __init__(self, writer):
         self.writer = writer
-
-    # ------------------------------------------------------------------
-    def story_review(self, spec: PuzzleSpec) -> Optional[dict]:
-        """**独立复核**"这到底是不是海龟汤"。返回 dict 或 None。
-
-        ## 为什么不是第四个审核 LLM
-
-        任务书明确禁止"再加一个内容审核 LLM"。这里复用的是**同一个
-        client、同一个模型、同一份 system prompt 家族** —— 差别只在
-        **问的问题**。这不是新的审核层, 是把已有的审核能力用在一个
-        它本来就该回答的问题上。
-
-        与 `_review_spec` 的分工:
-            `_review_spec`   "这一稿能不能用"(结构 / 真实性 / 好不好玩)
-            本函数           "这**是不是**海龟汤"(题型)
-        两者都对同一道题作答, 但视角不同 —— 这正是"独立"的含义。
-        如果把它们并成一次调用, 模型会在一个上下文里同时权衡"结构不错"
-        和"题型不对", 然后倾向于和稀泥通过。
-
-        ## 失败一律返回 None
-
-        None 会被 `story_gate_from_review` 判成 `story_review_missing`
-        (= 不合格)。这是 fail closed: 复核调不动时**不放过**那一稿。
-        代价是网关抖动会丢掉一些本来合格的题 —— 而那些题会走
-        `technical_defer` 下次再来, 不是 rejected, 所以不会永久损失。
-        """
-        try:
-            from story.llm import STORY_REVIEW_SYSTEM, _TOOL_STORY_REVIEW
-            from story.llm import story_review_user
-        except Exception:                       # noqa: BLE001
-            log.exception("复核提示词不可用 -> 该稿按复核缺失处理")
-            return None
-        client = getattr(self.writer, "client", None)
-        if client is None:
-            return None
-        try:
-            res = client.messages(
-                STORY_REVIEW_SYSTEM, story_review_user(spec),
-                max_tokens=800, tool=_TOOL_STORY_REVIEW,
-                temperature=0.0)
-        except Exception:                       # noqa: BLE001
-            log.exception("故事复核调用异常 -> 按复核缺失处理(下次重试)")
-            return None
-        ti = getattr(res, "tool_input", None)
-        if not isinstance(ti, dict):
-            log.warning("故事复核没有 tool_input(不放过这一稿)")
-            return None
-        return _unwrap(ti)
 
     # ------------------------------------------------------------------
     def compile_one(self, rec, *, recent: Optional[list] = None,
@@ -1042,30 +1027,28 @@ class CuratedCompiler:
             if _live_busy():
                 return None, _mark_interrupted(info, "before_review")
 
-            # ---- ③b 故事门的**独立复核**(§六) ----
+            # ---- ③b 故事门的**独立复核**(§六, H3-D3 起并入审稿) ----
             #
             # 为什么不能只信 `story_gate_reasons`: 它读的是**编译模型
             # 自己填的** quality_checks。模型一旦自信地判错(十八楼那道
             # 题在它眼里是"物品用途反转"), 代码层无从知道。
             #
-            # 所以让**独立的第二次调用**回答同一组问题。它与编译不是
-            # 同一个上下文、任务也不同(它只判题型, 不判结构), 因此它
-            # 的判断是独立证据。两边**串行**: 任意一边说不合格 -> reject。
+            # H3-D 里这一层是**独立的一次 LLM 调用**(`story_review`)。
+            # H3-D3 §一-2 把它并进了**紧跟着的审稿调用**: `_TOOL_CHECK`
+            # 的 `quality_checks` 现在多带四个题型字段, 而
+            # `_QUALITY_CHECK_FIELDS` 对 curated 题是**十二项 fail
+            # closed** —— 也就是说, 审稿人不填 / 填 false, 那一稿在
+            # `_review_spec` 里就**已经**被拒了, 根本走不到这里。
             #
-            # 位置刻意放在审稿**之前**: 复核不过的题没必要再花一次审稿
-            # 的钱。也不放在最前面 —— 那样会把 d 的解析路径与故事门
-            # 混在一起, 而故事门(Schema 层)与复核(LLM 层)是两件事。
-            srev = self.story_review(spec)
-            sgr2 = story_gate_from_review(srev)
-            if sgr2:
-                info["story_gate"] = sgr2
-                info["reject_reasons"] = sgr2
-                info["stage"] = "story_review"
-                log.info("v3 故事复核拒收 %s: %s",
-                         info["external_id"], ", ".join(sgr2))
-                # 复核判的是**题型的本质**, 与 `single_trick` 同理:
-                # 再审十次, 它还是同一类题。不重试。
-                return None, info
+            # 这条 accepted 路径因此从 4 次 LLM 降到 3 次
+            # (compile / review / audit), 符合任务书要求。
+            #
+            # ⚠️ 那为什么**还留着** `story_gate_from_review` 这一层?
+            # 因为它是**独立的 judge**: `_review_spec` 看的是"这一稿能不能
+            # 用"(结构/真实性/好不好玩), 十二项里那四条题型问题只是顺带
+            # 回答; 这里做的是**把题型单独再拎出来判一次**。两层是 AND
+            # 关系 —— 任一层说不合格就拒。宁可少收一道题, 不可放过一道
+            # 脑筋急转弯。
 
             # ---- ④ Reviewer(**复用现有审稿人**) ----
             reviewed, why, need_rewrite, technical = (
@@ -1073,10 +1056,72 @@ class CuratedCompiler:
                     spec, spec.blueprint, must_fix=vr.must_fix(),
                     own_fix_focus=list(vr.fixable),
                     should_continue=should_continue))
+            # ---- ③b 故事门的**独立复核**(§六, H3-D3 起并入审稿) ----
+            #
+            # 判在 `reviewed is None` **之前**, 因为这两件事是**不同**的
+            # 拒绝理由, 而报告要分得开:
+            #
+            #     题型不合格   -> stage=story_review, reasons=single_trick,…
+            #     结构不合格   -> stage=review
+            #
+            # 审稿那次答复里的十二项是**一起**判的, 所以"题型四项挂了"
+            # 与"结构八项挂了"都会让 `_review_spec` 返回 None。如果把它们
+            # 混成一句"审稿未过", 验收报告就分不清"这批外部题有多少是
+            # 题型不对"与"有多少是稿子质量不行" —— 而那恰恰是本批要
+            # 回答的问题(新源的 yield 到底好不好)。
+            #
+            # ⚠️ 判据方向由 `story_gate_from_review` 处理(它读的是
+            # `check_value_ok` 同一份方向定义)。
+            srev = getattr(self.writer, "_last_review_checks", None)
+            sgr2 = story_gate_from_review(srev)
+            _answered = isinstance(srev, dict) and any(
+                k in srev for k in STORY_GATE_FIELDS)
+            if sgr2 and _answered:
+                # 只有在**审稿人确实回答了那四项**时才把拒稿归因到题型 ——
+                # 否则一份"结构不合格、题型压根没答"的回复会被误报成
+                # "题型不合格", 那会污染验收统计。
+                info["story_gate"] = sgr2
+                info["reject_reasons"] = sgr2
+                info["stage"] = "story_review"
+                log.info("v3 故事复核拒收 %s: %s",
+                         info["external_id"], ", ".join(sgr2))
+                # 复核判的是**题型的本质**: 再审十次, 它还是同一类题。
+                # 不重试。
+                return None, info
+            if reviewed is None and not _answered:
+                # ---- §一-3: 题型四问**没答** -> 技术失败, 可重试 ----
+                #
+                # 这不是"这道题不行", 而是"这次没审成" —— 网关可能回了一份
+                # 结构合格但缺字段的答复, 也可能压根没答完。两种情况换一次
+                # 网络都可能好。记成 rejected 会永久吃掉一道题, 而那正是
+                # §一-3 明令禁止的方向。
+                #
+                # 判据**必须**与"复核被并进审稿"这件事一致: 并进来之后,
+                # "复核缺失"与"审稿技术失败"是同一件事。
+                info["technical"] = True
+                info["reject_reasons"] = ["story_review_missing"]
+                info["stage"] = "story_review"
+                log.info("第 %d 稿题型四问缺失 -> technical_defer: %s",
+                         attempt, info["external_id"])
+                return None, info
             if reviewed is None:
                 last_err = why
+                # ---- §一-3: 技术失败 == technical_defer, **不是** rejected ----
+                #
+                # 审稿超时 / 网关错 / 空 tool_input / schema 坏掉, 都不是
+                # "这道题不行", 而是"这次没审成"。记成 rejected 会让那道
+                # 题**永久消失**, 而它可能是一道好题。
+                #
+                # 判据已经由 `_review_spec_with_retry` 分好了(第 4 个
+                # 返回值), 这里只负责**把技术失败标成技术 stage** ——
+                # `_classify` 靠 `info["technical"]` / 技术 stage 把它翻成
+                # technical_defer。
                 st = "review_technical" if technical else "review"
                 _bump(info, st)
+                if technical:
+                    # 标记成"技术性未审成", 供上层复核(与 `_mark_interrupted`
+                    # 同一个语义: 可重试, 不是内容拒绝)。
+                    info["technical"] = True
                 log.info("第 %d 稿审稿未过(%s): %s",
                          attempt, st, str(why)[:120])
                 continue
