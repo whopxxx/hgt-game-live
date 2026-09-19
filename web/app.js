@@ -290,11 +290,32 @@
     // 用 data 属性把阶段暴露给测试与 CSS(几何断言需要知道现在哪一段)。
     el.reveal.setAttribute("data-stage", stage);
 
-    // ---- 核心答案: legacy 题没有 core_answer -> fallback 到完整谜底 ----
-    // **三个阶段都显示** —— 它是视觉第一层, 观众要一直能对照。
-    const core = s.revealed_core_answer || s.revealed_full_answer
-               || s.revealed_answer || "";
-    const full = s.revealed_full_answer || s.revealed_answer || "";
+    // ---- U3-B: 结构化题与 legacy 题必须**分开**推导 ----
+    // 后端 U3-A 起:
+    //     revealed_core_answer = raw core_answer
+    //     revealed_full_answer = raw answer(结构化题拿不到就空串)
+    //     revealed_answer      = legacy/组合揭晓文案
+    //
+    // 早先的写法是两边各自 `||` 一路兜到底:
+    //     core = revealed_core_answer || revealed_full_answer || revealed_answer
+    //     full = revealed_full_answer || revealed_answer
+    // 对**结构化题**这是错的: 一旦 `revealed_full_answer` 为空(后端某次
+    // full 丢失 / 老后端根本没这个字段), `full` 会 fallback 到
+    // `revealed_answer` —— 而那是
+    //     【核心答案】...
+    //     【完整解释】...
+    // 整段组合文案, 灌回正文后重复 bug 直接复活(正文里又一次核心答案,
+    // 还多出两个本不该出现的标签)。
+    //
+    // 所以: **有结构化 core 时, full 为空就让它空着。**
+    // 只有 legacy(没有 core)才允许往 `revealed_answer` 退。
+    const hasStructuredCore = !!s.revealed_core_answer;
+    const core = hasStructuredCore
+      ? s.revealed_core_answer
+      : (s.revealed_full_answer || s.revealed_answer || "");
+    const full = hasStructuredCore
+      ? (s.revealed_full_answer || "")
+      : (s.revealed_full_answer || s.revealed_answer || "");
     if (el.revealCore.textContent !== core) el.revealCore.textContent = core;
 
     // ---- "XX 补齐最后线索" —— 只在该题是 solved 时出现 ----

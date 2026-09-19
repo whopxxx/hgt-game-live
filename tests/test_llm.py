@@ -4045,6 +4045,52 @@ def test_g4e_archive_round_trip_keeps_g4_metrics():
                                   "repair_success_reasons")})
 
 
+def test_u3e_archive_reveal_keeps_composed_compat():
+    """**U3-E 落盘回归**: 旧组合揭晓文案必须**逐字**保留在 archive 里。
+
+    U3 把 Snapshot 的 `revealed_full_answer` 从"组合文案"改成了"raw
+    answer"。但 archive 的 `reveal` 字段**不是**同一个东西 —— 它一直是
+    Director 侧 `_compose_reveal()` 出来的展示文案, 历史数据与离线分析
+    都按这个格式读。修 Snapshot 时**顺手把它也改成 raw** 会让整段历史
+    口径断裂, 而这类"展示数据拆分"不该动归档格式。
+
+    所以这条钉住: archive 的 `reveal` 仍是组合文案, `core_answer` 仍是
+    raw core, 且**不需要** bump 任何 version(纯展示数据拆分)。
+    """
+    print("\n[U3-E] archive 保持旧组合 reveal 兼容")
+    import json
+    import os
+    import tempfile
+    import director as D
+    from story.puzzle import PuzzleSpec
+
+    d = tempfile.mkdtemp()
+    cfg = D.Config(sim_path="x", no_llm=True,
+                   puzzle_out_path=os.path.join(d, "puzzle.jsonl"))
+    dr = D.Director(cfg)
+    core = "他每天看锅, 是在确认有没有人动过他的东西。"
+    ans = "锅里的状态被他当成一个固定记号, 他靠它判断私人物品有没有被动过。"
+    spec = PuzzleSpec(puzzle=_GOOD_PUZ, answer=ans, core_answer=core)
+    before = (spec.quality_policy_version, spec.prompt_version)
+    text = D.Director._compose_reveal(core, ans)
+    check("组合文案确实带两个标签",
+          "【核心答案】" in text and "【完整解释】" in text, text[:40])
+    dr._archive_reveal({"puzzle": spec.puzzle, "answer": ans, "spec": spec},
+                       text)
+    with open(cfg.puzzle_out_path, encoding="utf-8") as f:
+        rec = json.loads(f.readline())
+    # reveal 仍是**组合文案**(逐字), 不是 raw answer
+    check("**archive 的 reveal 仍是组合文案(逐字兼容)**",
+          rec.get("reveal") == text, (rec.get("reveal") or "")[:60])
+    check("archive 的 core_answer 仍是 raw core",
+          rec.get("core_answer") == core, rec.get("core_answer"))
+    check("archive 的 answer 仍是 raw answer",
+          rec.get("answer") == ans, rec.get("answer"))
+    check("**没有 bump 任何 version**(纯展示数据拆分)",
+          (spec.quality_policy_version, spec.prompt_version) == before,
+          (before, spec.quality_policy_version, spec.prompt_version))
+
+
 def test_g4_fix_reasons_never_guesses():
     """认不出的 fixable 文案 -> "other", **不猜**。
 
@@ -4210,6 +4256,7 @@ def main():
               test_g4e_repair_attempt_is_not_repair_success,
               test_g4e_archive_round_trip_keeps_g4_metrics,
               test_g4_fix_reasons_never_guesses,
+              test_u3e_archive_reveal_keeps_composed_compat,
               test_q2_discovery_beats_schema_and_prompts,
               test_q2_v7_pool_quarantined_but_v8_eligible,
               test_q2_reviewer_all_four_new_fields_required,

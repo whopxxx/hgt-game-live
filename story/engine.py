@@ -2003,8 +2003,34 @@ class RoundEngine:
             detail_visible = False
             reveal_stage = ""
             if self.phase == Phase.REVEALED:
-                full_out = self._revealed or ""
                 core_out = self._core_answer or ""
+                # ---- U3-A: 三个字段职责必须分开 ----
+                #     revealed_answer      = legacy/组合揭晓文案(逐字保留旧语义)
+                #     revealed_core_answer = **raw** core_answer
+                #     revealed_full_answer = **raw** answer
+                #
+                # 修之前这里是 `full_out = self._revealed` —— 而 `_revealed`
+                # 是 `_compose_reveal(core, answer)` 拼出来的**展示字符串**:
+                #     【核心答案】{core}
+                #     【完整解释】{answer}
+                # 前端又独立渲染 `revealed_core_answer`, 于是观众看到两次
+                # 核心答案, 而且组合标签【核心答案】/【完整解释】也一起进了
+                # 正文。名字叫 full, 内容却是"core + answer 的合成展示串"。
+                #
+                # 现代结构化题(core 非空) -> full 必须是 **raw** answer;
+                # 拿不到就**空着**, 绝不退回组合文案(否则 full 一丢就整段
+                # 灌回正文, 重复 bug 复活)。
+                #
+                # legacy(无结构化 core) -> `_revealed` 就是仅有的揭晓正文,
+                # 保持旧兼容语义。
+                #
+                # 门控必须看 `_core_answer` 而**不是** `_revealed`: legacy
+                # 路径下 `_revealed` 同样非空(它被兜底成 `self._answer`),
+                # 用它会判错。
+                if core_out:
+                    full_out = self._answer or ""
+                else:
+                    full_out = self._revealed or self._answer or ""
                 # 经过时间从 deadline 反推 —— `_next_puzzle_deadline` 是
                 # `进入 REVEALED 的时刻 + reveal_hold_seconds`, 所以这里
                 # 不需要再存一个"揭晓开始时刻"。

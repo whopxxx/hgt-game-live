@@ -880,7 +880,93 @@ window.addEventListener("load", async () => {
     check(!vis("reveal-body"),
           "U2-G: 无 reveal_stage 且 detail_visible=false -> 不显示完整解释");
 
-    // ⑮ U1-F: 观众可见的 DOM 里**绝不能**出现补题/库存类文案
+    // ⑭b U3: 结构化题的正文**绝不能**重复核心答案
+    //
+    // 真实截图 bug: 顶部已经大字显示一次 core_answer, 正文里又出现
+    //     【核心答案】
+    //     同一段 core_answer
+    //     【完整解释】
+    //     answer
+    // 于是观众看到两次核心答案。
+    //
+    // 根因在后端(Snapshot 把组合文案当成了 raw full answer, 已由
+    // U3-A 修掉); 这一组是**前端**侧的兜底 —— 即使后端某次又下发
+    // 组合文案, 前端也不能把整段灌回正文。
+    {
+      // 现代题的真实形态(U3-A 之后): full 是 raw answer
+      const u3Core = "他每天看锅, 是在确认有没有人动过他的东西。";
+      const u3Ans = "锅里的状态被他当成一个固定记号; 每天回家后, "
+        + "他通过检查这个状态有没有变化, 判断私人物品是否被人动过。";
+      // 故意**同时**给一份组合文案的 revealed_answer, 模拟老后端/丢字段
+      const u3Composed = "【核心答案】\n" + u3Core + "\n\n【完整解释】\n" + u3Ans;
+      const u3Send = (extra) => send(Object.assign({
+        phase: "revealed", puzzle_index: 40, story_index: 40,
+        puzzle: "他每天回家都要看一眼锅。为什么?",
+        revealed_answer: u3Composed, revealed_core_answer: u3Core,
+        revealed_full_answer: u3Ans, reveal_stage: "explanation",
+        reveal_detail_visible: true, solved: false,
+        reveal_contributors: [], next_puzzle_ms: 15000,
+      }, extra || {}));
+
+      // ---- U3-C1: core / body 各取 raw, 正文无组合标签 ----
+      u3Send({});
+      const coreEl = document.getElementById("reveal-core");
+      const bodyEl = document.getElementById("reveal-body");
+      check(coreEl.textContent.includes(u3Core),
+            "U3-C1: 大号 core 应显示 raw core_answer");
+      check(bodyEl.textContent.includes(u3Ans),
+            "U3-C1: 正文应显示 raw answer");
+      for (const tag of ["【核心答案】", "【完整解释】"]) {
+        check(bodyEl.textContent.indexOf(tag) === -1,
+              "U3-C1: 正文不得出现 " + tag);
+      }
+      // **最关键的一条**: 查**完整文本出现次数**, 不能只查标签 ——
+      // 哪天标签没了但 core 仍重复, 只查标签会假绿。
+      {
+        const all = document.body.innerText || document.body.textContent || "";
+        const occ = all.split(u3Core).length - 1;
+        check(occ === 1,
+              "U3-C1: core 完整句在可见 DOM 中应只出现 1 次, 实际 " + occ);
+        const occAns = all.split("【核心答案】").length - 1;
+        check(occAns === 0,
+              "U3-C1: 可见 DOM 不该出现任何【核心答案】标签, 实际 " + occAns);
+      }
+
+      // ---- U3-C2: `revealed_full_answer` 为空时**绝不**退回组合文案 ----
+      //
+      // 这是 U3-B 的核心: 结构化题只要有 core, full 为空就让它空着。
+      // 若 fallback 到 `revealed_answer`, 上面整段组合文案会灌回正文,
+      // 重复 bug 原地复活。
+      u3Send({revealed_full_answer: ""});
+      check(document.getElementById("reveal-core").textContent.includes(u3Core),
+            "U3-C2: full 丢失时大号 core 仍应显示");
+      check(!vis("reveal-body"),
+            "U3-C2: full 为空 -> 正文不得显示(绝不退回组合文案)");
+      {
+        const all = document.body.innerText || document.body.textContent || "";
+        check(all.indexOf("【核心答案】") === -1,
+              "U3-C2: full 丢失后正文不得重新出现组合标签");
+        check(all.split(u3Core).length - 1 === 1,
+              "U3-C2: core 仍只出现 1 次 (实际 "
+              + (all.split(u3Core).length - 1) + ")");
+      }
+
+      // ---- U3-D: legacy(无 core)仍能正常揭晓 ----
+      //
+      // 修 modern path **不能**把老 pool/archive 题的 reveal 弄空。
+      send({phase: "revealed", puzzle_index: 41, story_index: 41,
+            puzzle: "旧题。", revealed_answer: "旧题只有这一段揭晓。",
+            revealed_core_answer: "", revealed_full_answer: "",
+            reveal_stage: "explanation", reveal_detail_visible: true,
+            solved: false, reveal_contributors: [], next_puzzle_ms: 15000});
+      check(document.getElementById("reveal-core").textContent
+              .includes("旧题只有这一段揭晓"),
+            "U3-D: legacy 题应靠 revealed_answer 兜底显示核心区");
+      check(document.body.innerText.indexOf("旧题只有这一段揭晓") !== -1,
+            "U3-D: legacy 揭晓文案必须可见");
+    }
+
+
     //
     // 后台补题是运维概念, 不该泄漏给观众 —— 他们只该感受到
     // "看答案 60 秒 -> 下一题直接出现"。

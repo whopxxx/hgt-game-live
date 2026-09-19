@@ -461,6 +461,77 @@ def test_u1_reveal_core_falls_back_when_absent():
           and "reveal_detail_visible" in s.to_json())
 
 
+def test_u3_snapshot_full_is_raw_answer_not_composed():
+    """**U3-A**: 结构化题的 `revealed_full_answer` 必须是 **raw answer**。
+
+    真实截图 bug: explanation 阶段顶部已经单独大字显示一次 core_answer,
+    正文里却又出现 `【核心答案】` + 同一段 core + `【完整解释】` —— 观众
+    看到两次核心答案。
+
+    根因是 Snapshot 把 `_revealed`(=`_compose_reveal(core, answer)` 拼出来
+    的**展示字符串**)当成了 "raw full answer" 下发。前端又独立渲染
+    `revealed_core_answer`, 于是重复。
+
+    三个字段的职责必须彻底分开:
+        revealed_answer      = legacy/组合揭晓文案(旧兼容, 逐字保留)
+        revealed_core_answer = **raw** core_answer
+        revealed_full_answer = **raw** answer
+    """
+    print("\n[U3-Engine] 结构化题的 full 是 raw answer, 不是组合文案")
+    from director import Director
+    eng, clk, sp = boot_v5(mkcfg(reveal_hold_seconds=60.0),
+                           core_answer="他每天看锅, 是在确认有没有人动过他的东西。")
+    eng.submit_danmaku("u3", "甲", "#下一题")
+    eng.tick()
+    assert eng.phase == Phase.REVEALING, eng.phase
+    # 模拟 Director 的现代路径: 传的是**组合文案**
+    composed = Director._compose_reveal(sp.core_answer, sp.answer)
+    assert "【核心答案】" in composed and "【完整解释】" in composed
+    eng.submit_reveal(composed)
+    s = eng.snapshot()
+    check("core = raw core_answer",
+          s.revealed_core_answer == sp.core_answer, s.revealed_core_answer)
+    check("**full = raw answer(不是组合文案)**",
+          s.revealed_full_answer == sp.answer, s.revealed_full_answer)
+    check("**full 里没有【核心答案】标签**",
+          "【核心答案】" not in s.revealed_full_answer,
+          s.revealed_full_answer[:60])
+    check("**full 里没有【完整解释】标签**",
+          "【完整解释】" not in s.revealed_full_answer,
+          s.revealed_full_answer[:60])
+    check("**full 里不含 core 正文**(重复的直接判据)",
+          sp.core_answer not in s.revealed_full_answer,
+          s.revealed_full_answer[:60])
+    # `revealed_answer` 保持旧兼容语义: 它仍是那份组合文案(archive/legacy
+    # 依赖它), 所以**不能**顺手把它也改成 raw。
+    check("revealed_answer 仍是组合文案(旧兼容)",
+          s.revealed_answer == composed, s.revealed_answer[:40])
+
+
+def test_u3_snapshot_full_empty_when_answer_missing():
+    """**U3-A 续**: 结构化题拿不到 raw answer 时, full 必须**空着**。
+
+    绝不 fallback 到组合文案 —— 否则以后后端某次 full 丢失, 整段
+    `【核心答案】...【完整解释】...` 会灌回正文, 重复 bug 复活。
+    """
+    print("\n[U3-Engine] 结构化题 answer 缺失 -> full 空, 不退回组合文案")
+    from director import Director
+    eng, clk, sp = boot_v5(mkcfg(reveal_hold_seconds=60.0))
+    eng.submit_danmaku("u3", "甲", "#下一题")
+    eng.tick()
+    assert eng.phase == Phase.REVEALING, eng.phase
+    composed = Director._compose_reveal(sp.core_answer, sp.answer)
+    # 把引擎的 raw answer 清掉, 模拟"raw answer 丢失但组合文案还在"
+    with eng._lock:
+        eng._answer = ""
+    eng.submit_reveal(composed)
+    s = eng.snapshot()
+    check("core 仍有值", s.revealed_core_answer == sp.core_answer,
+          s.revealed_core_answer)
+    check("**full 为空(绝不退回组合文案)**", s.revealed_full_answer == "",
+          s.revealed_full_answer[:60])
+
+
 def test_u1_pressure_exposes_reveal_remaining():
     """**U1**: pressure() 暴露 reveal_remaining_seconds(只读)。"""
     print("\n[U1-Engine] pressure 暴露剩余秒数")
@@ -3473,6 +3544,8 @@ def main():
              test_u2_stage_boundaries_come_from_config_not_literals,
              test_u2_detail_boundary_validation,
              test_u1_reveal_core_falls_back_when_absent,
+             test_u3_snapshot_full_is_raw_answer_not_composed,
+             test_u3_snapshot_full_empty_when_answer_missing,
              test_u1_pressure_exposes_reveal_remaining,
              test_reveal_once,
              test_next_puzzle_cycle,
