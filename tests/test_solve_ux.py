@@ -31,6 +31,7 @@ Solve UX + Puzzle Truthfulness 回归套件。
 
 数据全部是**去身份化的最小构造**, 不含真实昵称 / session。
 """
+import json
 import sys
 from pathlib import Path
 
@@ -1821,6 +1822,389 @@ def test_v6_candidate_not_gated_by_answer_presence():
               out[0].established_fact_ids if out else None)
 
 
+def _contrib_qids(eng):
+    return [c["qid"] for c in eng._reveal_contributors_locked()]
+
+
+def _contrib(eng):
+    return eng._reveal_contributors_locked()
+
+
+# ----------------------------------------------------------------------
+# R1/R2-A —— 真正贡献链
+# ----------------------------------------------------------------------
+def test_r1_a_real_contribution_chain():
+    print("\n[R1-A] 真贡献链: A 建 f1, B 建 f2 -> contributors=[A,B], B is_final")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    ask(eng, clk, "u2", "乙", "她昨晚和父亲吃饭了吗", verdict="是",
+        established_fact_ids=["f2"])
+    check("已通关", eng.phase == Phase.REVEALING, eng.phase)
+    c = _contrib(eng)
+    check("贡献链长度 2", len(c) == 2, c)
+    check("顺序 = 甲,乙", [x["user_name"] for x in c] == ["甲", "乙"], c)
+    check("B(乙) is_final=True", c[1]["is_final"] is True, c)
+    check("A(甲) is_final=False", c[0]["is_final"] is False, c)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-B —— 重复确认不能重复领奖
+# ----------------------------------------------------------------------
+def test_r1_b_duplicate_confirmation_not_credited():
+    print("\n[R1-B] 重复确认: A 建 f1, B 再确认 f1, C 建 f2 -> [A,C] 不含 B")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "A", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    # B 语义上**又**建立了 f1 —— 但它不是第一次, 所以不该领奖。
+    ask(eng, clk, "u2", "B", "她是不是父亲的女儿", verdict="是",
+        established_fact_ids=["f1"])
+    ask(eng, clk, "u3", "C", "她昨晚和父亲吃饭了吗", verdict="是",
+        established_fact_ids=["f2"])
+    c = _contrib(eng)
+    check("只有 A,C 领奖", [x["user_name"] for x in c] == ["A", "C"], c)
+    check("B 不在贡献链里", "B" not in [x["user_name"] for x in c], c)
+    # 而 B 的 established 依然记着 f1 —— 语义与贡献是两件事。
+    rec_b = [r for r in eng._qa_archive if r.user_name == "B"][0]
+    check("B 的 established 仍含 f1", rec_b.established_fact_ids
+          and "f1" in rec_b.established_fact_ids, rec_b.established_fact_ids)
+    check("B 的 contribution 为空",
+          not rec_b.completion_contribution_fact_ids,
+          rec_b.completion_contribution_fact_ids)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-C —— 并发回包顺序(本批最重要的正确性测试)
+# ----------------------------------------------------------------------
+def test_r1_c_concurrent_commit_order():
+    print("\n[R1-C] 并发: qid=2 先提交建 f1, qid=1 后回也声称 f1 -> 归属 qid=2")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    # 两条都在途(派发顺序 1,2)
+    eng.submit_danmaku("u1", "甲", "#问题一")
+    clk.advance(20.0)
+    a1 = [a for a in eng.tick() if a.kind == ActionKind.ANSWER][0].payload
+    eng.submit_danmaku("u2", "乙", "#问题二")
+    clk.advance(20.0)
+    a2 = [a for a in eng.tick() if a.kind == ActionKind.ANSWER][0].payload
+    check("两条 qid 按派发顺序", a1["qid"] == 1 and a2["qid"] == 2,
+          (a1["qid"], a2["qid"]))
+    # 真实完成顺序反转: qid=2 先回来
+    eng.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"])])
+    # qid=1 后回来, 也声称建立了 f1
+    eng.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f1"])])
+    # 第三条补齐 f2
+    eng.submit_danmaku("u3", "丙", "#问题三")
+    clk.advance(20.0)
+    a3 = [a for a in eng.tick() if a.kind == ActionKind.ANSWER][0].payload
+    eng.submit_qa([QAResult(qid=a3["qid"], verdict="是",
+                            established_fact_ids=["f2"])])
+    check("已通关", eng.phase == Phase.REVEALING, eng.phase)
+    # archive 按 qid 重排 —— 它是 1,2,3
+    check("archive 顺序为 qid 1,2,3",
+          [r.qid for r in eng._qa_archive] == [1, 2, 3],
+          [r.qid for r in eng._qa_archive])
+    # 而贡献链必须按**真实提交顺序**: 2 先, 然后 3。qid=1 没有功劳。
+    check("贡献链 = [2,3] 而非 [1,3]", _contrib_qids(eng) == [2, 3],
+          _contrib_qids(eng))
+    c = _contrib(eng)
+    check("qid=2 是最后线索", c[-1]["is_final"] is True and c[-1]["qid"] == 3, c)
+    # qid=1 的贡献是空的
+    rec1 = [r for r in eng._qa_archive if r.qid == 1][0]
+    check("qid=1 无贡献", not rec1.completion_contribution_fact_ids,
+          rec1.completion_contribution_fact_ids)
+
+    # ---- 追加: 两位贡献者, 提交顺序与 qid 顺序**完全相反** ----
+    #
+    # 上面那组只钉住了"重复确认不领奖"(qid=1 被过滤掉), 于是排序键
+    # `(ts,qid)` 退化成 `qid` 也能过 —— 它**没有**验证排序本身。
+    # 这一组让两条都带贡献、且 qid 大的先提交, 两个排序键才会分叉:
+    #     真实提交顺序 = [2, 1]    (正确)
+    #     按 qid 排     = [1, 2]   (错误)
+    print("  -- 追加: 提交顺序与 qid 顺序相反 --")
+    eng2, clk2 = boot(ident_spec())
+    eng2.submit_danmaku("u1", "甲", "#问题一")
+    clk2.advance(20.0)
+    b1 = [a for a in eng2.tick() if a.kind == ActionKind.ANSWER][0].payload
+    eng2.submit_danmaku("u2", "乙", "#问题二")
+    clk2.advance(20.0)
+    b2 = [a for a in eng2.tick() if a.kind == ActionKind.ANSWER][0].payload
+    check("派发顺序 1,2", (b1["qid"], b2["qid"]) == (1, 2),
+          (b1["qid"], b2["qid"]))
+    # qid=2 先提交并建立 f1 —— 它是第一位贡献者
+    eng2.submit_qa([QAResult(qid=2, verdict="是", established_fact_ids=["f1"])])
+    # qid=1 后提交并建立 f2 —— 它是**最后**一块, 必须拿 is_final
+    eng2.submit_qa([QAResult(qid=1, verdict="是", established_fact_ids=["f2"])])
+    check("已通关", eng2.phase == Phase.REVEALING, eng2.phase)
+    check("archive 按 qid 排成 1,2",
+          [r.qid for r in eng2._qa_archive] == [1, 2],
+          [r.qid for r in eng2._qa_archive])
+    c2 = _contrib(eng2)
+    check("贡献链 = [2,1] 真实提交序", [x["qid"] for x in c2] == [2, 1], c2)
+    check("qid=1(后提交)拿 is_final",
+          c2[-1]["qid"] == 1 and c2[-1]["is_final"] is True, c2)
+    check("qid=2(先提交)不是 is_final", c2[0]["is_final"] is False, c2)
+    check("胜者也是 qid=1 那位", eng2._solved_by == "甲", eng2._solved_by)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-D —— support 不算贡献
+# ----------------------------------------------------------------------
+def test_r1_d_support_is_not_contribution():
+    print("\n[R1-D] support fact 建立 -> 不进贡献链")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "开门的人认识她吗", verdict="是",
+        established_fact_ids=["f3"])
+    check("仍在 QA(support 不推进通关)", eng.phase == Phase.QA, eng.phase)
+    rec = eng._qa_archive[-1]
+    check("support 已建立", "f3" in (rec.established_fact_ids or []),
+          rec.established_fact_ids)
+    check("但无 completion 贡献",
+          not rec.completion_contribution_fact_ids,
+          rec.completion_contribution_fact_ids)
+    check("贡献链为空", _contrib(eng) == [], _contrib(eng))
+
+
+# ----------------------------------------------------------------------
+# R1/R2-E —— touched 不算
+# ----------------------------------------------------------------------
+def test_r1_e_touched_is_not_contribution():
+    print("\n[R1-E] touched 非空但 established 空 -> 不进贡献链")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她昨晚吃饭了吗", verdict="是",
+        touched_fact_ids=["f1", "f2"], established_fact_ids=[])
+    check("仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("贡献链为空", _contrib(eng) == [], _contrib(eng))
+    check("无任何记录带贡献",
+          all(not r.completion_contribution_fact_ids
+              for r in eng._qa_archive), eng._qa_archive)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-F —— verifier 补回也算真人贡献
+# ----------------------------------------------------------------------
+def test_r1_f_verifier_rescue_counts_as_human():
+    print("\n[R1-F] verifier 补回的 f2 首次建立 -> 仍算这位真人的贡献")
+    # ⚠️ 形状说明: 复核是**就地**把 id 并进 `r0.established_fact_ids`
+    # 并**另记** `completion_verified_fact_ids` 说明provenance(见
+    # `PuzzleWriter._completion_verify`)。所以到 Engine 手上时,
+    # established 里**已经有** f2 —— 这两个字段不是二选一。
+    #
+    # 这里先用真 writer 跑一遍, 拿真实产出喂 Engine, 避免手写出一个
+    # 生产路径不会产生的形状(我第一版就是这么错的: 只填 verified 不填
+    # established, 于是 Engine 侧什么都没建立)。
+    fc = FakeClient([
+        _verdict(established=[], cand=True),
+        _completion_match(["f2"]),
+    ])
+    spec = auction_spec()
+    # 甲先建立 f1 —— 于是 missing 只剩 f2
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", "他自己送拍自己拍高, 是在刷成交记录?", verdict="是",
+        established_fact_ids=["f1"])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, _err = w.answer(
+        spec.puzzle, spec.answer, [], 2, "乙", _AUCTION_TEXT_CAUSAL, spec=spec,
+        completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer,
+        room_established_fact_ids=["f1"])
+    check("writer 恰好 2 次调用", len(fc.calls) == 2, len(fc.calls))
+    check("复核只补回 f2", out and out[0].established_fact_ids == ["f2"],
+          out[0].established_fact_ids if out else None)
+    check("provenance 记着 f2",
+          out and out[0].completion_verified_fact_ids == ["f2"],
+          out[0].completion_verified_fact_ids if out else None)
+    # ---- 交给 Engine: 合同 {f1,f2} 补齐 -> 通关, 乙 是贡献者 ----
+    ask(eng, clk, "u2", "乙", _AUCTION_TEXT_CAUSAL,
+        verdict=out[0].verdict, status=out[0].status,
+        solution_candidate=True,
+        established_fact_ids=list(out[0].established_fact_ids or []),
+        completion_verified_fact_ids=list(
+            out[0].completion_verified_fact_ids or []))
+    check("已通关", eng.phase == Phase.REVEALING, eng.phase)
+    c = _contrib(eng)
+    check("贡献链 = [甲,乙]", [x["user_name"] for x in c] == ["甲", "乙"], c)
+    check("乙 is_final", c[-1]["is_final"] is True, c)
+    rec = [r for r in eng._qa_archive if r.user_name == "乙"][0]
+    check("乙的贡献含 f2",
+          rec.completion_contribution_fact_ids == ["f2"],
+          rec.completion_contribution_fact_ids)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-G —— 时间到的部分贡献
+# ----------------------------------------------------------------------
+def test_r1_g_timeout_partial_contribution():
+    print("\n[R1-G] 时间到只建立 f1 -> solved=False, 贡献链有 1 条且无 is_final")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    check("未通关", eng.phase == Phase.REVEALING, eng.phase)
+    check("solved=False", eng._solved is False, eng._solved)
+    c = _contrib(eng)
+    check("贡献链 1 条", len(c) == 1, c)
+    check("是甲", c[0]["user_name"] == "甲", c)
+    check("无 is_final", c[0]["is_final"] is False, c)
+    snap = eng.snapshot()
+    check("Snapshot 也带贡献链", snap.reveal_contributors == c,
+          snap.reveal_contributors)
+    check("Snapshot solved=False", snap.to_json()["solved"] is False)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-H —— 完全没推到 completion
+# ----------------------------------------------------------------------
+def test_r1_h_no_contribution_at_all():
+    print("\n[R1-H] 没有任何 completion 贡献 -> 贡献链为空")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是不是来讨债的", verdict="是",
+        established_fact_ids=["f3"])
+    ask(eng, clk, "u2", "乙", "门锁了吗", verdict="不是",
+        established_fact_ids=[])
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    check("贡献链为空", _contrib(eng) == [], _contrib(eng))
+    check("Snapshot 里也是空", eng.snapshot().reveal_contributors == [],
+          eng.snapshot().reveal_contributors)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-I —— legacy 无合同
+# ----------------------------------------------------------------------
+def test_r1_i_legacy_no_contract_empty_contributors():
+    print("\n[R1-I] legacy 无合同: Final Judge P.SOLVE 也不产出贡献链")
+    sp = ident_spec(completion=())
+    sp.quality_policy_version = "quality-v4"
+    eng, clk = boot(sp)
+    acts = ask(eng, clk, "u1", "甲", "门外女人是父亲的亲生女儿",
+               verdict="揭晓", established_fact_ids=["f1", "f2"])
+    check("legacy 直接通关", eng.phase == Phase.REVEALING, eng.phase)
+    check("贡献链为空(不猜旧数据)", _contrib(eng) == [], _contrib(eng))
+    check("Snapshot 里也是空", eng.snapshot().reveal_contributors == [])
+
+
+# ----------------------------------------------------------------------
+# R1/R2-J —— 公开形状
+# ----------------------------------------------------------------------
+def test_r1_j_public_shape_has_no_internal_fields():
+    print("\n[R1-J] 公开贡献链形状固定, 绝不含内部 fact 字段")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    ask(eng, clk, "u2", "乙", "她昨晚和父亲吃饭了吗", verdict="是",
+        established_fact_ids=["f2"])
+    c = _contrib(eng)
+    allowed = {"qid", "user_name", "text", "verdict", "is_final"}
+    for row in c:
+        check("行 key 恰为公开五字段",
+              set(row.keys()) == allowed, sorted(row.keys()))
+    # 整个 JSON 序列化后再扫一遍 —— 防止将来有人"顺手"加字段
+    blob = json.dumps(eng.snapshot().to_json(), ensure_ascii=False)
+    for bad in ("fact_id", "established_fact_ids", "completion_fact_ids",
+                "completion_verified_fact_ids",
+                "completion_contribution_fact_ids", "touched_fact_ids"):
+        check(f"Snapshot JSON 不含 {bad}", bad not in blob)
+    check("Snapshot JSON 含 reveal_contributors",
+          "reveal_contributors" in blob)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-K —— QA 阶段不下发贡献链
+# ----------------------------------------------------------------------
+def test_r1_k_qa_phase_does_not_leak_contributors():
+    print("\n[R1-K] QA 阶段 Snapshot 的 reveal_contributors 恒为空")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    check("仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("QA 阶段不下发", eng.snapshot().reveal_contributors == [],
+          eng.snapshot().reveal_contributors)
+    check("to_json 里也是空数组",
+          eng.snapshot().to_json()["reveal_contributors"] == [])
+
+
+# ----------------------------------------------------------------------
+# R1/R2-L —— 一条 QA 同时建立 f1+f2 -> 只有一行
+# ----------------------------------------------------------------------
+def test_r1_l_one_qa_covering_both_is_single_row():
+    print("\n[R1-L] 一条真人问答同时建立 f1+f2 -> 贡献链只有 1 行")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "完整解答: 她是父亲的女儿, 昨晚才相认",
+        verdict="是", established_fact_ids=["f1", "f2"])
+    check("通关", eng.phase == Phase.REVEALING, eng.phase)
+    c = _contrib(eng)
+    check("只有一行", len(c) == 1, c)
+    check("is_final=True", c[0]["is_final"] is True, c)
+
+
+# ----------------------------------------------------------------------
+# R1/R2-M —— archive 有 reveal_contributors
+# ----------------------------------------------------------------------
+def test_r1_m_archive_boundary():
+    print("\n[R1-M] archive 带 reveal_contributors; to_json 不带贡献字段")
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    ask(eng, clk, "u2", "乙", "她昨晚和父亲吃饭了吗", verdict="是",
+        established_fact_ids=["f2"])
+    # QARec: contribution 只进 archive
+    rec = eng._qa_archive[-1]
+    check("to_archive 有 contribution",
+          "completion_contribution_fact_ids" in rec.to_archive(),
+          sorted(rec.to_archive().keys()))
+    check("to_json 无 contribution",
+          "completion_contribution_fact_ids" not in rec.to_json(),
+          sorted(rec.to_json().keys()))
+    snap = eng.snapshot()
+    check("snapshot.reveal_contributors 非空",
+          len(snap.reveal_contributors) == 2, snap.reveal_contributors)
+
+
+def test_r1_n_non_qa_rows_are_filtered():
+    print("\n[R1-N] kind/status/verdict 三重门: 非真人 OK 问答一律不进贡献链")
+    # 说明: 正常路径下 hint / nudge 的 contribution 字段本来就是空的, 所以
+    # 光靠"跑一遍 hint 看结果"**测不出** kind 过滤到底在不在 —— 那是我的
+    # mutation M6 跑出 0 FAIL 的原因。要真正钉住这道门, 必须**直接构造**
+    # 那些"理论上不该出现"的 archive 行, 再断言 filter 挡住了它们。
+    # 这道门保护的是**将来**: Step 14 的 Detective 若误写了 contribution,
+    # 公屏不能把它当成真人共同解谜的功劳。
+    sp = ident_spec()
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    # 手工塞进四种"带贡献但不该被表彰"的记录
+    eng._qa_archive.append(QARec(
+        qid=-1, user_name="提示", text="注意她的身份", verdict="",
+        kind="hint", commit_seq=99,
+        completion_contribution_fact_ids=["f2"]))
+    eng._qa_archive.append(QARec(
+        qid=-2, user_name="重述", text="刚才聊到身份", verdict="",
+        kind="nudge", commit_seq=100,
+        completion_contribution_fact_ids=["f2"]))
+    eng._qa_archive.append(QARec(
+        qid=90, user_name="超时观众", text="她是女儿", verdict="是",
+        kind="qa", status="unavailable", commit_seq=101,
+        completion_contribution_fact_ids=["f2"]))
+    eng._qa_archive.append(QARec(
+        qid=91, user_name="无关观众", text="她吃了吗", verdict="无关",
+        kind="qa", commit_seq=102,
+        completion_contribution_fact_ids=["f2"]))
+    c = _contrib(eng)
+    check("只有真人 QA 那一条", [x["user_name"] for x in c] == ["甲"], c)
+    check("commit_seq=99 的提示没进来",
+          all(x["qid"] >= 0 for x in c), c)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -1878,6 +2262,21 @@ def main():
         test_v6_e_legacy_solve_still_wins,
         test_v6_first_layer_never_owns_victory,
         test_v6_candidate_not_gated_by_answer_presence,
+        # ---- R1/R2: 揭晓贡献链 ----
+        test_r1_a_real_contribution_chain,
+        test_r1_b_duplicate_confirmation_not_credited,
+        test_r1_c_concurrent_commit_order,
+        test_r1_d_support_is_not_contribution,
+        test_r1_e_touched_is_not_contribution,
+        test_r1_f_verifier_rescue_counts_as_human,
+        test_r1_g_timeout_partial_contribution,
+        test_r1_h_no_contribution_at_all,
+        test_r1_i_legacy_no_contract_empty_contributors,
+        test_r1_j_public_shape_has_no_internal_fields,
+        test_r1_k_qa_phase_does_not_leak_contributors,
+        test_r1_l_one_qa_covering_both_is_single_row,
+        test_r1_m_archive_boundary,
+        test_r1_n_non_qa_rows_are_filtered,
     ]
     for t in tests:
         t()

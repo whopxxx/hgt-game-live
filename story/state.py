@@ -146,6 +146,14 @@ class QARec:
     comment: str = ""
     kind: str = "qa"       # "qa" | "hint" | "nudge"
     ts: float = 0.0
+    #: R2: 本题内的**真实提交顺序**序号(Engine lock 内自增)。
+    #:
+    #: `ts` 是墙钟, 并发回包可以落在同一刻度上; 这个计数器不会。贡献链
+    #: 按它排序才能保证"谁先补上那一块"是结构性正确的。`ts` 仍然保留,
+    #: 它回答的是另一个问题("这条发生在直播的第几秒")。
+    #:
+    #: 提示/重述(qid < 0)不参与, 恒为 0。
+    commit_seq: int = 0
     # ---- 裁判覆盖结果(仅落盘/复盘, 不上屏) ----
     status: str = "ok"     # ok | unavailable
     is_guess: Optional[bool] = None
@@ -157,6 +165,31 @@ class QARec:
     established_fact_ids: Optional[list] = None
     #: v6: 上述集合里, **由 completion 复核补入**的那几条(只进 archive)。
     completion_verified_fact_ids: Optional[list] = None
+    #: R1: 这条真人问答在**实际提交到 Engine 的那一刻**, 首次为房间
+    #: 新增了哪些 `completion_fact_ids`。
+    #:
+    #: ## 为什么不能拿 `established_fact_ids` 倒推
+    #:
+    #: `established_fact_ids` 是"这条问答语义上建立了什么", 描述的是
+    #: **语义**。而揭晓贡献链要回答的是"**谁**把拼图放上去的" ——
+    #: 那是**时序**问题, 两者不是一回事。
+    #:
+    #: Answer 并发 5 条, 回包顺序与 qid 顺序无关。可能:
+    #:     qid=2 先返回 -> 第一次建立 f1
+    #:     qid=1 后返回 -> 又"确认"了一次 f1
+    #: 而 `_qa_archive` 会按 qid 重排成 1,2,3。若揭晓时扫 archive 倒推:
+    #:     seen = set()
+    #:     for rec in archive: ...      # ✗ 会把 f1 的功劳记给 qid=1
+    #: 真正推进进度的是 qid=2, 记账却算在 qid=1 头上 —— 公屏会表彰错人。
+    #:
+    #: 所以归属在 `submit_qa()` 的 Engine lock 内、状态提交那一刻就算定,
+    #: 见 engine 里的 before-snapshot 差分。
+    #:
+    #: 语义: 本字段非空 ⟺ 这条问答**真的把房间进度往前推了一格**。
+    #: "语义上又确认了一遍 f1" 若 f1 早已建立, 这里就是空。
+    #:
+    #: 只进 `to_archive()`, **绝不进 `to_json()`** —— 前端永远不看 fact ID。
+    completion_contribution_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
 
     def to_json(self) -> dict[str, Any]:
@@ -179,6 +212,8 @@ class QARec:
         d = self.to_json()
         d.update({
             "status": self.status,
+            # R2: 真实提交顺序 —— archive 需要它来复盘贡献归属。
+            "commit_seq": self.commit_seq,
             "is_guess": self.is_guess,
             "cause_hit": self.cause_hit,
             "mechanism_hit": self.mechanism_hit,
@@ -187,6 +222,9 @@ class QARec:
             "established_fact_ids": self.established_fact_ids,
             "completion_verified_fact_ids":
                 self.completion_verified_fact_ids,
+            # R1: 只有 archive 知道"这条是谁真正推进的"。
+            "completion_contribution_fact_ids":
+                self.completion_contribution_fact_ids,
             "solution_candidate": self.solution_candidate,
         })
         return d
@@ -253,6 +291,16 @@ class Snapshot:
     # 也不该看到内部判定细节, 但复盘**必须**有 —— 否则只能看到"未中",
     # 不知道是 cause 没中还是 mechanism 没中。
     qa_archive: list[dict[str, Any]] = field(default_factory=list)
+    #: R2: 揭晓贡献链 —— "这题大家是怎么一起推出来的"。
+    #:
+    #: ⚠️ **内容全是已经公开过的信息**: 用户名 / 提问原文 / 裁决。
+    #: 内部 fact ID **绝不出现**在这里(筛选是服务端做的, 见
+    #: `Engine._reveal_contributors_locked`)。
+    #:
+    #: 只在 REVEALING / REVEALED 阶段非空。QA 阶段刻意不发: 这些文本
+    #: 本身早就公开过, 但**"哪几条刚好在通关路径上"**是新的信息 ——
+    #: 提前下发等于让前端(以及任何抓包的观众)提前知道题目快解开了。
+    reveal_contributors: list[dict[str, Any]] = field(default_factory=list)
     qa_total: int = 0                       # 含已滑出快照的条数 -> 前端只追加不重排
     pending_count: int = 0                  # 排队中(未答)的提问数 -> "AI 正在思考…"
     # ---- 提示 / 空闲 ----
@@ -302,6 +350,8 @@ class Snapshot:
             "solved_by": self.solved_by,
             "qa_log": self.qa_log,
             "qa_total": self.qa_total,
+            # R2: 揭晓贡献链(QA 阶段恒为空数组, 见字段说明)。
+            "reveal_contributors": self.reveal_contributors,
             "pending_count": self.pending_count,
             "hint_count": self.hint_count,
             "hint_text": self.hint_text,

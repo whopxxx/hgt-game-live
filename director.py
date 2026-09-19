@@ -765,6 +765,17 @@ class Director:
             reason=payload.get("reason", ""),
             winner=payload.get("winner", ""),
             reveal=text, qa=list(snap.qa_archive),
+            # R2: 公开贡献链 —— "这题大家是怎么一起推出来的"。
+            #
+            # **直接搬 payload 那份**, 不在这里重新推理: 归档发生时
+            # Engine 还在 REVEALING、reveal 状态尚未最终提交, payload
+            # 是那一刻唯一权威的快照。
+            #
+            # 形状固定为公开字段(qid/user_name/text/verdict/is_final),
+            # 内部 fact ID 在 Engine 侧就已经被筛掉了。要分析内部归属
+            # 请看 `qa` 里的 `completion_contribution_fact_ids`。
+            reveal_contributors=list(
+                payload.get("reveal_contributors") or []),
             # 出题时定下的原子事实与公平线索 —— 赛后复盘
             # "为什么这条没判中"时必须能对照它们。
             #

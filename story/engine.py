@@ -182,6 +182,17 @@ class RoundEngine:
         #: 自己把题解掉。
         self._established_fact_ids: set = set()
         self._qa_total = 0
+        #: R2: 本题**真实提交顺序**的单调序号 —— 每接受一条真人 QA +1。
+        #:
+        #: 为什么不能只用 `ts`: 并发 worker 回包可以落在同一个时钟刻度上
+        #: (尤其 FakeClock / 秒级精度的时钟), 此时 `(ts, qid)` 会退化成
+        #: **按 qid 排**, 而 qid 是**派发**顺序、不是**提交**顺序 ——
+        #: 恰好会在"谁是最后一块拼图"上表彰错人, 也就是贡献链最该答对的
+        #: 那一个问题。这个计数器在 Engine lock 内自增, 是结构性的顺序
+        #: 保证, 不依赖时钟分辨率。
+        #:
+        #: 只在本题内单调; 换题时随其它题内状态一起清零。
+        self._qa_commit_seq = 0
         self._verdict_counts: dict[str, int] = {}
         self._last_ask: dict[tuple[str, str], float] = {}   # 去重
         self._last_activity = 0.0
@@ -812,6 +823,7 @@ class RoundEngine:
             self._qa_log.clear()
             self._qa_archive.clear()
             self._qa_total = 0
+            self._qa_commit_seq = 0
             self._verdict_counts.clear()
             self._last_ask.clear()
             self._questions_total = 0
@@ -859,11 +871,32 @@ class RoundEngine:
                 # 边界**显式可查**: 将来 Step 14 实现 Detective 时,
                 # `submit_detective(...)` 绝不能调用它。提示 / nudge
                 # 同样绝不能调用。
+                #
+                # R1: union **之前**的 before-snapshot。贡献归属必须在
+                # 这一刻算, 不能等揭晓时从 established 倒推 —— 见
+                # `QARec.completion_contribution_fact_ids` 的说明。
+                before = set(self._established_fact_ids)
                 est = self._record_human_established_locked(
                     r.established_fact_ids, verdict=r.verdict,
                     status=r.status)
+                # R2: 真实提交顺序。**必须在这个 lock 内自增** —— 出了这里
+                # 就可能被别的 worker 插队, 序号就不再等于提交顺序。
+                self._qa_commit_seq += 1
+                # 这次真正新增的(est 是 `_record_human_established_locked`
+                # 采纳的 id, 已经过滤过不存在/重复的; 再减去 before 才
+                # 是"推进了房间进度"的那部分)。
+                #
+                # 只有落在 completion 合同里的才算**通关**贡献:
+                # support / exclusion fact 建立了也不推进通关, 不该上
+                # 贡献链 —— 否则"所有和谜底沾边的人"都会被列出来, 又变
+                # 成一屏噪音。
+                completion_contrib = [
+                    fid for fid in est
+                    if fid not in before and fid in self._completion_fact_ids
+                ]
                 rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
                             verdict=r.verdict, comment=r.comment, kind="qa", ts=now,
+                            commit_seq=self._qa_commit_seq,
                             status=r.status,
                             is_guess=r.is_guess, cause_hit=r.cause_hit,
                             mechanism_hit=r.mechanism_hit,
@@ -872,6 +905,8 @@ class RoundEngine:
                             established_fact_ids=est,
                             completion_verified_fact_ids=list(
                                 r.completion_verified_fact_ids or []) or None,
+                            completion_contribution_fact_ids=(
+                                completion_contrib or None),
                             solution_candidate=r.solution_candidate)
                 self._append_qa_locked(rec)
                 # 累加"观众已经探索过哪些方向"(方案 §32)。
@@ -1442,6 +1477,85 @@ class RoundEngine:
                 self._puzzle_index, sig.mechanism_family, sig.solution_shape,
                 len(self._recent_signatures))
 
+    def _reveal_contributors_locked(self) -> list[dict]:
+        """R2: 公开贡献链 —— "这题大家是怎么一起推出来的"。
+
+        ## 只读派生, 不维护第二套 ledger
+
+        每次调用都从 `_qa_archive` + `_completion_fact_ids` 现算。**不要**
+        在 `submit_qa` 里 `self._reveal_contributors.append(...)` ——
+        那会造出第二份可变状态, 与 `_qa_archive` 迟早不一致(换题清空、
+        迟到回包、失败重试都会让两份记录分叉)。
+
+        ## 谁算贡献
+
+        `completion_contribution_fact_ids` 非空 = 这条真人问答在**实际
+        提交的那一刻**首次为房间补进了一块通关拼图(见 R1)。
+
+        因此下面这些**一律不算**, 哪怕它们和谜底有关:
+          - support / exclusion fact:   建立了也不推进通关;
+          - `touched_fact_ids`:          只是问过这个方向;
+          - 重复确认(别人早说过了):       贡献是空的;
+          - hint / nudge:                `kind != "qa"`;
+          - 「未判定」:                   `status != "ok"`;
+          - 「无关」:                     它没确认任何东西。
+        将来 Step 14 的 Detective 也**绝不能**算进来 —— 这一层是
+        "真人共同解谜"的表彰, 系统自己推出来的不算。
+
+        ## 排序: 按真实提交顺序, 不按 archive 顺序
+
+        `_qa_archive` 被刻意按 qid 重排(展示/复盘需要), 而 qid 是
+        **派发顺序**, 不是完成顺序。并发 5 条时 qid=2 完全可能先回来。
+        贡献链要回答"谁先真正补上那一块", 所以按 `commit_seq` 排 ——
+        它在 Engine lock 内自增, 是**结构性**的提交顺序保证。
+
+        ⚠️ 刻意**不用** `(ts, qid)`: 同一时钟刻度上提交的两条会退化成
+        按 qid 排, 也就是按**派发**顺序排, 等于把归属倒过来 —— 而那正是
+        贡献链最该答对的那一问("谁是最后一块")。
+
+        ## 公开形状固定
+
+        调用方拿到的 dict **只**含 qid/user_name/text/verdict/is_final。
+        fact ID 是服务端内部筛选用的事实, 一到公屏就消灭 —— 前端永远
+        看不到 `completion_fact_ids` / `established_fact_ids` 这些东西。
+        """
+        comp = set(self._completion_fact_ids or ())
+        if not comp:
+            # 无合同的 legacy 题: 没有 completion 概念, 也就没有
+            # "谁推进了 completion"可谈。**不从旧 cause/mechanism
+            # 数据猜贡献** —— 猜出来的东西宁可没有。
+            return []
+        rows: list[QARec] = []
+        for rec in self._qa_archive:
+            if rec.kind != "qa":
+                continue
+            if rec.status != "ok":
+                continue
+            if rec.verdict not in (P.YES, P.NO):
+                continue
+            if not rec.completion_contribution_fact_ids:
+                continue
+            rows.append(rec)
+        # 按真实提交顺序 ── 这才是"谁先补上"的顺序。
+        rows.sort(key=lambda r: r.commit_seq)
+        out: list[dict] = []
+        covered: set = set()
+        for rec in rows:
+            # 累计覆盖, 谁让 `comp <= covered` 第一次成立谁就是最后一块。
+            #
+            # ⚠️ 刻意**不用** `user_name == solved_by` 来判定 is_final:
+            # 两个观众可以同名, 名字不是 identity。用集合覆盖推是确定性的。
+            covered |= {str(x) for x in (rec.completion_contribution_fact_ids
+                                         or [])}
+            out.append({
+                "qid": rec.qid,
+                "user_name": rec.user_name,
+                "text": rec.text,
+                "verdict": rec.verdict,
+                "is_final": comp <= covered,
+            })
+        return out
+
     def _record_human_established_locked(
             self, raw_ids, verdict: str = "", status: str = "") -> list:
         """把一条**真人 QA** 公开确认的事实并进房间共识。返回真正采纳的 id。
@@ -1571,6 +1685,11 @@ class RoundEngine:
             "spec": self._spec,
             # provenance 一路带到 archive(director._archive_reveal 读它)。
             "spec_source": self._spec_source,
+            # R2: 揭晓贡献链 —— 和 Snapshot 里那份**同源**, 都来自这里。
+            # director 归档时直接用它, 不重新推理(归档发生在 Engine 还是
+            # REVEALING、状态尚未最终提交的那一刻, director 手上没有别的
+            # 权威来源)。
+            "reveal_contributors": self._reveal_contributors_locked(),
             "transcript": self._transcript_locked(),
         })]
 
@@ -1711,6 +1830,13 @@ class RoundEngine:
                 solved_by=self._solved_by,
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
                 qa_archive=[r.to_archive() for r in self._qa_archive],
+                # R2: 只在揭晓阶段下发。QA 阶段这些文本虽然已经公开过,
+                # 但"哪几条在通关路径上"是新信息 —— 提前下发等于让前端
+                # 提前知道题目快解开了。
+                reveal_contributors=(
+                    self._reveal_contributors_locked()
+                    if self.phase in (Phase.REVEALING, Phase.REVEALED)
+                    else []),
                 qa_total=self._qa_total,
                 pending_count=len(self._pending) + len(self._inflight),
                 hint_count=self._hints_given,
