@@ -2840,6 +2840,24 @@ class PuzzleWriter:
         m = {"generation_attempts": 0, "review_calls": 0, "rewrite_count": 0}
         m["review_issues"] = []
         m["review_decision"] = ""
+        # ---- G4: 修复救回 vs 硬拒的对照计数 ----
+        #
+        # 任务书要求下一场直播能直接读到:
+        #
+        #     以前 10 次 hard reject
+        #     现在其中 6 次被 repair 救回
+        #
+        # 不用再从日志肉眼扒。三个量互斥且穷尽本轮出题的每一稿:
+        #     candidate_repair_count        —— 带 fixable 交审稿人修补
+        #     hard_reject_before_review_count —— 硬校验就毙(没花审稿)
+        #     repair_reasons                —— 按原因分类的计数
+        #
+        # `hard_reject_before_review` 这个名字是**故意的**: 它数的是
+        # "reviewer 之前就被毙掉"的那些(结构错误 / blueprint 违反),
+        # 而不是所有被拒的稿 —— 审稿语义拒绝是另一条路(rewrite_count)。
+        m["candidate_repair_count"] = 0
+        m["hard_reject_before_review_count"] = 0
+        m["repair_reasons"] = {}
         # 审稿**累计**耗时(第三轮 review): 一题可能审多次, 所以是 total。
         # 复盘时用 total / review_calls 自己算均值 —— 只存"最后一次"
         # 会把"审了 5 次"的题算得和"审了 1 次"一样快。
@@ -2936,6 +2954,7 @@ class PuzzleWriter:
             vr = validate_spec(spec)
             if not vr.ok:
                 log.info("出题第 %d 稿硬校验不过: %s", attempts, vr.why()[:120])
+                m["hard_reject_before_review_count"] += 1
                 _remember(seen_why, "结构问题: " + vr.why()[:120])
                 bad.append(spec.puzzle)
                 last = spec
@@ -2947,6 +2966,7 @@ class PuzzleWriter:
                   else ValidationResult())
             if not vb.ok:
                 log.info("出题第 %d 稿违反 blueprint: %s", attempts, vb.why()[:120])
+                m["hard_reject_before_review_count"] += 1
                 _remember(seen_why, "违反 blueprint: " + vb.why()[:120])
                 bad.append(spec.puzzle)
                 last = spec
@@ -2962,6 +2982,14 @@ class PuzzleWriter:
             # SETTING, 再往下就是又一轮几十秒的审稿。
             if _stop():
                 break
+            # ---- G4: 记下"这一稿是带病送来修的" ----
+            # 有 fixable 却走到这里, 说明它**没有**被硬拒 —— 正是
+            # "repair 救回"的那一类。按原因分类累积, 下一场直播直接看数。
+            if vr.fixable:
+                m["candidate_repair_count"] += 1
+                for _slug in vr.fix_reasons():
+                    m["repair_reasons"][_slug] = (
+                        m["repair_reasons"].get(_slug, 0) + 1)
             _tr = _t.monotonic()
             reviewed, why, need_rewrite, technical = self._review_spec_with_retry(
                 spec, bp, must_fix=vr.must_fix(),

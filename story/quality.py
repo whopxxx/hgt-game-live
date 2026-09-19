@@ -161,6 +161,53 @@ class ValidationResult:
         """这次修复是否**完全**不需要动谜面(且确实有要修的东西)。"""
         return bool(self.fixable) and not self.puzzle_touching_fix()
 
+    def fix_reasons(self) -> list:
+        """把 `fixable` 归成**短标签**, 供指标/日志按原因分类。
+
+        ---- G4 可观测性 ----
+        任务书要求下一场直播能直接看到:
+
+            以前 10 次 hard reject
+            现在其中 6 次被 repair 救回
+
+        没有这个分类就只能从日志肉眼看。**不新增任何 LLM 调用**, 纯粹
+        是对已经算出来的 `fixable` 文案做归类。
+
+        判据是**子串匹配**, 顺序即优先级(一条文案只归一类)。这与
+        `puzzle_touching_fix()` 用文本标记是同一个理由: 文案的**生产者**
+        只有本文档里的那几处 `can_fix()`, 多处各写一份判据必然漂移。
+
+        认不出的文案一律归 `"other"` —— 宁可分类不全, 也不要猜错后
+        让指标说谎。
+        """
+        out: list = []
+        for f in self.fixable:
+            for slug, needle in _FIX_REASON_PATTERNS:
+                if needle in f:
+                    out.append(slug)
+                    break
+            else:
+                out.append("other")
+        return out
+
+
+#: `fix_reasons()` 的归类表。顺序即优先级 —— 先匹配到的先算。
+#: 每加一条新的 `can_fix()` 规则, 这里**应当**同步加一行; 忘了加不会
+#: 出错(落到 "other"), 只是指标少一个维度 —— 这个方向比"猜错"安全。
+_FIX_REASON_PATTERNS = (
+    ("puzzle_question", "谜面结尾不是问句"),
+    ("puzzle_person", "谜面是第一人称叙事"),
+    ("puzzle_meta", "谜面混进了"),
+    ("fact_enum", "的 kind 非法"),
+    ("fact_enum", "的 visibility 非法"),
+    ("core_length", "core_answer 有"),
+    ("linkage", "没有被任何 solve_atom 引用"),
+    ("linkage", "指向通关事实的推理路径"),
+    ("clue_quote", "fair_clue 缺 quote"),
+    ("clue_quote", "的 quote 不在谜面里"),
+    ("hint_fix", "条提示超过"),
+)
+
 
 #: 标在"**必须改动谜面**"的修复文案里的记号。
 #: 见 `ValidationResult.puzzle_touching_fix` —— 这是白名单, 不是黑名单。

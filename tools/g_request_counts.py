@@ -48,6 +48,19 @@ def _report(title, fc):
     return _count(fc, "emit_riddle")
 
 
+def _obs(spec):
+    """G4 可观测性: repair 救回 / 硬拒 的对照。"""
+    m = spec.metrics or {}
+    rep = m.get("candidate_repair_count", 0)
+    hard = m.get("hard_reject_before_review_count", 0)
+    print("    **repair 救回: %d / 硬拒(审稿前): %d**" % (rep, hard))
+    rr = m.get("repair_reasons") or {}
+    if rr:
+        print("    按原因: " + ", ".join("%s=%d" % kv
+                                        for kv in sorted(rr.items())))
+    return rep, hard
+
+
 def scenario_a():
     """核心场景: 81 字 core + clue quote 错 + Reviewer 首次技术失败。"""
     print("")
@@ -76,6 +89,7 @@ def scenario_a():
                     for c in (spec.fair_clues or []))
     print("    最终 quote 都在谜面里: %s" % quotes_ok)
     print("    出题成功: %s" % bool(spec.puzzle))
+    _obs(spec)
     print("")
     print("  >>> **generator 请求数 = %d**(任务书要求: 仍然只有 1 次)" % gens)
     return gens
@@ -217,6 +231,88 @@ def scenario_prefetch_yield():
     return ok
 
 
+
+def scenario_d_fact_enum():
+    """**G4-A**: fact kind=public / visibility=hidden -> repair 而不是换稿。
+
+    这是 G2 的真实漏口: 只有**完整互换**才会被自动纠正, 半错位落到
+    r.fail -> 整稿扔掉 -> 重新生成。实播日志里那三条
+    `fact f7 kind 非法: public` 走的正是这条路。
+    """
+    print("")
+    print(BAR)
+    print("场景 D: fact kind=public / visibility=hidden")
+    print(BAR)
+    P = T._GOOD_PUZ
+    bad = T.riddle()
+    bad["facts"][2] = dict(bad["facts"][2])
+    bad["facts"][2]["kind"] = "public"
+    bad["facts"][2]["visibility"] = "hidden"
+    fixed = T.review_fix(P)
+    fixed["facts"] = [dict(f) for f in fixed["facts"]]
+    fixed["facts"][2]["kind"] = "support"
+    fixed["facts"][2]["visibility"] = "public"
+    fc = T.FakeClient([
+        LLMResult(tool_input=bad, model="m"),
+        LLMResult(tool_input=fixed, model="m"),
+        T._truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    gens = _report("修复同一稿", fc)
+    _obs(spec)
+    kinds = [(f.id, f.kind) for f in (spec.facts or [])]
+    print("    最终 fact kind: %s" % kinds)
+    print("    出题成功: %s" % bool(spec.puzzle))
+    ok = gens == 1 and bool(spec.puzzle)
+    print("")
+    print("  >>> **generator = %d(应为 1: 修 enum 不换稿)** -> %s"
+          % (gens, "通过" if ok else "**不通过**"))
+    return ok
+
+
+def scenario_e_prefill():
+    """**G4-B**: prefill 必须真的看得见池内 signature。
+
+    旧实现直接摸 `pool._items` 并 `isinstance(rec, dict)` —— 而里面装的
+    是 `PuzzleSpec` **对象**, 于是永远返回 []。预热会连补同 pair 的题
+    并打印"达标", 真开播时库存立刻塌。
+    """
+    print("")
+    print(BAR)
+    print("场景 E: prefill 看得见池内 signature(真实 PuzzlePool)")
+    print(BAR)
+    import random
+    import tempfile
+    import prefill_pool as PF
+    from story.pool import PuzzlePool
+    from story.quality import Quotas, choose_blueprint
+
+    d = tempfile.mkdtemp()
+    cfg = _mkcfg(d)
+    sys.path.insert(0, os.path.join(_ROOT, "tests"))
+    import test_prefetch as TP                        # noqa: E402
+    pool = PuzzlePool.open(_mkcfg(tempfile.mkdtemp()))
+    pool.add(TP.variant(100))
+    sigs = PF._recent_sigs(pool, cfg)
+    print("    池内 1 道 -> prefill recent = %d 条" % len(sigs))
+    # 调度器必须避开已有的 exact pair
+    if sigs:
+        blocked = (sigs[0].mechanism_family, sigs[0].solution_shape)
+    else:
+        blocked = None
+    hits = 0
+    for seed in range(60):
+        bp = choose_blueprint(sigs, rng=random.Random(seed), quotas=Quotas())
+        if blocked and (bp.mechanism_family, bp.solution_shape) == blocked:
+            hits += 1
+    print("    **60 个种子选中已有 pair 的次数: %d(应为 0)**" % hits)
+    ok = len(sigs) == 1 and hits == 0
+    print("")
+    print("  >>> recent 非空 且 不自我重复 -> %s"
+          % ("通过" if ok else "**不通过**"))
+    return ok
+
 def main() -> int:
     print(BAR)
     print("Batch G 验收 —— 请求计数对照")
@@ -224,11 +320,16 @@ def main() -> int:
     gens = scenario_a()
     ok_b = scenario_prefetch_guard()
     ok_c = scenario_prefetch_yield()
+    ok_d = scenario_d_fact_enum()
+    ok_e = scenario_e_prefill()
     print("")
     print(BAR)
-    ok = (gens == 1) and ok_b and ok_c
-    print("结论: generator 请求数 = %d(要求 1); 场景 B %s; 场景 C %s"
-          % (gens, "通过" if ok_b else "不通过", "通过" if ok_c else "不通过"))
+    ok = (gens == 1) and ok_b and ok_c and ok_d and ok_e
+    print("结论: generator 请求数 = %d(要求 1); B %s; C %s; D %s; E %s"
+          % (gens, "通过" if ok_b else "不通过",
+             "通过" if ok_c else "不通过",
+             "通过" if ok_d else "不通过",
+             "通过" if ok_e else "不通过"))
     print("总体: %s" % ("**全部通过**" if ok else "**有不通过项**"))
     print(BAR)
     return 0 if ok else 1

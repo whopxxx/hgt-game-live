@@ -3820,6 +3820,111 @@ def test_g2f_no_draft_requests_are_capped():
     check("确实没出题", not spec.puzzle, spec.puzzle[:20])
 
 
+
+def test_g4_repair_vs_hard_reject_counts():
+    """**G4 可观测性**: 出题指标必须能回答"几次 repair 救回了几次硬拒"。
+
+    任务书要求下一场直播直接看到:
+
+        以前 10 次 hard reject
+        现在其中 6 次被 repair 救回
+
+    没有这三个量就只能从日志肉眼看。它们**不新增任何 LLM 调用**,
+    纯粹是对已经算出来的结果做分类。
+
+    三个量互斥且穷尽本轮出题的每一稿:
+        candidate_repair_count          —— 带 fixable 交审稿人修补
+        hard_reject_before_review_count —— 硬校验就毙(没花审稿)
+        rewrite_count                   —— 审稿语义拒绝(已有)
+    """
+    print("\n[G4-OBS] repair vs hard-reject 计数")
+    # ---- ① 一稿带 core 超长(可修) -> repair 计数 + 分类 ----
+    P = _GOOD_PUZ
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(core_answer="他" * 100), model="m"),
+        LLMResult(tool_input=review_ok(P, core_answer="短答案。"), model="m"),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    m = spec.metrics
+    check("**candidate_repair_count = 1**",
+          m.get("candidate_repair_count") == 1, m.get("candidate_repair_count"))
+    check("**repair_reasons 归到了 core_length**",
+          m.get("repair_reasons", {}).get("core_length") == 1,
+          m.get("repair_reasons"))
+    check("硬拒计数为 0(它没被硬拒)",
+          m.get("hard_reject_before_review_count") == 0,
+          m.get("hard_reject_before_review_count"))
+    check("出题成功", bool(spec.puzzle), spec.puzzle[:30])
+
+    # ---- ② 一稿结构错误 -> hard_reject 计数, 不花审稿 ----
+    bad = riddle()
+    bad["facts"] = [dict(f) for f in bad["facts"]]
+    bad["facts"][0]["text"] = ""          # fact 文本为空 -> 硬拒
+    fc2 = FakeClient([
+        LLMResult(tool_input=bad, model="m"),
+        LLMResult(tool_input=riddle(), model="m"),
+        LLMResult(tool_input=review_ok(P), model="m"),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    spec2 = w2.gen_spec(blueprint=fc2.default_blueprint)
+    m2 = spec2.metrics
+    check("**hard_reject_before_review_count = 1**",
+          m2.get("hard_reject_before_review_count") == 1,
+          m2.get("hard_reject_before_review_count"))
+    check("那一稿没走进审稿(第一稿没花审稿调用)",
+          m2.get("candidate_repair_count") == 0,
+          m2.get("candidate_repair_count"))
+
+    # ---- ③ fact enum 错位(G4-A) 现在算 repair 而不是 hard reject ----
+    bad3 = riddle()
+    bad3["facts"] = [dict(f) for f in bad3["facts"]]
+    bad3["facts"][2]["kind"] = "public"
+    bad3["facts"][2]["visibility"] = "hidden"
+    fixed3 = review_ok(P)
+    fixed3["facts"] = [dict(f) for f in fixed3["facts"]]
+    fixed3["facts"][2]["kind"] = "support"
+    fixed3["facts"][2]["visibility"] = "public"
+    fc3 = FakeClient([
+        LLMResult(tool_input=bad3, model="m"),
+        LLMResult(tool_input=fixed3, model="m"),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w3 = PuzzleWriter(client=fc3, runtime_cfg=fc3.runtime_cfg)
+    spec3 = w3.gen_spec(blueprint=fc3.default_blueprint)
+    m3 = spec3.metrics
+    check("**fact enum 归到 repair(不是 hard reject)**",
+          m3.get("candidate_repair_count") == 1
+          and m3.get("hard_reject_before_review_count") == 0,
+          (m3.get("candidate_repair_count"),
+           m3.get("hard_reject_before_review_count")))
+    check("**分类为 fact_enum**",
+          m3.get("repair_reasons", {}).get("fact_enum") == 1,
+          m3.get("repair_reasons"))
+
+
+def test_g4_fix_reasons_never_guesses():
+    """认不出的 fixable 文案 -> "other", **不猜**。
+
+    猜错会让指标说谎 —— 那比分类不全更糟。
+    """
+    print("\n[G4-OBS2] fix_reasons 不猜")
+    from story.quality import ValidationResult
+    vr = ValidationResult()
+    vr.can_fix("一条全新的、归类表里没有的修复要求")
+    check("**认不出 -> other**", vr.fix_reasons() == ["other"],
+          vr.fix_reasons())
+    vr2 = ValidationResult()
+    vr2.can_fix("core_answer 有 90 字, 超过 80 字上限")
+    check("认得出 core_length", vr2.fix_reasons() == ["core_length"],
+          vr2.fix_reasons())
+    check("**空 fixable -> 空分类(不产生假 other)**",
+          ValidationResult().fix_reasons() == [],
+          ValidationResult().fix_reasons())
+
+
 def main():
     for t in (test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
@@ -3960,6 +4065,9 @@ def main():
               # ---- G4-A: fact enum 错位不再换稿 ----
               test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft,
               test_g4a_enums_are_imported_for_the_swap,
+              # ---- G4: 可观测性 ----
+              test_g4_repair_vs_hard_reject_counts,
+              test_g4_fix_reasons_never_guesses,
               test_q2_discovery_beats_schema_and_prompts,
               test_q2_v7_pool_quarantined_but_v8_eligible,
               test_q2_reviewer_all_four_new_fields_required,
