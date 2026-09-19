@@ -17,7 +17,7 @@
     stage: $("stage"),
     puzzleIndex: $("puzzle-index"), puzzleElapsed: $("puzzle-elapsed"),
     puzzleTimer: $("puzzle-timer"),
-    puzzle: $("puzzle"),
+    puzzleViewport: $("puzzle-viewport"), puzzle: $("puzzle"),
     reveal: $("reveal"), revealBody: $("reveal-body"), revealNext: $("reveal-next"),
     revealLabel: $("reveal-label"),
     revealCore: $("reveal-core"), revealWho: $("reveal-who"),
@@ -46,6 +46,94 @@
   }
   window.addEventListener("resize", fit);
   fit();
+
+  // 同一份可取消控制器服务谜面与完整解释。key 不变时什么也不做，
+  // 所以 4Hz snapshot 不会把阅读位置反复拉回顶部。
+  const SCROLL_TIMING = Object.assign({
+    topHoldMs: 3000, bottomHoldMs: 4500, speedPxPerSec: 26,
+  }, window.__AUTO_SCROLL_TIMING__ || {});
+
+  class AutoScroller {
+    constructor(viewport) {
+      this.viewport = viewport;
+      this.key = null;
+      this.generation = 0;
+      this.timer = null;
+      this.loop = false;
+    }
+
+    update(key, active, loop) {
+      if (!active) {
+        this.cancel();
+        return;
+      }
+      if (this.key === key) return;
+      this.cancel();
+      this.key = key;
+      this.loop = loop;
+      const generation = this.generation;
+      // 让本轮 render + layout 完成后再量真实 overflow。
+      this.timer = setTimeout(() => this.start(generation), 0);
+    }
+
+    cancel() {
+      this.generation++;
+      if (this.timer != null) {
+        clearTimeout(this.timer);
+        clearInterval(this.timer);
+      }
+      this.timer = null;
+      this.key = null;
+      this.viewport.scrollTop = 0;
+      this.viewport.removeAttribute("data-auto-scroll");
+      this.viewport.removeAttribute("data-scroll-state");
+    }
+
+    start(generation) {
+      if (generation !== this.generation) return;
+      const max = Math.max(0, this.viewport.scrollHeight
+                             - this.viewport.clientHeight);
+      if (max <= 1) {
+        this.viewport.setAttribute("data-scroll-state", "static");
+        return;
+      }
+      this.viewport.setAttribute("data-auto-scroll", "true");
+      this.viewport.setAttribute("data-scroll-state", "top");
+      this.timer = setTimeout(() => this.move(generation, max),
+                              SCROLL_TIMING.topHoldMs);
+    }
+
+    move(generation, max) {
+      if (generation !== this.generation) return;
+      const started = performance.now();
+      const duration = max / Math.max(1, SCROLL_TIMING.speedPxPerSec) * 1000;
+      this.viewport.setAttribute("data-scroll-state", "moving");
+      const step = () => {
+        if (generation !== this.generation) return;
+        const now = performance.now();
+        const progress = Math.min(1, (now - started) / duration);
+        this.viewport.scrollTop = max * progress;
+        if (progress < 1) return;
+        clearInterval(this.timer);
+        this.timer = null;
+        this.viewport.scrollTop = max;
+        this.viewport.setAttribute("data-scroll-state", "bottom");
+        if (!this.loop) return;
+        this.timer = setTimeout(() => {
+          if (generation !== this.generation) return;
+          this.viewport.scrollTop = 0;
+          this.viewport.setAttribute("data-scroll-state", "top");
+          this.timer = setTimeout(() => this.move(generation, max),
+                                  SCROLL_TIMING.topHoldMs);
+        }, SCROLL_TIMING.bottomHoldMs);
+      };
+      this.timer = setInterval(step, 16);
+      step();
+    }
+  }
+
+  const puzzleScroller = new AutoScroller(el.puzzleViewport);
+  const revealScroller = new AutoScroller(el.revealBody);
 
   // ================= 上半部: 谜面 =================
   let lastPuzzleIndex = undefined;
@@ -105,75 +193,6 @@
     const txt = s.puzzle || "";
     if (el.puzzle.textContent !== txt) el.puzzle.textContent = txt;
     el.puzzleElapsed.textContent = s.phase === "qa" ? fmtElapsed(s.puzzle_elapsed_ms) : "";
-  }
-
-  // 揭晓层字号自适应: 42px 基准, 内容超高就缩, 下限 22px。
-  //
-  // ⚠️ 可用高度必须**按 DOM 实际高度算**, 不能像早先那样写死常数。
-  //
-  // U1 起**只对 #reveal-body(完整解释)缩字号**:
-  //   - #reveal-core 是视觉第一层, 字号由 CSS 定死 64px, **绝不改**。
-  //     早先两者共用一个正文块, fitReveal 会一路缩到 22px —— 那正是
-  //     "原来如此那一下看不清"的根因。
-  //   - 贡献链字号小且最多 1~2 条(completion 合同上限 2 个 fact),
-  //     缩它只会让它不可读。
-  // 所以这里只留一个可压缩区域, 下限 34px。
-  //
-  // ⚠️ U2: 三阶段下这仍然是**兜底**, 不是正常路径。正常质量政策允许的
-  // answer 必须在 explanation 阶段**不用滚动**就完整可见(由 Web 测试的
-  // `body.scrollHeight <= body.clientHeight` 钉住)。缩字号只在极端超长
-  // 文本时兜底 —— 而且下限 34px 保证它不会退回到"22px 看不清"。
-  //
-  // ⚠️ C2: 可用高度是**下半部工作区**的高度(约 1920 - TOP_MIN=620
-  // 到 1920 - TOP_MAX=1000), 不再是整屏。`el.reveal.clientHeight` 会
-  // 自动反映这一点(它是 #bottom 那个矩形的孪生), 所以这里的算法不用改
-  // —— 只要别再有人把 #reveal 改回 inset:0。
-  const REVEAL_EXPLAIN_BASE = 34;
-  const REVEAL_EXPLAIN_MIN = 34;
-  let lastRevealFitKey = null;
-  function fitReveal(fullText, coreText, stage) {
-    // 只在"会影响布局的东西"变化时重算 —— 每次推送都量 DOM 会很贵,
-    // 而这函数在 4Hz 的推送里被调用。
-    //
-    // ⚠️ 这里原本用一个裸控制字节当分隔符。它本身无害, 但它
-    // 让文件里藏了一个不可见字节 —— 任何按文本处理的工具(补丁脚本 /
-    // 编辑器的查找替换 / 复制粘贴)都可能把它吃掉或换成别的字符, 于是
-    // "同一份代码"在两次读之间就不再相等。U2 顺手换成可见的 `|`。
-    // (拼接出来的 key 只用于相等比较, 不在任何地方被解析, 所以换分隔符
-    //  不影响语义 —— 真要小心的是别让 key 本身变得有歧义: 文本里出现
-    //  `|` 只会让两个不同输入撞成同一个 key, 而那仅仅是"少重算一次",
-    //  下一次内容变化一定会重算。)
-    const key = [fullText || "", coreText || "", stage || "",
-                 el.revealContrib.classList.contains("hidden"),
-                 el.revealBody.classList.contains("hidden")].join("|");
-    if (lastRevealFitKey === key) return;
-    lastRevealFitKey = key;
-    if (el.revealBody.classList.contains("hidden")) return;
-    // 先把字号复位再量 —— 否则上一阶段缩过的字号会留着, 新阶段明明
-    // 空间更大却仍显示小字。
-    el.revealBody.style.fontSize = REVEAL_EXPLAIN_BASE + "px";
-    const rs = getComputedStyle(el.reveal);
-    const padding = (parseFloat(rs.paddingTop) || 0)
-                  + (parseFloat(rs.paddingBottom) || 0);
-    const gap = parseFloat(rs.rowGap || rs.gap || "0") || 0;
-    // 固定高度的块: 标题 + 核心答案 + "谁补齐的" + 贡献链(可见时) + 倒计时
-    let fixed = el.revealLabel.offsetHeight + el.revealCore.offsetHeight;
-    const whoHidden = el.revealWho.classList.contains("hidden");
-    if (!whoHidden) fixed += el.revealWho.offsetHeight;
-    const contribHidden = el.revealContrib.classList.contains("hidden");
-    if (!contribHidden) fixed += el.revealContrib.offsetHeight;
-    fixed += el.revealNext.offsetHeight;
-    // flex 的 gap 出现在**每个**可见块之间。
-    const visibleBlocks = 3 + (whoHidden ? 0 : 1) + (contribHidden ? 0 : 1);
-    const avail = el.reveal.clientHeight - padding - fixed
-                - gap * (visibleBlocks - 1);
-    if (!(avail > 0)) return;          // 布局还没稳, 别把字号缩成 0
-    let fs = REVEAL_EXPLAIN_BASE;
-    for (let i = 0; i < 14 && fs > REVEAL_EXPLAIN_MIN; i++) {
-      if (el.revealBody.scrollHeight <= avail) break;
-      fs -= 2;
-      el.revealBody.style.fontSize = fs + "px";
-    }
   }
 
   // 换题过渡提示(短暂显示后淡出)
@@ -260,6 +279,18 @@
     return s.reveal_detail_visible ? "explanation" : "core";
   }
 
+  function revealTexts(s) {
+    const structured = !!s.revealed_core_answer;
+    return {
+      core: structured
+        ? s.revealed_core_answer
+        : (s.revealed_full_answer || s.revealed_answer || ""),
+      full: structured
+        ? (s.revealed_full_answer || "")
+        : (s.revealed_full_answer || s.revealed_answer || ""),
+    };
+  }
+
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
     el.reveal.classList.toggle("hidden", !on);
@@ -282,7 +313,6 @@
       el.revealWho.textContent = "";
       el.revealWho.classList.add("hidden");
       el.revealBody.textContent = "";
-      lastRevealFitKey = null;
       return;
     }
 
@@ -309,13 +339,8 @@
     //
     // 所以: **有结构化 core 时, full 为空就让它空着。**
     // 只有 legacy(没有 core)才允许往 `revealed_answer` 退。
-    const hasStructuredCore = !!s.revealed_core_answer;
-    const core = hasStructuredCore
-      ? s.revealed_core_answer
-      : (s.revealed_full_answer || s.revealed_answer || "");
-    const full = hasStructuredCore
-      ? (s.revealed_full_answer || "")
-      : (s.revealed_full_answer || s.revealed_answer || "");
+    const texts = revealTexts(s);
+    const core = texts.core, full = texts.full;
     if (el.revealCore.textContent !== core) el.revealCore.textContent = core;
 
     // ---- "XX 补齐最后线索" —— 只在该题是 solved 时出现 ----
@@ -334,7 +359,6 @@
     el.revealBody.classList.toggle("hidden", !showDetail);
     if (showDetail && el.revealBody.textContent !== full) {
       el.revealBody.textContent = full;
-      lastRevealFitKey = null;
     }
 
     // ---- 共同解谜: 只在 contribution 阶段显示 ----
@@ -344,9 +368,6 @@
     } else {
       renderRevealContributors({reveal_contributors: []});
     }
-    // 核心/贡献链的显隐改变了可用高度 -> 重算解释区字号。
-    fitReveal(full, core, stage);
-
     if (s.next_puzzle_ms != null) {
       el.revealNext.textContent = Math.ceil(s.next_puzzle_ms / 1000) + " 秒后开启新谜题";
     } else {
@@ -533,16 +554,15 @@
     const stageH = 1920;
     const avail = stageH;
 
-    // 谜面过长时按内容自动缩小字号(而不是溢出压到问答流上)。
-    // 58px 是基准; 内容越高缩得越小, 下限 30px。
+    // 谜面先适配字号；到 46px 仍 overflow 就交给 AutoScroller。
     const maxPuzzleH = TOP_MAX - 260;                // 谜面可用高度
     let fs = 58;
-    for (let i = 0; i < 12 && fs > 30; i++) {
+    for (let i = 0; i < 8; i++) {
       if (el.puzzle.style.fontSize === fs + "px"
           && el.puzzle.scrollHeight <= maxPuzzleH) break;
       el.puzzle.style.fontSize = fs + "px";
-      if (el.puzzle.scrollHeight <= maxPuzzleH) break;
-      fs -= 3;
+      if (el.puzzle.scrollHeight <= maxPuzzleH || fs === 46) break;
+      fs = Math.max(46, fs - 3);
     }
 
     // ⚠️ 这里读 `el.puzzle.scrollHeight` —— 对 `display:none` 的元素它恒为
@@ -625,6 +645,17 @@
     renderStats(s);
     renderDebug(s);
     layout();
+    puzzleScroller.update(
+      JSON.stringify([s.puzzle_index, s.puzzle || "", s.phase || ""]),
+      s.phase === "qa", true);
+    const revealStage = revealStageOf(s);
+    const revealText = revealTexts(s).full;
+    const revealOn = !!(s.revealed_answer
+      && (s.phase === "revealed" || s.phase === "revealing"));
+    revealScroller.update(
+      JSON.stringify([s.puzzle_index, revealStage, revealText]),
+      revealOn && revealStage === "explanation"
+        && !el.revealBody.classList.contains("hidden"), false);
   }
 
   document.addEventListener("keydown", function (e) {

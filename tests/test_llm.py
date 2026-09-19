@@ -3541,6 +3541,48 @@ def test_g2a_core_answer_121_is_hard_fail():
     check("采用了第二稿", "二稿" in (spec.puzzle or ""), spec.puzzle[:30])
 
 
+def test_u4_livestream_text_length_bounds():
+    """U4 长度合同只加硬门，不改变 core_answer 的既有分档。"""
+    print("\n[U4-LENGTH] puzzle/answer 硬上限；core 合同不变")
+    from story.puzzle import PuzzleSpec
+    from story.quality import (
+        ANSWER_HARD_MAX_LEN, CORE_ANSWER_MAX_LEN,
+        PUZZLE_HARD_MAX_LEN, validate_spec,
+    )
+
+    def spec(puzzle_len=PUZZLE_HARD_MAX_LEN,
+             answer_len=ANSWER_HARD_MAX_LEN,
+             core_len=CORE_ANSWER_MAX_LEN):
+        puzzle = "灯" * (puzzle_len - 4) + "为什么？"
+        data = riddle(puzzle=puzzle, answer="底" * answer_len,
+                      core_answer="核" * core_len,
+                      quality_policy_version=QUALITY_POLICY_VERSION)
+        return PuzzleSpec.from_dict(data)
+
+    at_limit = validate_spec(spec())
+    check("puzzle=220 / answer=300 / core=80 通过",
+          at_limit.ok and not at_limit.fixable,
+          (at_limit.errors, at_limit.fixable))
+
+    puzzle_over = validate_spec(spec(puzzle_len=PUZZLE_HARD_MAX_LEN + 1))
+    check("puzzle=221 硬失败",
+          not puzzle_over.ok and any("谜面超过直播展示硬上限" in e
+                                     for e in puzzle_over.errors),
+          puzzle_over.errors)
+
+    answer_over = validate_spec(spec(answer_len=ANSWER_HARD_MAX_LEN + 1))
+    check("answer=301 硬失败",
+          not answer_over.ok and any("谜底超过直播展示硬上限" in e
+                                     for e in answer_over.errors),
+          answer_over.errors)
+
+    core_81 = validate_spec(spec(core_len=CORE_ANSWER_MAX_LEN + 1))
+    check("core_answer=81 仍是原有 fixable 语义",
+          core_81.ok and any("core_answer 有 81 字" in f
+                             for f in core_81.fixable),
+          (core_81.errors, core_81.fixable))
+
+
 def test_g2b_clue_quote_repaired_in_place():
     """**G2-B**: quote 不在谜面 -> 就地改 quote, **不换稿**。"""
     print("\n[G2-B] clue quote 不在谜面 -> 就地修")
@@ -4256,6 +4298,7 @@ def main():
               # ---- G2: 可修问题不再整题重造 ----
               test_g2a_core_answer_81_is_repaired_not_regenerated,
               test_g2a_core_answer_121_is_hard_fail,
+              test_u4_livestream_text_length_bounds,
               test_g2b_clue_quote_repaired_in_place,
               test_g2b_reviewer_must_not_change_puzzle_for_quote,
               test_g2c_linkage_is_fixable_but_missing_content_is_not,
