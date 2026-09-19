@@ -76,7 +76,7 @@ from typing import Any, Callable, Optional
 from tools.curated_compiler import CURATED_POLICY_VERSION, CuratedCompiler
 from tools.curated_ledger import (
     ACCEPTED, COMPILE_INVALID_STAGES, INTERRUPTED, REJECTED, TECHNICAL_DEFER,
-    DecisionLedger, content_hash_of,
+    DecisionLedger, content_hash_of, looks_like_compile_invalid,
 )
 log = logging.getLogger("hgt.lazycurator")
 
@@ -935,6 +935,20 @@ class LazyCurator:
         # stage 保持原值(报告要按原因分类), 但 decision 是 defer。
         if stage in self._COMPILE_INVALID_STAGES:
             return (TECHNICAL_DEFER, stage,
+                    reasons or [f"compile_invalid:{stage}"])
+        # ---- reason 说是结构问题 -> 同样不是内容判决 ----
+        #
+        # 实测错配: `_deepest` 记的是**走到过最深**的门, 而
+        # `reject_reasons` 取的是**最后一次**尝试的原因 —— 两者来自不同
+        # 稿件时, 会出现 stage=truth_audit 而 reason="第 2 条提示超过
+        # 30 字"。只看 stage 会把一条 hint 超长算成"审计没过"。
+        #
+        # ⚠️ 但**硬内容门优先**: ai_gate / story_gate / story_review 是
+        # 确定性内容判决, 它们一旦出现就说明这道题**内容**已经被否了 ——
+        # 那时不该因为 reason 里恰好有个"提示"字样就改判成 defer。
+        if stage not in ("ai_gate", "story_gate", "story_review") and \
+                looks_like_compile_invalid(stage, reasons):
+            return (TECHNICAL_DEFER, stage or "compile_invalid",
                     reasons or [f"compile_invalid:{stage}"])
         # ---- 复核**缺失**同样是技术失败, 不是内容拒绝 ----
         #

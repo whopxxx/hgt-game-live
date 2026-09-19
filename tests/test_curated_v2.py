@@ -1154,6 +1154,45 @@ def test_stratified_sample_is_deterministic_and_spread():
           len(stratified_sample(recs, 999)) == 200)
 
 
+def test_structural_reason_beats_shallow_stage():
+    """实测错配: stage 是深门, reason 却是结构问题 -> 仍算 compile_invalid。
+
+    `_deepest` 记"走到过最深"的门, `reject_reasons` 取"最后一次"尝试的
+    原因 —— 两者来自不同稿件时会错配。实跑抓到:
+
+        stage  = truth_audit            (最深走到审计)
+        reason = 第 2 条提示超过 30 字   (另一次尝试死在 hint 长度)
+
+    只看 stage 会把一条 hint 超长算成"审计没过"。
+    """
+    print("\n[H4-C §十四] reason 说是结构问题 -> compile_invalid")
+    from story.lazy_curator import LazyCurator
+    from tools.curated_ledger import REJECTED, TECHNICAL_DEFER
+    cur = LazyCurator.__new__(LazyCurator)
+    cur._budget = 45.0
+    dec, stage, _r = cur._classify(
+        None, {"stage": "truth_audit",
+               "reject_reasons": ["第 2 条提示超过 30 字(31 字)"]}, 0.5)
+    check("**hint 超长不再算内容拒绝**", dec == TECHNICAL_DEFER, dec)
+    dec, _s, _r = cur._classify(
+        None, {"stage": "truth_audit",
+               "reject_reasons": ["completion fact f3 没有被任何 solve_atom "
+                                  "引用"]}, 0.5)
+    check("completion 连线问题也算 compile_invalid",
+          dec == TECHNICAL_DEFER, dec)
+    # ---- 反向: **硬内容门优先** ----
+    # 一道被 story_gate 判死的题, 哪怕 reason 里恰好提到"提示", 也不该
+    # 被改判成 defer —— 它的**内容**已经被确定性门否了。
+    dec, _s, _r = cur._classify(
+        None, {"stage": "ai_gate",
+               "reject_reasons": ["not_a_story", "提示超过 30 字"]}, 0.5)
+    check("**ai_gate 上的内容判决优先于 reason 指纹**",
+          dec == REJECTED, dec)
+    dec, _s, _r = cur._classify(
+        None, {"stage": "story_gate", "reject_reasons": ["single_trick"]}, 0.5)
+    check("story_gate 仍是 rejected", dec == REJECTED, dec)
+
+
 # ======================================================================
 def main():
     tests = [
@@ -1197,6 +1236,7 @@ def main():
         test_checks_do_not_affect_decision_identity,
         test_fair_clue_requote_is_deterministic_and_never_touches_puzzle,
         test_stratified_sample_is_deterministic_and_spread,
+        test_structural_reason_beats_shallow_stage,
     ]
     for t in tests:
         try:

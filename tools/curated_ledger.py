@@ -103,6 +103,49 @@ COMPILE_INVALID_STAGES = frozenset({
     "too_similar",            # 与最近某题文本太像(分布问题, 非内容)
 })
 
+#: 结构问题的**文本指纹** —— 用于"reason 说是结构问题, 但 stage 更浅"
+#: 的那种情况。
+#:
+#: ## 为什么光看 stage 不够(实测)
+#:
+#: `compile_one` 会记录"走到过的最深一道门"(`_deepest`), 而
+#: `reject_reasons` 取的是**最后一次**尝试的原因。两者来自不同稿件时
+#: 就会错配。实跑抓到一条:
+#:
+#:     stage  = truth_audit          (最深走到审计)
+#:     reason = 第 2 条提示超过 30 字 (另一次尝试死在 hint 长度)
+#:
+#: 只看 stage 会把它算成"审计没过"(像内容问题), 而它**其实是**一条
+#: hint 超长 —— 结构问题。分类必须读 reason 文本才能纠正。
+#:
+#: ⚠️ 这些指纹只在**没有更硬的内容判决理由**时才用于归类:
+#: `_classify` 先让 `ai_gate` / `story_gate` / `story_review` 这些
+#: **确定性内容门**胜出, 免得一个恰好提到"提示"两字的内容拒绝被误归。
+COMPILE_INVALID_REASON_MARKS = (
+    "提示超过",           # hint 长度
+    "hints 应为",         # hint 数量
+    "fair_clue",          # quote 溯源
+    "completion fact",    # 合同连线
+    "core hidden facts",  # 内部上限
+    "没有被任何 solve_atom 引用",
+    "工具调用返回空 input",
+)
+
+
+def looks_like_compile_invalid(stage: str, reasons: Optional[list]) -> bool:
+    """这条决策的**死因**是编译期结构问题吗?
+
+    stage 命中即算; 否则看 reasons 里有没有结构问题的文本指纹。
+    见 `COMPILE_INVALID_REASON_MARKS` 的说明。
+    """
+    if str(stage or "") in COMPILE_INVALID_STAGES:
+        return True
+    for r in (reasons or []):
+        s = str(r)
+        if any(m in s for m in COMPILE_INVALID_REASON_MARKS):
+            return True
+    return False
+
 
 def content_hash_of(rec: Any, *, n: int = 12) -> str:
     """一条候选记录的**内容**哈希(surface + bottom)。
@@ -368,7 +411,8 @@ class DecisionLedger:
             counts[dec] += 1
             st = str(d.get("stage") or "unknown")
             by_stage[st] = by_stage.get(st, 0) + 1
-            if dec == TECHNICAL_DEFER and st in COMPILE_INVALID_STAGES:
+            if dec == TECHNICAL_DEFER and looks_like_compile_invalid(
+                    st, d.get("reasons")):
                 compile_invalid += 1
         acc = counts[ACCEPTED]
         crej = counts[REJECTED]
