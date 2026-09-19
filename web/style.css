@@ -102,6 +102,40 @@ html, body {
   letter-spacing: 1.5px;
   overflow-wrap: anywhere; word-break: break-word;
   text-align: left;
+  /* 极端长文 + 两条贡献链仍超高时的兜底: 优先保证不互相覆盖。
+     正常情况下 fitReveal() 会缩字号把它压进可用高度, 走不到这里。 */
+  overflow-y: auto;
+}
+/* ---- 揭晓贡献链 ----
+   字号**明显小于**正文(fitReveal 只缩正文, 不缩这里), 因为它是
+   "这题大家怎么推出来的"的注解, 不是第二份谜底。 */
+#reveal-contrib {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; gap: 10px;
+  padding-top: 22px;
+  border-top: 2px solid rgba(212,175,110,.28);
+  text-align: left;
+}
+#reveal-contrib.hidden { display: none; }
+#reveal-contrib-title {
+  color: #d4af6e; font-size: 25px; letter-spacing: 6px;
+}
+#reveal-contrib-list {
+  display: flex; flex-direction: column; gap: 12px;
+}
+.reveal-contrib-row {
+  color: #cdbd9a; font-size: 28px; line-height: 1.5;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.reveal-contrib-row .who { color: #e8d7ae; }
+.reveal-contrib-row .vd {
+  display: inline-block; margin-left: 10px; padding: 2px 12px;
+  border-radius: 999px; font-size: 22px;
+  background: rgba(212,175,110,.20); color: #ffd98a;
+}
+.reveal-contrib-row .final {
+  margin-left: 12px; font-size: 24px;
+  color: #ffd15e; letter-spacing: 1px;
 }
 /* 揭晓面板整体淡入, 避免"啪"地切过去 */
 #reveal { animation: revealIn .45s ease-out; }

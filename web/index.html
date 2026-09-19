@@ -22,6 +22,16 @@
         <div id="reveal" class="hidden">
           <div id="reveal-label">谜底揭晓</div>
           <div id="reveal-body"></div>
+          <!--
+            揭晓贡献链: "这题大家是怎么一起推出来的"。
+            刻意放在正文**之后** —— 核心答案始终是视觉第一层, 贡献链是
+            对它的注解, 不是第二份谜底。字号也明显小于正文。
+            只在 REVEALING / REVEALED 阶段由服务端下发内容。
+          -->
+          <div id="reveal-contrib" class="hidden">
+            <div id="reveal-contrib-title"></div>
+            <div id="reveal-contrib-list"></div>
+          </div>
           <div id="reveal-next"></div>
         </div>
       </section>

@@ -2072,6 +2072,113 @@ def test_spec_source_defaults_to_live_generate():
     check("默认来源", eng._spec_source == "live_generate", eng._spec_source)
 
 
+def test_reveal_contributors_reach_archive():
+    """R2: 公开贡献链必须一路走到落盘。
+
+    结构在 Engine 里对, 不代表数据会流过去 —— 这个项目里已经踩过好几
+    次"结构齐了、字段没传"(solve_atoms / fair_clues 就是这么恒为空
+    数组的)。所以这里跑**真实**链路:
+
+        真人 QA -> _qa_archive + contribution
+        -> _enter_revealing_locked -> REVEAL payload
+        -> Director._archive_reveal -> json 落盘
+
+    并同时钉住两件事:
+      - 公开形状只有 qid/user_name/text/verdict/is_final;
+      - 内部 fact ID **绝不**出现在 reveal_contributors 里(它们只在
+        qa[] 的 completion_contribution_fact_ids 里, 那是复盘用的)。
+    """
+    import io as _io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleFact, PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_contrib.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    # ⚠️ Director 自己**没有** clock(它用 time.time)。这里要用 FakeClock
+    # 精确推进"什么时候派发 ANSWER", 所以把注入了时钟的引擎交给它 ——
+    # 否则 tick() 会因为墙钟没走动而不派发。
+    clk = FakeClock()
+    d.engine = RoundEngine(cfg, clock=clk)
+    d.engine.start()
+    sp = PuzzleSpec(
+        id="r2-arch", title="贡献链",
+        puzzle="门外站着一个女人, 开门的人一见她就愣住了。为什么?",
+        answer="门外女人是父亲的亲生女儿, 她昨晚才与父亲同桌吃饭相认。",
+        core_answer="门外女人是父亲的亲生女儿。",
+        completion_fact_ids=["f1", "f2"],
+        prompt_version="riddle-v6", quality_policy_version="quality-v6",
+        facts=[
+            PuzzleFact(id="f1", text="她是父亲的亲生女儿", kind="core",
+                       visibility="hidden"),
+            PuzzleFact(id="f2", text="她昨晚与父亲同桌吃饭", kind="core",
+                       visibility="hidden"),
+        ])
+    d.engine.submit_riddle(sp.puzzle, sp.answer, ["a"], spec=sp, source="pool")
+    check("停在 QA", d.engine.phase == Phase.QA, d.engine.phase)
+
+    # 两位真人分别补齐 f1 / f2
+    for uid, name, ask, fid in (("u1", "甲", "她是父亲的女儿吗", "f1"),
+                                ("u2", "乙", "她昨晚和父亲吃饭了吗", "f2")):
+        d.engine.submit_danmaku(uid, name, "#" + ask)
+        clk.advance(1.0)
+        ans = [a for a in d.engine.tick() if a.kind == ActionKind.ANSWER]
+        check(f"派发 ANSWER({name})", len(ans) == 1, kinds(ans))
+        p = ans[0].payload
+        d.engine.submit_qa(
+            [QAResult(qid=p["qid"], verdict="是", established_fact_ids=[fid])],
+            expect_round=p.get("expect_round"),
+            expect_spec_key=p.get("expect_spec_key"))
+
+    check("合同补齐 -> REVEALING",
+          d.engine.phase == Phase.REVEALING, d.engine.phase)
+    # 通关本身已经产出过 REVEAL。这里再显式取一次 payload —— 我们要验的
+    # 是 payload -> archive 这一段, 不依赖上一步是否恰好被调用。
+    rev = [a for a in d.engine._enter_revealing_locked(0.0, "giveup", "")
+           if a.kind == ActionKind.REVEAL]
+    check("产出 REVEAL", len(rev) == 1, kinds(rev))
+    payload = rev[0].payload if rev else {}
+    check("payload 带 reveal_contributors",
+          "reveal_contributors" in payload, sorted(payload.keys()))
+    contrib = payload.get("reveal_contributors") or []
+    check("贡献链有 2 条", len(contrib) == 2, contrib)
+    check("公开形状只有五个字段",
+          all(set(c.keys()) == {"qid", "user_name", "text", "verdict",
+                                "is_final"} for c in contrib),
+          [sorted(c.keys()) for c in contrib])
+
+    d._archive_reveal(payload, "揭晓文案")
+    check("落盘成功", os.path.exists(out), out)
+    rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
+    check("archive 顶层有 reveal_contributors",
+          "reveal_contributors" in rec, sorted(rec.keys()))
+    got = rec.get("reveal_contributors") or []
+    check("落盘里是 2 条", len(got) == 2, got)
+    check("落盘形状也是公开五字段",
+          all(set(c.keys()) == {"qid", "user_name", "text", "verdict",
+                                "is_final"} for c in got),
+          [sorted(c.keys()) for c in got])
+    blob = json.dumps(rec, ensure_ascii=False)
+    # reveal_contributors 内部绝不能有 fact ID
+    check("公开贡献链里没有 fact 痕迹",
+          all("f1" not in (c.get("text") or "")
+              and "f2" not in (c.get("text") or "") for c in got),
+          got)
+    # 而 qa[] 里**应该**有内部归属(复盘要看)
+    qa = [r for r in (rec.get("qa") or []) if r.get("kind") == "qa"]
+    check("qa[] 记录了 completion_contribution_fact_ids",
+          any(r.get("completion_contribution_fact_ids") for r in qa),
+          [(r.get("qid"), r.get("completion_contribution_fact_ids"))
+           for r in qa])
+
+
 def test_spec_source_is_recorded_and_reaches_reveal():
     """Q8: 来源要一路进 REVEAL payload —— archive 靠它区分 pool/现场。"""
     clk = FakeClock()
@@ -2918,6 +3025,8 @@ def main():
              # ---- Q8c: source provenance ----
              test_spec_source_defaults_to_live_generate,
              test_spec_source_is_recorded_and_reaches_reveal,
+             # ---- R2: 揭晓贡献链 ----
+             test_reveal_contributors_reach_archive,
              test_fallback_marks_source_as_fallback,
              test_spec_source_resets_between_puzzles,
              test_archive_records_source,

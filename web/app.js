@@ -18,6 +18,10 @@
     puzzleTimer: $("puzzle-timer"),
     puzzle: $("puzzle"),
     reveal: $("reveal"), revealBody: $("reveal-body"), revealNext: $("reveal-next"),
+    revealLabel: $("reveal-label"),
+    revealContrib: $("reveal-contrib"),
+    revealContribTitle: $("reveal-contrib-title"),
+    revealContribList: $("reveal-contrib-list"),
     top: $("top"), bottom: $("bottom"),
     qa: $("qa"), qaBody: $("qa-body"),
     thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
@@ -102,13 +106,33 @@
   }
 
   // 揭晓层字号自适应: 42px 基准, 内容超高就缩, 下限 22px。
-  // 量的是**揭晓层自己的可用高度**(它的 padding 与 #top 不同)。
+  //
+  // ⚠️ 可用高度必须**按 DOM 实际高度算**, 不能像早先那样写死
+  // (`clientHeight - 150 - 90 - 90`)。写死的常数在加入贡献链之后就错了:
+  // 贡献链有内容时它会再吃掉一块高度, 而常数还是老样子, 于是正文会
+  // 被算得比实际可用空间大 —— 表现为谜底或贡献链被裁掉。
+  //
+  // 只对 #reveal-body 缩字号: 贡献链本身字号就小(见 CSS), 缩它只会
+  // 让它不可读, 而它最多 1~2 条(completion 合同上限就是 2 个 fact)。
   let lastRevealText = null;
   function fitReveal(text) {
     if (lastRevealText === text) return;
     lastRevealText = text;
-    // 可用高度 = 揭晓层高度 - 上下 padding - 标题 - 倒计时行
-    const avail = el.reveal.clientHeight - 150 - 90 - 90;
+    const rs = getComputedStyle(el.reveal);
+    const padding = (parseFloat(rs.paddingTop) || 0)
+                  + (parseFloat(rs.paddingBottom) || 0);
+    const gap = parseFloat(rs.rowGap || rs.gap || "0") || 0;
+    const contribHidden = el.revealContrib.classList.contains("hidden");
+    // 固定高度的块: 标题 + 贡献链(可见时) + 倒计时行
+    const fixed = el.revealLabel.offsetHeight
+                + (contribHidden ? 0 : el.revealContrib.offsetHeight)
+                + el.revealNext.offsetHeight;
+    // flex 的 gap 出现在**每个**可见块之间, 块数 = 标题 + 正文 +
+    // (贡献链) + 倒计时。
+    const visibleBlocks = contribHidden ? 3 : 4;
+    const avail = el.reveal.clientHeight - padding - fixed
+                - gap * (visibleBlocks - 1);
+    if (!(avail > 0)) return;          // 布局还没稳, 别把字号缩成 0
     let fs = 42;
     for (let i = 0; i < 12 && fs > 22; i++) {
       el.revealBody.style.fontSize = fs + "px";
@@ -126,6 +150,54 @@
     toastTimer = setTimeout(function () { el.toast.classList.add("hidden"); }, 1800);
   }
 
+  // 揭晓贡献链: "这题大家是怎么一起推出来的"。
+  //
+  // 服务端下发的每行只有 qid/user_name/text/verdict/is_final —— 内部
+  // fact ID 在服务端就已经被筛掉了, 前端拿不到也不该拿到。
+  //
+  // ⚠️ 全部用 textContent / createElement 构造。用户名和提问都来自
+  // 观众, 任何 innerHTML 拼接都是注入口子。
+  function renderRevealContributors(s) {
+    const rows = Array.isArray(s.reveal_contributors)
+               ? s.reveal_contributors : [];
+    if (!rows.length) {
+      // 没内容 -> 整块隐藏并**清空**。清空很重要: 换题后如果不擦,
+      // 上一题的名字会残留到下一题的揭晓里。
+      el.revealContrib.classList.add("hidden");
+      el.revealContribTitle.textContent = "";
+      el.revealContribList.textContent = "";
+      return;
+    }
+    el.revealContribTitle.textContent =
+      s.solved ? "共同解谜" : "大家已经推到这里";
+    const box = document.createDocumentFragment();
+    rows.forEach(function (r) {
+      const row = document.createElement("div");
+      row.className = "reveal-contrib-row";
+      const who = document.createElement("span");
+      who.className = "who";
+      who.textContent = (r.user_name || "") + "：";
+      row.appendChild(who);
+      row.appendChild(document.createTextNode(r.text || ""));
+      if (r.verdict) {
+        const vd = document.createElement("span");
+        vd.className = "vd";
+        vd.textContent = "→ " + r.verdict;
+        row.appendChild(vd);
+      }
+      if (r.is_final) {
+        const fin = document.createElement("span");
+        fin.className = "final";
+        fin.textContent = "✓ 最后线索";
+        row.appendChild(fin);
+      }
+      box.appendChild(row);
+    });
+    el.revealContribList.textContent = "";
+    el.revealContribList.appendChild(box);
+    el.revealContrib.classList.remove("hidden");
+  }
+
   // 揭晓覆盖层
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
@@ -133,10 +205,22 @@
     // 揭晓时**隐藏谜面** —— 否则揭晓层是半透明的, 两层文字会叠在一起
     // (就是"揭晓时字被遮挡"的根因)。
     el.puzzle.classList.toggle("hidden", on);
-    if (!on) return;
+    if (!on) {
+      // 揭晓层整体关掉时, 贡献链也跟着收起来 —— 否则下一题进入
+      // revealing 之前会残留上一题的名字。
+      renderRevealContributors({reveal_contributors: []});
+      return;
+    }
+    renderRevealContributors(s);
     if (el.revealBody.textContent !== s.revealed_answer) {
       el.revealBody.textContent = s.revealed_answer;
       lastRevealText = null;              // 让 fitReveal 重新算字号
+      fitReveal(s.revealed_answer);
+    } else {
+      // 正文没变, 但贡献链的显隐改变了可用高度 -> 重算一次。
+      // (不能无条件调: fitReveal 内部有 lastRevealText 短路, 这里
+      //  显式清掉缓存才是真的重算。)
+      lastRevealText = null;
       fitReveal(s.revealed_answer);
     }
     if (s.next_puzzle_ms != null) {

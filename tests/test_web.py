@@ -350,6 +350,137 @@ window.addEventListener("load", async () => {
     check(document.querySelector(".qa-row:not(.kind-fold) .q")
           || document.body.textContent.includes("关键问题"),
           "关键的'是'问答必须保留");
+
+    // ⑫ 揭晓贡献链: "这题大家是怎么一起推出来的"
+    //
+    // 服务端只下发 qid/user_name/text/verdict/is_final —— 内部 fact ID
+    // 在服务端就被筛掉了。这里验的是**渲染契约**。
+    const mkContrib = (final) => ([
+      {qid: 1, user_name: "甲", text: "这是测试飞行吗？", verdict: "是", is_final: false},
+      {qid: 2, user_name: "乙", text: "复飞就是考试项目？", verdict: "是", is_final: final},
+    ]);
+    send({phase: "revealed", puzzle_index: 20, story_index: 20,
+          revealed_answer: "这是一次预设的测试飞行，复飞本身就是考核项目。",
+          solved: true, solved_by: "乙",
+          reveal_contributors: mkContrib(true), next_puzzle_ms: 20000});
+    const cb = document.getElementById("reveal-contrib");
+    check(!cb.classList.contains("hidden"), "有贡献链时应显示该块");
+    check(document.getElementById("reveal-contrib-title").textContent
+          === "共同解谜",
+          "solved=true 标题应为'共同解谜', 实际 "
+          + document.getElementById("reveal-contrib-title").textContent);
+    const cRows = [...document.querySelectorAll(".reveal-contrib-row")];
+    check(cRows.length === 2, "应渲染 2 条贡献, 实际 " + cRows.length);
+    check(cRows[0].textContent.includes("甲")
+          && cRows[0].textContent.includes("这是测试飞行吗"),
+          "第一条应含甲与提问: " + (cRows[0] && cRows[0].textContent));
+    check(cRows[1].textContent.includes("乙")
+          && cRows[1].textContent.includes("复飞就是考试项目"),
+          "第二条应含乙与提问: " + (cRows[1] && cRows[1].textContent));
+    check(cRows[1].textContent.includes("最后线索"),
+          "is_final 那条应带'最后线索': " + cRows[1].textContent);
+    check(!cRows[0].textContent.includes("最后线索"),
+          "非 final 那条不该带'最后线索': " + cRows[0].textContent);
+    check(cRows[0].textContent.includes("是"),
+          "应显示裁决");
+
+    // ⑫.2 未解开: 标题变"大家已经推到这里", 且没有 is_final
+    send({phase: "revealed", puzzle_index: 20, story_index: 20,
+          revealed_answer: "这是一次预设的测试飞行，复飞本身就是考核项目。",
+          solved: false,
+          reveal_contributors: mkContrib(false), next_puzzle_ms: 20000});
+    check(document.getElementById("reveal-contrib-title").textContent
+          === "大家已经推到这里",
+          "solved=false 标题应为'大家已经推到这里', 实际 "
+          + document.getElementById("reveal-contrib-title").textContent);
+    const cRows2 = [...document.querySelectorAll(".reveal-contrib-row")];
+    check(cRows2.every(r => !r.textContent.includes("最后线索")),
+          "未解开时不该有'最后线索'");
+
+    // ⑫.3 空贡献链 -> 整块隐藏
+    send({phase: "revealed", puzzle_index: 20, story_index: 20,
+          revealed_answer: "谜底。", solved: false,
+          reveal_contributors: [], next_puzzle_ms: 20000});
+    check(cb.classList.contains("hidden"),
+          "无贡献时应隐藏整块");
+    check(document.getElementById("reveal-contrib-list").children.length === 0,
+          "隐藏时列表应清空");
+
+    // ⑫.4 换题必须擦掉上一题的名字(残留是最难发现的那类 bug)
+    send({phase: "revealed", puzzle_index: 20, story_index: 20,
+          revealed_answer: "谜底。", solved: true,
+          reveal_contributors: mkContrib(true), next_puzzle_ms: 20000});
+    check(document.getElementById("reveal-contrib-list").children.length === 2,
+          "先确保上一题贡献链在");
+    send({phase: "qa", puzzle_index: 21, story_index: 21,
+          puzzle: "新的一道题。", revealed_answer: "", qa_log: [], qa_total: 0});
+    check(document.getElementById("reveal-contrib-list").children.length === 0,
+          "换题后贡献链列表必须清空(不能残留上一题名字)");
+    check(document.getElementById("reveal-contrib-title").textContent === "",
+          "换题后标题也必须清空");
+
+    // ⑬ 长谜底 + 两条贡献链 + 倒计时: 三者不得互相覆盖
+    //
+    // 这是 fitReveal 从"写死常数"改成"按 DOM 实算"的那条回归。
+    // 写死常数时, 贡献链一出现就把可用高度算多了, 正文会压到贡献链上。
+    const longReveal = "这是一段刻意写得很长的谜底，用来把揭晓层的可用高度"
+      + "压到很紧，从而检验字号自适应与贡献链的布局是否会互相覆盖。"
+      + "再补一些字，确保它必然超过一屏的容量，逼迫 fitReveal 真正去缩字号。"
+      + "继续补一些字，继续补一些字，继续补一些字，继续补一些字。";
+    send({phase: "revealed", puzzle_index: 22, story_index: 22,
+          revealed_answer: longReveal, solved: true, solved_by: "乙",
+          reveal_contributors: mkContrib(true), next_puzzle_ms: 18000});
+    {
+      const body = document.getElementById("reveal-body");
+      const contrib = document.getElementById("reveal-contrib");
+      const next = document.getElementById("reveal-next");
+      const panel = document.getElementById("reveal").getBoundingClientRect();
+      const br = body.getBoundingClientRect();
+      const cr = contrib.getBoundingClientRect();
+      const nr = next.getBoundingClientRect();
+      check(cr.height > 0, "贡献链应可见且有高度: " + cr.height);
+      check(br.height > 0, "正文应有高度: " + br.height);
+      // 正文底 <= 贡献链顶(允许 1px 取整)
+      check(br.bottom <= cr.top + 1,
+            "正文不得压到贡献链上 (body.bottom=" + br.bottom.toFixed(1)
+            + " contrib.top=" + cr.top.toFixed(1) + ")");
+      // 贡献链底 <= 倒计时顶
+      check(cr.bottom <= nr.top + 1,
+            "贡献链不得压到倒计时上 (contrib.bottom=" + cr.bottom.toFixed(1)
+            + " next.top=" + nr.top.toFixed(1) + ")");
+      // 全部落在揭晓面板内
+      check(br.top >= panel.top - 1 && nr.bottom <= panel.bottom + 1,
+            "正文与倒计时都应落在揭晓面板内 (panel="
+            + panel.top.toFixed(1) + ".." + panel.bottom.toFixed(1)
+            + " body=" + br.top.toFixed(1) + " next.bottom="
+            + nr.bottom.toFixed(1) + ")");
+      const fs = parseFloat(getComputedStyle(body).fontSize);
+      check(fs >= 22, "字号不应缩到下限以下: " + fs);
+    }
+
+    // ⑭ 贡献链绝不做 HTML 拼接
+    //
+    // 用户名与提问都来自观众。贡献链是**新增的**一处把观众字符串放上
+    // 大屏的地方, 必须和问答流一样走 textContent —— 否则一个叫
+    // `<img onerror=...>` 的观众就能在公屏上执行脚本。
+    send({phase: "revealed", puzzle_index: 23, story_index: 23,
+          revealed_answer: "谜底。", solved: true,
+          reveal_contributors: [
+            {qid: 1, user_name: "<b>坏名字</b>",
+             text: "<img src=x onerror=\"window.__xss=1\">",
+             verdict: "是", is_final: true},
+          ], next_puzzle_ms: 20000});
+    {
+      const list = document.getElementById("reveal-contrib-list");
+      check(list.querySelector("b") === null,
+            "用户名里的 <b> 不该被解析成元素");
+      check(list.querySelector("img") === null,
+            "提问里的 <img> 不该被解析成元素");
+      check(window.__xss === undefined,
+            "注入的 onerror 不该被执行");
+      check(list.textContent.includes("<b>坏名字</b>"),
+            "标签应原样作为文本显示: " + list.textContent);
+    }
   } catch (e) { errors.push(e.stack); }
   const result = document.createElement("pre");
   result.id = "test-result"; result.hidden = true;
@@ -391,7 +522,7 @@ def main():
         assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
         assert not errors, errors
-    print("PASS: 问答追加/提示行/思考中/揭晓层/换题清空/不截断/调试宽度/长流可滚；data/preview.png")
+    print("PASS: 问答追加/提示行/思考中/揭晓层/贡献链/换题清空/不截断/调试宽度/长流可滚；data/preview.png")
 
 
 if __name__ == "__main__":
