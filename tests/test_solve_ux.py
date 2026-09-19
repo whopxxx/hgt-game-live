@@ -1502,6 +1502,58 @@ def test_v6_verified_ids_archive_boundary():
           is None)
 
 
+def test_v6_progress_log_leaks_no_truth():
+    """v6 进度 INFO 只能打 **fact ID**, 绝不能打 fact 文本 / core_answer。
+
+    INFO 会进 data/run.log。打文本等于把隐藏真相摊在日志里, 而日志是
+    最容易被随手分享出去的东西。这条断言是**防回归**的 —— 以后有人
+    想让日志"更好读"而把文本加回来, 这里会红。
+    """
+    print("\n[v6] 进度日志不泄漏隐藏真相")
+    import logging
+    spec = auction_spec()
+    eng, clk = boot(spec)
+    buf = _CaptureLogs()
+    try:
+        ask(eng, clk, "u1", "甲", "他自己拍高",
+            verdict="是", solution_candidate=True, established_fact_ids=["f1"])
+    finally:
+        buf.detach()
+    lines = [l for l in buf.text().splitlines() if "v6进度" in l]
+    check("确实打了 v6进度", bool(lines), buf.text()[-200:])
+    for l in lines:
+        check("进度行只有 fact ID, 不含 core_answer",
+              spec.core_answer not in l, l)
+        check("进度行不含 answer", spec.answer not in l, l)
+        for f in spec.facts:
+            check(f"进度行不含 fact 文本({f.id})", f.text not in l, l)
+    check("进度行含必要的四个字段",
+          all(k in lines[0] for k in
+              ("qid=", "candidate=", "covered=", "remaining=")), lines[0])
+
+
+class _CaptureLogs:
+    """把 root logger 的 INFO 抓进内存, 退出时还原。"""
+
+    def __init__(self):
+        import io
+        import logging
+        self._buf = io.StringIO()
+        self._h = logging.StreamHandler(self._buf)
+        self._h.setLevel(logging.INFO)
+        self._root = logging.getLogger()
+        self._old = self._root.level
+        self._root.addHandler(self._h)
+        self._root.setLevel(logging.INFO)
+
+    def text(self):
+        return self._buf.getvalue()
+
+    def detach(self):
+        self._root.removeHandler(self._h)
+        self._root.setLevel(self._old)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -1550,6 +1602,7 @@ def main():
         test_v6_case9_trigger_matrix,
         test_v6_case10_status_must_be_ok_for_verifier,
         test_v6_verified_ids_archive_boundary,
+        test_v6_progress_log_leaks_no_truth,
     ]
     for t in tests:
         t()
