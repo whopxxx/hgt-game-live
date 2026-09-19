@@ -314,6 +314,25 @@ class Snapshot:
     #: ⚠️ 由**服务端按 phase + 经过时间**算, 不是前端自己计时 ——
     #: 前端刷新/重连后仍要与服务端一致, 而前端本地计时会从 0 重来。
     reveal_detail_visible: bool = False
+    #: U2: 揭晓的**当前阶段** —— "core" | "explanation" | "contribution"。
+    #:
+    #: 为什么由服务端给而不是前端自己按秒数推:
+    #:   1. 前端刷新/重连后本地计时会从 0 重来, 与服务端不一致;
+    #:   2. 阶段边界是**配置**(reveal_core_focus_seconds /
+    #:      reveal_detail_seconds), 前端不该硬编码一份副本
+    #:      —— 两份拷贝迟早漂移。
+    #:
+    #: 60 秒分三段, 是为了让下半屏**同一时刻只有一组长内容**:
+    #:   0..focus        只有核心答案(超大字号)
+    #:   focus..detail   核心答案 + 完整解释(共同解谜隐藏)
+    #:   detail..hold    核心答案 + 共同解谜(完整解释隐藏)
+    #:
+    #: 实播故障: 三块同时上屏 -> 互相争空间 -> fitReveal 只能一路缩字号
+    #: -> 完整解释被压成一条矮滚动框, 而观众没有鼠标去滚直播源。
+    #:
+    #: ⚠️ 这个字段**只是 UI 状态**, 不含任何 hidden truth。它不携带
+    #: fact id / completion id / discovery beats。REVEALED 之外恒为 ""。
+    reveal_stage: str = ""
     qa_total: int = 0                       # 含已滑出快照的条数 -> 前端只追加不重排
     pending_count: int = 0                  # 排队中(未答)的提问数 -> "AI 正在思考…"
     # ---- 提示 / 空闲 ----
@@ -363,6 +382,9 @@ class Snapshot:
             "revealed_core_answer": self.revealed_core_answer,
             "revealed_full_answer": self.revealed_full_answer,
             "reveal_detail_visible": self.reveal_detail_visible,
+            # U2: 揭晓三阶段("core"/"explanation"/"contribution" 或 "")。
+            # 纯 UI 状态, 不含 hidden truth。
+            "reveal_stage": self.reveal_stage,
             "solved": self.solved,
             "solved_by": self.solved_by,
             "qa_log": self.qa_log,

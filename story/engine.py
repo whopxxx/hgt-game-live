@@ -1994,6 +1994,7 @@ class RoundEngine:
             core_out = ""
             full_out = ""
             detail_visible = False
+            reveal_stage = ""
             if self.phase == Phase.REVEALED:
                 full_out = self._revealed or ""
                 core_out = self._core_answer or ""
@@ -2004,9 +2005,23 @@ class RoundEngine:
                     shown = self.cfg.reveal_hold_seconds - max(
                         0.0, self._next_puzzle_deadline - now)
                     detail_visible = shown >= self.cfg.reveal_core_focus_seconds
+                    # ---- U2: 三阶段 ----
+                    # 由**服务端**按 phase + 经过时间算, 前端不自己计时
+                    # (刷新/重连后本地计时会从 0 重来, 与服务端不一致;
+                    # 而且阶段边界是配置, 前端不该硬编码一份副本)。
+                    #
+                    # `reveal_hold_seconds` 被改了也自洽: 边界全部来自
+                    # cfg, 不写死 15/45。
+                    if shown < self.cfg.reveal_core_focus_seconds:
+                        reveal_stage = "core"
+                    elif shown < self.cfg.reveal_detail_seconds:
+                        reveal_stage = "explanation"
+                    else:
+                        reveal_stage = "contribution"
                 else:
                     # 没有 deadline(理论上不该发生) -> 保守: 不显示细节。
                     detail_visible = False
+                    reveal_stage = "core"
             elapsed = None
             if self.phase in (Phase.QA, Phase.REVEALING) and self._puzzle_started:
                 elapsed = max(0, int((now - self._puzzle_started) * 1000))
@@ -2038,6 +2053,7 @@ class RoundEngine:
                 revealed_core_answer=core_out,
                 revealed_full_answer=full_out,
                 reveal_detail_visible=detail_visible,
+                reveal_stage=reveal_stage,
                 solved=self._solved,
                 solved_by=self._solved_by,
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],

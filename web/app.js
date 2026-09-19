@@ -119,6 +119,11 @@
   //     缩它只会让它不可读。
   // 所以这里只留一个可压缩区域, 下限 34px。
   //
+  // ⚠️ U2: 三阶段下这仍然是**兜底**, 不是正常路径。正常质量政策允许的
+  // answer 必须在 explanation 阶段**不用滚动**就完整可见(由 Web 测试的
+  // `body.scrollHeight <= body.clientHeight` 钉住)。缩字号只在极端超长
+  // 文本时兜底 —— 而且下限 34px 保证它不会退回到"22px 看不清"。
+  //
   // ⚠️ C2: 可用高度是**下半部工作区**的高度(约 1920 - TOP_MIN=620
   // 到 1920 - TOP_MAX=1000), 不再是整屏。`el.reveal.clientHeight` 会
   // 自动反映这一点(它是 #bottom 那个矩形的孪生), 所以这里的算法不用改
@@ -126,15 +131,27 @@
   const REVEAL_EXPLAIN_BASE = 34;
   const REVEAL_EXPLAIN_MIN = 34;
   let lastRevealFitKey = null;
-  function fitReveal(fullText, coreText) {
+  function fitReveal(fullText, coreText, stage) {
     // 只在"会影响布局的东西"变化时重算 —— 每次推送都量 DOM 会很贵,
     // 而这函数在 4Hz 的推送里被调用。
-    const key = [fullText || "", coreText || "",
+    //
+    // ⚠️ 这里原本用一个裸控制字节当分隔符。它本身无害, 但它
+    // 让文件里藏了一个不可见字节 —— 任何按文本处理的工具(补丁脚本 /
+    // 编辑器的查找替换 / 复制粘贴)都可能把它吃掉或换成别的字符, 于是
+    // "同一份代码"在两次读之间就不再相等。U2 顺手换成可见的 `|`。
+    // (拼接出来的 key 只用于相等比较, 不在任何地方被解析, 所以换分隔符
+    //  不影响语义 —— 真要小心的是别让 key 本身变得有歧义: 文本里出现
+    //  `|` 只会让两个不同输入撞成同一个 key, 而那仅仅是"少重算一次",
+    //  下一次内容变化一定会重算。)
+    const key = [fullText || "", coreText || "", stage || "",
                  el.revealContrib.classList.contains("hidden"),
-                 el.revealBody.classList.contains("hidden")].join("");
+                 el.revealBody.classList.contains("hidden")].join("|");
     if (lastRevealFitKey === key) return;
     lastRevealFitKey = key;
     if (el.revealBody.classList.contains("hidden")) return;
+    // 先把字号复位再量 —— 否则上一阶段缩过的字号会留着, 新阶段明明
+    // 空间更大却仍显示小字。
+    el.revealBody.style.fontSize = REVEAL_EXPLAIN_BASE + "px";
     const rs = getComputedStyle(el.reveal);
     const padding = (parseFloat(rs.paddingTop) || 0)
                   + (parseFloat(rs.paddingBottom) || 0);
@@ -152,7 +169,6 @@
                 - gap * (visibleBlocks - 1);
     if (!(avail > 0)) return;          // 布局还没稳, 别把字号缩成 0
     let fs = REVEAL_EXPLAIN_BASE;
-    el.revealBody.style.fontSize = fs + "px";
     for (let i = 0; i < 14 && fs > REVEAL_EXPLAIN_MIN; i++) {
       if (el.revealBody.scrollHeight <= avail) break;
       fs -= 2;
@@ -217,14 +233,33 @@
     el.revealContrib.classList.remove("hidden");
   }
 
-  // 揭晓工作区(U1)
+  // 揭晓工作区(U2: 60 秒三阶段)
   //
-  // 分两段显示:
-  //   0..reveal_core_focus_seconds  只显示核心答案(超大字号)
-  //   之后(reveal_detail_visible)   追加完整解释 + 共同解谜
+  //   阶段           显示内容                              隐藏内容
+  //   core           核心答案(超大字号) + "XX 补齐最后线索"  完整解释 / 共同解谜
+  //   explanation    核心答案 + 完整解释                     共同解谜
+  //   contribution   核心答案 + 共同解谜                     完整解释
   //
-  // `reveal_detail_visible` 由**服务端**算(见 engine.snapshot) —— 前端
-  // 不自己计时, 否则刷新/重连后计时会从 0 重来, 与服务端不一致。
+  // `reveal_stage` 由**服务端**算(见 engine.snapshot) —— 前端不自己
+  // 计时: 刷新/重连后本地计时会从 0 重来, 与服务端不一致; 而且阶段边界
+  // 是配置, 前端硬编码一份副本迟早漂移。
+  //
+  // ⚠️ 为什么必须分三段: 实播里核心答案 + 完整解释 + 共同解谜**同时**
+  // 上屏, 下半屏三块互相争空间, fitReveal 只能一路缩字号, 完整解释被压
+  // 成一条矮滚动框 —— 而观众没有鼠标去滚直播源。
+  // **关键内容不能依赖用户滚动才能看见。** 60 秒本来就是时间资源:
+  // 用时间换空间, 而不是把字缩小。
+  //
+  // 兼容: 老快照没有 `reveal_stage` 时退化成 U1 的两段行为
+  // (`reveal_detail_visible` 为真就进 explanation)。
+  function revealStageOf(s) {
+    const st = s.reveal_stage;
+    if (st === "core" || st === "explanation" || st === "contribution") {
+      return st;
+    }
+    return s.reveal_detail_visible ? "explanation" : "core";
+  }
+
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
     el.reveal.classList.toggle("hidden", !on);
@@ -251,7 +286,12 @@
       return;
     }
 
+    const stage = revealStageOf(s);
+    // 用 data 属性把阶段暴露给测试与 CSS(几何断言需要知道现在哪一段)。
+    el.reveal.setAttribute("data-stage", stage);
+
     // ---- 核心答案: legacy 题没有 core_answer -> fallback 到完整谜底 ----
+    // **三个阶段都显示** —— 它是视觉第一层, 观众要一直能对照。
     const core = s.revealed_core_answer || s.revealed_full_answer
                || s.revealed_answer || "";
     const full = s.revealed_full_answer || s.revealed_answer || "";
@@ -267,24 +307,24 @@
       el.revealWho.classList.add("hidden");
     }
 
-    // ---- 完整解释: 只在细节可见、且确实与核心答案不同的时候显示 ----
+    // ---- 完整解释: 只在 explanation 阶段显示 ----
     // 若 full === core(legacy 单段题), 显示两块就是同一句话出现两次。
-    const showDetail = !!s.reveal_detail_visible && full && full !== core;
+    const showDetail = stage === "explanation" && full && full !== core;
     el.revealBody.classList.toggle("hidden", !showDetail);
     if (showDetail && el.revealBody.textContent !== full) {
       el.revealBody.textContent = full;
       lastRevealFitKey = null;
     }
-    // ---- 共同解谜: **也只在细节阶段**显示 ----
-    // 前 core_focus 秒是核心答案独占的, 摆一屏名字会把它挤下去
-    // (任务书: 0–15s 不要同时显示完整解释 / 完整贡献链)。
-    if (showDetail) {
+
+    // ---- 共同解谜: 只在 contribution 阶段显示 ----
+    // 早显示会跟完整解释抢空间, 而那正是这次要修的故障。
+    if (stage === "contribution") {
       renderRevealContributors(s);
     } else {
       renderRevealContributors({reveal_contributors: []});
     }
     // 核心/贡献链的显隐改变了可用高度 -> 重算解释区字号。
-    fitReveal(full, core);
+    fitReveal(full, core, stage);
 
     if (s.next_puzzle_ms != null) {
       el.revealNext.textContent = Math.ceil(s.next_puzzle_ms / 1000) + " 秒后开启新谜题";

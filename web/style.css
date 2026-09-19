@@ -151,7 +151,20 @@ html, body {
   letter-spacing: 1.5px;
   overflow-wrap: anywhere; word-break: break-word;
   text-align: left;
+  /* ⚠️ U2: `overflow-y: auto` 只是**极端超长文本的兜底**, 不是正常
+     路径。正常质量政策允许的 answer 必须在这个区域**不用滚动**就完整
+     可见 —— 观众没有鼠标去滚直播源。
+     这条不变量由 `tests/test_web.py` 的
+     `body.scrollHeight <= body.clientHeight` 断言钉住。
+     留着 auto 而不是 hidden: 万一真出现极端文本, 宁可让它可滚(表现
+     为"内容很长"), 也不要静默裁掉最后一段 —— 裁掉会让谜底看起来
+     少了一截, 而观众无从知道。 */
   overflow-y: auto;
+}
+/* explanation 阶段: 共同解谜是隐藏的, 完整解释独占剩余空间。
+   这是三段里唯一"可以长得比较大"的一块。 */
+#reveal[data-stage="explanation"] #reveal-body {
+  flex: 1 1 auto;
 }
 #reveal-body.hidden { display: none; }
 /* ---- 揭晓贡献链 ----

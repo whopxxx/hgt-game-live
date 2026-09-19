@@ -221,12 +221,18 @@ class Config:
 
     # ---- 谜题循环 ----
     reveal_hold_seconds: float = 60.0     # 揭晓展示时长(用户指定 60s)
-    # 0..reveal_core_focus_seconds 只显示核心答案(超大字号);
-    # 之后追加完整解释 + 共同解谜。见 web/app.js 的 renderReveal。
-    # 为什么要有这个分段: 实播里核心答案和完整解释**同时**上屏, 而
-    # fitReveal 会把正文一路缩到 22px 才塞得下 —— "原来如此"那一下
-    # 根本看不清。先给 15 秒只有核心答案的独占时间, 再把细节铺开。
+    # 揭晓 60 秒分**三段**(U2):
+    #   0 .. reveal_core_focus_seconds        只显示核心答案(超大字号)
+    #   core_focus .. reveal_detail_seconds   追加完整解释(共同解谜隐藏)
+    #   reveal_detail_seconds .. hold         完整解释隐藏, 让位给共同解谜
+    #
+    # 为什么必须分三段而不是两段: 实播里核心答案 + 完整解释 + 共同解谜
+    # **同时**上屏, 于是下半屏三块互相争空间, fitReveal 只能一路缩字号,
+    # 完整解释被压成一条矮滚动框 —— 而观众没有鼠标去滚直播源。
+    # 60 秒本来就是时间资源: 用时间换空间, 而不是把字缩小。
     reveal_core_focus_seconds: float = 15.0
+    # 完整解释展示到什么时候为止(之后让位给贡献链)。
+    reveal_detail_seconds: float = 45.0
     # 出题在途超时。**必须大于 gen_riddle 的最坏耗时**: 它内部最多 3 次
     # 生成 + 每次一次质检, 实测单次 4-27 秒, 最坏能跑到一分多钟。
     # 实测踩过: 原来设 45 秒, 引擎在外面判超时, 而 gen_riddle 内部还在跑,
@@ -439,6 +445,22 @@ class Config:
                 f"内: 核心答案独占时段不能是负的, 也不能长过整个揭晓展示"
                 f"(否则完整解释永远不会出现)。"
             )
+        # U2: 三段的中间边界必须严格落在两段之间。
+        # 注意允许 `reveal_detail_seconds == reveal_hold_seconds`(完整解释
+        # 一直显示到下一题)与 `== reveal_core_focus_seconds`(跳过中间段),
+        # 但**不允许**越界或倒挂 —— 那会让某一段永远不出现, 且前端拿到
+        # 一个自相矛盾的 stage。
+        if not (self.reveal_core_focus_seconds
+                <= self.reveal_detail_seconds
+                <= self.reveal_hold_seconds):
+            warns.append(
+                f"reveal_detail_seconds({self.reveal_detail_seconds}) 必须落在 "
+                f"[reveal_core_focus_seconds"
+                f"({self.reveal_core_focus_seconds}), "
+                f"reveal_hold_seconds({self.reveal_hold_seconds})] 内: "
+                f"完整解释的结束时刻不能早于核心答案独占结束, 也不能晚过"
+                f"整个揭晓展示。"
+            )
         if self.reveal_hold_seconds <= 0:
             warns.append(
                 f"reveal_hold_seconds({self.reveal_hold_seconds}) <= 0: "
@@ -563,6 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="揭晓展示时长(秒), 默认 60")
     ap.add_argument("--reveal-core-focus", type=float, default=15.0,
                     help="揭晓前多少秒只显示核心答案(超大字号), 默认 15")
+    ap.add_argument("--reveal-detail-until", type=float, default=45.0,
+                    help="完整解释显示到揭晓的第几秒(之后让位给共同解谜), "
+                         "默认 45")
     ap.add_argument("--tick-hz", type=float, default=4.0,
                     help="调度线程频率, 默认 4")
     ap.add_argument("--stall-seconds", type=float, default=120.0,
@@ -627,6 +652,7 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         giveup_seconds=a.giveup_seconds,
         reveal_hold_seconds=a.reveal_hold,
         reveal_core_focus_seconds=a.reveal_core_focus,
+        reveal_detail_seconds=a.reveal_detail_until,
         max_hints=a.max_hints,
         hint_questions_per_level=a.hint_questions_per_level,
         hint_min_gap_seconds=a.hint_min_gap_seconds,

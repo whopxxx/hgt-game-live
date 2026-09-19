@@ -337,16 +337,20 @@ window.addEventListener("load", async () => {
     check(document.getElementById("reveal-contrib").classList.contains("hidden"),
           "核心答案阶段不应显示共同解谜");
 
-    // ④.3 U1: 过了 core_focus -> 追加完整解释 + 共同解谜
+    // ④.3 U2: explanation 阶段 -> 追加完整解释, **共同解谜仍隐藏**
+    //
+    // ⚠️ U2 把 U1 的"细节阶段"一分为二: 15-45s 只给完整解释,
+    // 45-60s 才轮到共同解谜。它们在时间上错开, 不再同屏争空间 ——
+    // 那正是"完整解释被压成一条矮滚动框"的病根。
     send({phase: "revealed", qa_log: mkQa(4), qa_total: 4,
           revealed_answer: "多年前他遭遇海难，同伴给他喝的其实是同伴自己的肉。",
           revealed_core_answer: "同伴给他喝的是同伴自己的肉。",
           revealed_full_answer: "多年前他遭遇海难，同伴给他喝的其实是同伴自己的肉，他知情后崩溃。",
-          reveal_detail_visible: true,
+          reveal_detail_visible: true, reveal_stage: "explanation",
           solved: true, solved_by: "观众戊", next_puzzle_ms: 10000,
           reveal_contributors: [{user_name: "甲", verdict: "是", is_final: true}]});
     check(!document.getElementById("reveal-body").classList.contains("hidden"),
-          "细节阶段完整解释应可见");
+          "explanation 阶段完整解释应可见");
     check(document.getElementById("reveal-body").textContent.includes("他知情后崩溃"),
           "完整解释内容缺失");
     check(!document.getElementById("reveal-core").textContent.includes("他知情后崩溃"),
@@ -354,22 +358,24 @@ window.addEventListener("load", async () => {
     check(parseFloat(
       getComputedStyle(document.getElementById("reveal-body")).fontSize) >= 34,
       "完整解释字号应 >= 34px");
-    check(!document.getElementById("reveal-contrib").classList.contains("hidden"),
-          "细节阶段应显示共同解谜");
-    // U1: 无重叠 —— 核心答案底 <= 解释顶 <= 贡献链顶 <= 倒计时顶
+    check(document.getElementById("reveal-contrib").classList.contains("hidden"),
+          "**explanation 阶段共同解谜必须隐藏**(把空间让给完整解释)");
+    // U2: 无重叠 —— 核心答案底 <= 解释顶 <= 倒计时顶
     {
       const g = (id) => document.getElementById(id).getBoundingClientRect();
       const kr = g("reveal-core"), br = g("reveal-body");
-      const cr = g("reveal-contrib"), nr = g("reveal-next");
+      const nr = g("reveal-next");
       check(kr.bottom <= br.top + 1,
             "核心答案不得压到解释上 (" + kr.bottom.toFixed(1)
             + " > " + br.top.toFixed(1) + ")");
-      check(br.bottom <= cr.top + 1,
-            "解释不得压到贡献链上 (" + br.bottom.toFixed(1)
-            + " > " + cr.top.toFixed(1) + ")");
-      check(cr.bottom <= nr.top + 1,
-            "贡献链不得压到倒计时上 (" + cr.bottom.toFixed(1)
+      check(br.bottom <= nr.top + 1,
+            "解释不得压到倒计时上 (" + br.bottom.toFixed(1)
             + " > " + nr.top.toFixed(1) + ")");
+      // **U2 的核心**: 正常长度的完整解释必须不用滚动就完整可见。
+      const body = document.getElementById("reveal-body");
+      check(body.scrollHeight <= body.clientHeight + 1,
+            "U2: explanation 阶段的解释不得依赖滚动 (scrollH="
+            + body.scrollHeight + " clientH=" + body.clientHeight + ")");
     }
 
     // ⑤ 换题: 谜面/问答流被清空
@@ -539,6 +545,9 @@ window.addEventListener("load", async () => {
           revealed_core_answer: "复飞本身就是考核项目。",
           revealed_full_answer: "这是一次预设的测试飞行，复飞本身就是考核项目。",
           reveal_detail_visible: true,
+          // U2: 共同解谜只在 contribution 阶段显示(它要跟完整解释
+          // 错开时间, 否则两块在同一屏争空间 —— 那正是要修的病)。
+          reveal_stage: "contribution",
           solved: true, solved_by: "乙",
           reveal_contributors: mkContrib(true), next_puzzle_ms: 20000});
     const cb = document.getElementById("reveal-contrib");
@@ -568,6 +577,7 @@ window.addEventListener("load", async () => {
           revealed_core_answer: "复飞本身就是考核项目。",
           revealed_full_answer: "这是一次预设的测试飞行，复飞本身就是考核项目。",
           reveal_detail_visible: true,
+          reveal_stage: "contribution",
           solved: false,
           reveal_contributors: mkContrib(false), next_puzzle_ms: 20000});
     check(document.getElementById("reveal-contrib-title").textContent
@@ -582,6 +592,7 @@ window.addEventListener("load", async () => {
     send({phase: "revealed", puzzle_index: 20, story_index: 20,
           revealed_answer: "谜底。", revealed_core_answer: "核心。",
           revealed_full_answer: "谜底。", reveal_detail_visible: true,
+          reveal_stage: "contribution",
           solved: false,
           reveal_contributors: [], next_puzzle_ms: 20000});
     check(cb.classList.contains("hidden"),
@@ -593,6 +604,7 @@ window.addEventListener("load", async () => {
     send({phase: "revealed", puzzle_index: 20, story_index: 20,
           revealed_answer: "谜底。", revealed_core_answer: "核心。",
           revealed_full_answer: "谜底。", reveal_detail_visible: true,
+          reveal_stage: "contribution",
           solved: true,
           reveal_contributors: mkContrib(true), next_puzzle_ms: 20000});
     check(document.getElementById("reveal-contrib-list").children.length === 2,
@@ -604,59 +616,81 @@ window.addEventListener("load", async () => {
     check(document.getElementById("reveal-contrib-title").textContent === "",
           "换题后标题也必须清空");
 
-    // ⑬ 长谜底 + 两条贡献链 + 倒计时: 三者不得互相覆盖
+    // ⑬ U2: 长文本在**各自阶段**都不得压到别的块上
     //
-    // 这是 fitReveal 从"写死常数"改成"按 DOM 实算"的那条回归。
-    // 写死常数时, 贡献链一出现就把可用高度算多了, 正文会压到贡献链上。
+    // ⚠️ U2 改写了这条的形态。U1 时"正文 + 贡献链同时可见"是要测的
+    // 场景; U2 之后它们**在时间上错开**(explanation 只有正文,
+    // contribution 只有贡献链), 所以"正文压到贡献链上"这个组合结构上
+    // 不可能出现 —— 再断言它只会得到一条**永远真**的假测试
+    // (contrib.top=0 时它当然不重叠)。
     //
-    // U1: 现在**只有完整解释区**会被缩字号, 核心答案(>=58px)与贡献链
-    // 都不参与。所以这条断言改成"可压缩区不压到不可压缩区上"。
+    // 真正要守的不变量变成了: 每个阶段里, 该阶段可见的块必须按顺序
+    // 排列、互不重叠、且都落在面板内。下面分两个阶段各测一遍。
     const longReveal = "这是一段刻意写得很长的谜底，用来把揭晓层的可用高度"
-      + "压到很紧，从而检验字号自适应与贡献链的布局是否会互相覆盖。"
+      + "压到很紧，从而检验字号自适应与其它块的布局是否会互相覆盖。"
       + "再补一些字，确保它必然超过一屏的容量，逼迫 fitReveal 真正去缩字号。"
       + "继续补一些字，继续补一些字，继续补一些字，继续补一些字。"
       + "仍然继续补字，仍然继续补字，仍然继续补字，仍然继续补字。";
+    const boxes = () => ({
+      core: document.getElementById("reveal-core").getBoundingClientRect(),
+      body: document.getElementById("reveal-body").getBoundingClientRect(),
+      contrib: document.getElementById("reveal-contrib").getBoundingClientRect(),
+      next: document.getElementById("reveal-next").getBoundingClientRect(),
+      panel: document.getElementById("reveal").getBoundingClientRect(),
+    });
+
+    // ---- explanation 阶段: 核心 + 正文 + 倒计时, 无贡献链 ----
     send({phase: "revealed", puzzle_index: 22, story_index: 22,
           revealed_answer: longReveal,
           revealed_core_answer: "核心答案一句。",
           revealed_full_answer: longReveal, reveal_detail_visible: true,
+          reveal_stage: "explanation",
           solved: true, solved_by: "乙",
           reveal_contributors: mkContrib(true), next_puzzle_ms: 18000});
     {
-      const core = document.getElementById("reveal-core");
-      const body = document.getElementById("reveal-body");
-      const contrib = document.getElementById("reveal-contrib");
-      const next = document.getElementById("reveal-next");
-      const panel = document.getElementById("reveal").getBoundingClientRect();
-      const kr = core.getBoundingClientRect();
-      const br = body.getBoundingClientRect();
-      const cr = contrib.getBoundingClientRect();
-      const nr = next.getBoundingClientRect();
-      check(cr.height > 0, "贡献链应可见且有高度: " + cr.height);
-      check(br.height > 0, "正文应有高度: " + br.height);
-      // U1: 核心答案 -> 正文 的顺序不得颠倒/重叠
-      check(kr.bottom <= br.top + 1,
-            "核心答案不得压到正文上 (core.bottom=" + kr.bottom.toFixed(1)
-            + " body.top=" + br.top.toFixed(1) + ")");
-      // 正文底 <= 贡献链顶(允许 1px 取整)
-      check(br.bottom <= cr.top + 1,
-            "正文不得压到贡献链上 (body.bottom=" + br.bottom.toFixed(1)
-            + " contrib.top=" + cr.top.toFixed(1) + ")");
-      // 贡献链底 <= 倒计时顶
-      check(cr.bottom <= nr.top + 1,
-            "贡献链不得压到倒计时上 (contrib.bottom=" + cr.bottom.toFixed(1)
-            + " next.top=" + nr.top.toFixed(1) + ")");
-      // 全部落在揭晓面板内
-      check(kr.top >= panel.top - 1 && nr.bottom <= panel.bottom + 1,
-            "核心/正文/倒计时都应落在揭晓面板内 (panel="
-            + panel.top.toFixed(1) + ".." + panel.bottom.toFixed(1)
-            + " core=" + kr.top.toFixed(1) + " next.bottom="
-            + nr.bottom.toFixed(1) + ")");
-      // U1: 核心答案**绝不**被缩到下限以下 —— 它是视觉第一层。
-      const kfs = parseFloat(getComputedStyle(core).fontSize);
-      check(kfs >= 58, "核心答案字号不得低于 58px: " + kfs);
-      const fs = parseFloat(getComputedStyle(body).fontSize);
-      check(fs >= 34, "完整解释字号不应缩到 34px 以下: " + fs);
+      const b = boxes();
+      check(b.contrib.height === 0,
+            "U2-⑬: explanation 阶段贡献链应**不可见** (h="
+            + b.contrib.height.toFixed(1) + ")");
+      check(b.body.height > 0, "U2-⑬: 正文应有高度: " + b.body.height);
+      check(b.core.bottom <= b.body.top + 1,
+            "U2-⑬: 核心答案不得压到正文上");
+      check(b.body.bottom <= b.next.top + 1,
+            "U2-⑬: 正文不得压到倒计时上 (body.bottom="
+            + b.body.bottom.toFixed(1) + " next.top=" + b.next.top.toFixed(1)
+            + ")");
+      check(b.core.top >= b.panel.top - 1 && b.next.bottom <= b.panel.bottom + 1,
+            "U2-⑬: 核心/正文/倒计时都应落在揭晓面板内");
+      const kfs = parseFloat(getComputedStyle(
+        document.getElementById("reveal-core")).fontSize);
+      check(kfs >= 58, "U2-⑬: 核心答案字号不得低于 58px: " + kfs);
+      const fs = parseFloat(getComputedStyle(
+        document.getElementById("reveal-body")).fontSize);
+      check(fs >= 34, "U2-⑬: 完整解释字号不应缩到 34px 以下: " + fs);
+    }
+
+    // ---- contribution 阶段: 核心 + 贡献链 + 倒计时, 无正文 ----
+    send({phase: "revealed", puzzle_index: 22, story_index: 22,
+          revealed_answer: longReveal,
+          revealed_core_answer: "核心答案一句。",
+          revealed_full_answer: longReveal, reveal_detail_visible: true,
+          reveal_stage: "contribution",
+          solved: true, solved_by: "乙",
+          reveal_contributors: mkContrib(true), next_puzzle_ms: 18000});
+    {
+      const b = boxes();
+      check(b.body.height === 0,
+            "U2-⑬: contribution 阶段正文应**不可见** (h="
+            + b.body.height.toFixed(1) + ")");
+      check(b.contrib.height > 0,
+            "U2-⑬: 贡献链应可见且有高度: " + b.contrib.height);
+      check(b.core.bottom <= b.contrib.top + 1,
+            "U2-⑬: 核心答案不得压到贡献链上");
+      check(b.contrib.bottom <= b.next.top + 1,
+            "U2-⑬: 贡献链不得压到倒计时上");
+      check(b.core.top >= b.panel.top - 1
+            && b.next.bottom <= b.panel.bottom + 1,
+            "U2-⑬: 核心/贡献链/倒计时都应落在揭晓面板内");
     }
 
     // ⑭ 贡献链绝不做 HTML 拼接
@@ -668,6 +702,7 @@ window.addEventListener("load", async () => {
           revealed_answer: "谜底。", solved: true,
           revealed_core_answer: "核心。",
           revealed_full_answer: "谜底。", reveal_detail_visible: true,
+          reveal_stage: "contribution",
           reveal_contributors: [
             {qid: 1, user_name: "<b>坏名字</b>",
              text: "<img src=x onerror=\"window.__xss=1\">",
@@ -684,6 +719,166 @@ window.addEventListener("load", async () => {
       check(list.textContent.includes("<b>坏名字</b>"),
             "标签应原样作为文本显示: " + list.textContent);
     }
+
+    // ⑯ U2: 60 秒揭晓三阶段(core / explanation / contribution)
+    //
+    // 修的病: 实播里核心答案 + 完整解释 + 共同解谜**同时**上屏, 下半屏
+    // 三块互相争空间, fitReveal 只能一路缩字号, 完整解释被压成一条矮
+    // 滚动框。而**观众没有鼠标去滚直播源** —— 直播画面里的关键内容不能
+    // 依赖滚动才能看见。
+    //
+    // 冻结的不变量(逐阶段):
+    //   core          谜面可见 / core 可见 / 解释隐藏 / 贡献隐藏 / core>=58
+    //   explanation   谜面可见 / core 可见 / 解释可见 / 贡献隐藏 / 无需滚动
+    //   contribution  谜面可见 / core 可见 / 解释隐藏 / 贡献可见 / final 可见
+    const coreTxt = "他一直睡在原房门的正前方。";
+    // 正常质量政策允许范围内的完整解释(几行, 不该需要滚动)
+    const fullTxt = "衣柜是后来封住那扇门的隔板, 他把床摆在了原来门的位置, "
+      + "所以每晚其实都睡在门口, 门外走廊的声响让他不敢关灯。";
+    const u2Send = (stage, extra) => send(Object.assign({
+      phase: "revealed", puzzle_index: 30, story_index: 30,
+      puzzle: "他每晚都不敢关灯, 却一直睡在衣柜前面。为什么?",
+      revealed_answer: fullTxt, revealed_core_answer: coreTxt,
+      revealed_full_answer: fullTxt, reveal_stage: stage,
+      reveal_detail_visible: stage !== "core",
+      solved: true, solved_by: "乙",
+      reveal_contributors: mkContrib(true), next_puzzle_ms: 15000,
+    }, extra || {}));
+    const vis = (id) => {
+      const e = document.getElementById(id);
+      if (!e || e.classList.contains("hidden")) return false;
+      const r = e.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+
+    // ---- U2-A: 0-15s 只看核心答案 ----
+    u2Send("core");
+    check(vis("puzzle"), "U2-A: 谜面应可见");
+    check(vis("reveal-core"), "U2-A: 核心答案应可见");
+    check(!vis("reveal-body"), "U2-A: 完整解释应隐藏");
+    check(!vis("reveal-contrib"), "U2-A: 共同解谜应隐藏");
+    {
+      const kfs = parseFloat(getComputedStyle(
+        document.getElementById("reveal-core")).fontSize);
+      check(kfs >= 58, "U2-A: 核心答案字号 >= 58, 实际 " + kfs);
+      const kr = document.getElementById("reveal-core").getBoundingClientRect();
+      check(kr.top >= -1 && kr.bottom <= 1921,
+            "U2-A: 核心答案不得溢出舞台 (" + kr.top.toFixed(1) + ".."
+            + kr.bottom.toFixed(1) + ")");
+      check(document.getElementById("reveal-next").textContent.includes("秒后"),
+            "U2-A: 倒计时应可见");
+    }
+
+    // ---- U2-B: 15-45s 核心 + 完整解释, 共同解谜隐藏 ----
+    u2Send("explanation");
+    check(vis("puzzle"), "U2-B: 谜面应可见");
+    check(vis("reveal-core"), "U2-B: 核心答案应可见");
+    check(vis("reveal-body"), "U2-B: 完整解释应可见");
+    check(!vis("reveal-contrib"), "U2-B: 共同解谜应隐藏(让位给解释)");
+    {
+      const body = document.getElementById("reveal-body");
+      const br = body.getBoundingClientRect();
+      const kr = document.getElementById("reveal-core").getBoundingClientRect();
+      const panel = document.getElementById("reveal").getBoundingClientRect();
+      check(kr.bottom <= br.top + 1,
+            "U2-B: 核心答案不得压到解释上");
+      check(br.bottom <= panel.bottom + 1,
+            "U2-B: 解释底边不得超出揭晓面板 (body=" + br.bottom.toFixed(1)
+            + " panel=" + panel.bottom.toFixed(1) + ")");
+      // **U2-C 的核心断言**: 正常长度的 answer 必须**不用滚动**就完整可见。
+      check(br.height > 0, "U2-B: 解释应有高度");
+      check(body.scrollHeight <= body.clientHeight + 1,
+            "U2-C: 正常长度解释不得依赖滚动 (scrollH=" + body.scrollHeight
+            + " clientH=" + body.clientHeight + ")");
+      const fs = parseFloat(getComputedStyle(body).fontSize);
+      check(fs >= 34, "U2-C: 解释字号不得低于 34, 实际 " + fs);
+    }
+
+    // ---- U2-C2: 质量政策允许的**上限**长度也必须不用滚动 ----
+    //
+    // 上面 U2-C 用的是"一段正常的解释"。这一条把长度推到 v8 允许的
+    // 上限附近(多句、多行), 确认 explanation 阶段仍然不依赖滚动。
+    //
+    // ⚠️ 为什么必须单独测: `fitReveal` 会缩字号来兜底, 所以"能放下"
+    // 可能只是**字号被缩过头**换来的。所以这里同时断言字号仍 >= 34
+    // —— 否则一个"把字缩到 20px 塞进去"的实现会假绿。
+    {
+      const maxAns = "衣柜是后来封住那扇门的隔板, 他把床摆在了原来门的位置, "
+        + "所以每晚其实都睡在门口; 门外走廊的声响让他不敢关灯, "
+        + "而他自己一直以为那只是习惯。他搬进这间房的时候, "
+        + "前一位租客已经把那扇门封死了, 房东只说了句那面墙不要挂重物。"
+        + "他每晚听见的其实是楼道里的脚步, 而门就在他背后。";
+      u2Send("explanation", {revealed_answer: maxAns,
+                             revealed_full_answer: maxAns});
+      const body = document.getElementById("reveal-body");
+      const fs = parseFloat(getComputedStyle(body).fontSize);
+      check(body.scrollHeight <= body.clientHeight + 1,
+            "U2-C2: 上限长度解释不得依赖滚动 (scrollH=" + body.scrollHeight
+            + " clientH=" + body.clientHeight + ")");
+      check(fs >= 34,
+            "U2-C2: 不得靠缩字号到 34px 以下来塞进内容, 实际 " + fs);
+    }
+
+    // ---- U2-D: 45-60s 核心 + 共同解谜, 完整解释隐藏 ----
+    u2Send("contribution");
+    check(vis("puzzle"), "U2-D: 谜面应可见");
+    check(vis("reveal-core"), "U2-D: 核心答案仍应可见");
+    check(!vis("reveal-body"), "U2-D: 完整解释应隐藏(让位给共同解谜)");
+    check(vis("reveal-contrib"), "U2-D: 共同解谜应可见");
+    {
+      const fin = [...document.querySelectorAll(".reveal-contrib-row .final")];
+      check(fin.length >= 1, "U2-D: 应出现 ✓ 最后线索 标记");
+      const kr = document.getElementById("reveal-core").getBoundingClientRect();
+      const cr = document.getElementById("reveal-contrib")
+        .getBoundingClientRect();
+      check(kr.bottom <= cr.top + 1, "U2-D: 核心答案不得压到贡献链上");
+    }
+
+    // ---- U2-E: 谜面中心在三阶段都不被揭晓层盖住 ----
+    //
+    // ⚠️ 这条必须用 `elementFromPoint`, 不能只断言 `#puzzle` 没有
+    // `.hidden` —— 被一层不透明背景盖住的元素**照样**"可见"(U1 之前
+    // 就吃过这个假绿)。
+    for (const stage of ["core", "explanation", "contribution"]) {
+      u2Send(stage);
+      const pr = document.getElementById("puzzle").getBoundingClientRect();
+      const cx = Math.round(pr.left + pr.width / 2);
+      const cy = Math.round(pr.top + pr.height / 2);
+      const hit = document.elementFromPoint(cx, cy);
+      const inPuzzle = !!(hit && (hit.closest("#top")
+                                  || hit.id === "puzzle"
+                                  || hit.closest("#puzzle")));
+      check(inPuzzle,
+            "U2-E: " + stage + " 阶段谜面中心被别的元素盖住 (hit="
+            + (hit && (hit.id || hit.className || hit.tagName)) + ")");
+    }
+
+    // ---- U2-F: 60 秒结束 -> QA 恢复, 上一题贡献不残留 ----
+    send({phase: "qa", puzzle_index: 31, story_index: 31,
+          puzzle: "下一道题的谜面。", revealed_answer: "",
+          qa_log: [], qa_total: 0, reveal_stage: ""});
+    check(!vis("reveal"), "U2-F: 新题揭晓层应隐藏");
+    check(vis("bottom"), "U2-F: 问答区应恢复");
+    check(document.getElementById("reveal-contrib-list").children.length === 0,
+          "U2-F: 上一题贡献链不得残留");
+    check(document.getElementById("reveal-core").textContent === "",
+          "U2-F: 核心答案应清空");
+
+    // ---- U2-G: 老快照没有 reveal_stage 时退化成两段(U1 行为) ----
+    send({phase: "revealed", puzzle_index: 32, story_index: 32,
+          puzzle: "兼容测试。", revealed_answer: fullTxt,
+          revealed_core_answer: coreTxt, revealed_full_answer: fullTxt,
+          reveal_detail_visible: true, solved: false,
+          reveal_contributors: [], next_puzzle_ms: 15000});
+    check(vis("reveal-body"),
+          "U2-G: 无 reveal_stage 但有 detail_visible -> 应显示完整解释");
+    send({phase: "revealed", puzzle_index: 33, story_index: 33,
+          puzzle: "兼容测试2。", revealed_answer: fullTxt,
+          revealed_core_answer: coreTxt, revealed_full_answer: fullTxt,
+          reveal_detail_visible: false, solved: false,
+          reveal_contributors: [], next_puzzle_ms: 15000});
+    check(!vis("reveal-body"),
+          "U2-G: 无 reveal_stage 且 detail_visible=false -> 不显示完整解释");
 
     // ⑮ U1-F: 观众可见的 DOM 里**绝不能**出现补题/库存类文案
     //
@@ -738,8 +933,8 @@ def main():
         assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
         assert not errors, errors
-    print("PASS: 问答追加/提示行/思考中/揭晓工作区(U1 两阶段)/贡献链/换题清空/"
-          "不截断/调试宽度/长流可滚/无补题文案；data/preview.png")
+    print("PASS: 问答追加/提示行/思考中/揭晓工作区(U2 三阶段 + 不依赖滚动)/"
+          "贡献链/换题清空/不截断/调试宽度/长流可滚/无补题文案；data/preview.png")
 
 
 if __name__ == "__main__":

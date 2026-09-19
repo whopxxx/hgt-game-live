@@ -298,6 +298,107 @@ def test_solve_and_reveal():
           s.next_puzzle_ms is not None and s.next_puzzle_ms > 0, s.next_puzzle_ms)
 
 
+def test_u2_reveal_stage_three_phase():
+    """**U2**: 揭晓分三阶段下发(core / explanation / contribution)。
+
+    60 秒分三段, 是为了让下半屏**同一时刻只有一组长内容**:
+        0..focus       只有核心答案
+        focus..detail  核心答案 + 完整解释(共同解谜隐藏)
+        detail..hold   核心答案 + 共同解谜(完整解释隐藏)
+
+    实播故障: 三块同时上屏 -> 互相争空间 -> fitReveal 只能一路缩字号
+    -> 完整解释被压成一条矮滚动框, 而观众没有鼠标去滚直播源。
+
+    ⚠️ 阶段由**服务端**算(前端不自己计时): 刷新/重连后本地计时会从 0
+    重来, 与服务端不一致; 而且边界是配置, 前端硬编码一份副本迟早漂移。
+    """
+    print("\n[U2-Engine] 揭晓快照三阶段")
+    eng, clk = boot(mkcfg(reveal_hold_seconds=60.0,
+                          reveal_core_focus_seconds=15.0,
+                          reveal_detail_seconds=45.0))
+    # ---- QA / REVEALING: 阶段为空(不提前泄 hidden truth) ----
+    check("QA: stage 为空", eng.snapshot().reveal_stage == "",
+          eng.snapshot().reveal_stage)
+    eng.submit_danmaku("u1", "甲", "#是同伴的肉")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="揭晓")])
+    check("REVEALING: 仍不提前给 stage",
+          eng.snapshot().reveal_stage == "", eng.snapshot().reveal_stage)
+
+    # ---- REVEALED: 逐秒核对三段边界 ----
+    eng.submit_reveal("完整解释在此。")
+    # 用 deadline 反推: 进入 REVEALED 的时刻 = deadline - hold
+    base = eng._next_puzzle_deadline - 60.0
+    cases = [
+        (0.0, "core"),
+        (14.9, "core"),
+        (15.0, "explanation"),      # 边界**含** focus
+        (44.9, "explanation"),
+        (45.0, "contribution"),     # 边界**含** detail
+        (59.0, "contribution"),
+    ]
+    for dt, want in cases:
+        s = eng.snapshot(now=base + dt)
+        check(f"{dt:4.1f}s -> {want}", s.reveal_stage == want,
+              (dt, s.reveal_stage, want))
+    # detail_visible 与 stage 必须自洽(前端两者都用)
+    s = eng.snapshot(now=base + 5.0)
+    check("core 阶段 detail_visible=False", s.reveal_detail_visible is False)
+    s = eng.snapshot(now=base + 30.0)
+    check("explanation 阶段 detail_visible=True",
+          s.reveal_detail_visible is True)
+    s = eng.snapshot(now=base + 50.0)
+    check("contribution 阶段 detail_visible 仍为 True(它只表示'过了 focus')",
+          s.reveal_detail_visible is True)
+
+
+def test_u2_stage_boundaries_come_from_config_not_literals():
+    """**U2**: 阶段边界必须**来自配置**, 不是写死的 15/45。
+
+    把 hold/core_focus/detail 都换一组值, 阶段必须跟着变 —— 否则就是
+    代码里抄了一份常量, 改了配置却不生效。
+    """
+    print("\n[U2-Engine] 阶段边界来自配置")
+    eng, clk = boot(mkcfg(reveal_hold_seconds=20.0,
+                          reveal_core_focus_seconds=4.0,
+                          reveal_detail_seconds=12.0))
+    eng.submit_danmaku("u1", "甲", "#是同伴的肉")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="揭晓")])
+    eng.submit_reveal("解释。")
+    base = eng._next_puzzle_deadline - 20.0
+    for dt, want in ((0.0, "core"), (4.0, "explanation"),
+                     (11.9, "explanation"), (12.0, "contribution")):
+        s = eng.snapshot(now=base + dt)
+        check(f"自定义边界 {dt:4.1f}s -> {want}", s.reveal_stage == want,
+              (dt, s.reveal_stage, want))
+
+
+def test_u2_detail_boundary_validation():
+    """**U2**: `reveal_detail_seconds` 必须落在 [focus, hold] 内。
+
+    越界会让某一段永远不出现(前端拿到自相矛盾的 stage)。
+    注意两端**允许**相等: `== hold` = 解释一直显示到下一题;
+    `== focus` = 跳过中间段。倒挂与越界必须报错。
+    """
+    print("\n[U2-Config] reveal_detail_seconds 边界校验")
+    check("正常值 -> 无告警",
+          not mkcfg(reveal_hold_seconds=60.0, reveal_core_focus_seconds=15.0,
+                    reveal_detail_seconds=45.0).validate())
+    check("== hold -> 允许",
+          not mkcfg(reveal_hold_seconds=60.0, reveal_core_focus_seconds=15.0,
+                    reveal_detail_seconds=60.0).validate())
+    check("== focus -> 允许",
+          not mkcfg(reveal_hold_seconds=60.0, reveal_core_focus_seconds=15.0,
+                    reveal_detail_seconds=15.0).validate())
+    bad = mkcfg(reveal_hold_seconds=60.0, reveal_core_focus_seconds=15.0,
+                reveal_detail_seconds=10.0).validate()
+    check("**早于 focus -> 报错**", bool(bad), bad)
+    bad2 = mkcfg(reveal_hold_seconds=40.0, reveal_core_focus_seconds=15.0,
+                 reveal_detail_seconds=50.0).validate()
+    check("**晚于 hold -> 报错**", bool(bad2), bad2)
+
+
 def test_u1_reveal_snapshot_two_phase():
     """**U1**: 揭晓正文分两段下发, 且**只在 REVEALED**。
 
@@ -3368,6 +3469,9 @@ def main():
              test_no_duplicate_worker_per_qid, test_answer_payload_carries_qa_budget,
              test_dedupe_and_cap, test_solve_and_reveal,
              test_u1_reveal_snapshot_two_phase,
+             test_u2_reveal_stage_three_phase,
+             test_u2_stage_boundaries_come_from_config_not_literals,
+             test_u2_detail_boundary_validation,
              test_u1_reveal_core_falls_back_when_absent,
              test_u1_pressure_exposes_reveal_remaining,
              test_reveal_once,
