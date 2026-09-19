@@ -111,11 +111,15 @@ window.addEventListener("load", async () => {
     // `renderStats` 排在 pushDanmaku **之前**, 所以哪怕 pushDanmaku 炸了,
     // 它照样更新 —— 用 stats 当探针会得到假绿(我第一版就是这么错的)。
     //
-    // pushDanmaku 之后只剩 `renderDebug` 和 `layout()`。layout() 会设置
-    // `#bottom.style.top`(按谜面高度算), 这是**唯一**能被外部观察、
-    // 且必然发生在 pushDanmaku 之后的副作用。
-    const bottom = document.getElementById("bottom");
-    const topBefore = bottom.style.top;
+    // pushDanmaku 之后只剩 `renderDebug` 和 `layout()`。layout() 会写入
+    // 工作区分界值 `--workspace-top`(#top / #bottom / #reveal 三者共用),
+    // 这是**唯一**能被外部观察、且必然发生在 pushDanmaku 之后的副作用。
+    //
+    // ⚠️ C2: 早先这里读 `#bottom.style.top`。C2 把分界值改成 CSS 变量
+    // 单一来源后那个 inline style 不再被写, 于是探针会恒等 —— 探针失效
+    // 会让 B2 变成"永远绿"的假测试。所以读变量本身。
+    const content = document.getElementById("content");
+    const topBefore = content.style.getPropertyValue("--workspace-top");
     // 换一道**很长**的谜面, 保证 layout() 会算出不同的 top(否则值不变,
     // 无法区分"没执行"和"执行了但结果一样")
     const longPuzzle = "这是一道很长的谜面。".repeat(12);
@@ -127,12 +131,29 @@ window.addEventListener("load", async () => {
     check(document.querySelectorAll(".dm").length === 0,
           "B1: 不应再生成 .dm 节点 (got "
           + document.querySelectorAll(".dm").length + ")");
-    check(bottom.style.top !== topBefore,
+    const topAfter = content.style.getPropertyValue("--workspace-top");
+    check(topAfter && topAfter !== topBefore,
           "B2: 带 danmaku 的 snapshot 之后 onState 必须跑完 —— "
           + "layout() 是最后一步, 它没执行说明中途被截断 "
-          + "(#bottom.top " + topBefore + " -> " + bottom.style.top + ")");
+          + "(--workspace-top " + (topBefore || "(空)") + " -> "
+          + (topAfter || "(空)") + ")");
+    // C2: 分界值必须**同时**驱动 #bottom 与 #reveal —— 三者同一来源。
     {
-      const content = document.getElementById("content");
+      const bot = document.getElementById("bottom");
+      const rev = document.getElementById("reveal");
+      const bs = getComputedStyle(bot).top;
+      check(bs === topAfter,
+            "C2: #bottom 的 top 应等于 --workspace-top ("
+            + bs + " vs " + topAfter + ")");
+      const wasH = rev.classList.contains("hidden");
+      rev.classList.remove("hidden");
+      const rs = getComputedStyle(rev).top;
+      check(rs === topAfter,
+            "C2: #reveal 的 top 应等于 --workspace-top ("
+            + rs + " vs " + topAfter + ")");
+      if (wasH) rev.classList.add("hidden");
+    }
+    {
       const stage = document.getElementById("stage");
       const cr = content.getBoundingClientRect();
       const sr = stage.getBoundingClientRect();
@@ -219,6 +240,96 @@ window.addEventListener("load", async () => {
     // U1: 下半部问答工作区整个让给答案(只视觉隐藏, DOM 保留)。
     check(document.getElementById("bottom").classList.contains("hidden"),
           "U1: 揭晓时下半部问答区应让位");
+    // ---- C2: 揭晓工作区**真实几何** ----
+    //
+    // 上面两条(U1)只证明谜面没有 `.hidden`、底部分区被关了 —— 它们
+    // **证明不了谜面真的看得见**。C2 之前 #reveal 是 `inset:0` + 不透明
+    // 背景 + z-index:20, 于是它从 y=0 起把整屏刷掉, 谜面虽然"没被隐藏",
+    // 但被盖在下面 —— 屏幕上看不见, 测试却全绿。这就是假绿。
+    //
+    // 现在断言**几何**:
+    //   ① 揭晓工作区顶边 >= 谜面区底边(两者不重叠)
+    //   ② 揭晓工作区与 #bottom 是**同一个矩形**(共用工作区分界值)
+    //   ③ 谜面**中心点**的最上层元素属于谜面区域, 而不是揭晓层
+    //       —— 只有这一条能真正抓住"被不透明层盖住"。
+    {
+      const r = (id) => document.getElementById(id).getBoundingClientRect();
+      // ⚠️ `getBoundingClientRect()` 返回的是**缩放后**的 CSS 像素:
+      //    fit() 把 #stage transform: scale(min(vw/1080, vh/1920))。
+      //    headless 视口是 1064x1825(不是 1080x1920), scale ≈ 0.9505,
+      //    所以直接比两个元素的 rect 会混进缩放差异。
+      //
+      // ⚠️⚠️ 还要**关掉动画**: headless 的 --virtual-time-budget 会把动画
+      //    时钟冻在 t=0, `#reveal` 的入场动画(早先是 translateY(16px))
+      //    会永久停在 from 帧 —— 量出来的 top 恒偏 16px, 断言随机红。
+      //    生产里那段位移也真的会把面板底边推出 #stage(overflow:hidden)
+      //    被裁掉, 所以 C2 把动画改成纯 opacity 淡入; 这里再显式 `none`
+      //    一次, 让断言与"动画播到哪一帧"彻底无关。
+      const revEl = document.getElementById("reveal");
+      const savedAnim = revEl.style.animation;
+      revEl.style.animation = "none";
+      void revEl.getBoundingClientRect();      // 强制回流后再量
+      const scale = document.getElementById("stage")
+        .getBoundingClientRect().width / 1080;
+      check(scale > 0 && scale < 1.01, "C2: scale 应在 (0,1]: " + scale);
+      const rl = (id) => {
+        const b = r(id);
+        return {top: b.top / scale, bottom: b.bottom / scale,
+                left: b.left / scale, right: b.right / scale,
+                height: b.height / scale};
+      };
+      const topR = rl("top"), revR = rl("reveal");
+      const bot = document.getElementById("bottom");
+      check(revR.top >= topR.bottom - 1,
+            "C2: 揭晓工作区不得盖住谜面区 (reveal.top="
+            + revR.top.toFixed(1) + " top.bottom=" + topR.bottom.toFixed(1)
+            + " @scale " + scale.toFixed(4) + ")");
+      check(revR.height > 0 && revR.bottom <= 1920 + 1,
+            "C2: 揭晓工作区应在舞台内 (top=" + revR.top.toFixed(1)
+            + " bottom=" + revR.bottom.toFixed(1) + ")");
+      // ② 与 #bottom 同一矩形 —— 先把 #bottom 临时显示出来量(它此刻
+      //    是 display:none, 量不到)。量完立刻还原, 不影响后续断言。
+      const wasHidden = bot.classList.contains("hidden");
+      bot.classList.remove("hidden");
+      const botR = rl("bottom");
+      check(Math.abs(revR.top - botR.top) <= 1
+            && Math.abs(revR.bottom - botR.bottom) <= 1
+            && Math.abs(revR.left - botR.left) <= 1
+            && Math.abs(revR.right - botR.right) <= 1,
+            "C2: 揭晓工作区必须与 #bottom 是同一矩形 (reveal="
+            + revR.top.toFixed(1) + ".." + revR.bottom.toFixed(1) + " bottom="
+            + botR.top.toFixed(1) + ".." + botR.bottom.toFixed(1) + ")");
+      if (wasHidden) bot.classList.add("hidden");
+      // ③ 谜面中心点的最上层元素必须属于谜面区域。
+      //
+      // **这一条才是真正抓住"被不透明层盖住"的断言** —— 前两条只
+      // 证明"两个盒子没重叠", 而 `inset:0` 那种实现两个盒子也不会
+      // "重叠", 真正的问题是 hit test 命中了谁。
+      // `elementFromPoint` 吃视口坐标, 所以用未缩放的 r()。
+      //
+      // ⚠️ 必须在**揭晓层可见**时测 —— `display:none` 的元素不参与
+      //    hit test, 那样"谜面没被盖住"会无条件通过, 又是假绿。
+      check(!revEl.classList.contains("hidden"),
+            "C2: 揭晓层此刻应可见, 否则这条 hit test 是假绿");
+      const px = (r("top").left + r("top").right) / 2;
+      const py = (r("top").top + r("top").bottom) / 2;
+      const hit = document.elementFromPoint(px, py);
+      const topEl = document.getElementById("top");
+      const inTop = !!(hit && (hit === topEl || topEl.contains(hit)));
+      check(inTop,
+            "C2: 谜面中心 (" + px.toFixed(0) + "," + py.toFixed(0)
+            + ") 的最上层元素应属于谜面区, 实际 <"
+            + (hit ? hit.id || hit.tagName : "null") + ">");
+      // 对称地: 揭晓工作区中心点的最上层元素应属于揭晓层。
+      const rv = r("reveal");
+      const hx = (rv.left + rv.right) / 2;
+      const hy = (rv.top + rv.bottom) / 2;
+      const hit2 = document.elementFromPoint(hx, hy);
+      check(!!(hit2 && (hit2 === revEl || revEl.contains(hit2))),
+            "C2: 揭晓工作区中心的最上层元素应属于揭晓层, 实际 <"
+            + (hit2 ? hit2.id || hit2.tagName : "null") + ">");
+      revEl.style.animation = savedAnim;
+    }
     const coreFs = parseFloat(
       getComputedStyle(document.getElementById("reveal-core")).fontSize);
     check(coreFs >= 58, "核心答案字号应 >= 58px, 实际 " + coreFs);

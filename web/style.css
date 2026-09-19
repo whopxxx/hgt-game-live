@@ -3,9 +3,13 @@
  *  上半部 (#top):    谜面(大字, 固定不动)
  *  下半部 (#bottom): 问答流(持续上滚) + 思考中 + 提示 + 统计
  *
- *  揭晓时 (#reveal, #content 的直接子节点) 覆盖下半部:
- *    0..reveal_core_focus_seconds  只显示核心答案(64px, 不缩放)
- *    之后                          追加完整解释 + 共同解谜
+ *  揭晓时 (#reveal) **接替 #bottom 的同一个矩形** —— 两者共用
+ *  `--workspace-top` 这一个动态分界值(C2)。所以揭晓时:
+ *
+ *      上半部: 谜面**仍然可见**(观众要对照"原来那句话是这个意思")
+ *      下半部: 揭晓工作区
+ *        0..reveal_core_focus_seconds  只显示核心答案(64px, 不缩放)
+ *        之后                          追加完整解释 + 共同解谜
  */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -83,23 +87,33 @@ html, body {
 #puzzle.hidden { display: none; }   /* U1 起揭晓时不再隐藏(谜面保持可见) */
 @keyframes breathe { 50% { color: #ffe9b8; } }
 
-/* 揭晓覆盖层(不透明: 盖住下面的谜面/问答, 不叠字) */
-/* ---- 揭晓工作区(U1) ----
-   ⚠️ 它是 #content 的直接子节点(与 #top / #bottom 平级), inset:0 ->
-   拿到整个舞台 1080x1920。揭晓时覆盖下半部的问答区, 而上半部的谜面
-   在它之上仍可见(它从 y=0 开始, 但内容用 padding-top 让开谜面区)。
+/* 揭晓覆盖层(不透明: 盖住下面的问答, 不叠字) */
+/* ---- 揭晓工作区(C2) ----
+   ⚠️ **几何不变量**: 揭晓工作区与 #bottom 是**同一个矩形**。
 
-   早先它嵌在 #top 内(靠盖住谜面工作), 高度被 #top 的 900px 盒子限制,
-   完整的核心答案放不下 -> fitReveal() 只能把字号一路缩到 22px。
-   现在有整屏空间, 核心答案固定在 64px, **不参与任何缩放**。 */
+   它只占原来 `#bottom` 的下半部工作区, 绝不覆盖上半部的谜面:
+
+       top: var(--workspace-top)   ← 与 #bottom 的 top 同一个动态值
+       bottom: 0
+
+   C2 之前这里是 `inset: 0` + `padding-top: calc(var(--top-h) + 40px)`。
+   那**看起来**给谜面留了位置, 实际上不透明的背景仍然从 y=0 开始绘制,
+   于是整块谜面被盖住 —— "上方谜面保留"只是报告里的说法, 屏幕上是假的。
+   现有 Web 测试只检查 `#puzzle` 没有 `.hidden`, 没有检查它被谁遮住,
+   所以是假绿。
+
+   修法是**落下布局**, 不是给 `#top` 提 z-index: 补一层遮蔽只会把
+   "谁是工作区"这件事继续搅浑, 而分界值本来就由 layout() 维护。
+   现在两个区块共用 `--workspace-top` 一个来源 —— 它变了, 两者一起变,
+   不可能再错位。
+
+   字号: 核心答案写死 64px(CSS), **不参与任何缩放**。 */
 #reveal {
-  position: absolute; inset: 0;
+  position: absolute;
+  top: var(--workspace-top, 900px);
+  bottom: 0; left: 0; right: 0;
   background: linear-gradient(180deg, #17130a 0%, #0c0a06 100%);
-  /* 谜面在揭晓时保持可见(占上方 #top 的高度, 由 layout() 动态算,
-     实测 589~1000)。揭晓正文从 `top` 推入的 CSS 变量下方开始 ——
-     不写死 560, 因为谜面长短会改变 #top 的高度。
-     `--top-h` 由 app.js 的 layout() 写入, 兜底 620。 */
-  padding: calc(var(--top-h, 620px) + 40px) 80px 80px;
+  padding: 30px 80px 80px;
   display: flex; flex-direction: column;
   gap: 26px;
   overflow: hidden;
@@ -171,11 +185,18 @@ html, body {
   margin-left: 12px; font-size: 24px;
   color: #ffd15e; letter-spacing: 1px;
 }
-/* 揭晓面板整体淡入, 避免"啪"地切过去 */
+/* 揭晓面板整体淡入, 避免"啪"地切过去。
+   ⚠️ C2: 只做**淡入**, 不做位移。
+   早先这里是 `translateY(16px) -> none`。揭晓工作区改成
+   `top: var(--workspace-top); bottom: 0` 之后, 它的下边缘**正好压在**
+   舞台底边(#stage 是 overflow:hidden), 于是那 16px 位移会把面板底边
+   推出舞台、被裁掉; 而且位移期间 `getBoundingClientRect()` 与
+   #bottom 对不上 —— 几何断言会随机红/绿, 取决于量的时候动画跑到哪。
+   淡入没有任何这个问题: opacity 不改变盒模型。 */
 #reveal { animation: revealIn .45s ease-out; }
 @keyframes revealIn {
-  from { opacity: 0; transform: translateY(16px); }
-  to   { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 /* 进下一题时: 谜面淡入, 提示"新题" */
 #puzzle.newpuzzle { animation: puzzleIn .6s ease-out; }
@@ -200,9 +221,11 @@ html, body {
 }
 
 /* ================= 下半部 ================= */
+/* 下半部工作区: `--workspace-top` 是 #top 与 #bottom / #reveal 的**唯一**
+   分界值, 由 app.js 的 layout() 写入。三处引用同一个变量 -> 不可能错位。 */
 #bottom {
   position: absolute;
-  top: 900px; bottom: 0; left: 0; right: 0;
+  top: var(--workspace-top, 900px); bottom: 0; left: 0; right: 0;
   padding: 0 80px 20px;
   display: flex; flex-direction: column;
   gap: 14px;
@@ -210,7 +233,11 @@ html, body {
 /* 揭晓期间下半部整个让给答案(任务书 U1)。
    ⚠️ 必须真的 `display:none`, 不能只靠 #reveal 盖住 —— 实测过:
    只靠 z-index 时问答流/提示/统计仍会从揭晓面板的 padding 区透出来
-   (它们没被盖住的部分照常绘制)。DOM 保留, 下一题直接恢复。 */
+   (它们没被盖住的部分照常绘制)。DOM 保留, 下一题直接恢复。
+
+   C2 起 #reveal 与 #bottom 是同一个矩形, 所以这里少了一层"不该露的
+   边缘"可露; 但 display:none 仍然保留 —— 它让"下半部此刻不存在"
+   这件事在 DOM 层就是真的, 而不是靠另一个元素遮挡来实现的。 */
 #bottom.hidden { display: none; }
 #qa-title {
   flex: 0 0 auto;

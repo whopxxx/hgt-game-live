@@ -1,7 +1,8 @@
 /* 竖屏 AI 海龟汤直播 —— 前端 (两段式布局)
  *
- * 上半部: #puzzle  谜面大字(固定) + #reveal 揭晓覆盖层
- * 下半部: #qa      问答流, 持续向上滚动
+ * 上半部: #top / #puzzle  谜面大字(固定)
+ * 下半部: #bottom         问答流; 揭晓时由 #reveal 接替**同一个矩形**
+ *                         (两者共用 --workspace-top, 见 C2)
  *
  * 复用旧版的: WS 管道 / fit() 舞台缩放 / 自动滚动兜底 / layout()
  */
@@ -117,6 +118,11 @@
   //   - 贡献链字号小且最多 1~2 条(completion 合同上限 2 个 fact),
   //     缩它只会让它不可读。
   // 所以这里只留一个可压缩区域, 下限 34px。
+  //
+  // ⚠️ C2: 可用高度是**下半部工作区**的高度(约 1920 - TOP_MIN=620
+  // 到 1920 - TOP_MAX=1000), 不再是整屏。`el.reveal.clientHeight` 会
+  // 自动反映这一点(它是 #bottom 那个矩形的孪生), 所以这里的算法不用改
+  // —— 只要别再有人把 #reveal 改回 inset:0。
   const REVEAL_EXPLAIN_BASE = 34;
   const REVEAL_EXPLAIN_MIN = 34;
   let lastRevealFitKey = null;
@@ -222,11 +228,14 @@
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
     el.reveal.classList.toggle("hidden", !on);
-    // ⚠️ U1 起**不再**隐藏谜面: 揭晓工作区已从 #top 移出, 从 y=0 起用
-    // padding-top 让开谜面区。谜面在上半部保持可见 —— 观众要对照着看
-    // "原来谜面那句话是这个意思"。
+    // ⚠️ C2: 揭晓工作区与 #bottom 是**同一个矩形**(共用 --workspace-top),
+    // 所以谜面天然不会被盖住 —— 这条不变量由 CSS 保证, 不靠"揭晓层
+    // 自己让出上方"。
     //
-    // 但**下半部的问答工作区要让位**(任务书: 揭晓期间下半部整个给答案)。
+    // 依然**不碰** #puzzle 的 hidden(谜面整个揭晓过程保持可见: 观众要
+    // 对照着看"原来谜面那句话是这个意思")。
+    //
+    // 下半部的问答工作区要让位(任务书: 揭晓期间下半部整个给答案)。
     // 只视觉隐藏, DOM 与 Engine 数据都保留 —— 下一题直接恢复, 不需要
     // 重建任何东西。
     el.bottom.classList.toggle("hidden", on);
@@ -487,10 +496,10 @@
     if (height !== lastTopH) {
       lastTopH = height;
       el.top.style.height = height + "px";
-      el.bottom.style.top = height + "px";
-      // U1: 揭晓工作区的 padding-top 跟着谜面区走 —— 它要把正文推到
-      // 谜面下方。写死一个常数会在谜面长短变化时压到/远离谜面。
-      el.content.style.setProperty("--top-h", height + "px");
+      // C2: `#bottom` 与 `#reveal` **共用**这一个分界值 —— 它们是同一个
+      // 工作区矩形的两个占用者(#reveal 揭晓时接替 #bottom)。
+      // 只写 CSS 变量而不各自 set style.top: 单一来源, 不可能错位。
+      el.content.style.setProperty("--workspace-top", height + "px");
     }
   }
   new ResizeObserver(layout).observe(el.puzzle);
