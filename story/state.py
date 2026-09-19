@@ -354,6 +354,9 @@ class Snapshot:
     danmaku: list[dict[str, Any]] = field(default_factory=list)
     notice: Optional[str] = None
     phase_hint: str = ""
+    # ---- AI 玩家 ----
+    # 只公开计量与在途状态；reservation token / round / spec_key 永不下发。
+    ai_player: dict[str, Any] = field(default_factory=dict)
     # ---- 统计 ----
     stat_questions: int = 0                 # 本题累计提问数
     stat_answered: int = 0                  # 本题累计已答数
@@ -404,6 +407,7 @@ class Snapshot:
             "danmaku": self.danmaku,
             "notice": self.notice,
             "phase_hint": self.phase_hint,
+            "ai_player": self.ai_player,
             "stats": {
                 "questions": self.stat_questions,
                 "answered": self.stat_answered,

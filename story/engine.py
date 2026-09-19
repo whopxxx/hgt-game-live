@@ -33,6 +33,7 @@ from .puzzle import PuzzleSignature, PuzzleSpec, runtime_spec_key
 from .state import (CMD_PREFIX, HINT_TOKENS, NEXT_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
+from .summon import LIKES_PER_SUMMON, SummonLedger
 
 log = logging.getLogger("story.engine")
 
@@ -257,6 +258,9 @@ class RoundEngine:
         self._notice = ""
         self._phase_hint = ""
 
+        # 直播 session 级 AI 玩家次数；跨题/揭晓不重置。
+        self._ai_player_ledger = SummonLedger()
+
     # ==================================================================
     # 生命周期
     # ==================================================================
@@ -338,27 +342,24 @@ class RoundEngine:
     def submit_interaction(self, ev: Any = None,
                            now: Optional[float] = None
                            ) -> list[EngineAction]:
-        """互动事件入口(Step 11: **characterization stub**)。
-
-        ## 这一步为什么是 no-op
-
-        Step 11 只打通"Like/Gift 能进业务链"这条路, **不记 Summon**、
-        不调 AI、不改 UI。真正的计量在 Step 13(Summon Ledger), 而它必须
-        等 Step 12 拿到真实协议语义之后才能写 —— 在证据之前实现累计器,
-        等于拿猜测当规格。
-
-        所以这里只是个**契约占位**: 定义好入口形状(收什么、返回什么),
-        让 Step 13 往里填。它现在返回空动作列表, 不碰任何状态。
-
-        ## 为什么要有这个占位(而不是 Step 13 直接加)
-
-        有了它, director 的分发逻辑、ingest 的事件类型、以及"keep_all 与
-        interaction_enabled 解耦"这三件事可以在**没有业务逻辑**的情况下
-        独立验证(测试直接打这个入口)。Step 13 填进来时, 那些 plumbing
-        测试一行都不用改。
-        """
-        # 故意的 no-op: 不改任何状态, 不产生动作。
-        return []
+        """把 Like.total 接入 AI 玩家次数；Gift 只保留 raw 计数。"""
+        with self._lock:
+            kind = str(getattr(ev, "kind", "") or "").lower()
+            if kind == "gift":
+                self._ai_player_ledger.on_gift_event(ev)
+                return []
+            if kind != "like":
+                return []
+            total = getattr(ev, "total", 0)
+            gained = self._ai_player_ledger.on_like_total(total, now=now)
+            if not gained:
+                return []
+            log.info("like total=%s -> AI玩家提问次数 +%d available=%d",
+                     total, gained, self._ai_player_ledger.available)
+            return [EngineAction(ActionKind.BROADCAST, {
+                "ai_player_questions_gained": gained,
+                "phase_changed": False,
+            })]
 
     def submit_danmaku(self, user_id, user_name: str, content: str,
                        now: Optional[float] = None,
@@ -2112,6 +2113,17 @@ class RoundEngine:
                 danmaku=[d.to_json() for d in self._danmaku[-40:]],
                 notice=self._notice or None,
                 phase_hint=self._phase_hint,
+                ai_player={
+                    "questions_available": self._ai_player_ledger.available,
+                    "questions_earned":
+                        self._ai_player_ledger.summon_earned_total,
+                    "questions_used":
+                        self._ai_player_ledger.summon_consumed_total,
+                    "likes_progress": self._ai_player_ledger.likes_progress,
+                    "likes_per_question": LIKES_PER_SUMMON,
+                    "in_flight": bool(
+                        self._ai_player_ledger.detective_reservation),
+                },
                 stat_questions=self._questions_total,
                 stat_answered=self._answered_total,
                 stat_solved=self._solved_total,
