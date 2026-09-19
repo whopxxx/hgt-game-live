@@ -625,7 +625,11 @@ def test_snapshot_keys():
 
 def test_hint_order_and_dedup():
     print("[提示: 保留历史 + 挡重复]")
-    eng, clk = boot(mkcfg(hint_seconds=5, restate_seconds=9999, max_hints=3))
+    # `hint_min_gap_seconds=0`: 这条测的是**提示历史与去重**, 不是冷却。
+    # 它每 6 秒推进一次时间轴, 而 H1 的默认冷却 45 秒会把第 2、3 条挡住
+    # —— 那不是这条用例要断言的东西。冷却有 H1-C 专门测。
+    eng, clk = boot(mkcfg(hint_seconds=5, restate_seconds=9999, max_hints=3,
+                          hint_min_gap_seconds=0))
     eng.submit_danmaku("u1", "甲", "#问题一")
     eng.tick()
     eng.submit_qa([QAResult(qid=1, verdict="是")])
@@ -2963,8 +2967,292 @@ def test_stale_reveal_callback_is_discarded():
     check("阶段没变", eng.phase == Phase.REVEALING, eng.phase)
 
 
+# ======================================================================
+# H1: 提示 = 时间 OR 真人成功问答数
+# ======================================================================
+def _answer_n(eng, n, start=1, clk=None, gap=0.5):
+    """喂 n 条**成功**的真人裁决。
+
+    ⚠️ 必须走**真实派发链**: `submit_qa` 只认"还在 `_inflight` 里"的
+    qid(不在途的回包一律丢弃 —— 那是防跨题/重复的纪律)。所以这里先
+    发弹幕 -> tick 派发 -> 再 submit_qa。直接凭空 submit_qa 什么都不
+    会发生, 那会测出"提示永远不来"的假故障。
+    """
+    # ⚠️ 两个坑:
+    #   ① 在途数被 `qa_max_inflight` 封顶(默认 5) —— 先全发再全回会卡住,
+    #      所以必须边派发边回包。
+    #   ② qid 由**引擎**按 `_next_qid` 递增分配, 不是弹幕文本里的数字。
+    #      凭空 submit_qa(qid=N) 只会被当成"不在途的过期回包"丢掉, 于是
+    #      计数永远是 0 —— 那会测出"提示永远不来"的假故障。
+    #      所以 qid 从 tick 派发的 ANSWER 动作里读。
+    win = max(1, eng.cfg.qa_max_inflight)
+    done = 0
+    tag = 0
+    while done < n:
+        batch = min(win, n - done)
+        for _ in range(batch):
+            tag += 1
+            eng.submit_danmaku(f"u{start}_{tag}", f"观众{start}_{tag}",
+                               f"#问题{start}_{tag}")
+        if clk is not None:
+            clk.advance(gap)
+        qids = [a.payload["qid"] for a in eng.tick()
+                if a.kind == ActionKind.ANSWER]
+        for qid in qids:
+            eng.submit_qa([QAResult(qid=qid, verdict="是", comment="")])
+        done += batch
+
+
+def test_h1_a_question_count_triggers_hint():
+    """**H1-A**: 19 条成功裁决不发提示; 第 20 条发 Hint 1。
+
+    时间轴设得很远(9999s), 所以这条只可能是问答数触发的。
+    """
+    print("\n[H1-A] 20 条成功问答 -> Hint 1")
+    eng, clk = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=45.0))
+    _answer_n(eng, 19, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("19 条: **不发提示**", not got, [a.payload for a in got])
+    _answer_n(eng, 1, start=20, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**第 20 条 -> Hint 1**", len(got) == 1, got)
+    check("level=1", got and got[0].payload["level"] == 1,
+          got[0].payload if got else None)
+
+
+def test_h1_b_time_after_question_does_not_repeat():
+    """**H1-B**: 20 问已经发过 Hint1; 到 5 分钟**不能**重复 Hint1。"""
+    print("\n[H1-B] 问答触发过之后, 时间到不重复同一条")
+    eng, clk = boot(mkcfg(hint_seconds=300, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=45.0))
+    _answer_n(eng, 20, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("20 问 -> Hint 1", len(got) == 1, got)
+    eng.submit_hint("提示一")
+    # 空转到 5 分钟时间格
+    clk.advance(301)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**时间到 5min 但不重复 Hint 1**", not got, [a.payload for a in got])
+    check("_hints_given 仍是 1", eng._hints_given == 1, eng._hints_given)
+
+
+def test_h1_c_cooldown_prevents_back_to_back():
+    """**H1-C**: 40 问在 Hint1 后立刻达到 -> 冷却内不发 Hint2; 45s 后发。"""
+    print("\n[H1-C] cooldown 防连发")
+    eng, clk = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=45.0))
+    _answer_n(eng, 20, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("20 问 -> Hint 1", len(got) == 1, got)
+    eng.submit_hint("提示一")
+    # 立刻冲到 40 问
+    _answer_n(eng, 20, start=100, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**40 问但冷却未过 -> 不发 Hint 2**", not got,
+          [a.payload for a in got])
+    # 冷却过了
+    clk.advance(50)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**45s 后 -> Hint 2**", len(got) == 1, got)
+    check("level=2", got and got[0].payload["level"] == 2,
+          got[0].payload if got else None)
+
+
+def test_h1_d_only_successful_human_verdicts_count():
+    """**H1-D**: 只有正常裁决计数 —— unavailable / 未判定不算。"""
+    print("\n[H1-D] 只数成功真人裁决")
+    eng, clk = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=0))
+    # 19 条正常 + 一堆"未判定"
+    _answer_n(eng, 19, clk=clk)
+    from story import parser as P
+    for i in range(200, 260):
+        eng.submit_qa([QAResult(qid=i, verdict=P.UNAVAILABLE,
+                                status="unavailable")])
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**19 正常 + 60 未判定 -> 仍不发提示**", not got,
+          [a.payload for a in got])
+    check("verdict_counts 里没有未判定",
+          P.UNAVAILABLE not in eng._verdict_counts, eng._verdict_counts)
+    # 第 20 条正常 -> 发
+    _answer_n(eng, 1, start=20, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("第 20 条正常 -> Hint 1", len(got) == 1, got)
+
+
+def test_h1_e_question_count_never_reveals():
+    """**H1-E**: 问答数**绝不能**改变 20min 自动揭晓时间。
+
+    刷 500 条提问也只会给满 3 条提示, 揭晓仍等时间轴。
+    """
+    print("\n[H1-E] 问答数不触发揭晓")
+    N = 300.0
+    eng, clk = boot(mkcfg(hint_seconds=N, max_hints=3, restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=0))
+    # ⚠️ `_answer_n` 内部的 tick 也可能把 HINT 派发出来 —— 那些动作会被
+    # 它丢掉, 于是 `_hint_pending` 永远挂着, 后面的循环一条提示都看不到
+    # (不是"提示没来", 是"上一条还在途")。所以这里自己驱动, 边 tick
+    # 边回收 HINT。
+    given = 0
+    for _ in range(60):
+        clk.advance(1)
+        for a in eng.tick():
+            if a.kind == ActionKind.HINT:
+                given += 1
+                eng.submit_hint(f"提示{given}")
+    # 疯狂刷提问(远超 60 条 = 3 格)
+    win = max(1, eng.cfg.qa_max_inflight)
+    tag = 0
+    for _ in range((500 // win) + 1):
+        for _ in range(win):
+            tag += 1
+            eng.submit_danmaku(f"u{tag}", f"观众{tag}", f"#问题{tag}")
+        clk.advance(1)
+        qids = []
+        for a in eng.tick():
+            if a.kind == ActionKind.ANSWER:
+                qids.append(a.payload["qid"])
+            elif a.kind == ActionKind.HINT:
+                given += 1
+                eng.submit_hint(f"提示{given}")
+        for qid in qids:
+            eng.submit_qa([QAResult(qid=qid, verdict="是", comment="")])
+    check("**仍在 QA(没被问答数刷到揭晓)**",
+          eng.phase == Phase.QA, (eng.phase, clk.t))
+    check("提示给满 3 条就停", eng._hints_given == 3, eng._hints_given)
+    # 时间轴走完才揭晓
+    clk.advance(N * 4)
+    eng.tick()
+    check("**时间轴走完 -> 揭晓**", eng.phase == Phase.REVEALING,
+          (eng.phase, clk.t))
+
+
+def test_h1_f_failed_hint_does_not_consume_slot_or_cooldown():
+    """**H1-F**: hint worker 失败 -> 不消耗槽位, 也不开冷却。
+
+    原有 retry 纪律必须继续成立(第三轮 review P1)。
+    """
+    print("\n[H1-F] 提示失败不消耗槽位/不开冷却")
+    eng, clk = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=45.0,
+                          hint_retry_seconds=1.0))
+    _answer_n(eng, 20, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("派发 Hint 1", len(got) == 1, got)
+    before = eng._hints_given
+    eng.submit_hint(error="网关超时")
+    check("**槽位不被消耗**", eng._hints_given == before, eng._hints_given)
+    check("**冷却没被打开**", eng._hint_cooldown_until == 0.0,
+          eng._hint_cooldown_until)
+    # 退避过后重试同一格
+    clk.advance(2)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("**退避后重试 Hint 1**", len(got) == 1, got)
+    check("level 仍是 1", got and got[0].payload["level"] == 1,
+          got[0].payload if got else None)
+    # 这次成功 -> 消耗 + 开冷却
+    eng.submit_hint("提示一")
+    check("成功后槽位 +1", eng._hints_given == 1, eng._hints_given)
+    check("成功后冷却已开", eng._hint_cooldown_until > 0,
+          eng._hint_cooldown_until)
+
+
+def test_h1_g_desired_level_is_max_of_two():
+    """desired = max(时间格, 问答格) —— 两条腿谁先到谁算数。"""
+    print("\n[H1-G] 两个触发源取 max")
+    # 时间快、问答慢
+    eng, clk = boot(mkcfg(hint_seconds=100, max_hints=3, restate_seconds=99999,
+                          hint_questions_per_level=20,
+                          hint_min_gap_seconds=0))
+    clk.advance(101)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("时间先到 -> 时间格给提示", len(got) == 1, got)
+    eng.submit_hint("提示一")
+    # 问答快、时间慢
+    eng2, clk2 = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                            restate_seconds=99999,
+                            hint_questions_per_level=20,
+                            hint_min_gap_seconds=0))
+    _answer_n(eng2, 20, clk=clk2)
+    clk2.advance(1)
+    got = [a for a in eng2.tick() if a.kind == ActionKind.HINT]
+    check("问答先到 -> 问答格给提示", len(got) == 1, got)
+
+
+def test_h1_h_zero_disables_question_trigger():
+    """`hint_questions_per_level=0` = 关掉问答触发, 退回纯时间轴。"""
+    print("\n[H1-H] 0 = 关掉问答触发")
+    eng, clk = boot(mkcfg(hint_seconds=9999, max_hints=3,
+                          restate_seconds=99999,
+                          hint_questions_per_level=0))
+    _answer_n(eng, 100, clk=clk)
+    clk.advance(1)
+    got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
+    check("100 问也不发提示", not got, [a.payload for a in got])
+
+
+def test_h1_config_warnings():
+    print("\n[H1-I] Config 抓异常值")
+    w = Config(sim_path="x", hint_questions_per_level=-1).validate()
+    check("负值有告警", any("hint_questions_per_level" in x for x in w), w)
+    w2 = Config(sim_path="x", hint_min_gap_seconds=-1).validate()
+    check("冷却为负有告警", any("hint_min_gap_seconds" in x for x in w2), w2)
+    w3 = Config(sim_path="x").validate()
+    check("默认无这两条告警",
+          not any("hint_questions_per_level" in x
+                  or "hint_min_gap_seconds" in x for x in w3), w3)
+
+
+def test_h1_cli_flags_wired():
+    """只加字段不接线 = dead config(而 --help 里写着)。"""
+    print("\n[H1-J] CLI flag 真的接上了")
+    from story.config import from_args
+    cfg = from_args(["--sim", "x", "--hint-questions-per-level", "7",
+                     "--hint-min-gap-seconds", "12.5"])
+    check("hint_questions_per_level 接上", cfg.hint_questions_per_level == 7,
+          cfg.hint_questions_per_level)
+    check("hint_min_gap_seconds 接上", cfg.hint_min_gap_seconds == 12.5,
+          cfg.hint_min_gap_seconds)
+    d = from_args(["--sim", "x"])
+    check("默认 20", d.hint_questions_per_level == 20,
+          d.hint_questions_per_level)
+    check("默认 45.0", d.hint_min_gap_seconds == 45.0,
+          d.hint_min_gap_seconds)
+
+
 def main():
-    tests = [test_start_and_riddle, test_question_routing, test_concurrency_cap,
+    tests = [test_start_and_riddle,
+             # ---- H1: 时间 OR 真人成功问答数 ----
+             test_h1_a_question_count_triggers_hint,
+             test_h1_b_time_after_question_does_not_repeat,
+             test_h1_c_cooldown_prevents_back_to_back,
+             test_h1_d_only_successful_human_verdicts_count,
+             test_h1_e_question_count_never_reveals,
+             test_h1_f_failed_hint_does_not_consume_slot_or_cooldown,
+             test_h1_g_desired_level_is_max_of_two,
+             test_h1_h_zero_disables_question_trigger,
+             test_h1_config_warnings,
+             test_h1_cli_flags_wired, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
              test_no_duplicate_worker_per_qid, test_answer_payload_carries_qa_budget,
              test_dedupe_and_cap, test_solve_and_reveal, test_reveal_once,

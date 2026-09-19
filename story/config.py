@@ -194,6 +194,24 @@ class Config:
     #   另外: 有人猜中 -> 立即揭晓。(提问条数不设上限)
     hint_seconds: float = 300.0           # 每条提示之间的间隔(也是最后等待揭晓的时间)
     max_hints: int = 3                    # 给几条提示(之后再过 hint_seconds 揭晓)
+    # ---- H1: 提示的**第二个触发源**(真人成功问答数) ----
+    #
+    # 时间轴只管"这道题开了多久"; 但房间可能在一分钟内就问出 30 条有信息
+    # 量的问答 —— 那时观众早就推到了该给提示的位置, 而时间轴还没到点。
+    # 所以提示改成 **时间 OR 问答数** 二者取先到:
+    #
+    #     每 hint_questions_per_level 条**成功**的真人裁决 -> 进一格提示
+    #
+    # 默认 20 -> 20 问给 Hint1, 40 问给 Hint2, 60 问给 Hint3。
+    # `0` = 关掉这条触发源, 退回纯时间轴。
+    #
+    # ⚠️ 问答数**绝不能**触发自动揭晓 —— 揭晓仍然只由时间轴与"有人猜中"
+    # 决定。否则房间刷得快一点就会把题刷掉, 那是灾难。
+    hint_questions_per_level: int = 20
+    # 两条提示之间的**最小间隔**(秒)。防止"房间突然从 20 问冲到 45 问"
+    # 时 Hint1 与 Hint2 连发 —— 那是信息轰炸, 观众根本来不及想。
+    # 手动 `#提示` 成功也走同一条冷却(它们最终都落在 `submit_hint`)。
+    hint_min_gap_seconds: float = 45.0
     restate_seconds: float = 120.0        # 长时间无人说话 -> 零成本重述谜面
     # 非 QA 阶段观众发 #问题 时, 多久最多回一条"现在不能问"的提示。
     # 全局节流(不是按观众): 多人同发时不刷屏。取小值 —— 窗口内其他人
@@ -392,6 +410,18 @@ class Config:
                 f"phase_ack_seconds({self.phase_ack_seconds}) <= 0: "
                 f"非 QA 阶段的 #问题 提示不会节流, 多人同发时会刷屏。"
             )
+        # H1: 问答数触发提示。负值会被 int() 截成 0(= 关掉), 但那多半是
+        # 配置写错了, 而不是"我想关掉"——显式写 0 才是关掉。
+        if self.hint_questions_per_level < 0:
+            warns.append(
+                f"hint_questions_per_level({self.hint_questions_per_level}) "
+                f"为负, 已按 0 处理(0 = 关掉问答数触发, 只看时间轴)。"
+            )
+        if self.hint_min_gap_seconds < 0:
+            warns.append(
+                f"hint_min_gap_seconds({self.hint_min_gap_seconds}) 为负, "
+                f"已按 0 处理(等于没有冷却, 提示可能连发)。"
+            )
         if self.replay_guard_seconds <= 0:
             warns.append(
                 f"replay_guard_seconds({self.replay_guard_seconds}) <= 0: "
@@ -459,6 +489,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="提示间隔(秒), 也是最后一条提示到揭晓的间隔, 默认 300(5分钟)")
     ap.add_argument("--max-hints", type=int, default=3,
                     help="给几条提示(之后再过 hint-seconds 揭晓), 默认 3")
+    ap.add_argument("--hint-questions-per-level", type=int, default=20,
+                    help=("每多少条**成功的真人裁决**进一格提示(0=关掉"
+                          "这条触发源, 只看时间轴), 默认 20"))
+    ap.add_argument("--hint-min-gap-seconds", type=float, default=45.0,
+                    help="两条提示之间的最小间隔(秒), 防止连发, 默认 45")
     ap.add_argument("--restate-seconds", type=float, default=120.0,
                     help="多久无人发言就重述谜面(零成本), 默认 120")
     ap.add_argument("--giveup-seconds", type=float, default=1800.0,
@@ -529,6 +564,8 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         giveup_seconds=a.giveup_seconds,
         reveal_hold_seconds=a.reveal_hold,
         max_hints=a.max_hints,
+        hint_questions_per_level=a.hint_questions_per_level,
+        hint_min_gap_seconds=a.hint_min_gap_seconds,
         tick_hz=a.tick_hz,
         stall_seconds=a.stall_seconds,
         max_puzzles=a.max_puzzles,

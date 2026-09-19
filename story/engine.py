@@ -137,6 +137,11 @@ class RoundEngine:
         # 什么都不提交 -> 那个槽位白白损失, 观众少一条提示。
         self._hint_pending = False
         self._hint_retry_at = 0.0
+        #: H1: 下一次允许给提示的最早时刻(monotonic)。
+        #: 成功 `submit_hint` 时设为 `now + hint_min_gap_seconds`。
+        #: 用途: 房间从 20 问瞬间冲到 45 问时, Hint1 与 Hint2 不该连发 ——
+        #: 那是信息轰炸, 观众来不及想。换题清零(它属于"这一题")。
+        self._hint_cooldown_until = 0.0
         self._hint_text = ""
         self._setting_attempts = 0
         self._setting_deadline: Optional[float] = None
@@ -809,6 +814,9 @@ class RoundEngine:
             self._hints_given = 0
             self._hint_pending = False
             self._hint_retry_at = 0.0
+            # H1: 冷却属于**这一题** —— 换题必须清零, 否则上一题末尾的
+            # 冷却会压住新题的第一次提示。
+            self._hint_cooldown_until = 0.0
             self._hint_text = ""
             self._solved = False
             self._solved_by = ""
@@ -1029,6 +1037,13 @@ class RoundEngine:
                 return []
             # ---- 成功: 现在才真正消耗槽位 ----
             self._hints_given += 1
+            # H1: 成功上屏 -> 开一个最小间隔冷却。
+            #
+            # 放在**成功路径**上是刻意的: 失败重试不该消耗冷却(那会让
+            # 提示来得更晚), 而手动 `#提示` 也走同一个函数 —— 所以手动
+            # 与自动两条路共用同一份冷却, 不会互相插队。
+            self._hint_cooldown_until = now + float(
+                getattr(self.cfg, "hint_min_gap_seconds", 45.0) or 0.0)
             self._hint_text = text
             # 记进"实际给过"的历史 —— 下一条提示要靠它告诉 AI 别重复。
             # (以前这里传的是出题时的 _hint_pool, 那个从头到尾不变,
@@ -1359,12 +1374,27 @@ class RoundEngine:
                 "max_retries": self.cfg.qa_answer_retries,
             }))
 
-        # ③ 收尾与提示 —— **单一时间轴**:
+        # ③ 收尾与提示 —— **两个触发源, 取先到的那个**:
+        #
+        #    时间轴(H1 之前唯一的那条, 语义不变):
         #      t0          出题
         #      t0 + 1×N    提示 1
         #      t0 + 2×N    提示 2
         #      t0 + 3×N    提示 3        (N = hint_seconds)
         #      t0 + 4×N    揭晓
+        #
+        #    H1 新增的第二条: **成功的真人裁决条数**
+        #      每 hint_questions_per_level 条 -> 进一格提示
+        #
+        #        desired = max(time_level, question_level)
+        #
+        #    为什么需要它: 时间轴只管"这道题开了多久"。但房间可能在一分钟
+        #    内就问出 30 条有信息量的问答 —— 那时观众早就推到了该给提示的
+        #    位置, 而时间轴还没到点, 于是他们干等。
+        #
+        #    **问答数绝不能触发揭晓**: 揭晓仍然只由时间轴(`slot >= max+1`)
+        #    与"有人猜中"(submit_qa)决定。否则房间刷得快一点就会把题刷掉。
+        #
         #    另外: 有人猜中 -> 立即揭晓(由 submit_qa 触发)。提问条数不设上限。
         #
         #    **计时用 _puzzle_started, 与观众活动完全无关** —— 这条时间轴
@@ -1388,11 +1418,24 @@ class RoundEngine:
         #   成功回调时才 `_hints_given += 1`(见 submit_hint),
         #   失败则设一个退避时间, 过一会儿再试同一格 —— 不是每 tick
         #   重试(那会形成失败风暴, 每秒打一次 LLM)。
-        if (1 <= slot <= self.cfg.max_hints
-                and self._hints_given < slot
+        time_level = min(self.cfg.max_hints, max(0, slot))
+        # 只数**成功的真人裁决**。不数 queued / timeout / unavailable:
+        # 它们没有产生任何信息量, 凭什么推动提示。`_verdict_counts` 是
+        # `submit_qa` 唯一的落点, 它只收正常真人裁决(是/不是/无关),
+        # 提示/system/detective 都不进 —— 所以这里直接用它。
+        n_qa = sum(self._verdict_counts.values())
+        per = int(getattr(self.cfg, "hint_questions_per_level", 20) or 0)
+        question_level = (min(self.cfg.max_hints, n_qa // per)
+                          if per > 0 else 0)
+        desired = max(time_level, question_level)
+        if (1 <= desired <= self.cfg.max_hints
+                and self._hints_given < desired
                 and not self._hint_pending
-                and now >= self._hint_retry_at):
+                and now >= self._hint_retry_at
+                and now >= self._hint_cooldown_until):
             self._hint_pending = True
+            log.info("派发提示: 时间格=%d 问答格=%d(成功问答 %d 条) -> 第 %d 条",
+                     time_level, question_level, n_qa, self._hints_given + 1)
             acts.append(EngineAction(ActionKind.HINT, {
                 "level": self._hints_given + 1,
                 "expect_round": self.round_index,
