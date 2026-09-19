@@ -596,6 +596,37 @@ class PuzzleSpec:
     #: 兜底题 / 自由生成 / 老数据 = False。
     blueprint_specified: bool = False
 
+    # ---- Batch H2-F: curated(外部题库)来源溯源 ----
+    #
+    # 这些字段**只用于归档 / attribution / 排查 / 版权追踪**, 并且
+    # **绝不下发直播前端**。理由:
+    #
+    #   1. 观众不需要知道题目来自 Stack Exchange;
+    #   2. attribution 里有作者昵称与链接, 下发等于把第三方个人信息
+    #      推进直播流;
+    #   3. 许可条款要求的是"复用者提供署名", 那是**我们**在归档/展示
+    #      层面履行的义务, 不是把它塞进每条 API 响应。
+    #
+    # 默认全空 = "不是 curated 题"(自由生成的老路径)。**不从任何值
+    # 推断** —— 与 `blueprint_specified` 同一条原则。
+    #:
+    #: "curated" 表示来自外部题库; "" 表示自由生成。
+    source_type: str = ""
+    #: 来源名, 如 "Puzzling Stack Exchange" / "TurtleBench1.5k"。
+    external_source: str = ""
+    #: 来源内的稳定 id, 如 "pse:q:12345"。
+    external_id: str = ""
+    #: 原帖/数据集链接。
+    source_url: str = ""
+    #: question 侧许可证。answer 侧可能不同(跨版本), 所以分开存。
+    license: str = ""
+    answer_license: str = ""
+    #: 完整署名信息(dict)。H2-H 的 ATTRIBUTIONS.jsonl 从这里取。
+    attribution: dict = field(default_factory=dict)
+    #: AI 审题时打的风格标签(identity_flip / perspective_flip …)。
+    #: 验收要按它统计"认知反转占比 >= 70%"。
+    style_tags: list = field(default_factory=list)
+
     # ------------------------------------------------------------------
     # 便捷访问 —— engine / llm 需要"原子事实的文本列表"这类视图
     # ------------------------------------------------------------------
@@ -667,6 +698,16 @@ class PuzzleSpec:
             "prompt_version": self.prompt_version,
             "quality_policy_version": self.quality_policy_version,
             "blueprint_specified": bool(self.blueprint_specified),
+            # ---- H2-F: curated 溯源 ----
+            # 跟着 archive 走(归档/attribution/排查要它), 但**不进前端**。
+            "source_type": self.source_type,
+            "external_source": self.external_source,
+            "external_id": self.external_id,
+            "source_url": self.source_url,
+            "license": self.license,
+            "answer_license": self.answer_license,
+            "attribution": dict(self.attribution or {}),
+            "style_tags": list(self.style_tags or []),
             # ---- 生成溯源(见 _PROVENANCE_KEYS 的说明) ----
             "usage": self.usage,
             "model": self.model,
@@ -725,6 +766,17 @@ class PuzzleSpec:
             prompt_version=str(d.get("prompt_version", "") or ""),
             quality_policy_version=str(d.get("quality_policy_version", "") or ""),
             blueprint_specified=bool(d.get("blueprint_specified", False)),
+            # ---- H2-F: curated 溯源(老 archive 没有 -> 宽容读成空) ----
+            source_type=str(d.get("source_type", "") or ""),
+            external_source=str(d.get("external_source", "") or ""),
+            external_id=str(d.get("external_id", "") or ""),
+            source_url=str(d.get("source_url", "") or ""),
+            license=str(d.get("license", "") or ""),
+            answer_license=str(d.get("answer_license", "") or ""),
+            attribution=(dict(d.get("attribution"))
+                         if isinstance(d.get("attribution"), dict) else {}),
+            style_tags=[str(x).strip() for x in (d.get("style_tags") or [])
+                        if str(x).strip()],
             # ---- 生成溯源 ----
             # 用 `.get()` 而不是 `d[...]`: 现存 archive 里绝大多数
             # (实测 data/puzzle.jsonl 105 条中 103 条)是这四把键出现
