@@ -131,6 +131,14 @@ jobs:
       - name: 离线套件 curated_v2
         run: uv run tests/test_curated_v2.py
 
+      # Batch H3-B: **Lazy Curator** —— 后台按需审题 + 直播让路。
+      # 最要紧的两条: (a) 真人 pending / AI 玩家在途 / hint / reveal /
+      # 下一题临近 —— 任一成立都不得启动新的 LLM; (b) 技术失败记
+      # `technical_defer`(可重试)而**不是** `rejected`(终态) ——
+      # 写错方向会永久吃掉一道题, 且没有任何地方会显示丢了。
+      - name: 离线套件 lazy_curator
+        run: uv run tests/test_lazy_curator.py
+
       # 单元测试覆盖不到的**装配**问题(线程/端口/信号/落盘接线)。
       # director 是常驻进程, 没有"跑完就退出"的模式, 所以用 timeout 兜底:
       # 正常情况一定是被 timeout 杀掉的(退出码 124), 那时看日志判定。
