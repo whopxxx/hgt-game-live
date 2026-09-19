@@ -345,6 +345,40 @@ class Config:
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
     pool_path: str = os.path.join("data", "pool.jsonl")
     pool_used_path: str = os.path.join("data", "pool_used.jsonl")
+
+    # ---- Batch H2-F/G: curated(外部题库)池 ----
+    #
+    # curated 题放**单独一个文件**, 不与 `pool.jsonl` 混。任务书 H2-F:
+    # "不要直接和普通 pool.jsonl 混成不可区分"。分开的三个好处:
+    #   1. 想"只播 curated"只要换一个路径, 不必按来源筛;
+    #   2. 可以单独清空/重建 curated 而不动 AI 生成的存量;
+    #   3. 出问题时一眼看得出是哪批。
+    curated_pool_path: str = os.path.join("data", "curated_pool.jsonl")
+    curated_used_path: str = os.path.join("data", "curated_used.jsonl")
+    #: 版权溯源(H2-H)。每道 curated 题都要能反查"来自哪 / 作者是谁 /
+    #: 什么许可 / 是否翻译"。
+    attributions_path: str = os.path.join("data", "ATTRIBUTIONS.jsonl")
+
+    #: **取题顺序(H2-G)**: curated 优先 -> AI 生成池 -> 现场生成。
+    #:
+    #: `prefer_curated=False` 时**完全不碰** curated 池(而不是"最后再
+    #: 试") —— 与 `pool_enabled` 同一条原则: 关掉就要是真的关掉。
+    prefer_curated: bool = True
+    #: **现场 AI 生成默认关闭**(H2-G 第一阶段)。
+    #:
+    #: 理由: 这批的目的正是"看看题源换掉以后风格是不是立刻变好"。
+    #: 若现场生成照常开着, 池子一空就回到 AI 造题 —— 那样测出来的
+    #: 是混合风格, 分不清改善来自哪一边。
+    #:
+    #: ⚠️ 关掉**不等于**开天窗: curated + 生成池都没有时, 引擎仍会走
+    #: 它自己的结构化兜底(`_riddle_failed_locked`), 直播不会中断。
+    allow_live_generation: bool = True
+
+    # ---- Batch H2-G: 补齐外部题库的实时性 ----
+    #: curated 池的补池总开关。与 `pool_prefetch_enabled` 分开: curated
+    #: 的补池是**离线编译**(compile_curated.py), 不是直播时后台生成 ——
+    #: 直播期间不该调它。这个开关只控制"是否把 curated 池纳入取题候选"。
+    curated_pool_enabled: bool = True
     # 注: 这里**曾**有一个 `pool_op_budget_ms`, 号称给 pop_next 的 I/O 一个
     # 上界。它没有任何代码读它 —— 是个 dead config, 注释却会让人以为
     # "500ms 后一定回落", 那是不存在的保证(单次 open/fsync 真卡住时,
@@ -693,6 +727,20 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_false",
                     help="不后台补池(只用已有/手工灌的题; 默认开启)。"
                          "网关故障时用它停掉后台生成, 池子里的存量题照常播")
+    # ---- Batch H2-F/G: curated 池 ----
+    ap.add_argument("--no-curated", dest="prefer_curated",
+                    action="store_false",
+                    help="不使用 curated(外部题库)池。默认**优先**用它 —— "
+                         "这是 Batch H2 的核心: 外部好题的认知反转密度比 "
+                         "AI 现场造的高。关掉时连文件都不读")
+    ap.add_argument("--curated-pool", dest="curated_pool_path", default=None,
+                    help="curated 池文件路径(默认 data/curated_pool.jsonl)")
+    ap.add_argument("--no-live-generate", dest="allow_live_generation",
+                    action="store_false",
+                    help="**关闭现场 AI 生成**(H2-G 第一阶段默认建议开这个)。"
+                         "两个池都空时不回到 AI 造题, 而是走引擎兜底 —— "
+                         "这样测出来的风格改善才不会被 AI 现造的题混掉。"
+                         "注意这不等于开天窗: 直播不会中断")
     ap.add_argument("--prefetch-max-attempts", type=int, default=2,
                     help="后台补池每道题最多出几稿(默认 2)。直播现场出题"
                          "是 4 稿 —— 那是观众在干等时的预算; 后台补池只是"
@@ -769,6 +817,10 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         # 只加 flag 不在这里接上 = 又一个 dead config(参数形同虚设,
         # 而 --help 里明明写着)。加 flag 和接线必须同一处完成。
         pool_prefetch_enabled=a.pool_prefetch_enabled,
+        prefer_curated=a.prefer_curated,
+        allow_live_generation=a.allow_live_generation,
+        curated_pool_path=(a.curated_pool_path
+                           or Config.curated_pool_path),
         pool_prefetch_max_attempts=a.prefetch_max_attempts,
         pool_prefetch_budget_seconds=a.prefetch_budget,
         pool_reveal_start_guard_seconds=a.pool_reveal_guard,

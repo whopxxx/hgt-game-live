@@ -287,6 +287,49 @@ class PuzzlePool:
         p.load()
         return p
 
+    @classmethod
+    def open_curated(cls, cfg: Any, rng: Optional[random.Random] = None
+                     ) -> Optional["PuzzlePool"]:
+        """建 **curated** 池并载入(Batch H2-F)。
+
+        ## 为什么不复用 `open()`
+
+        `PuzzlePool` 的路径是**构造时**从 cfg 读的(`self.pool_path`),
+        所以"用另一份文件"必须是一个**不同的实例**。而直接把 cfg 的
+        `pool_path` 改掉再 `open()` 是危险的: cfg 是全局共享的,
+        改它等于把 AI 生成池也指到 curated 文件上 —— 两条链会互相
+        污染, 而且这种错误在测试里很难发现(它们各自都"能工作")。
+
+        所以这里显式拷贝一份**浅**配置对象, 只覆盖三个路径字段。
+        浅拷贝足够: 我们只读不写, 且 `PuzzlePool` 只存了 cfg 的引用
+        用于读 quota / 路径。
+
+        ## 为什么 curated 用**独立**的 used 账本
+
+        `pool_used.jsonl` 记的是"交付过哪些题"。两个池的题集不相交
+        (来源不同), 但**共用一份账本**会让:
+          1. 任一文件损坏 -> 两个池一起 fail closed(H2 的 curation 白做);
+          2. "curated 播了几道"没法单独统计。
+        分开之后任一个坏掉只影响它自己 —— 而 curated 池恰恰是我们
+        最不希望被 AI 池的磁盘问题拖垮的那个。
+
+        `curated_pool_enabled=False` -> 返回 None(完全关闭)。
+        """
+        if not getattr(cfg, "curated_pool_enabled", True):
+            log.info("curated_pool_enabled=False: curated 池关闭")
+            return None
+        import copy as _copy
+        sub = _copy.copy(cfg)
+        sub.pool_path = str(getattr(cfg, "curated_pool_path", "") or "")
+        sub.pool_used_path = str(getattr(cfg, "curated_used_path", "") or "")
+        # `pool_enabled=False` 时 curated 也一并关掉 —— 它是**总开关**,
+        # 不该被绕过(与 prefer_curated 无关: 那个只管取题顺序)。
+        sub.pool_enabled = bool(getattr(cfg, "pool_enabled", True))
+        p = cls(sub, rng=rng)
+        p.load()
+        log.info("curated 池载入: %d 道(库存 %d)", p.size(), p.stock_count())
+        return p
+
     # ------------------------------------------------------------------
     def load(self) -> int:
         """载入池子与 used 账本。返回载入的池内题数。**不抛**。

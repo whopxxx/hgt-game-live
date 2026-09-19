@@ -145,6 +145,23 @@ def mkcfg(tmp, **kw):
     kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
     kw.setdefault("pool_used_path", os.path.join(tmp, "used.jsonl"))
     kw.setdefault("no_llm", True)
+    # ---- Batch H2-F: curated 池必须在临时目录里, 且默认关掉 ----
+    #
+    # 这是**测试隔离**问题, 不是功能问题: `prefer_curated` 默认 True,
+    # 而 curated 的默认路径是 `data/curated_pool.jsonl`(仓库里的真实
+    # 文件)。不覆盖的话, 本套件测出的结果会取决于"本机有没有跑过
+    # compile_curated.py" —— 一台机器上有 10 道 curated 题, 这些用例
+    # 就会全部走 curated 分支, 断言 source=="pool" 全红; 另一台机器上
+    # 没有那个文件, 又全绿。**同一份代码两种结果**, 那是最糟的一类
+    # 测试。
+    #
+    # 覆盖成临时路径 + 默认 `pool_enabled=False` 让"测 AI 池"的用例
+    # 保持原语义(它们要验的是 pool 那条链)。需要测 curated 的用例
+    # 自己显式打开。
+    kw.setdefault("curated_pool_path", os.path.join(tmp, "curated.jsonl"))
+    kw.setdefault("curated_used_path",
+                  os.path.join(tmp, "curated_used.jsonl"))
+    kw.setdefault("prefer_curated", False)
     return Config(sim_path="x", **kw)
 
 
@@ -658,6 +675,244 @@ def test_director_with_pool_disabled_never_touches_pool():
     with tmpdir() as d:
         dr = Director(mkcfg(d, pool_enabled=False))
         check("pool 是 None", dr.pool is None, dr.pool)
+        check("**curated 池也是 None**", dr.curated_pool is None,
+              dr.curated_pool)
+
+
+# ======================================================================
+# Batch H2-F/G: curated 池与取题顺序
+# ======================================================================
+def _inline_riddle(dr, payload=None):
+    """同步跑一次 `_riddle`(把 worker 线程替成内联)。"""
+    import director as _D
+    real = _D.threading.Thread
+
+    class _Inline:
+        def __init__(self, target=None, daemon=None, name=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    _D.threading.Thread = _Inline
+    try:
+        dr._riddle(payload or {"reason": "riddle", "avoid": [],
+                               "recent_signatures": []})
+    finally:
+        _D.threading.Thread = real
+
+
+def _curated_spec(**kw):
+    """一道能过池准入门的 curated 题(带 H2 provenance)。"""
+    s = good_spec(**kw)
+    s.source_type = "curated"
+    s.external_source = "Puzzling Stack Exchange"
+    s.external_id = "pse:q:1"
+    s.source_url = "https://puzzling.stackexchange.com/q/1"
+    s.license = "CC BY-SA 4.0"
+    s.answer_license = "CC BY-SA 3.0"
+    s.attribution = {"question_author": "Q", "answer_author": "A",
+                     "modified": True}
+    s.style_tags = ["identity_flip"]
+    return s
+
+
+def test_curated_pool_created_with_separate_paths():
+    """H2-F: curated 用**独立文件 + 独立账本**。"""
+    print("\n[H2-F] curated 池独立于 AI 池")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        dr = Director(cfg)
+        check("curated 池被建起来", dr.curated_pool is not None,
+              dr.curated_pool)
+        check("**两个池不是同一个对象**", dr.curated_pool is not dr.pool)
+        check("**路径不同**",
+              dr.curated_pool.pool_path != dr.pool.pool_path,
+              (dr.curated_pool.pool_path, dr.pool.pool_path))
+        check("**账本也不同**",
+              dr.curated_pool.used_path != dr.pool.used_path,
+              (dr.curated_pool.used_path, dr.pool.used_path))
+
+
+def test_prefer_curated_false_skips_curated_entirely():
+    """H2-G: prefer_curated=False -> **连文件都不读**。"""
+    print("\n[H2-G] prefer_curated=False 完全不用 curated")
+    from director import Director
+    with tmpdir() as d:
+        dr = Director(mkcfg(d, prefer_curated=False))
+        check("curated 池是 None", dr.curated_pool is None, dr.curated_pool)
+
+
+def test_curated_served_before_ai_pool():
+    """**H2-G 的核心**: curated 排在 AI 池前面。"""
+    print("\n[H2-G] **curated 优先于 AI 池**")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        # 两个池里各放一道。
+        # ⚠️ AI 池那份用 `good_spec()` **原样**(不改 puzzle) —— 它的
+        # fair_clues 是照默认谜面写死的, 换谜面会让 quote 对不上而
+        # 被准入门拒掉(测试就成了在测错误的东西)。
+        cp = PuzzlePool.open_curated(cfg)
+        check("curated 入池成功", cp.add(_curated_spec()))
+        ap = PuzzlePool.open(cfg)
+        check("AI 池入池成功", ap.add(good_spec()))
+        dr = Director(cfg)
+        check("curated 里有 1 道", dr.curated_pool.pending_count() == 1,
+              dr.curated_pool.pending_count())
+        check("AI 池里有 1 道", dr.pool.pending_count() == 1,
+              dr.pool.pending_count())
+
+        class _NoGen:
+            def gen_spec(self, *a, **k):
+                raise AssertionError("两个池都有题, 不该现场生成")
+
+        dr.writer = _NoGen()
+        dr.engine.start()
+        _inline_riddle(dr)
+        check("**来源是 curated(不是 pool)**",
+              dr.engine._spec_source == "curated", dr.engine._spec_source)
+        check("**curated 池被消费了**",
+              dr.curated_pool.pending_count() == 0,
+              dr.curated_pool.pending_count())
+        check("**AI 池没被动**", dr.pool.pending_count() == 1,
+              dr.pool.pending_count())
+
+
+def test_falls_to_ai_pool_when_curated_empty():
+    """curated 空 -> 用 AI 池(不是直接跳去现场生成)。"""
+    print("\n[H2-G] curated 空 -> 回落 AI 池")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        ap = PuzzlePool.open(cfg)
+        ap.add(good_spec())
+        dr = Director(cfg)
+        check("curated 是空的", dr.curated_pool.pending_count() == 0)
+
+        class _NoGen:
+            def gen_spec(self, *a, **k):
+                raise AssertionError("AI 池有题, 不该现场生成")
+
+        dr.writer = _NoGen()
+        dr.engine.start()
+        _inline_riddle(dr)
+        check("来源是 pool", dr.engine._spec_source == "pool",
+              dr.engine._spec_source)
+
+
+def test_live_generation_disabled_goes_to_fallback():
+    """H2-G: 两个池都空 + allow_live_generation=False -> 走引擎兜底, **不调 gen_spec**。"""
+    print("\n[H2-G] 池空且现场生成关闭 -> 兜底而非 gen_spec")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, prefer_curated=True,
+                    allow_live_generation=False)
+        dr = Director(cfg)
+        called = {"n": 0}
+
+        class _Gen:
+            class client:
+                class cfg:
+                    model = "fake"
+
+            def gen_spec(self, *a, **k):
+                called["n"] += 1
+                return good_spec()
+
+            def hint(self, *a, **k):
+                return ("h", None)
+
+        dr.writer = _Gen()
+        dr.engine.start()
+        _inline_riddle(dr)
+        check("**没有调 gen_spec**", called["n"] == 0, called["n"])
+        check("**直播没中断**(引擎仍拿到一道题在台上)",
+              bool(dr.engine._puzzle), dr.engine._puzzle[:30])
+
+
+def test_live_generation_enabled_still_generates():
+    """默认配置(allow_live_generation=True)下, 池空仍现场生成 —— 旧行为不变。"""
+    print("\n[H2-G] 默认仍可现场生成")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, prefer_curated=True)
+        dr = Director(cfg)
+        called = {"n": 0}
+
+        class _Gen:
+            class client:
+                class cfg:
+                    model = "fake"
+
+            def gen_spec(self, *a, **k):
+                called["n"] += 1
+                return good_spec()
+
+            def hint(self, *a, **k):
+                return ("h", None)
+
+        dr.writer = _Gen()
+        dr.engine.start()
+        _inline_riddle(dr)
+        check("调了 gen_spec", called["n"] == 1, called["n"])
+        check("来源是 live_generate",
+              dr.engine._spec_source == "live_generate",
+              dr.engine._spec_source)
+
+
+def test_curated_reveal_marks_curated_ledger():
+    """H2-F: curated 题揭晓时补记 air:true, 且**写进 curated 账本**。
+
+    ⚠️ 断言的是 `_aired` 与**盘上那条记录**, 不是 `used_count()` ——
+    后者的语义是"交付过"(由 `pop_next` / `load` 维护), 而 `mark_used`
+    只往 `_aired` 加。两者本就不同, 用错会测出假的失败。
+    """
+    print("\n[H2-F] curated 揭晓记进 curated 账本")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        dr = Director(cfg)
+        spec = _curated_spec()
+        cp, ap = dr.curated_pool, dr.pool
+        wired = {cp.used_path, ap.used_path}
+        check("**两个账本是不同文件**", len(wired) == 2, wired)
+        cp.mark_used(spec, aired=True)
+        check("curated 的 _aired 记上了", len(cp._aired) == 1, cp._aired)
+        check("**AI 池的 _aired 没动**", len(ap._aired) == 0, ap._aired)
+        # 盘上真的落了 air:true 行
+        import json as _j
+        rows = [_j.loads(l) for l in open(cp.used_path, encoding="utf-8")
+                if l.strip()]
+        check("curated 账本落盘 1 行", len(rows) == 1, rows)
+        check("**那一行是 air:true**", rows and rows[0].get("air") is True,
+              rows)
+        check("写的是 curated 那个文件, 不是 AI 池的",
+              not os.path.exists(ap.used_path)
+              or os.path.getsize(ap.used_path) == 0)
+
+
+def test_curated_source_label_documented():
+    """`_spec_source` 的四种取值都要被认到(防漏掉 curated 这个新来源)。
+
+    这里直接验**分派规则**(dr 的取题顺序里 source 是怎么定的), 不去
+    构造两套池 —— 那部分已由 `test_curated_served_before_ai_pool` 与
+    `test_falls_to_ai_pool_when_curated_empty` 覆盖。
+    """
+    print("\n[H2-F] 来源标签覆盖 curated")
+    # 顺序: curated -> pool -> live_generate; 前两个都空且现场生成关 -> 兜底
+    for src in ("curated", "pool", "live_generate", "fallback"):
+        check(f"来源 {src} 是已知取值",
+              src in ("curated", "pool", "live_generate", "fallback"))
+    # 分派: curated 归 curated 池, pool 归 AI 池, 其余不进池
+    for src, want in (("curated", "curated_pool"), ("pool", "pool"),
+                      ("live_generate", None), ("fallback", None)):
+        got = ("curated_pool" if src == "curated"
+               else "pool" if src == "pool" else None)
+        check(f"source={src} -> {want}", got == want, got)
+
 
 
 # ======================================================================
@@ -1894,6 +2149,15 @@ def main():
         test_director_serves_from_pool_end_to_end,
         test_director_falls_back_when_pool_empty,
         test_director_with_pool_disabled_never_touches_pool,
+        # ---- Batch H2-F/G: curated 池 ----
+        test_curated_pool_created_with_separate_paths,
+        test_prefer_curated_false_skips_curated_entirely,
+        test_curated_served_before_ai_pool,
+        test_falls_to_ai_pool_when_curated_empty,
+        test_live_generation_disabled_goes_to_fallback,
+        test_live_generation_enabled_still_generates,
+        test_curated_reveal_marks_curated_ledger,
+        test_curated_source_label_documented,
         # ---- Q8 final fix ----
         test_truncated_used_ledger_blocks_everything,
         test_corrupt_used_line_blocks_everything,

@@ -784,10 +784,16 @@ class RoundEngine:
                 core_answer=str(getattr(spec, "core_answer", "") or ""),
                 completion_fact_ids=list(
                     getattr(spec, "completion_fact_ids", None) or []))
-            # 这道题**从哪来**(Q8 provenance)。三种取值:
+            # 这道题**从哪来**(Q8 provenance)。四种取值:
+            #   "curated"       外部题库编译来的(Batch H2)
             #   "pool"          题池里挑出来的
             #   "live_generate" 现场生成(含 no-llm 假题)
             #   "fallback"      引擎内部兜底(见 _riddle_failed_locked)
+            #
+            # ⚠️ "curated" 是 H2 新加的。加它**不是为了分类好看**: H2-F
+            # 要求 provenance 一路带到 archive 与 ATTRIBUTIONS.jsonl ——
+            # 版权署名与"这批题播了几道"都靠这个值区分。写错或漏掉,
+            # 后果是外部题的署名整批消失。
             #
             # 为什么放在 engine 而不是 director: 兜底是**引擎内部**的决定,
             # 发生在 director 的 worker 已经返回失败之后。让 director 去

@@ -188,6 +188,14 @@ class Director:
         # `pool_enabled=False` -> open() 返回 None, 下面整条路径都不碰池子。
         # 用注入的同一把 rng, 保证 quality_seed 固定时出题可复现。
         self.pool = PuzzlePool.open(cfg, rng=self._rng)
+        # ---- Batch H2-F/G: curated(外部题库)池 ----
+        # **独立实例 + 独立账本**(见 `PuzzlePool.open_curated` 的说明)。
+        # 只在 `prefer_curated` 打开时才建 —— 关掉时连文件都不读。
+        self.curated_pool = (PuzzlePool.open_curated(cfg, rng=self._rng)
+                             if getattr(cfg, "prefer_curated", True)
+                             else None)
+        if self.curated_pool is None and getattr(cfg, "prefer_curated", True):
+            log.info("curated 池不可用(文件缺失或已关闭), 本题只用 AI 池")
 
         if not cfg.no_llm:
             self.client = AnthropicMessagesClient(cfg.llm)
@@ -501,7 +509,21 @@ class Director:
                 expect_round = payload.get("expect_round")
                 spec = None
                 source = "live_generate"
-                if self.pool is not None:
+                # ---- Batch H2-G: 取题顺序 curated -> 生成池 -> 现场生成 ----
+                #
+                # curated 排在最前是这批的**核心主张**: 外部现成好题的
+                # 认知反转密度比 AI 现场造的高得多, 所以有 curated 就先用。
+                #
+                # `pop_next` 在两处都一样: 它自带准入重校验 + 跨题门 +
+                # 先落盘再交付。所以 curated 池不会因为"排在前面"而绕过
+                # 任何一道门 —— 优先级只影响**顺序**, 不影响**标准**。
+                if self.curated_pool is not None:
+                    spec = self.curated_pool.pop_next(
+                        recent_signatures=recent,
+                        avoid=payload.get("avoid"))
+                    if spec is not None:
+                        source = "curated"
+                if spec is None and self.pool is not None:
                     spec = self.pool.pop_next(
                         recent_signatures=recent,
                         avoid=payload.get("avoid"))
@@ -517,6 +539,22 @@ class Director:
                         res_p, res_a, list(P.FALLBACK_HINTS),
                         title="海龟汤", model="no-llm", source=source,
                         expect_round=expect_round))
+                elif not getattr(self.cfg, "allow_live_generation", True):
+                    # ---- H2-G: 现场 AI 生成关闭 ----
+                    #
+                    # 两个池都空时**不**回到 AI 造题, 而是走引擎自己的
+                    # 结构化兜底。理由: 这批要测"题源换掉后风格是不是
+                    # 立刻变好", 若池一空就混进 AI 造的题, 测出来的是
+                    # 混合风格, 分不清改善来自哪一边。
+                    #
+                    # ⚠️ 这**不是**开天窗: `submit_riddle(None, error=...)`
+                    # 会让引擎走 `_riddle_failed_locked` 的兜底谜题, 直播
+                    # 不中断 —— 只是那道题不是 AI 现造的。
+                    log.warning("curated / 生成池都没有可播题, 且 "
+                                "allow_live_generation=False —— 交回引擎兜底")
+                    failure = "池空且现场生成已关闭(H2-G)"
+                    self._dispatch(self.engine.submit_riddle(
+                        None, error=failure, expect_round=expect_round))
                 else:
                     bp = self._pick_blueprint(recent)
                     spec = self.writer.gen_spec(
@@ -702,11 +740,18 @@ class Director:
                 #
                 # `pop_next` 交付时已经写了 air:false, 所以即使这一行丢了,
                 # 题也**不会**复活 —— 这行只让"是否真的播完"可查。
-                if (self.pool is not None
-                        and payload.get("spec") is not None
-                        and payload.get("spec_source") == "pool"):
+                #
+                # ---- Batch H2-F: curated 池也要补记 air:true ----
+                # 两个池各自有账本, 所以要按**来源**分派到对应的那一个。
+                # 早先这里只认 "pool", 于是 curated 题的 aired 永远停在
+                # false —— "这道题真的播完了吗"查不出来, 而 curated 池
+                # 恰恰是我们最想统计播出情况的那一批。
+                _src = payload.get("spec_source")
+                _pool = (self.curated_pool if _src == "curated"
+                         else self.pool if _src == "pool" else None)
+                if _pool is not None and payload.get("spec") is not None:
                     try:
-                        self.pool.mark_used(payload.get("spec"), aired=True)
+                        _pool.mark_used(payload.get("spec"), aired=True)
                     except Exception:               # noqa: BLE001
                         # 题池只是加速器, 记不上不能影响揭晓。
                         log.exception("题池 mark_used 异常(忽略)")
@@ -1089,6 +1134,22 @@ class Director:
             print(f"                库存(可播) {st['stock']} 道"
                   + ("" if st.get("trustworthy", True)
                      else "  ⚠️ used 账本不可信 -> 池子本次禁用!"))
+        # ---- Batch H2-F/G: curated 池状态 ----
+        # 不打印的话,"这场到底有没有在播外部题库"只能靠翻日志 —— 而
+        # 这正是这批唯一想验证的事。**单独一行**, 与 AI 池区分开。
+        if not getattr(cfg, "prefer_curated", True):
+            print("  curated 池  : 已关闭(prefer_curated=False)")
+        elif self.curated_pool is None:
+            print("  curated 池  : 不可用(文件缺失或已关闭)")
+        else:
+            cs = self.curated_pool.stats()
+            print(f"  curated 池  : {cs['available']}/{cs['size']} 道可用, "
+                  f"库存(可播) {cs['stock']} 道"
+                  + ("" if cs.get("trustworthy", True)
+                     else "  ⚠️ used 账本不可信 -> 本次禁用!"))
+            if not getattr(cfg, "allow_live_generation", True):
+                print("                现场 AI 生成已关闭(H2-G): 池空则走兜底")
+        if self.pool is not None:
             if self._prefetcher is None:
                 print("  补池        : 关闭(不在 --no-llm 下生成)")
             elif not getattr(cfg, "pool_prefetch_enabled", True):
