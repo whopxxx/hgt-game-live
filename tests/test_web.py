@@ -61,10 +61,20 @@ _NEED_MSG = ("没找到 Chrome/Chromium —— 这个套件验证的是真实浏
 CHECK = r'''
 window.socket = null;
 window.WebSocket = class { constructor() { window.socket = this; } };
+// 生产值是 3s / 26px/s / 4.5s；浏览器回归只压缩时间，不改状态机。
+window.__AUTO_SCROLL_TIMING__ = {
+  topHoldMs: 60, bottomHoldMs: 180, speedPxPerSec: 300,
+};
 window.addEventListener("load", async () => {
   await document.fonts.ready;
   const errors = [];
   const check = (ok, message) => { if (!ok) errors.push(message); };
+  const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const waitFor = async (fn, message, timeout=1800) => {
+    const end = performance.now() + timeout;
+    while (!fn() && performance.now() < end) await wait(10);
+    check(!!fn(), typeof message === "function" ? message() : message);
+  };
 
   const mkQa = (n) => Array.from({length: n}, (_, i) => ({
     qid: i + 1, user_name: "观众" + i, text: "问题编号" + (i + 1) + "：他是不是瞎了",
@@ -1001,6 +1011,161 @@ window.addEventListener("load", async () => {
             "U3-D: legacy 揭晓文案必须可见");
     }
 
+    // ⑮ U4: 长文本只在真实 overflow 时自动滚动。
+    {
+      const sizedPuzzle = (n, seed) =>
+        (seed.repeat(Math.ceil(n / seed.length) + 1)).slice(0, n - 4)
+        + "为什么？";
+      const pv = document.getElementById("puzzle-viewport");
+      const puzzle = document.getElementById("puzzle");
+
+      // Case 1: 短谜面保持大字、居中、静态。
+      send({phase: "qa", puzzle_index: 50, story_index: 50,
+            puzzle: "他每天都把空杯子放在门口。为什么？",
+            revealed_answer: "", qa_log: [], qa_total: 0});
+      await waitFor(() => pv.dataset.scrollState === "static",
+                    "U4-1: 短谜面应完成静态判定 (state="
+                    + pv.dataset.scrollState + " scroll=" + pv.scrollHeight
+                    + "/" + pv.clientHeight + ")");
+      const shortP = puzzle.getBoundingClientRect();
+      const shortV = pv.getBoundingClientRect();
+      check(!pv.hasAttribute("data-auto-scroll"), "U4-1: 短谜面不得滚动");
+      check(parseFloat(getComputedStyle(puzzle).fontSize) >= 55,
+            "U4-1: 短谜面应保持大字");
+      check(Math.abs((shortP.top + shortP.bottom - shortV.top - shortV.bottom) / 2) < 3,
+            "U4-1: 短谜面应垂直居中");
+
+      // Case 2: 中等谜面可以缩字，但完整静态显示。
+      const mediumPuzzle = sizedPuzzle(120, "他每晚回家都会检查门缝里的纸片是否移动，");
+      send({phase: "qa", puzzle_index: 51, story_index: 51,
+            puzzle: mediumPuzzle, revealed_answer: "", qa_log: [], qa_total: 0});
+      await waitFor(() => pv.dataset.scrollState === "static",
+                    () => "U4-2: 中等谜面应完成静态判定 (state="
+                      + pv.dataset.scrollState + " scroll=" + pv.scrollHeight
+                      + "/" + pv.clientHeight + " fs="
+                      + getComputedStyle(puzzle).fontSize + ")");
+      check(!pv.hasAttribute("data-auto-scroll"), "U4-2: 中等谜面不得滚动");
+      check(pv.scrollHeight <= pv.clientHeight + 1,
+            "U4-2: 中等谜面应完整放下");
+      check(parseFloat(getComputedStyle(puzzle).fontSize) >= 46,
+            "U4-2: 中等谜面字号不得低于 46px");
+
+      // Case 3/4: 220 字 overflow 后真实移动、到底，且永不侵入 QA。
+      const longPuzzle = sizedPuzzle(220, "男人每晚都会记录窗边灯光和走廊脚步的先后顺序，");
+      const longState = {phase: "qa", puzzle_index: 52, story_index: 52,
+        puzzle: longPuzzle, revealed_answer: "", qa_log: [], qa_total: 0};
+      send(longState);
+      await waitFor(() => pv.hasAttribute("data-auto-scroll"),
+                    () => "U4-3: overflow 谜面应启用自动滚动 (state="
+                      + pv.dataset.scrollState + " scroll=" + pv.scrollHeight
+                      + "/" + pv.clientHeight + " fs="
+                      + getComputedStyle(puzzle).fontSize + ")");
+      check(parseFloat(getComputedStyle(puzzle).fontSize) >= 46,
+            "U4-3: overflow 谜面字号不得低于 46px");
+      {
+        const vr = pv.getBoundingClientRect();
+        const workspaceTop = parseFloat(document.getElementById("content")
+          .style.getPropertyValue("--workspace-top"));
+        const br = document.getElementById("bottom").getBoundingClientRect();
+        const hr = document.getElementById("puzzle-head").getBoundingClientRect();
+        const sr = document.getElementById("stage").getBoundingClientRect();
+        const expectedTop = sr.top + workspaceTop * (sr.height / 1920);
+        check(hr.bottom <= vr.top + 1,
+              "U4-4: puzzle viewport 不得覆盖 puzzle header");
+        check(vr.bottom <= expectedTop + 1,
+              "U4-4: puzzle viewport 不得侵入 QA");
+        check(Math.abs(br.top - expectedTop) <= 1,
+              "U4-4: bottom 仍服从 workspace-top (bottom=" + br.top
+              + " workspace=" + expectedTop + ")");
+      }
+      await waitFor(() => pv.dataset.scrollState === "moving" && pv.scrollTop > 0,
+                    "U4-3: 顶部停留后谜面应真实向下移动");
+      const beforeSnapshot = pv.scrollTop;
+      send(Object.assign({}, longState, {stats: {questions: 9, answered: 8}}));
+      await wait(35);
+      check(pv.scrollTop >= beforeSnapshot,
+            "U4-3: 无关 4Hz snapshot 不得重启滚动");
+      await waitFor(() => pv.dataset.scrollState === "bottom",
+                    "U4-3: 长谜面应到达底部");
+      check(pv.scrollTop + pv.clientHeight >= pv.scrollHeight - 1,
+            "U4-3: 长谜面最后一行必须完整进入 viewport");
+
+      // Case 5: 揭晓立刻取消谜面滚动并复位顶部。
+      const shortAnswer = "纸片是他留下的记号，用来确认是否有人进过房间。";
+      send({phase: "revealed", puzzle_index: 52, story_index: 52,
+            puzzle: longPuzzle, revealed_answer: shortAnswer,
+            revealed_core_answer: "纸片是防入侵记号。",
+            revealed_full_answer: shortAnswer, reveal_stage: "explanation",
+            reveal_detail_visible: true, solved: false,
+            reveal_contributors: [], next_puzzle_ms: 15000});
+      check(pv.scrollTop === 0 && !pv.hasAttribute("data-auto-scroll"),
+            "U4-5: 揭晓时谜面应停止并回到顶部");
+      {
+        const rr = document.getElementById("reveal").getBoundingClientRect();
+        const sr = document.getElementById("stage").getBoundingClientRect();
+        const workspaceTop = parseFloat(document.getElementById("content")
+          .style.getPropertyValue("--workspace-top"));
+        const expectedTop = sr.top + workspaceTop * (sr.height / 1920);
+        check(Math.abs(rr.top - expectedTop) <= 1
+              && Math.abs(rr.bottom - sr.bottom) <= 1,
+              "U4-5: reveal 必须继续接替原 bottom 工作区");
+      }
+
+      // Case 6/8: 短汤底静态；core 始终 64px 且不滚。
+      const rb = document.getElementById("reveal-body");
+      const rc = document.getElementById("reveal-core");
+      await waitFor(() => rb.dataset.scrollState === "static",
+                    "U4-6: 短汤底应完成静态判定 (state="
+                    + rb.dataset.scrollState + " scroll=" + rb.scrollHeight
+                    + "/" + rb.clientHeight + ")");
+      check(!rb.hasAttribute("data-auto-scroll"), "U4-6: 短汤底不得滚动");
+      check(parseFloat(getComputedStyle(rc).fontSize) === 64,
+            "U4-8: core_answer 应保持 64px");
+      check(!rc.hasAttribute("data-auto-scroll") && rc.scrollTop === 0,
+            "U4-8: core_answer 永远静态");
+
+      // Case 7: 300 字完整解释自动滚一遍并停在底部。
+      const longAnswer = ("纸片的位置是他故意留下的记号，走廊灯光与脚步声让他怀疑有人进入房间。"
+        .repeat(12)).slice(0, 300);
+      send({phase: "revealed", puzzle_index: 52, story_index: 52,
+            puzzle: longPuzzle, revealed_answer: longAnswer,
+            revealed_core_answer: "纸片是防入侵记号。",
+            revealed_full_answer: longAnswer, reveal_stage: "explanation",
+            reveal_detail_visible: true, solved: false,
+            reveal_contributors: [], next_puzzle_ms: 15000});
+      await waitFor(() => rb.dataset.scrollState === "moving" && rb.scrollTop > 0,
+                    "U4-7: 长汤底顶部停留后应真实移动");
+      await waitFor(() => rb.dataset.scrollState === "bottom",
+                    "U4-7: 长汤底应滚到结尾");
+      check(rb.scrollTop + rb.clientHeight >= rb.scrollHeight - 1,
+            "U4-7: 长汤底最后一行必须完整可见");
+
+      // Case 9: explanation -> contribution 清理旧滚动；下一题从顶部开始。
+      send({phase: "revealed", puzzle_index: 52, story_index: 52,
+            puzzle: longPuzzle, revealed_answer: longAnswer,
+            revealed_core_answer: "纸片是防入侵记号。",
+            revealed_full_answer: longAnswer, reveal_stage: "contribution",
+            reveal_detail_visible: true, solved: false,
+            reveal_contributors: mkContrib(false), next_puzzle_ms: 10000});
+      check(rb.scrollTop === 0 && !rb.hasAttribute("data-auto-scroll"),
+            "U4-9: contribution 应取消并复位汤底滚动");
+      send({phase: "qa", puzzle_index: 53, story_index: 53,
+            puzzle: "下一题从顶部开始。为什么？", revealed_answer: "",
+            qa_log: [], qa_total: 0});
+      check(pv.scrollTop === 0, "U4-9: 下一题谜面必须从顶部开始");
+
+      // Case 10: A/B/C 快切，旧异步回调不能移动当前题。
+      const fastA = sizedPuzzle(220, "题目A记录了很多连续发生但互相矛盾的细节，");
+      const fastB = sizedPuzzle(220, "题目B记录了很多连续发生但互相矛盾的细节，");
+      const fastC = sizedPuzzle(220, "题目C记录了很多连续发生但互相矛盾的细节，");
+      send({phase: "qa", puzzle_index: 54, story_index: 54, puzzle: fastA});
+      send({phase: "qa", puzzle_index: 55, story_index: 55, puzzle: fastB});
+      send({phase: "qa", puzzle_index: 56, story_index: 56, puzzle: fastC});
+      await wait(35); // 小于 C 的 top hold；A/B 的 RAF 已有机会误触发。
+      check(puzzle.textContent === fastC && pv.scrollTop === 0,
+            "U4-10: 快切后 A/B callback 不得移动 C");
+    }
+
 
     //
     // 后台补题是运维概念, 不该泄漏给观众 —— 他们只该感受到
@@ -1046,7 +1211,7 @@ def main():
         result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu",
                                  "--no-first-run", "--hide-scrollbars",
                                  "--user-data-dir=" + str(Path(tmp) / "profile"),
-                                 "--window-size=1080,1920", "--virtual-time-budget=7000",
+                                 "--window-size=1080,1920", "--virtual-time-budget=15000",
                                  "--screenshot=" + str(ROOT / "data/preview.png"),
                                  "--dump-dom", page.as_uri()], capture_output=True, timeout=45)
         dom = result.stdout.decode("utf-8", errors="replace")
@@ -1054,8 +1219,8 @@ def main():
         assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
         assert not errors, errors
-    print("PASS: 问答追加/提示行/思考中/揭晓工作区(U2 三阶段 + 不依赖滚动)/"
-          "贡献链/换题清空/不截断/调试宽度/长流可滚/无补题文案；data/preview.png")
+    print("PASS: 问答追加/提示行/思考中/揭晓三阶段/U4 长文本自动滚动/"
+          "贡献链/换题清空/调试宽度/长流可滚/无补题文案；data/preview.png")
 
 
 if __name__ == "__main__":

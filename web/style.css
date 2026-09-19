@@ -57,6 +57,7 @@ html, body {
 }
 #puzzle-head {
   position: absolute; top: 44px; left: 80px; right: 80px;
+  z-index: 1;
   display: flex; justify-content: space-between; align-items: center;
   color: rgba(212,175,110,.75);
   font-size: 28px; letter-spacing: 2px;
@@ -70,6 +71,13 @@ html, body {
 }
 #puzzle-timer.soon { color: #e8684a; }   /* 快到点了变红 */
 #puzzle-timer.hidden { display: none; }
+#puzzle-viewport {
+  flex: 0 1 auto;
+  width: 100%; max-height: 100%;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+#puzzle-viewport::-webkit-scrollbar { display: none; }
 #puzzle {
   margin: 0 auto;
   max-width: 100%;
@@ -143,23 +151,14 @@ html, body {
   text-align: left;
 }
 #reveal-who.hidden { display: none; }
-/* 完整解释: **只对这一块**做字号适配(见 fitReveal)。
-   它是唯一允许被压缩的区域 —— 核心答案与贡献链都不参与。 */
+/* 完整解释: 固定可读字号；放不下时由 AutoScroller 自动滚一遍。 */
 #reveal-body {
   flex: 0 1 auto; min-height: 0;
   color: #f7ecd2; font-size: 34px; line-height: 1.6;
   letter-spacing: 1.5px;
   overflow-wrap: anywhere; word-break: break-word;
   text-align: left;
-  /* ⚠️ U2: `overflow-y: auto` 只是**极端超长文本的兜底**, 不是正常
-     路径。正常质量政策允许的 answer 必须在这个区域**不用滚动**就完整
-     可见 —— 观众没有鼠标去滚直播源。
-     这条不变量由 `tests/test_web.py` 的
-     `body.scrollHeight <= body.clientHeight` 断言钉住。
-     留着 auto 而不是 hidden: 万一真出现极端文本, 宁可让它可滚(表现
-     为"内容很长"), 也不要静默裁掉最后一段 —— 裁掉会让谜底看起来
-     少了一截, 而观众无从知道。 */
-  overflow-y: auto;
+  overflow-y: hidden;
 }
 /* explanation 阶段: 共同解谜是隐藏的, 完整解释独占剩余空间。
    这是三段里唯一"可以长得比较大"的一块。 */
@@ -214,8 +213,8 @@ html, body {
 /* 进下一题时: 谜面淡入, 提示"新题" */
 #puzzle.newpuzzle { animation: puzzleIn .6s ease-out; }
 @keyframes puzzleIn {
-  from { opacity: 0; transform: translateY(24px); }
-  to   { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 /* 换题过渡条 */
 #toast {
