@@ -1520,6 +1520,136 @@ def test_playable_count_limit_early_exit():
         check("limit=99 -> 3", pool.playable_count([], limit=99) == 3)
 
 
+def _dark_spec(i, emotion="eerie"):
+    """一道**可入池**的 spec, 情绪基调可控。
+
+    谜面/domain 逐题不同 —— 否则同 signature 会互相撞配额, 断言
+    "池里有 2 道可播"就变成在测夹具而不是测门。
+    """
+    dm = ("maritime", "nature", "daily", "music")[i % 4]
+    s = good_spec(
+        puzzle=f"第{i}座灯塔只在退潮时亮, 涨潮后反倒熄灯, 编号{i}。为什么?",
+        fair_clues=[
+            FairClue(quote="只在退潮时亮", supports_atoms=["a1"]),
+            FairClue(quote="涨潮后反倒熄灯", supports_atoms=["a2"]),
+        ])
+    s.signature = PuzzleSignature(
+        mechanism_family="hidden_function",
+        solution_shape="hidden_function_explains_behavior",
+        domain=dm, emotion_mode=emotion, relation="stranger",
+        time_shape="habitual", reveal_mode="meaning_flip")
+    s.blueprint_specified = False
+    return s
+
+
+def _window(emos):
+    """按情绪序列造一个 recent 窗口(只喂 signature, 门只看 emotion_mode)。"""
+    return [PuzzleSignature(mechanism_family="information_gap",
+                            solution_shape="information_advantage",
+                            domain="daily", emotion_mode=e)
+            for e in emos]
+
+
+def test_c6a_stale_dark_candidate_is_gated_at_delivery():
+    """**C6-A**: 池中陈旧候选在**交付这一刻**按当下 recent 重新判 dark 带。
+
+    这是 review 抓到的 blocker 的可执行版本。生产路径是
+    prefetch -> 池 -> `pop_next()`, 而池里的题**不会**进 Engine 的
+    recent —— 揭晓期连续预生成时, 后一道看不到前一道已经囤了 dark:
+
+        recent 5 dark
+        prefetch A 看 recent -> 生成 dark 入池        (池中 A = dark)
+        prefetch B 仍看同一份**已播** recent -> 又一道 dark  (池中 B = dark)
+
+    真正交付时 A 先播, recent 变 6; 这时 B 若仍照播, 滚动窗口就变 7。
+    C4 只把目标带接进了生成时的 `choose_emotion()`, 而 `check_signature()`
+    当时不管 dark —— 所以这条在生产路径上被绕过。
+
+    断言的是**池的真实路径**(`pop_next` / `playable_count`), 不是
+    `choose_emotion` 的连续调用 —— 后者证明不了池守不守规矩。
+    """
+    print("\n[C6-A] 池中陈旧 dark 候选在交付时被重新判")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        a, b = _dark_spec(0, "eerie"), _dark_spec(1, "eerie")
+        check("两道 dark 候选都入池", pool.add(a) and pool.add(b))
+
+        # A 交付时的窗口: 5 dark -> 播 A 之后成 6。
+        w5 = _window(["eerie"] * 5 + ["warm"] * 5)
+        check("5 dark 窗口下 A 可交付(dark, 播完是 6)",
+              pool.playable_count(w5) >= 1, pool.playable_count(w5))
+        got = pool.pop_next(w5)
+        check("A 真的被交付", got is not None)
+
+        # A 播完 -> 窗口变 6 dark, 且**最老是 warm**(A 挤掉的正是那道 warm)。
+        # 此时再交付一道 dark 会把窗口推到 7 —— 必须被挡。
+        w6 = _window(["warm"] + ["eerie"] * 6 + ["warm"] * 3)
+        check("A 播完后窗口 6 dark", True)
+        check("**第 2 道 dark 在 6-dark 窗口下不可交付(会到 7)**",
+              pool.playable_count(w6) == 0, pool.playable_count(w6))
+        check("**pop_next 也拿不到它**", pool.pop_next(w6) is None)
+        # A 已被交付 -> 进了 used 账本, 所以 stock 从 2 掉到 1 是**正常的**。
+        # 要断言的是 B **仍在池里**(被窗口挡住 != 被删), 等最近 10 题滚
+        # 过去它就能用 —— 这正是 L1 定下的"池子是集合不是队列"。
+        check("B 仍在池里(被窗口挡住 != 被删)",
+              pool.stock_count() == 1, pool.stock_count())
+        # 窗口滚过去之后 B 必须能出来 —— 证明它只是**此刻**被挡。
+        w_ok = _window(["warm"] * 4 + ["eerie"] * 5 + ["warm"])
+        got_b = pool.pop_next(w_ok)
+        check("**窗口滚过去后 B 立刻可交付**", got_b is not None)
+
+
+def test_c6a_dark_gate_blocks_both_directions():
+    """反向也要挡: 交付一道 non-dark 会把窗口推到 4 时同样不可交付。
+
+    只挡一侧的实现是半个门 —— C4 实现时正是"下限只检查 dark 那侧"
+    让窗口锁死在 4。
+    """
+    print("\n[C6-A] 门两个方向都挡")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        light = _dark_spec(0, "warm")
+        dark = _dark_spec(1, "eerie")
+        check("warm + eerie 入池", pool.add(light) and pool.add(dark))
+        # 5 dark 且**最老是 dark**: 交付 non-dark 会挤掉它 -> 4。
+        w5 = _window(["eerie"] * 5 + ["warm"] * 5)
+        check("**non-dark 在 5-dark(最老 dark)窗口下不可交付**",
+              pool.playable_count(w5, limit=99) == 1,
+              pool.playable_count(w5, limit=99))
+        got = pool.pop_next(w5)
+        check("交付的必须是那道 dark",
+              got is not None and got.signature.emotion_mode in ("eerie", "tense"),
+              got.signature.emotion_mode if got else None)
+
+
+def test_c6a_delivery_gate_is_shared_with_generator():
+    """交付门与生成器**同源** —— 两边对"带内"的判断必须一致。
+
+    这条防的是"抄一份逻辑到池里": 两份实现迟早在某个边界上漂开
+    (C4 的 `>` vs `>=` 就是这种漂移的实例), 而漂移的表现是
+    "choose_emotion 认为不能出、check_signature 认为能交付"。
+    """
+    print("\n[C6-A] 交付门与生成器同源")
+    from story.quality import (dark_tone_allowed, dark_tone_deliverable,
+                               dark_tone_band)
+    from story.config import Config
+    from story.quality import Quotas
+    q = Quotas.from_config(Config())
+    check("生产 config 的目标带是开着的(5~6)",
+          dark_tone_band(q) == (5, 6, True), dark_tone_band(q))
+    # 满窗之后两者必须逐点一致 —— warm-up 期刻意不同, 见
+    # `dark_tone_deliverable` 的 docstring。
+    full = _window(["warm"] + ["eerie"] * 6 + ["warm"] * 3)
+    same = all(dark_tone_allowed(e, full, q) == dark_tone_deliverable(e, full, q)
+               for e in ("eerie", "tense", "warm", "neutral", "grief"))
+    check("**满窗后生成判据 == 交付判据**", same)
+    # warm-up 期: 交付门**只守上限**, 不执行下限(否则冷启动前 5 题全是诡异题)
+    check("warm-up: 空窗口下 neutral 可交付(不会被强制成诡异题)",
+          dark_tone_deliverable("neutral", [], q) is True)
+    check("warm-up: 上限仍然生效(6 dark 未满窗 -> 第 7 道 dark 被挡)",
+          dark_tone_deliverable("eerie", _window(["eerie"] * 6), q) is False)
+
+
 def test_playable_count_never_raises():
     """与本模块其他公开方法一致: 任何意外退化成 0, 不抛。"""
     print("\n[L1-6] playable_count 绝不抛")
@@ -1601,6 +1731,10 @@ def main():
         test_playable_count_never_writes_used,
         test_playable_count_fail_closed,
         test_playable_count_limit_early_exit,
+        # ---- C6-A: 诡异基调目标带的交付门 ----
+        test_c6a_stale_dark_candidate_is_gated_at_delivery,
+        test_c6a_dark_gate_blocks_both_directions,
+        test_c6a_delivery_gate_is_shared_with_generator,
         test_playable_count_never_raises,
     ]
     for t in tests:

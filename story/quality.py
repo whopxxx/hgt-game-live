@@ -746,6 +746,29 @@ def check_signature(sig: PuzzleSignature, recent: Optional[list],
             and c.get("procedural_rule", 0) >= q.procedural_rule):
         bad.append(f"最近 {q.window} 题里有 {c['procedural_rule']} 道主要靠"
                    f"制度性设定成立(上限 {q.procedural_rule})")
+    # ---- C6-A: 诡异基调目标带的**交付**门 ----
+    #
+    # C4 把 5~6 接进了生成时的 `choose_emotion()`, 但生产路径是
+    # prefetch -> 池 -> `pop_next()`, 而池里的题**不会**进 Engine 的
+    # recent: 揭晓期连续预生成时, 后一道看不到前一道已经囤了 dark, 于是
+    # 能囤出"第 7 道 dark"。真正交付时这里若不管, 滚动窗口就变 7 ——
+    # 目标带在**生产路径**上被绕过(C4 的单元测试只连续调 choose_emotion,
+    # 测不到这条)。
+    #
+    # 判据与生成时**同源**(`dark_tone_allowed`), 所以"池中陈旧候选"
+    # 会在交付这一刻按**当下** recent 重新判一次 —— 这正是我们要的:
+    # 生成前 target + 生成后 gate + 交付时重判, 三层一套规则。
+    #
+    # `emotion_mode` 为空(没观察到)时**不判** —— 与 `reveal_mode` 同一
+    # 条既有原则: 拿未知当某一档会污染统计, 而候选题在交付前 signature
+    # 一定由生成器填好, 空值只出现在历史/残缺数据上。
+    if sig.emotion_mode and not dark_tone_deliverable(sig.emotion_mode, recent, q):
+        dmin, dmax, _on = dark_tone_band(q)
+        cur = sum(1 for s in _recent(recent, q.window)
+                  if getattr(s, "emotion_mode", "") in DARK_TONE_MODES)
+        bad.append(
+            f"情绪基调 {sig.emotion_mode} 会把最近 {q.window} 题的"
+            f"诡异/紧张数推出目标带 [{dmin}, {dmax}] (当前 {cur} 道)")
     return bad
 
 
@@ -977,6 +1000,113 @@ def _projected_dark_count(recent: Optional[list], q: "Quotas",
     return n + (1 if pick_dark else 0)
 
 
+def dark_tone_band(quotas: Optional["Quotas"] = None) -> tuple:
+    """返回 `(dmin, dmax, band_on)` —— 目标带是否启用, 以及两端。
+
+    `dmax <= 0` 或 `dmin > dmax` 视为**未启用**(0/0 = off)。写在一处,
+    是因为调度器和交付门必须对"带到底开没开"有一致的判断 —— 一边认为
+    开着、另一边认为关着, 就会出现"生成时被限制、交付时放飞"。
+    """
+    q = quotas or Quotas()
+    dmin, dmax = int(q.dark_tone_min or 0), int(q.dark_tone_max or 0)
+    return dmin, dmax, (dmax > 0 and dmin <= dmax)
+
+
+def dark_tone_allowed(emotion: str, recent: Optional[list],
+                      quotas: Optional["Quotas"] = None) -> bool:
+    """**这一档情绪此刻能不能出?** —— C4 目标带的唯一共享判据。
+
+    ## 为什么必须共享(而不是让交付门自己判一遍)
+
+    C4 只把目标带接进了**生成时**的 `choose_emotion()`。但生产路径上题的
+    实际来源是 prefetch -> 池 -> `pop_next()`, 而 `pop_next()` 只跑
+    `cross_puzzle_gate()` -> `check_signature()`, 那里**没有** dark 判据。
+    于是揭晓期的连续预生成会这样翻车:
+
+        当前 recent 已有 5 道 dark
+        prefetch A 看 recent -> 生成一道 dark 入池
+        prefetch B 仍看同一份**已播** recent -> 又生成一道 dark 入池
+        (池里的题没进 Engine 的 recent, 后面的 prefetch 不知道前一道已囤)
+
+    真正播题时逐道检查, 但 `check_signature()` 不管 dark —— 第 7 道 dark
+    照样交付 -> 滚动窗口变 7, 目标带在**生产路径**上被绕过。单元测试只
+    连续调 `choose_emotion()` 是测不到这一条的: 它证明不了池路径也守规矩。
+
+    同源之后是三层的同一套规则:
+
+        生成前 target (choose_emotion)  +  生成后 gate (cross_puzzle_gate)
+        +  池中陈旧候选在**交付时**按当下 recent 重新 gate (pop_next)
+
+    ## 规则(与 `choose_emotion` 逐条一致)
+
+        projected > max                       -> 禁止这一侧
+        projected < effective_min 且另一侧可行 -> 禁止这一侧
+        两侧都低于 min 的 dead-zone            -> 只允许 dark(往带内恢复)
+        两侧都在带内                           -> 两侧都允许
+        band = 0/0                            -> 不限制
+
+    `effective_min` 在窗口没满时折算成"可达下限"(`min(dmin, filled+1)`),
+    理由见 `choose_emotion` 的 docstring —— 窗口里只有 5 道题时, 要求
+    projected >= 5 会把 non-dark 全部禁掉, 而那时**唯一**能达到 5 的选择
+    就是 dark, 折算只是把这个事实写清楚。
+    """
+    dmin, dmax, band_on = dark_tone_band(quotas)
+    if not band_on:
+        return True
+    q = quotas or Quotas()
+    is_dark = emotion in DARK_TONE_MODES
+    proj_self = _projected_dark_count(recent, q, pick_dark=is_dark)
+    proj_other = _projected_dark_count(recent, q, pick_dark=not is_dark)
+    if proj_self > dmax:
+        return False
+    filled = len(_recent(recent, q.window))
+    effective_min = min(dmin, filled + 1)
+    if proj_self < effective_min:
+        # 自己够不到下限。只有当**另一侧**也够不到时才是死区 —— 那时
+        # 唯一有意义的方向是往带里走, 也就是只放行 dark。
+        if proj_other < effective_min:
+            return is_dark
+        return False
+    return True
+
+
+def dark_tone_deliverable(emotion: str, recent: Optional[list],
+                          quotas: Optional["Quotas"] = None) -> bool:
+    """**交付/入池**这一刻, 这一档情绪能不能过关? —— `check_signature` 用。
+
+    与 `dark_tone_allowed()` 只差一条: **窗口未满时下限不参与判定**。
+
+    ## 为什么两处必须有这个差别
+
+    生成时 (`choose_emotion`) 与交付时 (`check_signature`) 的容错度本就
+    不同 —— 这一点在 C6-A 实测中被一个具体事故逼出来:
+
+        filled = 0 时 effective_min = min(5, 0 + 1) = 1
+        非 dark 的投影恒为 0 < 1  ->  被拒
+
+    于是冷启动的**前 5 题全部被强制成 eerie/tense**, 一个刚开播的直播间
+    连着 5 道诡异题 —— 那是比"目标带没达标"严重得多的内容事故, 而且它
+    不是我们要拦的东西: 交付门要拦的是"**已经播够 10 题**之后还能再塞
+    第 7 道 dark 进池"(见 C6-A 的 stale pool regression)。
+
+    生成时的 warm-up 折算**保持原样**: 那是"出题往目标带凑"的调度倾向,
+    收窄方向但不阻塞; 交付门是**硬拒**。让交付门也去执行 warm-up 下限,
+    等于把"调度偏好"升级成"合法候选判死"。
+
+    上限两边一致(warm-up 期也生效) —— 它只看 `projected`, 与窗口满没满
+    无关。
+    """
+    q = quotas or Quotas()
+    if q.window > 0 and len(_recent(recent, q.window)) < q.window:
+        dmin, dmax, band_on = dark_tone_band(q)
+        if not band_on:
+            return True
+        # 只守上限: 窗口没满时"超出上限"仍然要拦(否则冷启动也能囤 dark)。
+        return _projected_dark_count(
+            recent, q, pick_dark=(emotion in DARK_TONE_MODES)) <= dmax
+    return dark_tone_allowed(emotion, recent, q)
+
+
 def choose_emotion(recent: Optional[list],
                    rng: Optional[random.Random] = None,
                    quotas: Optional[Quotas] = None) -> str:
@@ -1017,42 +1147,17 @@ def choose_emotion(recent: Optional[list],
     rng = rng or random.Random()
     q = quotas or Quotas()
     c = signature_counts(recent, q.window)
-    dmin, dmax = int(q.dark_tone_min or 0), int(q.dark_tone_max or 0)
-    band_on = dmax > 0 and dmin <= dmax
-    if band_on:
-        # 两种选择的预测 —— 见 `_projected_dark_count` 的 docstring:
-        # 下限必须**两侧都看**, 否则"正好 5 道且最老是 dark"时会放行
-        # 一次非 dark 选择, 窗口掉到 4 就再也爬不回来。
-        proj_dark = _projected_dark_count(recent, q, pick_dark=True)
-        proj_other = _projected_dark_count(recent, q, pick_dark=False)
-    else:
-        proj_dark = proj_other = 0
-    filled = len(_recent(recent, q.window))
-    # warm-up: 窗口还没满 -> 下限不能超过"这一道之后最多能有几道 dark"。
-    # `+1` 是这一道自己。窗口满时不做这个折算(那时 filled+1 > dmin,
-    # 折算本身是恒等变换)。
-    effective_min = min(dmin, filled + 1) if band_on else 0
+    dmin, dmax, band_on = dark_tone_band(q)
 
     ok = []
     for emo in EMOTION_MODES:
         if emo == "neutral" and c.get("emotion:neutral", 0) >= q.neutral_emotion:
             continue
-        if band_on:
-            is_dark = emo in DARK_TONE_MODES
-            # 选了它之后窗口会有几道 dark
-            projected = proj_dark if is_dark else proj_other
-            if projected > dmax:
-                # **超过**上限 -> 换一边。
-                #
-                # ⚠️ 边界是 `>` 不是 `>=`(C4 实测踩到的): 用 `>=` 时
-                # `projected == dmax(6)` 会拒掉 dark, 于是 6 成了**斥态**
-                # —— 一旦掉到 5, 就再也没有任何一步能回到 6, 目标带的
-                # 上半段永远不可达(实测 5 个 seed 全部只出 5)。目标带是
-                # **闭区间** [min, max], 端点必须可取。
-                continue
-            if projected < effective_min:
-                # 会跌破(可达)下限 -> 换一边。
-                continue
+        # ⚠️ 目标带判据走 `dark_tone_allowed()` —— 与 `check_signature()`
+        # 的交付门**同一份**实现。在这里重抄一遍三分支的后果, 就是交付门
+        # 和生成器对"带内"的理解慢慢漂开(C4 正是栽在这里)。
+        if not dark_tone_allowed(emo, recent, q):
+            continue
         ok.append(emo)
     if band_on and not ok:
         # ---- 死区: 两种选择都够不到下限 ----
