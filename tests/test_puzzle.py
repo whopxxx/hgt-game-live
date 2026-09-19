@@ -911,6 +911,154 @@ def test_structural_duplicate():
           is_structurally_duplicate(fresh, recent))
 
 
+def test_s1_recent_pairs_is_shared_key():
+    """**S1**: `recent_pairs()` 是判重键的**唯一**来源。
+
+    `is_structurally_duplicate` 与 scheduler 的候选过滤都必须从它取 ——
+    各写一份判重键迟早漂移, 而漂移的代价是调度器主动选一个后面必被
+    拒的组合(烧掉 3~4 稿配额)。
+    """
+    print("\n[S1-A] recent_pairs 是共享判重键")
+    from story.quality import recent_pairs
+    recent = [
+        PuzzleSignature(mechanism_family="rule_constraint",
+                        solution_shape="social_constraint", domain="workplace"),
+        PuzzleSignature(mechanism_family="hidden_function",
+                        solution_shape="misunderstood_object", domain="food"),
+    ]
+    got = recent_pairs(recent, 10)
+    check("**取到两个 pair**", got == {("rule_constraint", "social_constraint"),
+                                       ("hidden_function", "misunderstood_object")},
+          got)
+    # 刻意**不含** domain: 换职业不算换题
+    check("**判重键不含 domain**",
+          all(len(k) == 2 for k in got), got)
+    # 与 is_structurally_duplicate 一致
+    dup = PuzzleSignature(mechanism_family="rule_constraint",
+                          solution_shape="social_constraint", domain="medical")
+    check("is_structurally_duplicate 与 recent_pairs 一致",
+          bool(is_structurally_duplicate(dup, recent)), True)
+    check("空窗口 -> 空集合", recent_pairs([], 10) == set(), recent_pairs([], 10))
+    check("窗口截断生效",
+          recent_pairs(recent, 1)
+          == {("hidden_function", "misunderstood_object")},
+          recent_pairs(recent, 1))
+
+
+def test_s1_scheduler_never_picks_live_regression_pair():
+    """**S1-B**: 复现实播 —— recent 已有 rule_constraint/social_constraint。
+
+    实播日志里第 1/2/4 稿全被 cross gate 以"结构等价"拒掉。修好之后
+    调度器**绝不该再返回那个 pair**。
+    """
+    print("\n[S1-B] 实播 regression: 不再选必死的 pair")
+    import random
+    blocked = ("rule_constraint", "social_constraint")
+    recent = [PuzzleSignature(mechanism_family=blocked[0],
+                              solution_shape=blocked[1], domain="workplace")]
+    hit = 0
+    for seed in range(300):
+        bp = choose_blueprint(recent, rng=random.Random(seed), quotas=Quotas())
+        if (bp.mechanism_family, bp.solution_shape) == blocked:
+            hit += 1
+    check("**300 个 seed 里一次都没返回那个 pair**", hit == 0, hit)
+
+
+def test_s1_never_returns_duplicate_while_alternative_exists():
+    """**S1-C**: 通用不变量 —— 只要还有合法且不重复的 pair, 就绝不返回重复的。
+
+    这是 S1 的核心契约。用随机窗口扫, 而不是只测那个实播 pair。
+    """
+    print("\n[S1-C] 存在合法替代时永不返回重复 pair")
+    import random
+    from story.quality import recent_pairs, _legal_shapes_for, _quota_allows
+    viol = 0
+    checked = 0
+    for seed in range(400):
+        rng = random.Random(seed)
+        q = Quotas()
+        n = rng.randrange(0, 10)
+        recent = []
+        for _ in range(n):
+            fam = rng.choice(list(FAMILY_SHAPES))
+            sh = rng.choice(list(FAMILY_SHAPES[fam]))
+            recent.append(PuzzleSignature(
+                mechanism_family=fam, solution_shape=sh, domain="maritime",
+                emotion_mode="tense", relation="stranger",
+                time_shape="instant", reveal_mode="straight_explanation"))
+        bp = choose_blueprint(recent, rng=random.Random(seed ^ 0x5bf0),
+                              quotas=q)
+        if not bp.mechanism_family:
+            continue
+        blocked = recent_pairs(recent, q.window)
+        # 枚举空间里是否还存在合法且不重复的 pair?
+        alt = False
+        for fam in FAMILY_SHAPES:
+            for sh in FAMILY_SHAPES[fam]:
+                if (fam, sh) in blocked:
+                    continue
+                for emo in EMOTION_MODES:
+                    if (sh in _legal_shapes_for(fam, emo)
+                            and _quota_allows(fam, sh, emo, q, recent)):
+                        alt = True
+                        break
+                if alt:
+                    break
+            if alt:
+                break
+        checked += 1
+        if alt and (bp.mechanism_family, bp.solution_shape) in blocked:
+            viol += 1
+            if viol <= 3:
+                print(f"    VIOLATION seed={seed} "
+                      f"{bp.mechanism_family}/{bp.solution_shape}")
+    check(f"**扫描 {checked} 个窗口, 零违规**", viol == 0, viol)
+
+
+def test_s1_fallback_also_avoids_recent_pair():
+    """**S1-D**: `_least_recently_seen` 兜底也必须避开 recent pair。
+
+    它早先直接取 `FAMILY_SHAPES[fam][0]` —— 完全可能正好撞上最近的
+    pair, 于是**兜底反而稳定地产出必被拒的蓝图**。
+    """
+    print("\n[S1-D] 兜底路径也避开 recent pair")
+    from story.quality import _least_recently_seen, recent_pairs
+    q = Quotas()
+    # 构造: 所有 family 都在 recent 里出现过, 且第一条 family 的
+    # 第一个 shape 正是 recent 里的 pair。
+    fam = "rule_constraint"
+    first_shape = FAMILY_SHAPES[fam][0]
+    recent = [PuzzleSignature(mechanism_family=fam,
+                              solution_shape=first_shape, domain="workplace")]
+    bp = _least_recently_seen(q, recent)
+    check("**没返回被占用的那个 pair**",
+          (bp.mechanism_family, bp.solution_shape)
+          not in recent_pairs(recent, q.window),
+          (bp.mechanism_family, bp.solution_shape))
+    check("仍返回一个合法 blueprint", bool(bp.mechanism_family),
+          bp.mechanism_family)
+
+
+def test_s1_fallback_degrades_when_all_blocked():
+    """整个空间真被堵死时仍要返回(不能卡死出题链)。"""
+    print("\n[S1-E] 全堵死仍返回(不卡死)")
+    from story.quality import _least_recently_seen
+    q = Quotas()
+    # 把每个 family 的**所有** shape 都塞进 recent
+    recent = []
+    for fam, shapes in FAMILY_SHAPES.items():
+        for sh in shapes:
+            recent.append(PuzzleSignature(mechanism_family=fam,
+                                          solution_shape=sh,
+                                          domain="maritime"))
+    bp = _least_recently_seen(q, recent)
+    check("**仍然返回一个 blueprint(不抛异常)**",
+          bool(bp.mechanism_family), bp.mechanism_family)
+    check("返回的 shape 属于该 family",
+          bp.solution_shape in FAMILY_SHAPES.get(bp.mechanism_family, ()),
+          (bp.mechanism_family, bp.solution_shape))
+
+
 def test_cross_puzzle_gate():
     print("[跨题门: 生成后按最近的题判分布]")
     recent = [PuzzleSignature(mechanism_family="object_misuse",
@@ -1611,6 +1759,12 @@ def main():
         test_scheduler_deterministic_and_respects_quota,
         test_scheduler_quota_exhausted_still_returns,
         test_structural_duplicate,
+        # ---- S1: 调度器不选"生成前就必死"的 pair ----
+        test_s1_recent_pairs_is_shared_key,
+        test_s1_scheduler_never_picks_live_regression_pair,
+        test_s1_never_returns_duplicate_while_alternative_exists,
+        test_s1_fallback_also_avoids_recent_pair,
+        test_s1_fallback_degrades_when_all_blocked,
         test_cross_puzzle_gate,
         test_template_tables_have_no_dead_ends,
         test_scheduler_output_always_valid_blueprint,

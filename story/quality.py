@@ -675,6 +675,25 @@ def check_signature(sig: PuzzleSignature, recent: Optional[list],
 # ======================================================================
 # 4. 结构去重(方案 §10: **不是**"职业不同 = 题目不同")
 # ======================================================================
+def recent_pairs(recent: Optional[list],
+                 window: int = RECENT_WINDOW) -> set:
+    """最近窗口里出现过的 `(mechanism_family, solution_shape)` 集合。
+
+    ⚠️ 这是**唯一**的判重键来源 —— `is_structurally_duplicate()` 与
+    scheduler 的候选过滤都从它取, 不各写一遍。
+
+    为什么必须共享: 调度器要在"选之前"避开必死的 pair, 而最终 cross gate
+    在"生成之后"拒同一个 pair。两处若各写一份判重键, 迟早漂移 ——
+    漂移的结果就是调度器高高兴兴选一个后面必被拒的组合, 白烧 3~4 稿
+    配额(实播日志里的 rule_constraint/social_constraint 就是这个)。
+
+    刻意**不包含** domain/职业: 方案 §65 明确不要"职业不同 = 题目不同"。
+    """
+    return {(s.mechanism_family, s.solution_shape)
+            for s in _recent(recent, window)
+            if s.mechanism_family and s.solution_shape}
+
+
 def is_structurally_duplicate(sig: PuzzleSignature, recent: Optional[list],
                               window: int = RECENT_WINDOW) -> str:
     """和最近某题**结构上等价**吗? 返回冲突的那个坐标, 否则 ""。
@@ -684,11 +703,14 @@ def is_structurally_duplicate(sig: PuzzleSignature, recent: Optional[list],
 
     判据是 (mechanism_family, solution_shape) 二元组 —— 刻意**不包含**
     domain/职业。方案 §65 明确: 不要再用"职业不同 = 题目不同"。
+
+    判重键来自 `recent_pairs()`, 与 scheduler 的候选过滤**同源**。
     """
-    for s in reversed(_recent(recent, window)):
-        if (s.mechanism_family and s.mechanism_family == sig.mechanism_family
-                and s.solution_shape and s.solution_shape == sig.solution_shape):
-            return f"{sig.mechanism_family}/{sig.solution_shape}"
+    key = (sig.mechanism_family, sig.solution_shape)
+    if not key[0] or not key[1]:
+        return ""
+    if key in recent_pairs(recent, window):
+        return f"{key[0]}/{key[1]}"
     return ""
 
 
@@ -874,18 +896,38 @@ def choose_family_shape(recent: Optional[list], emotion: str,
     该 family 能展开出多少 shape/domain/relation **无关**。这样后面的维度
     不会反过来改变 family 被选中的概率。
 
+    ## 为什么候选过滤里必须有"结构重复"这一条(S1)
+
+    早先这里只查 `_quota_allows()`(计数配额), 而最终 `cross_puzzle_gate()`
+    会用 `is_structurally_duplicate()` 拒掉**同一个 exact pair** —— 两把
+    尺子不一样, 于是调度器会主动选一个后面必被拒的组合。实播日志:
+
+        blueprint: rule_constraint / social_constraint
+          ↓ recent 里已有完全相同的 pair
+          ↓ 第 1/2/4 稿全被 cross gate 拒掉
+
+    烧掉 3~4 稿配额, 而正确答案从一开始就不在合法集合里。
+
+    判重键用 `recent_pairs()` —— 与 cross gate **同源**, 不是各写一份。
+
+    原则: 只要枚举空间里还存在任何合法且不重复的 pair, 就绝不返回结构
+    重复的 pair。真全堵死时才返回 `("", "")`, 由兜底路径接手。
+
     返回 `(family, shape)`; 全堵死时返回 `("", "")`。
     """
     rng = rng or random.Random()
     q = quotas or Quotas()
     weights = family_headroom(q, recent)
-    # 只留"在这一 emotion 下至少有一个合法 shape 且过静态配额"的 family
+    blocked = recent_pairs(recent, q.window)
+    # 只留"在这一 emotion 下至少有一个合法 shape、过静态配额、且不与
+    # 最近窗口结构重复"的 family
     legal: list = []
     for fam, w in weights.items():
         if w <= 0:
             continue
         shapes = [sh for sh in _legal_shapes_for(fam, emotion)
-                  if _quota_allows(fam, sh, emotion, q, recent)]
+                  if _quota_allows(fam, sh, emotion, q, recent)
+                  and (fam, sh) not in blocked]
         if shapes:
             legal.append((fam, shapes, w))
     if not legal:
@@ -1124,19 +1166,38 @@ def choose_blueprint(recent: Optional[list],
 
 def _least_recently_seen(quotas: Quotas,
                          recent: Optional[list]) -> PuzzleBlueprint:
-    """配额堵死所有组合时的兜底: 取最久没出现的 family。"""
+    """配额堵死所有组合时的兜底: 取最久没出现的 family。
+
+    ⚠️ S1: 这条兜底**也**必须避开最近窗口里的 exact
+    `(mechanism_family, solution_shape)` pair。它早先直接取
+    `FAMILY_SHAPES[fam][0]` —— 那完全可能正好撞上最近的 pair, 于是
+    兜底反而稳定地生成一道必被 cross gate 拒的蓝图。
+
+    原则与 `choose_family_shape` 一致: 只要还有合法且不重复的 pair,
+    就绝不返回重复的。只有整个空间真的没有时才退化 —— 那时最终
+    cross gate 仍然会拒(defense-in-depth)。
+    """
     rs = _recent(recent, quotas.window)
+    blocked = recent_pairs(recent, quotas.window)
     used = [s.mechanism_family for s in rs if s.mechanism_family]
+
+    def _first_free_shape(family: str) -> str:
+        """该 family 里第一个不在最近 pair 里的 shape(全撞则取第一个)。"""
+        shapes = FAMILY_SHAPES.get(family, ("information_advantage",))
+        for sh in shapes:
+            if (family, sh) not in blocked:
+                return sh
+        return shapes[0]
+
     for fam in MECHANISM_FAMILIES:
         if fam not in used:
-            shapes = FAMILY_SHAPES.get(fam, ("information_advantage",))
             return PuzzleBlueprint(mechanism_family=fam,
-                                   solution_shape=shapes[0])
-    # 全都出现过 -> 用出现次数最少的那个
+                                   solution_shape=_first_free_shape(fam))
+    # 全都出现过 -> 用出现次数最少的那个(仍避开重复 pair)
     c = Counter(used)
     fam = min(MECHANISM_FAMILIES, key=lambda f: c.get(f, 0))
-    shapes = FAMILY_SHAPES.get(fam, ("information_advantage",))
-    return PuzzleBlueprint(mechanism_family=fam, solution_shape=shapes[0])
+    return PuzzleBlueprint(mechanism_family=fam,
+                           solution_shape=_first_free_shape(fam))
 
 
 # ======================================================================
