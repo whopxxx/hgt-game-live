@@ -3632,6 +3632,25 @@ def test_ai_player_solve_wrong_and_right_are_independent():
           (right._established_fact_ids, sr.qa_archive[-1]))
     check("产生正常 REVEAL 动作",
           any(a.kind == ActionKind.REVEAL for a in acts), kinds(acts))
+    reveal = next(a for a in acts if a.kind == ActionKind.REVEAL)
+    check("AI 猜中者进入 REVEAL payload",
+          reveal.payload["winner"] == "AI玩家", reveal.payload)
+
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    with tempfile.TemporaryDirectory() as td:
+        cfg = mkcfg()
+        cfg.puzzle_out_path = os.path.join(td, "puzzle.jsonl")
+        director = Director(cfg)
+        director.engine = right
+        director._archive_reveal(reveal.payload, "揭晓文案")
+        record = json.loads(io.open(
+            cfg.puzzle_out_path, encoding="utf-8").read().strip())
+    check("AI 猜中者进入 archive",
+          record["winner"] == "AI玩家", record)
 
 
 def test_ai_player_priority_cooldown_failure_giveup_and_stale():

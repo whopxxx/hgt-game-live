@@ -2088,7 +2088,7 @@ class RoundEngine:
         self._phase_hint = self._notice
         return [EngineAction(ActionKind.REVEAL, {
             "reason": reason,
-            "winner": winner if reason == "solved" else "",
+            "winner": winner if reason in ("solved", "ai_solved") else "",
             "expect_round": self.round_index,
             "expect_spec_key": self._current_spec_key,
             "puzzle": self._puzzle, "answer": self._answer,
