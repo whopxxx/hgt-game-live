@@ -105,7 +105,7 @@ def ident_spec(completion=("f1", "f2"), core="门外女人是父亲的亲生女�
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["注意她的身份", "注意昨晚发生了什么", "注意饭桌"],
-        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+        prompt_version="riddle-v6", quality_policy_version="quality-v6")
 
 
 def flight_spec():
@@ -128,7 +128,7 @@ def flight_spec():
         ],
         fair_clues=[FairClue(quote="乘客却在鼓掌", supports_atoms=["a1"])],
         hints=["注意掌声", "注意民航流程", "注意考核"],
-        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+        prompt_version="riddle-v6", quality_policy_version="quality-v6")
 
 
 def boot(spec):
@@ -517,7 +517,7 @@ def test_closeout_b1_minimal_identity_puzzle_valid():
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["a", "b", "c"],
-        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+        prompt_version="riddle-v6", quality_policy_version="quality-v6")
     vr = validate_spec(sp)
     check("validate_spec 通过", vr.ok, vr.why())
     check("只有 1 条 atom", len(sp.solve_atoms) == 1)
@@ -530,8 +530,8 @@ def test_closeout_b1_minimal_identity_puzzle_valid():
 
 
 def test_closeout_b2_v5_must_have_contract():
-    """Blocker 2: quality-v5 标签**不能**配 legacy 通关语义。"""
-    print("\n[B2] quality-v5 必须有完整合同")
+    """Blocker 2: 当前政策标签**不能**配 legacy 通关语义。"""
+    print("\n[B2] 当前政策必须有完整合同")
     from story.quality import QUALITY_POLICY_VERSION as _Q
     # v5 标签 + 空合同 -> 拒
     sp = ident_spec()
@@ -539,7 +539,7 @@ def test_closeout_b2_v5_must_have_contract():
     vr = validate_spec(sp)
     check("v5 + 空 completion -> 拒", not vr.ok, vr.why())
     check("理由点名了版本门",
-          "quality-v5" in vr.why() and "completion" in vr.why(), vr.why())
+          _Q in vr.why() and "completion" in vr.why(), vr.why())
     # v5 标签 + 空 core_answer -> 拒
     sp2 = ident_spec()
     sp2.core_answer = ""
@@ -556,7 +556,7 @@ def test_closeout_b2_v5_must_have_contract():
     ]
     vr3 = validate_spec(sp3)
     check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
-    check("版本常量确实是 v5", _Q == "quality-v5", _Q)
+    check("版本常量确实是 v6", _Q == "quality-v6", _Q)
     # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
     check("has_completion_contract 仍是运行时判据",
           ident_spec().has_completion_contract())
@@ -951,6 +951,116 @@ def test_established_archive_boundary():
           recs[-1].established_fact_ids if recs else None)
 
 
+# ======================================================================
+# v6: completion fact 必须是 core_answer 的**最小语义拆分**
+# ======================================================================
+def test_v6_versions_bumped():
+    """四个版本号必须一起走 —— 少 bump 一个就会让复盘分不清版本。"""
+    print("\n[v6] 版本号")
+    from story.llm import (ANSWER_PROMPT_VERSION, CHECK_PROMPT_VERSION,
+                           RIDDLE_PROMPT_VERSION)
+    from story.quality import QUALITY_POLICY_VERSION
+    check("QUALITY_POLICY_VERSION == quality-v6",
+          QUALITY_POLICY_VERSION == "quality-v6", QUALITY_POLICY_VERSION)
+    check("RIDDLE_PROMPT_VERSION == riddle-v6",
+          RIDDLE_PROMPT_VERSION == "riddle-v6", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v6",
+          CHECK_PROMPT_VERSION == "check-v6", CHECK_PROMPT_VERSION)
+    check("ANSWER_PROMPT_VERSION == answer-v5",
+          ANSWER_PROMPT_VERSION == "answer-v5", ANSWER_PROMPT_VERSION)
+    # spec_version 这次**不动** —— v6 没有改 PuzzleSpec schema。
+    from story.puzzle import PuzzleSpec
+    check("spec_version 仍是 3",
+          PuzzleSpec(puzzle="p", answer="a").to_archive().get("spec_version")
+          == 3)
+
+
+def test_v6_pool_quarantines_quality_v5():
+    """真实故障就是 quality-v5 的题, 它们绝不能继续进直播。
+
+    不迁移、不猜旧合同 —— 一律 quarantine, 等重新补池。
+    """
+    print("\n[v6] quality-v5 pool 必须被 quarantine")
+    import json
+    import os
+    import tempfile
+    from story.pool import PuzzlePool
+    from story.puzzle import PuzzleSignature
+
+    def _full(policy):
+        sp = ident_spec()
+        sp.quality_policy_version = policy
+        sp.signature = PuzzleSignature(
+            mechanism_family="identity_misread",
+            solution_shape="identity_reversal", domain="family",
+            emotion_mode="warm", relation="family", time_shape="instant",
+            reveal_mode="identity_flip")
+        return sp
+
+    # 入池门: 政策版本不匹配 -> quarantine(不迁移、不猜)。
+    ok, why = PuzzlePool._validate_pool_spec(_full("quality-v5"))
+    check("quality-v5 -> 入池被拒", not ok, why)
+    check("理由点名政策不兼容", "不兼容" in why, why)
+    ok2, why2 = PuzzlePool._validate_pool_spec(_full("quality-v6"))
+    check("quality-v6 完整题 -> 入池", ok2, why2)
+
+    # 出池门: 盘上**残留**的 v5 题也绝不能 pop 出来 —— 只拦入池不够,
+    # 因为故障现场就是升级前已经写进池子的那批。
+    d = tempfile.mkdtemp(prefix="v6pool_")
+    cfg = mkcfg(pool_path=os.path.join(d, "pool.jsonl"))
+    # 池记录是**包装过的**: `{"pool_version":.., "spec":{..}}`。
+    # 直接写裸 spec dict 会被 `_spec_from_record` 当成不合规记录跳过 ——
+    # 那样测出来的是"记录坏了", 不是"政策被隔离"。
+    from story.pool import POOL_VERSION
+    with open(cfg.pool_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"pool_version": POOL_VERSION,
+                             "spec": _full("quality-v5").to_dict()},
+                            ensure_ascii=False) + "\n")
+    pool = PuzzlePool.open(cfg)
+    check("盘上残留的 v5 题仍在池内(pending 不跑准入校验)",
+          pool.pending_count() == 1, pool.pending_count())
+    check("但 stock == 0(v5 无 live 资格)", pool.stock_count() == 0,
+          pool.stock_count())
+    check("pop 返回 None", pool.pop_next(recent_signatures=[]) is None)
+    check("隔离项**原样留在盘上**, 不被删",
+          os.path.exists(cfg.pool_path)
+          and len([ln for ln in open(cfg.pool_path, encoding="utf-8")
+                   if ln.strip()]) == 1)
+
+
+def test_v6_riddle_prompt_has_minimality_rule():
+    """生成端必须拿到"删除测试"这条硬规则, 否则合同还会写得更细。"""
+    print("\n[v6] RIDDLE_SYSTEM 最小拆分规则")
+    from story.llm import RIDDLE_SYSTEM
+    check("点明是 core_answer 的最小语义拆分",
+          "最小语义拆分" in RIDDLE_SYSTEM)
+    check("给了删除测试", "删除测试" in RIDDLE_SYSTEM)
+    check("明确禁止更严格/更细",
+          "不能比 core_answer 更严格" in RIDDLE_SYSTEM)
+    check("给了真实类型反例(鉴定人定价权)",
+          "鉴定人" in RIDDLE_SYSTEM)
+    check("反例含 support 降级指引", "降为 support" in RIDDLE_SYSTEM)
+
+
+def test_v6_reviewer_has_minimality_rule():
+    """Reviewer 的 completion_contract_minimal 必须同时管"不得严于"。"""
+    print("\n[v6] Reviewer 最小性规则")
+    from story.llm import CHECK_SYSTEM, _TOOL_CHECK
+    d = (_TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
+         ["properties"]["completion_contract_minimal"]["description"])
+    check("schema 描述含'不得严于 core_answer'", "不得严于 core_answer" in d)
+    check("schema 描述含删除测试", "删除测试" in d)
+    check("CHECK_SYSTEM 含 v6 段", "不得严于 core_answer" in CHECK_SYSTEM)
+    check("CHECK_SYSTEM 含删除测试", "删除测试" in CHECK_SYSTEM)
+    # fail-closed 必须还在: 四项仍全部 required。
+    req = (_TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
+           ["required"])
+    check("四项仍全部 required",
+          set(req) == {"narrator_truthful", "mechanism_consistent",
+                       "core_answer_direct", "completion_contract_minimal"},
+          req)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -982,6 +1092,11 @@ def main():
         test_final_closeout_status_must_be_ok,
         test_product_semantics_pinned,
         test_established_archive_boundary,
+        # ---- v6: completion 必须是最小语义拆分 ----
+        test_v6_versions_bumped,
+        test_v6_pool_quarantines_quality_v5,
+        test_v6_riddle_prompt_has_minimality_rule,
+        test_v6_reviewer_has_minimality_rule,
     ]
     for t in tests:
         t()

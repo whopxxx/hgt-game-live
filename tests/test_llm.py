@@ -1284,10 +1284,10 @@ def test_v4_prompt_versions_bumped():
     """Step 04: prompt 版本必须真的升到 v4(否则档案无法区分两代题)。"""
     print("\n[V4-1] riddle/check prompt 版本")
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
-    check("RIDDLE_PROMPT_VERSION == riddle-v5",
-          RIDDLE_PROMPT_VERSION == "riddle-v5", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v5",
-          CHECK_PROMPT_VERSION == "check-v5", CHECK_PROMPT_VERSION)
+    check("RIDDLE_PROMPT_VERSION == riddle-v6",
+          RIDDLE_PROMPT_VERSION == "riddle-v6", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v6",
+          CHECK_PROMPT_VERSION == "check-v6", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1450,8 +1450,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v5",
-          QUALITY_POLICY_VERSION == "quality-v5", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v6",
+          QUALITY_POLICY_VERSION == "quality-v6", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================

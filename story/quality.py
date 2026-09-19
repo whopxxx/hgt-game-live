@@ -65,7 +65,23 @@ from .puzzle import (
 #: 所以 v4 与 v5 的题**不可直接比较**: v4 的题是在"必须硬造 cause+
 #: mechanism"的前提下产出的, 它的 atoms/signature 描述的不是这道题
 #: 真实的解法形状。
-QUALITY_POLICY_VERSION = "quality-v5"
+#: v6(Solve UX 二): **completion fact 必须比 core_answer 更"核心"**
+#:   - v5 只要求"1~2 条 core/hidden", 于是生成器很自然地写出一条
+#:     **比 core_answer 更细**的合同 —— 例如 core_answer 说"制造虚高成交
+#:     记录抬高同类箱子价值", 而 completion 里塞进"鉴定人具有定价权"。
+#:     那种细节属于**解释骗局如何运转**的 support, 不是普通观众解出
+#:     谜面所必须说出的东西。后果在真实直播里已经出现: 房间明显已经
+#:     说出核心机制, 合同却永远覆盖不满, 于是一串"是"之后无语揭晓。
+#:   - v6 起 `completion_contract_minimal` 增加"不得严于 core_answer":
+#:     做删除测试 —— 删掉某个身份/权限/制度/职业/流程细节后, 观众仍然
+#:     能回答谜面最后的问题, 那个细节就不属于 completion。
+#:   - `Answer` 侧同时新增 completion verifier(见 `story/llm.py`), 但那
+#:     只补 `established_fact_ids`, **不产生第二个胜利入口**。
+#:
+#: 为什么必须 bump 政策版本而不是兼容 v5: 盘上已经存在按 quality-v5
+#: Reviewer 生成的题, 它们正是这次真实故障的来源。不 bump 的话修完
+#: prompt 旧题仍然能进直播 —— 所以 v5 一律 quarantine, 不迁移、不猜。
+QUALITY_POLICY_VERSION = "quality-v6"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -210,10 +226,10 @@ def validate_spec(spec: PuzzleSpec,
     is_v5 = str(spec.quality_policy_version or "") == QUALITY_POLICY_VERSION
     if is_v5:
         if not spec.completion_fact_ids:
-            r.fail("quality-v5 spec 缺 completion_fact_ids"
+            r.fail("当前政策(quality-v6) spec 缺 completion_fact_ids"
                    "(v5 标签不能配 legacy 通关语义)")
         if not (spec.core_answer or "").strip():
-            r.fail("quality-v5 spec 缺 core_answer")
+            r.fail("当前政策(quality-v6) spec 缺 core_answer")
 
     # ---- 通关合同(v5) 与 atom 要求 ----
     #

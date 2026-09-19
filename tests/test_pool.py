@@ -67,7 +67,7 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
                       fact_ids=["f2", "f3"]),
         ],
         # ---- v5 通关合同 ----
-        # 标的是当前政策(quality-v5), 所以必须带完整合同 —— 否则
+        # 标的是当前政策, 所以必须带完整合同 —— 否则
         # 它违反 Blocker 2 的版本硬门("v5 标签不能配 legacy 通关语义")。
         # 合同指向 f1/f2, 且 a1 引用 f1、clue 也指向 a1(线索通向通关路径)。
         core_answer="他亮灯是为了标出退潮时露出的礁石, 不是给船引路。",
@@ -1299,8 +1299,8 @@ def test_real_v3_to_v4_quarantine():
         v3.quality_policy_version = "quality-v3"
         _raw_pool(cfg.pool_path, v3)
         pool = PuzzlePool.open(cfg)
-        check("当前政策确实是 v4",
-              QUALITY_POLICY_VERSION == "quality-v5", QUALITY_POLICY_VERSION)
+        check("当前政策确实是 v6",
+              QUALITY_POLICY_VERSION == "quality-v6", QUALITY_POLICY_VERSION)
         check("pending 看得见(盘上有候选)", pool.pending_count() == 1,
               pool.pending_count())
         check("**stock == 0**(v3 已失去 live 资格)", pool.stock_count() == 0,

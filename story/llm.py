@@ -801,9 +801,9 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v5"
-CHECK_PROMPT_VERSION = "check-v5"
-ANSWER_PROMPT_VERSION = "answer-v4"
+RIDDLE_PROMPT_VERSION = "riddle-v6"
+CHECK_PROMPT_VERSION = "check-v6"
+ANSWER_PROMPT_VERSION = "answer-v5"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
 REVEAL_PROMPT_VERSION = "reveal-v2"
@@ -814,9 +814,9 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 2. 再定 **≤3 条**核心隐藏事实(即将来 facts 里 kind=core 的那些)。
 3. 建 facts(6~10 条): 主持判断「是/不是/无关」的事实空间, 别凑数。
    至少 1 条 kind=exclusion(排除常见错误路线)。
-4. **定通关合同 `completion_fact_ids`(1~2 条)** —— 从上面 kind=core 且
-   hidden 的事实里挑出"解出这题**最少**必须知道的那 1~2 条"。
-   ⚠️ 压不进 2 条就说明这题太绕, **换一个更简单的骨架重出**, 不要硬塞。
+4. **定通关合同 `completion_fact_ids`(1~2 条)** —— 它是 `core_answer`
+   的**最小语义拆分**, 见下面的硬规则。压不进 2 条就说明这题太绕,
+   **换一个更简单的骨架重出**, 不要硬塞, 也不要把细节塞进合同。
 5. 写 `core_answer`(一句话, ≤60 字, 不换行): 普通观众一听就懂的核心答案,
    必须**直接回答谜面最后那个问题**。
 6. 写 answer(2-4 句, 第一句正面解释核心反常)。
@@ -836,6 +836,36 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 - 每条都必须被某条 solve_atom 引用(否则观众没有推理抓手)。
 - 它是**累计**的: 房间已经确认过的会算数, 最后补齐缺口的观众立即获胜。
   所以不要写"必须一个人同时说出 A 和 B"这种要求 —— 那是旧模型。
+
+═══ completion fact 必须是 core_answer 的**最小语义拆分**(v6 硬规则) ═══
+先把 core_answer 写成一句普通人听得懂的话, 然后问自己:
+
+    "观众要说出**哪几件事**, 才算说出了这句话?"
+
+答案就是 completion。判据是**删除测试**:
+
+    如果删掉 fact 里的某个身份、权限、制度、职业、具体流程细节之后,
+    观众**仍然已经能回答谜面最后的问题**, 那个细节就**不属于 completion**,
+    应当放进 support。
+
+**completion 不能比 core_answer 更严格、更细。**
+
+✅ 正确(核心机制本身):
+core_answer "古董商通过人为制造虚高成交记录, 抬高手中同类旧箱的市场价值。"
+  f1 = 他通过自买自卖/配合竞拍, 制造虚高成交记录       (core/hidden)
+  f2 = 目的是抬高手中同类旧箱的市场价值               (core/hidden)
+
+❌ 错误(比 core_answer 更细的行业细节):
+  f2 = 拍卖行鉴定人具有根据成交记录调整估值的正式定价权 (support)
+
+  为什么错: "鉴定人定价权"解释的是这个骗局**在行业里如何运转**,
+  是 support detail。普通观众说出 f1 的核心机制就已经解出谜面了;
+  要求他再说出"鉴定人有定价权"才是通关, 等于把题变成考行业知识 ——
+  真实直播里就是这么出现"明明已经答中却永不满合同"的。
+
+自检: 把 core_answer 念出来, 再看 completion 两条 —— 合同里**不允许**
+出现 core_answer 没要求的额外人物权限、精确流程、具体职业、正式制度、
+背景历史。有, 就删掉或降为 support。
 
 ═══ facts 必须原子化 ═══
 一条 fact = **一个**可以独立被问到、独立被确认的命题。
@@ -1600,7 +1630,13 @@ _TOOL_CHECK = {
                         "type": "boolean",
                         "description": (
                             "completion_fact_ids 只包含**真正通关所需**的 1~2 个"
-                            "事实(只指向 core/hidden, 不含 support/exclusion)。"),
+                            "事实(只指向 core/hidden, 不含 support/exclusion)。\n"
+                            "**并且不得严于 core_answer**: 合同必须是 core_answer"
+                            " 的最小语义拆分。若某条 completion fact 含 core_answer"
+                            " 不要求的额外人物权限/精确流程/具体职业/正式制度/"
+                            "背景历史 -> false。\n"
+                            "删除测试: 删掉该细节后观众仍能完整回答谜面末尾的问题,"
+                            " 就必须删除或降为 support。"),
                     },
                 },
                 "required": ["narrator_truthful", "mechanism_consistent",
@@ -1732,6 +1768,21 @@ core_answer 普通人**一句能懂**, 并且**直接回答谜面末尾那个问
 completion_fact_ids 只包含**真正通关所需**的 1~2 个事实, 只指向
 kind=core 且 visibility=hidden。混进 support/exclusion, 或者为了保险
 塞到 4、5 条, 都是 false(那会让通关变得要么太易要么太绕)。
+
+**v6 新增 —— 不得严于 core_answer**(这条最容易漏):
+合同必须是 core_answer 的**最小语义拆分**, 不能比 core_answer 更细。
+- 先读 core_answer, 再读 completion facts。
+- 若某条 completion fact 含有 core_answer **不要求**的额外人物权限、
+  精确流程、具体职业、正式制度、背景历史 -> **false**。
+- 判据是**删除测试**: 删掉那个细节后, 观众仍然能完整回答谜面末尾的
+  问题 -> 这个细节不该在 completion 里, 必须删掉或降为 support。
+- 例: core_answer = "古董商通过人为制造虚高成交记录, 抬高手中同类旧箱
+  的市场价值" 时, completion 若是
+  "拍卖行鉴定人具有根据成交记录调整估值的正式定价权" -> **false**
+  (那是解释骗局如何运转的 support, 不是观众解出谜面必须说出的话)。
+
+为什么这条是硬门: 真实直播里出现过"房间已经公开说出核心机制, 但合同
+因为含更细的行业细节而永远覆盖不满", 结果连续十几个「是」却不揭晓。
 
 ═══ 情绪 ≠ 揭晓结构(评审时也要分开) ═══
 - `emotion_mode` 是**气氛**(读起来是伤感/温暖/中性/荒诞…)。
