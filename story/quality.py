@@ -240,6 +240,12 @@ CORE_ANSWER_MAX_LEN = 80
 #:     81 ~ 120   fixable —— 交给 reviewer **只压缩 core_answer**
 #:     > 120      这是真的写偏了(一段话而不是一句话), 硬失败
 CORE_ANSWER_FIXABLE_MAX_LEN = 120
+#: 直播固定画布的通用长度合同。preferred 只供提示/分析使用；第一版仅把
+#: hard max 作为确定性门，不让 reviewer 因长度自由改写故事。
+PUZZLE_PREFERRED_MAX_LEN = 180
+PUZZLE_HARD_MAX_LEN = 220
+ANSWER_PREFERRED_MAX_LEN = 260
+ANSWER_HARD_MAX_LEN = 300
 #: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
 #:
 #: ⚠️ 它**不是**整道题的复杂度上限。v8 起这一点由 `discovery_beats`
@@ -266,6 +272,10 @@ def validate_spec(spec: PuzzleSpec,
         r.fail("谜面为空")
     if not (spec.answer or "").strip():
         r.fail("谜底为空")
+    if len((spec.puzzle or "").strip()) > PUZZLE_HARD_MAX_LEN:
+        r.fail(f"谜面超过直播展示硬上限 {PUZZLE_HARD_MAX_LEN} 字")
+    if len((spec.answer or "").strip()) > ANSWER_HARD_MAX_LEN:
+        r.fail(f"谜底超过直播展示硬上限 {ANSWER_HARD_MAX_LEN} 字")
 
     # ---- 谜面格式 ----
     # 注意: 这三样归 `can_fix` 而不是 `fail` —— 审稿人改一句话就能救,
