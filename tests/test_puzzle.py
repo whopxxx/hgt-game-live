@@ -24,6 +24,7 @@ from story.quality import (  # noqa: E402
     QUALITY_POLICY_VERSION, Quotas, check_signature, choose_blueprint,
     cross_puzzle_gate, FAMILY_SHAPES, check_tables, is_structurally_duplicate,
     signature_counts, signature_of, validate_blueprint, validate_spec, _candidates,
+    DARK_TONE_MODES, choose_emotion, _projected_dark_count,
 )
 
 FAIL = [0]
@@ -1186,6 +1187,137 @@ def test_q2_dark_tone_target_is_code():
           EMOTION_MODES)
 
 
+def test_c4_dark_tone_rolling_simulation():
+    """**C4**: `choose_emotion` 真的把"最近 10 题 5~6 道诡异/紧张"落成代码。
+
+    Q2-J 只检查了 Config 里存在 `quality_dark_tone_min/max` 两个数字 ——
+    那是**配置字段存在**, 不是**行为被接通**。生产 `choose_emotion`
+    当时完全没读它们, 仍只是 `1/(1+count)` 随机加权。所以那条测试是
+    假绿: 把字段删了会红, 把逻辑删了不会。
+
+    这里做**顺序模拟**: 连续做 N 次真实选择, 每次都把选中的情绪喂回
+    recent, 然后检查**每一个滚动 10 题窗口**里的 dark 数。
+
+    为什么必须顺序模拟而不是"调一次看结果": 目标是**滚动窗口**上的
+    性质, 单次调用看不见窗口。而 warm-up(窗口未满)与满窗两段的规则
+    不同, 只有跑起来才能同时覆盖。
+    """
+    print("\n[C4] 滚动 10 题的诡异/紧张目标带")
+    import random as _random
+    from story.puzzle import PuzzleSignature
+
+    q = Quotas(dark_tone_min=5, dark_tone_max=6)
+    check("Quotas 带上了目标带", (q.dark_tone_min, q.dark_tone_max) == (5, 6),
+          (q.dark_tone_min, q.dark_tone_max))
+    check("DARK_TONE_MODES 就是 eerie/tense",
+          set(DARK_TONE_MODES) == {"eerie", "tense"}, DARK_TONE_MODES)
+
+    def sig(emo):
+        return PuzzleSignature(mechanism_family="information_gap",
+                               solution_shape="information_advantage",
+                               domain="daily", emotion_mode=emo)
+
+    # ---- ① projected 计数: "选了 dark / 非 dark 窗口会长成什么样" ----
+    # 语义是 剩下的 9 道里的 dark 数 + (选的是不是 dark)。
+    #
+    # 满窗 10 道、6 道 dark、且最老是 dark:
+    #   选 dark   -> 挤掉最老那道 dark -> 剩 5 道 + 1 = 6
+    #   选非 dark -> 挤掉最老那道 dark -> 剩 5 道 + 0 = 5
+    # 这是"进一出一、两侧都还在带内"的情形。
+    full = [sig("eerie") if i < 6 else sig("warm") for i in range(10)]
+    check("满窗 6 dark 且最老是 dark -> 选 dark 6, 选非 dark 5",
+          (_projected_dark_count(full, q, True),
+           _projected_dark_count(full, q, False)) == (6, 5),
+          (_projected_dark_count(full, q, True),
+           _projected_dark_count(full, q, False)))
+    # 最老是 warm: 挤掉 warm -> 剩 9 道里 6 道 dark -> 选 dark 是 7(超上限)
+    full2 = [sig("warm")] + [sig("eerie") if i < 6 else sig("warm")
+                             for i in range(9)]
+    check("满窗 6 dark 但最老是 warm -> 选 dark 会到 7(超上限)",
+          _projected_dark_count(full2, q, True) == 7,
+          _projected_dark_count(full2, q, True))
+
+    # ---- ② 下限强制: 窗口满且够不到下限 -> 只能出 dark ----
+    low = [sig("warm") if i < 6 else sig("absurd") for i in range(10)]
+    check("低 dark 窗口: 选 dark 是 1, 选非 dark 是 0",
+          (_projected_dark_count(low, q, True),
+           _projected_dark_count(low, q, False)) == (1, 0),
+          (_projected_dark_count(low, q, True),
+           _projected_dark_count(low, q, False)))
+    got = {choose_emotion(low, _random.Random(s), q) for s in range(40)}
+    check("**够不到下限 -> 强制 eerie/tense(往目标走)**",
+          got and got <= set(DARK_TONE_MODES), sorted(got))
+
+    # ---- ③ 上限强制: window 满且 projected >= 6 -> 只能出非 dark ----
+    got2 = {choose_emotion(full2, _random.Random(s), q) for s in range(40)}
+    check("**projected>=max -> 强制非 dark**",
+          got2 and not (got2 & set(DARK_TONE_MODES)), sorted(got2))
+
+    # ---- ④ 带内 -> 不再硬凑, 但**两种选择都必须仍在带内** ----
+    #
+    # ⚠️ 这里刻意选 6 道 dark 的满窗(最老是 dark):
+    #   选 dark   -> 挤掉最老那道 dark -> 剩 5 + 1 = 6   (在带内)
+    #   选非 dark -> 剩 5 + 0 = 5                        (也在带内)
+    # 只有这种"两侧都安全"的窗口才该放开自由选择。
+    #
+    # 早先这里用的是 5 道 dark 的窗口, 断言"两侧都可能出现" —— 那是
+    # **错的**: 5 道且最老是 dark 时, 选非 dark 会让窗口掉到 4(跌破
+    # 下限), 所以必须强制 dark。实测时正是这个"放行"让窗口锁死在 4。
+    mid = [sig("eerie") if i < 6 else sig("warm") for i in range(10)]
+    check("带内窗口: 选 dark 是 6, 选非 dark 是 5(两侧都安全)",
+          (_projected_dark_count(mid, q, True),
+           _projected_dark_count(mid, q, False)) == (6, 5),
+          (_projected_dark_count(mid, q, True),
+           _projected_dark_count(mid, q, False)))
+    got3 = {choose_emotion(mid, _random.Random(s), q) for s in range(60)}
+    check("两侧都安全时 dark 与非 dark 都可能出现(不硬凑)",
+          bool(got3 & set(DARK_TONE_MODES)) and bool(got3 - set(DARK_TONE_MODES)),
+          sorted(got3))
+
+    # ---- ④b 5 道 dark 的满窗 -> 只能 dark(否则跌破下限) ----
+    tight = [sig("eerie") if i < 5 else sig("warm") for i in range(10)]
+    check("5 dark 满窗: 选非 dark 会掉到 4",
+          _projected_dark_count(tight, q, False) == 4,
+          _projected_dark_count(tight, q, False))
+    got3b = {choose_emotion(tight, _random.Random(s), q) for s in range(40)}
+    check("**5 dark 满窗 -> 强制 dark(不许跌破 5)**",
+          got3b and got3b <= set(DARK_TONE_MODES), sorted(got3b))
+
+    # ---- ④c 死区: 两侧都够不到下限 -> 往目标方向走(dark) ----
+    # 10 道里 0 道 dark: 选 dark 只有 1, 选非 dark 是 0, 都 < 5。
+    # 此时若退回"自由选", 窗口会随机漂移、永远爬不回带内。
+    dead = [sig("warm")] * 10
+    got3c = {choose_emotion(dead, _random.Random(s), q) for s in range(40)}
+    check("**死区 -> 仍优先 dark(不放弃收敛)**",
+          got3c and got3c <= set(DARK_TONE_MODES), sorted(got3c))
+
+    # ---- ⑤ 顺序模拟: warm-up 之后每个滚动窗口都落在 5~6 ----
+    for seed in (1, 7, 42, 2026):
+        rng = _random.Random(seed)
+        recent: list = []
+        worst = []
+        for _step in range(80):
+            emo = choose_emotion(recent, rng, q)
+            recent.append(sig(emo))
+            if len(recent) >= 10:
+                win = recent[-10:]
+                n = sum(1 for s in win if s.emotion_mode in DARK_TONE_MODES)
+                worst.append(n)
+        check(f"seed={seed}: 每个滚动 10 题窗口的 dark 数都是 5 或 6",
+              all(n in (5, 6) for n in worst),
+              sorted(set(worst)))
+
+    # ---- ⑥ 关掉目标带 -> 与旧行为一致(不会再强制) ----
+    off = Quotas()                      # 默认 0/0 = 关闭
+    check("默认 Quotas 目标带是关的",
+          (off.dark_tone_min, off.dark_tone_max) == (0, 0),
+          (off.dark_tone_min, off.dark_tone_max))
+    low2 = [sig("warm") if i < 6 else sig("absurd") for i in range(10)]
+    got4 = {choose_emotion(low2, _random.Random(s), off) for s in range(40)}
+    check("关掉后不再强制 dark(可能出现非 dark)",
+          bool(got4 - set(DARK_TONE_MODES)), sorted(got4))
+
+
 def test_cross_puzzle_gate():
     print("[跨题门: 生成后按最近的题判分布]")
     recent = [PuzzleSignature(mechanism_family="object_misuse",
@@ -1897,6 +2029,8 @@ def main():
         test_q2_completion_stays_one_or_two,
         test_q2_legacy_archive_without_beats_still_reads,
         test_q2_dark_tone_target_is_code,
+        # ---- C4: 诡异基调目标带真的接到调度器上 ----
+        test_c4_dark_tone_rolling_simulation,
         test_cross_puzzle_gate,
         test_template_tables_have_no_dead_ends,
         test_scheduler_output_always_valid_blueprint,

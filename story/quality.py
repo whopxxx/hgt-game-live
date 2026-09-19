@@ -581,6 +581,17 @@ class Quotas:
     neutral_emotion: int = 3
     #: 主要靠制度性设定成立的题上限(`procedural_rule_dependency`, observed)。
     procedural_rule: int = 1
+    # ---- v8/C4: 最近 window 题的"诡异/紧张"目标带 ----
+    #: `eerie` + `tense` 在**滚动窗口**里应落进的区间。
+    #:
+    #: ⚠️ 这是**目标带**, 不是"每道都必须落在这里"的硬配额 —— 见
+    #: `choose_emotion` 的三分支规则。用区间而不是定值: 定值会让调度器
+    #: 每轮硬凑, 挤压 absurd/warm/neutral/grief 的空间。
+    #:
+    #: `min = max = 0` 表示**关掉这条规则**(退回纯缺口加权的旧行为),
+    #: 这样老配置/老测试不需要改。
+    dark_tone_min: int = 0
+    dark_tone_max: int = 0
 
     @classmethod
     def from_config(cls, cfg: Any) -> "Quotas":
@@ -599,6 +610,10 @@ class Quotas:
             straight_explanation=g("quota_straight_explanation", 1),
             neutral_emotion=g("quota_neutral_emotion", 3),
             procedural_rule=g("quota_procedural_rule", 1),
+            # C4: 目标带来自 Config 的两个整数字段。缺省 0/0 = 关闭,
+            # 这让"没配这条规则的调用方"行为与 v8 之前逐位相同。
+            dark_tone_min=g("quality_dark_tone_min", 0) or 0,
+            dark_tone_max=g("quality_dark_tone_max", 0) or 0,
         )
 
 
@@ -918,6 +933,50 @@ def _quota_allows(fam: str, shape: str, emotion: str,
     return True
 
 
+#: `eerie` + `tense` —— C4 的"诡异/紧张"目标带统计的就是这两档。
+#: 定义在这里(而不是各处写字符串)是因为它同时被调度器与测试引用。
+DARK_TONE_MODES = ("eerie", "tense")
+
+
+def _projected_dark_count(recent: Optional[list], q: "Quotas",
+                          pick_dark: bool = True) -> int:
+    """**下一题选了 `pick_dark` 之后**, 滚动窗口里会有几道 dark。
+
+        sigs = 最近窗口, 若已满先丢掉最老的那道(新题会挤掉它)
+        return 剩下这些里的 dark 数 + (1 if pick_dark else 0)
+
+    ## 为什么必须"先丢最老"
+
+    只看当前计数会在满窗时把目标带判错一整题。例: 窗口已有 6 道 dark,
+    当前计数 6 >= max 会强制选非 dark —— 但如果最老那题**正好是 dark**,
+    加一道 dark 之后窗口仍然是 6(进一出一), 完全在带内。
+
+    ## 为什么下限判定要**同时**看两种选择
+
+    这是 C4 实现里最容易错的一处。下限的语义是"别让窗口掉到 5 以下",
+    而掉下去**只需要选一道非 dark**: 窗口 10 道里正好 5 道 dark、且最老
+    那道**是 dark** 时, 选非 dark 会把它挤出去 -> 窗口变 4。
+
+    所以下限不能用"选 dark 的预测 >= 5"来判(那等于假设下一题一定是
+    dark, 于是 5 道时判定通过、放行任意选择, 结果自由选择挑了非 dark,
+    窗口掉到 4 再也回不来 —— 实测 seed=1 就卡在 4)。
+
+    正确判据是**两种选择的预测都要 >= min**:
+
+        pick_dark=True  时 >= min  且  pick_dark=False 时 >= min
+
+    两个都满足才说明"随便选都安全", 才可以放开。只满足 dark 那侧时,
+    非 dark 会让窗口跌破下限 -> 强制 dark。
+    """
+    sigs = _recent(recent, q.window)
+    # 加一道 -> 若窗口会溢出, 最老的先出去。
+    if q.window > 0 and len(sigs) >= q.window:
+        sigs = sigs[1:]
+    n = sum(1 for s in sigs
+            if getattr(s, "emotion_mode", "") in DARK_TONE_MODES)
+    return n + (1 if pick_dark else 0)
+
+
 def choose_emotion(recent: Optional[list],
                    rng: Optional[random.Random] = None,
                    quotas: Optional[Quotas] = None) -> str:
@@ -926,15 +985,95 @@ def choose_emotion(recent: Optional[list],
     规则:
       - `neutral` 达 `neutral_emotion` 上限后**不可选**;
       - 其余尽量补"最近缺口": 最近窗口里出现得少的情绪优先。
+
+    ## C4: 滚动窗口的"诡异/紧张"目标带
+
+    v8 把内容基调写进了 prompt, 但 prompt 说了模型也可能连着出 10 道
+    温馨题 —— 目标必须**代码化**才有约束力。规则三分支:
+
+        projected_dark < min  -> **强制**从 eerie/tense 里选
+        projected_dark >= max -> **强制**从非 dark 里选
+        否则                   -> 按缺口权重随机(与旧行为一致)
+
+    `projected_dark` 是"下一题加入之后的窗口"(`_projected_dark_count`)。
+
+    ## 为什么 warm-up 期用"可达下限"而不是直接跳过
+
+    窗口还没满时, 窗口里最多只有 `filled + 1` 道题 —— 前几题无论怎么选
+    都不可能立刻满足 `projected >= 5`。但**完全跳过下限**也是错的: 那样
+    开头几题会自由漂到 2~3 道 dark, 之后靠 `projected < min` 每次只补
+    一道, 而窗口是滚动的 —— 补一道的同时又滚出去一道,**永远追不上**,
+    首个完整窗口就锁死在低位(实测 seed=1 停在 2, seed=7 停在 1)。
+
+    所以 warm-up 期的下限取 `min(目标下限, 窗口内可达的最大值)`:
+
+        可达到的最大 dark 数 = 已经出的题数 + 1(这一道)
+        有效下限 = min(dmin, 那个最大值)
+
+    这样前几题会**主动**往 dark 上凑(而不是自由漂), 到窗口满时已经
+    接近目标带, 之后正常的三分支接手。目标带仍是"尽量", 不是"每题
+    都必须" —— warm-up 期它只收窄方向, 不保证逐题命中。
     """
     rng = rng or random.Random()
     q = quotas or Quotas()
     c = signature_counts(recent, q.window)
+    dmin, dmax = int(q.dark_tone_min or 0), int(q.dark_tone_max or 0)
+    band_on = dmax > 0 and dmin <= dmax
+    if band_on:
+        # 两种选择的预测 —— 见 `_projected_dark_count` 的 docstring:
+        # 下限必须**两侧都看**, 否则"正好 5 道且最老是 dark"时会放行
+        # 一次非 dark 选择, 窗口掉到 4 就再也爬不回来。
+        proj_dark = _projected_dark_count(recent, q, pick_dark=True)
+        proj_other = _projected_dark_count(recent, q, pick_dark=False)
+    else:
+        proj_dark = proj_other = 0
+    filled = len(_recent(recent, q.window))
+    # warm-up: 窗口还没满 -> 下限不能超过"这一道之后最多能有几道 dark"。
+    # `+1` 是这一道自己。窗口满时不做这个折算(那时 filled+1 > dmin,
+    # 折算本身是恒等变换)。
+    effective_min = min(dmin, filled + 1) if band_on else 0
+
     ok = []
     for emo in EMOTION_MODES:
         if emo == "neutral" and c.get("emotion:neutral", 0) >= q.neutral_emotion:
             continue
+        if band_on:
+            is_dark = emo in DARK_TONE_MODES
+            # 选了它之后窗口会有几道 dark
+            projected = proj_dark if is_dark else proj_other
+            if projected > dmax:
+                # **超过**上限 -> 换一边。
+                #
+                # ⚠️ 边界是 `>` 不是 `>=`(C4 实测踩到的): 用 `>=` 时
+                # `projected == dmax(6)` 会拒掉 dark, 于是 6 成了**斥态**
+                # —— 一旦掉到 5, 就再也没有任何一步能回到 6, 目标带的
+                # 上半段永远不可达(实测 5 个 seed 全部只出 5)。目标带是
+                # **闭区间** [min, max], 端点必须可取。
+                continue
+            if projected < effective_min:
+                # 会跌破(可达)下限 -> 换一边。
+                continue
         ok.append(emo)
+    if band_on and not ok:
+        # ---- 死区: 两种选择都够不到下限 ----
+        #
+        # 窗口远低于目标带时(例: 10 道里 0 道 dark, 选 dark 也只有 1),
+        # 上面两侧都会被拒 -> 候选清空。此时**不能**退回"自由选": 那
+        # 等于放弃收敛, 窗口会随机漂移, 永远爬不回带内。
+        #
+        # 正确动作是**往目标方向走**: 下限够不到时, 唯一有意义的约束
+        # 是"别撞上限", 在这个约束里**优先 dark**。
+        ok = [e for e in EMOTION_MODES
+              if e in DARK_TONE_MODES
+              and not (e == "neutral"
+                       and c.get("emotion:neutral", 0) >= q.neutral_emotion)]
+    if not ok:
+        # 兜底: 目标带把某一侧清空时(例如 neutral 用满 + 强制非 dark),
+        # 退回"不施加目标带"的候选集, 再由 neutral 那条兜底接管。
+        # 绝不返回空 —— 出题链不能因为配额算法卡死。
+        ok = [e for e in EMOTION_MODES
+              if not (e == "neutral"
+                      and c.get("emotion:neutral", 0) >= q.neutral_emotion)]
     if not ok:
         return "neutral"      # 全堵死时的兜底(理论上不可达: neutral 之上还有别的)
     # 缺口越大(计数越少)权重越高 —— 这就是"补最近缺口"。
