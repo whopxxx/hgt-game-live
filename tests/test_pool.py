@@ -1294,7 +1294,7 @@ def test_real_v3_to_v4_quarantine():
         _raw_pool(cfg.pool_path, v3)
         pool = PuzzlePool.open(cfg)
         check("当前政策确实是 v4",
-              QUALITY_POLICY_VERSION == "quality-v4", QUALITY_POLICY_VERSION)
+              QUALITY_POLICY_VERSION == "quality-v5", QUALITY_POLICY_VERSION)
         check("pending 看得见(盘上有候选)", pool.pending_count() == 1,
               pool.pending_count())
         check("**stock == 0**(v3 已失去 live 资格)", pool.stock_count() == 0,

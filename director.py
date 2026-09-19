@@ -711,7 +711,13 @@ class Director:
         record = dict(
             session=self.session_id, puzzle_index=snap.puzzle_index,
             # ---- 版本(方案 §55): 没有它就分不清成绩属于哪一版 ----
-            spec_version=2,
+            #
+            # **从 spec 自己的 archive 取**, 不写死。写死的话每次
+            # `PuzzleSpec.to_archive()` 升版, 落盘里都还是旧数字 ——
+            # `to_archive` 是 spec 的版本声明方, director 只是搬运工。
+            # 没有 spec(理论上不会: REVEAL payload 一定带 spec)时退到
+            # 当前值, 不猜。
+            spec_version=spec_d.get("spec_version", 3),
             # ---- 来源(Q8) ----
             # "pool" / "live_generate" / "fallback", 由 engine 显式标记并
             # 一路带过来。**不从任何值推断** —— 我们在 blueprint_specified

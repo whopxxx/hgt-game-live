@@ -724,12 +724,21 @@ class RoundEngine:
             self._spec = spec
             # 运行时内容身份(Batch B closeout)。从**交付的题本身**算,
             # 而不是从 spec 对象 —— 兜底题 / 老调用方没有 spec 时也要有。
+            #
+            # v5: `core_answer` 与 `completion_fact_ids` **必须**参与。
+            # 同一个谜面/谜底只换了通关合同, 已经是另一道题 —— 不进哈希
+            # 就会让按旧合同在飞的 ANSWER 写进新合同的题(identity bug)。
+            # 老调用方(兜底题 / legacy)不给这两个参数, 于是退化成空值 ——
+            # 那正是"无合同"的正确编码。
             self._current_spec_key = runtime_spec_key(
                 puzzle=puzzle, answer=answer or "",
                 facts=[f.to_dict() if hasattr(f, "to_dict") else f
                        for f in (getattr(spec, "facts", None) or [])],
                 solve_atoms=self._solve_atoms,
-                fair_clues=self._fair_clues)
+                fair_clues=self._fair_clues,
+                core_answer=str(getattr(spec, "core_answer", "") or ""),
+                completion_fact_ids=list(
+                    getattr(spec, "completion_fact_ids", None) or []))
             # 这道题**从哪来**(Q8 provenance)。三种取值:
             #   "pool"          题池里挑出来的
             #   "live_generate" 现场生成(含 no-llm 假题)

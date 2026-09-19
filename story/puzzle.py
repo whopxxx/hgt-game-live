@@ -9,15 +9,22 @@
     "是纪念某个人" / "以前出过事故" 这种万能悲情猜法都能通关。
 
     现在把"这道题的世界里什么是真的"固定成一份**有限事实表**:
-        facts        主持人整局判断"是/不是/无关"的事实空间
-        solve_atoms  玩家必须说中的原子事实(引用 facts), cause+mechanism
-        fair_clues   谜面原文里已经写着、回看能指向谜底的具体事实
-        hints        递进提示
+        facts                主持人整局判断"是/不是/无关"的事实空间
+        completion_fact_ids  **通关合同** —— 房间必须真正建立的 1~2 条核心事实
+        solve_atoms          谜底的分析拆分(提示/解释/复盘), **不是**通关条件
+        fair_clues           谜面原文里已经写着、回看能指向谜底的具体事实
+        hints                递进提示
 
-    四者职责**必须分开**, 不能混成一种数据:
+    五者职责**必须分开**, 不能混成一种数据:
         facts        ≠ hints   (事实是判定依据, 提示是给方向)
-        facts        ≠ atoms   (atoms 是 facts 的一个子集视角 + 通关要求)
+        completion   ≠ atoms   (合同是"达到什么程度算解出", atoms 是"这题怎么拆")
         atoms        ≠ clues   (clues 是题面抓手, 不是判定要求)
+
+    **v5 的关键修正**: 通关不再由"文学谜底 + solve_atoms + support 剧情"
+    决定, 而是由 `completion_fact_ids` 的**集合覆盖**决定 —— 房间已公开
+    确认的事实会累计, 最后补齐缺口的观众立即触发揭晓。旧模型要求某一个
+    观众独自同时说中 cause + mechanism, 于是"共同推理"根本不可能发生,
+    观众也普遍反馈"AI 太保守"。
 
 设计原则(方案 §69):
     内容导演权在代码(blueprint/quota/通关规则), 创作能力在 LLM(具体内容),
@@ -39,7 +46,19 @@ from typing import Any, Optional
 # ======================================================================
 FACT_KINDS = ("core", "support", "exclusion")
 FACT_VISIBILITY = ("public", "hidden")
-ATOM_ROLES = ("cause", "mechanism", "support")
+#: solve_atom 的角色。**这不是通关合同** —— 见 `PuzzleSpec.completion_fact_ids`。
+#:
+#: v5 之前这里只有 cause/mechanism/support, 而 `validate_spec` 硬性要求
+#: "必须恰好一条 required cause + 一条 required mechanism"。后果是**每道题
+#: 都被迫写成因果机制题** —— 一道"门外女人到底是谁"的身份题, 生成器只能
+#: 硬造一个 cause/mechanism 去满足校验, 于是 atoms 描述的不是这道题真正的
+#: 解法, 而 Final Judge 又拿这套假 atoms 当通关闸门, 观众说对了身份却因为
+#: "没说清机制"被判没过。
+#:
+#: v5 起 solve_atoms 降级为**提示 / 解释 / 复盘结构**, 通关改由
+#: `completion_fact_ids` 的集合覆盖决定(见 `quality.validate_spec`)。
+#: 于是身份、时间、目标翻转这类题可以用 `key` 表达核心翻转, 不必硬造因果。
+ATOM_ROLES = ("key", "cause", "mechanism", "support")
 
 #: 机制家族(方案 §8)。第一版刻意只有 12 种 —— 几十种会让配额失去意义。
 MECHANISM_FAMILIES = (
@@ -170,11 +189,19 @@ class PuzzleFact:
 
 @dataclass
 class SolveAtom:
-    """玩家必须说中的原子事实。
+    """谜底的**分析拆分**(提示 / 解释 / 复盘用)。
 
-    与 `PuzzleFact` 的区别: atom 是**通关要求**(有 role 和 required),
-    fact 是**事实空间**(所有可判定的事实)。atom 通过 `fact_ids` 引用 fact,
-    所以"说中了 atom"与"探明了 fact"是两件事。
+    与 `PuzzleFact` 的区别: atom 是**分析视角**, fact 是**事实空间**。
+    atom 通过 `fact_ids` 引用 fact, 所以"说中了 atom"与"探明了 fact"是两件事。
+
+    ⚠️ **v5 起 atom 不再是通关合同。** 通关由
+    `PuzzleSpec.completion_fact_ids` 的覆盖决定(见 `quality.validate_spec`)。
+    atom 的用途是: 给提示系统选方向、给揭晓做复盘结构、给 reviewer 做
+    线索回溯检查。它**不**决定观众必须说到什么程度。
+
+    这也是 `role="key"` 存在的理由: 一道身份题的原子事实是"门外女人是
+    父亲的亲生女儿", 那是 `key` 而不是 cause/mechanism —— v5 之前它被
+    迫伪装成因果链的一环。
     """
 
     id: str
@@ -441,7 +468,35 @@ class PuzzleSpec:
     id: str = ""
     title: str = ""
     puzzle: str = ""          # 谜面
-    answer: str = ""          # 谜底
+    answer: str = ""          # 谜底(完整解释, 可有背景与故事性细节)
+    #: **核心答案** —— 普通人一听就知道"这题到底怎么回事"的一句话。
+    #:
+    #: 与 `answer` 的分工(这是 v5 最重要的拆分):
+    #:     answer      = 完整解释, 允许背景、补充、故事性细节
+    #:     core_answer = 一句话核心, 必须直接回答谜面最后那个问题,
+    #:                   不能依赖额外脑补, 推荐 ≤60 汉字, 硬上限 80, 不换行
+    #:
+    #: 为什么需要它: 直播里"揭晓"过去是让第二个 LLM 把文学谜底重新加工
+    #: 一遍, 于是观众等了 1 次额外调用, 拿到的却是一段更绕的文字。有了
+    #: core_answer, 揭晓可以**确定性**地先把它原样念出来(零 LLM 调用),
+    #: 保证"人话"一定先出现。
+    core_answer: str = ""
+    #: **通关合同** —— 观众房间必须真正建立的最小核心事实集合(1~2 条)。
+    #:
+    #: 只允许指向 `kind="core"` 且 `visibility="hidden"` 的 fact。
+    #: support / exclusion **永远不得**作为通关要求 —— 它们是背景与排除项,
+    #: 不是这道题的解法本身。
+    #:
+    #: 语义与 solve_atoms **彻底分开**:
+    #:     completion_fact_ids = 胜利合同(代码做集合覆盖判定)
+    #:     solve_atoms         = 提示 / 解释 / 复盘结构
+    #:
+    #: 这正是"共同推理"的机制: 房间已公开确认的事实会累计, 最后补齐缺口的
+    #: 那位观众立即触发揭晓, 不要求他复述别人已经推出来的部分。
+    #:
+    #: **1~2 条是硬上限。** 一道题若压不进 2 条, 那是题本身太绕, 应该
+    #: rewrite —— 而不是把门槛放宽成 4、5 条。
+    completion_fact_ids: list = field(default_factory=list)
 
     facts: list = field(default_factory=list)          # list[PuzzleFact]
     solve_atoms: list = field(default_factory=list)     # list[SolveAtom]
@@ -490,6 +545,26 @@ class PuzzleSpec:
         return [f for f in self.facts
                 if f.kind == "core" and f.visibility == "hidden"]
 
+    def completion_facts(self) -> list:
+        """通关合同指向的 fact 对象(按 completion_fact_ids 的顺序)。
+
+        找不到的 id 直接跳过 —— 调用方拿到的永远是真实存在的 fact。
+        但这**不代表**校验通过: `validate_spec` 会独立检查每个 id 都存在。
+        """
+        by_id = self.fact_by_id()
+        return [by_id[fid] for fid in (self.completion_fact_ids or [])
+                if fid in by_id]
+
+    def has_completion_contract(self) -> bool:
+        """这道题有没有 v5 通关合同?
+
+        这是"走新路径还是 legacy 路径"的**唯一判据** —— 有合同就用代码集合
+        覆盖判定胜负, 没有就回落到旧的 solution_candidate + Final Judge。
+        绝不用 spec_version / quality_policy_version 去推断, 因为旧 archive
+        宽容读出来的 spec 这两者都可能是空的。
+        """
+        return bool(self.completion_fact_ids)
+
     #: 序列化时**必须**带上的非内容字段。
     #:
     #: 早先 `to_dict` 只写"内容字段"(puzzle/facts/atoms/...), 把
@@ -508,6 +583,9 @@ class PuzzleSpec:
         return {
             "id": self.id, "title": self.title,
             "puzzle": self.puzzle, "answer": self.answer,
+            # ---- v5 通关合同(与 answer 分开, 见字段注释) ----
+            "core_answer": self.core_answer,
+            "completion_fact_ids": list(self.completion_fact_ids or []),
             "facts": [f.to_dict() for f in self.facts],
             "solve_atoms": [a.to_dict() for a in self.solve_atoms],
             "fair_clues": [c.to_dict() for c in self.fair_clues],
@@ -534,7 +612,7 @@ class PuzzleSpec:
         混进来)。所以显式记一个标记。
         """
         d = self.to_dict()
-        d["spec_version"] = 2
+        d["spec_version"] = 3
         d["blueprint_specified"] = bool(self.blueprint_specified)
         d["signature_present"] = bool(
             self.signature and (self.signature.mechanism_family
@@ -551,6 +629,15 @@ class PuzzleSpec:
             title=str(d.get("title", "") or ""),
             puzzle=str(d.get("puzzle", "") or ""),
             answer=str(d.get("answer", "") or ""),
+            # ---- v5 通关合同 ----
+            # 老 archive 没有这两把键 -> 宽容读成空。空 completion 的语义是
+            # "这道题没有 v5 合同", 于是运行时回落到 legacy Final Judge 路径
+            # (见 `has_completion_contract`)。**绝不**从 answer 反推一个
+            # 合同出来 —— 那等于偷偷给旧题编一个通关条件。
+            core_answer=str(d.get("core_answer", "") or ""),
+            completion_fact_ids=[str(x).strip()
+                                 for x in (d.get("completion_fact_ids") or [])
+                                 if str(x).strip()],
             facts=[PuzzleFact.from_dict(x) for x in (d.get("facts") or [])],
             solve_atoms=[SolveAtom.from_dict(x, i)
                          for i, x in enumerate(d.get("solve_atoms") or [])],
@@ -601,6 +688,11 @@ class PuzzleSpec:
             title=getattr(r, "title", None) or "",
             puzzle=getattr(r, "puzzle", None) or "",
             answer=getattr(r, "answer", None) or "",
+            # 老 `RiddleResult` 没有通关合同的概念 —— 它是 legacy 形态,
+            # 运行时靠 `solution_candidate` + Final Judge 通关。
+            # **不**在这里编一个 completion 出来(见 from_dict 的同款说明)。
+            core_answer="",
+            completion_fact_ids=[],
             facts=facts,
             solve_atoms=atoms,
             fair_clues=[FairClue.from_dict(c) for c in clues_raw],
@@ -623,6 +715,12 @@ class PuzzleSpec:
             title=self.title or None,
             error=self.error,
             usage=self.usage, model=self.model,
+            # ---- v5 通关合同必须一路带到 runtime ----
+            # Engine 靠这两个字段决定"走代码集合覆盖还是走 legacy Final
+            # Judge"。漏传 = 新题被当成老题, 通关又回到 cause+mechanism
+            # 那条链 —— 正是本批要修的东西。
+            core_answer=self.core_answer or "",
+            completion_fact_ids=list(self.completion_fact_ids or []),
             solve_atoms=[{"role": a.role, "text": a.text,
                           "id": a.id, "fact_ids": list(a.fact_ids),
                           "required": bool(a.required)}
@@ -723,7 +821,9 @@ RUNTIME_KEY_LEN = 16
 def runtime_spec_key(puzzle: str = "", answer: str = "",
                      facts: Optional[list] = None,
                      solve_atoms: Optional[list] = None,
-                     fair_clues: Optional[list] = None) -> str:
+                     fair_clues: Optional[list] = None,
+                     core_answer: str = "",
+                     completion_fact_ids: Optional[list] = None) -> str:
     """一道题在**运行时**的规范身份(内容哈希)。
 
     任务书 Step 06 冻结的身份是 `round_index + spec_key +
@@ -739,10 +839,25 @@ def runtime_spec_key(puzzle: str = "", answer: str = "",
     绝不能碰的东西。
 
     而运行时身份要的是"这一题的**世界**是什么", 所以输入固定为:
-        puzzle / answer / facts / solve_atoms / fair_clues
+        puzzle / answer / core_answer / completion_fact_ids
+        / facts / solve_atoms / fair_clues
     刻意**不含** title 与 id(它们不是世界的一部分), 也**不含**
     signature / metrics / 时间戳(那些是观察与元信息, 换个说法不该改变
     "这是同一道题"的判断)。
+
+    ## v5: 通关合同**必须**进哈希(硬要求)
+
+    这条是 v5 新增的, 而且是本批最容易漏掉、后果最隐蔽的一条:
+
+        同一个谜面 + 同一个谜底, 只改了 `completion_fact_ids`
+        -> 这已经是**另一道题**了(观众要建立的事实不同, 通关时刻不同)
+
+    若它不进哈希, `runtime_spec_key` 会认为"还是那一稿", 于是异步回调
+    (ANSWER / HINT / REVEAL)的 `expect_spec_key` 复核**照样通过** ——
+    一道按旧合同在飞的 ANSWER 会把 established 写进新合同的题里。这是
+    identity bug, 与"新谜底 + 旧 facts"同一类。
+
+    `core_answer` 同理: 它决定揭晓时念给观众听的那句话。
 
     ## 用途
 
@@ -791,6 +906,13 @@ def runtime_spec_key(puzzle: str = "", answer: str = "",
     raw = json.dumps({
         "puzzle": str(puzzle or ""),
         "answer": str(answer or ""),
+        # v5: 通关合同进哈希 —— 见函数 docstring 的"硬要求"一节。
+        # `completion_fact_ids` **排序后**再哈希: 它是一个**集合**语义的
+        # 字段("要覆盖这几条"), 顺序不改变含义。不排序的话, 审稿人把
+        # fact_ids 顺序调一下就会算出新 key, 把同一道题判成两道。
+        "core_answer": str(core_answer or ""),
+        "completion_fact_ids": sorted(
+            str(x) for x in (completion_fact_ids or []) if str(x).strip()),
         "facts": _canon_list(facts),
         "solve_atoms": _canon_list(solve_atoms),
         "fair_clues": _canon_list(fair_clues),

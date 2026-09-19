@@ -111,6 +111,11 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
         "title": "灯塔",
         "puzzle": puzzle,
         "answer": answer,
+        # ---- v5 通关合同 ----
+        # 灯塔题: 房间确认"礁石露出" + "灯是标礁石" 两点就解出了,
+        # 这正是 completion 想表达的"最少必须知道什么"。
+        "core_answer": "他亮灯是为了标出退潮时露出的礁石, 不是给船引路。",
+        "completion_fact_ids": ["f1", "f2"],
         "hints": list(hints),
         "facts": [
             {"id": "f1", "text": "退潮时礁石露出水面", "kind": "core"},
@@ -174,6 +179,19 @@ def sig_ok():
             "procedural_rule_dependency": False}
 
 
+def qc_ok(**kw):
+    """v5 `quality_checks` —— 四项全 true 才是合格稿。
+
+    `_apply_review` 对它 **fail closed**: 缺一项、或任一项不是 True,
+    整稿拒收(即使 decision="pass")。所以所有"应该通过"的 fixture
+    都必须带上它。
+    """
+    d = {"narrator_truthful": True, "mechanism_consistent": True,
+         "core_answer_direct": True, "completion_contract_minimal": True}
+    d.update(kw)
+    return d
+
+
 def review_ok(puzzle=None, **kw):
     """审稿: pass —— **原样回传**整套字段。
 
@@ -186,7 +204,8 @@ def review_ok(puzzle=None, **kw):
     对不上就是"审稿人引用了不存在的句子", 会被正确拒掉。
     """
     d = riddle(puzzle=puzzle)
-    d.update({"decision": "pass", "observed_signature": sig_ok()})
+    d.update({"decision": "pass", "observed_signature": sig_ok(),
+              "quality_checks": qc_ok()})
     d.update(kw)
     if "fair_clues" not in kw:
         d["fair_clues"] = clues_for(d["puzzle"])
@@ -201,8 +220,15 @@ def review_fix(puzzle, **kw):
     """
     d = riddle(puzzle=puzzle)
     d.update({"decision": "fix", "note": "已修改",
-              "observed_signature": sig_ok()})
+              "observed_signature": sig_ok(), "quality_checks": qc_ok()})
     d.update(kw)
+    # v5: 审稿改了谜面/谜底 -> core_answer / completion_fact_ids 必须
+    # 一起给出, 否则 `_apply_review` 整稿拒收(它们与 facts/atoms/clues
+    # 同属一套同步 bundle)。
+    if "core_answer" not in kw:
+        d["core_answer"] = "他亮灯是为了标出退潮时露出的礁石。"
+    if "completion_fact_ids" not in kw:
+        d["completion_fact_ids"] = ["f1", "f2"]
     # 审稿改谜面时 quote 必须跟着改后的谜面走
     if "fair_clues" not in kw:
         d["fair_clues"] = clues_for(puzzle)
@@ -1182,10 +1208,10 @@ def test_v4_prompt_versions_bumped():
     """Step 04: prompt 版本必须真的升到 v4(否则档案无法区分两代题)。"""
     print("\n[V4-1] riddle/check prompt 版本")
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
-    check("RIDDLE_PROMPT_VERSION == riddle-v4",
-          RIDDLE_PROMPT_VERSION == "riddle-v4", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v4",
-          CHECK_PROMPT_VERSION == "check-v4", CHECK_PROMPT_VERSION)
+    check("RIDDLE_PROMPT_VERSION == riddle-v5",
+          RIDDLE_PROMPT_VERSION == "riddle-v5", RIDDLE_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v5",
+          CHECK_PROMPT_VERSION == "check-v5", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1348,8 +1374,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v4",
-          QUALITY_POLICY_VERSION == "quality-v4", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v5",
+          QUALITY_POLICY_VERSION == "quality-v5", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -1899,8 +1925,9 @@ def test_review_rewrite_has_no_patch_requirement():
     """rewrite 时**不该**要求审稿人给 patch —— 它只需要给理由。"""
     from story.llm import _TOOL_CHECK
     req = _TOOL_CHECK["input_schema"]["required"]
-    check("只要求 decision + observed_signature",
-          set(req) == {"decision", "observed_signature"}, req)
+    check("只要求 decision + observed_signature + quality_checks",
+          set(req) == {"decision", "observed_signature", "quality_checks"},
+          req)
     props = _TOOL_CHECK["input_schema"]["properties"]
     check("有 rewrite_reason 字段", "rewrite_reason" in props, sorted(props))
     check("有 facts 字段", "facts" in props, sorted(props))

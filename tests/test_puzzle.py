@@ -83,6 +83,120 @@ def good_spec(**kw) -> PuzzleSpec:
     return s
 
 
+def v5_spec(**kw) -> PuzzleSpec:
+    """在 `good_spec()` 之上加一份**合法**的 v5 通关合同。
+
+    合同指向 f1/f2 —— 两条 kind=core, visibility 默认 hidden, 且分别被
+    a1/a2 引用。这正好满足 validate_spec 的 v5 五条要求。
+    """
+    kw.setdefault("core_answer", "他亮灯是为了标出退潮时露出的礁石, 不是引路。")
+    kw.setdefault("completion_fact_ids", ["f1", "f2"])
+    return good_spec(**kw)
+
+
+# ======================================================================
+def test_v5_completion_contract_roundtrip():
+    print("\n[v5-1] 通关合同的序列化全链")
+    s = v5_spec()
+    d = s.to_dict()
+    check("to_dict 带 core_answer", d.get("core_answer") == s.core_answer, d)
+    check("to_dict 带 completion_fact_ids",
+          d.get("completion_fact_ids") == ["f1", "f2"], d)
+    s2 = PuzzleSpec.from_dict(d)
+    check("round trip 保持 core_answer", s2.core_answer == s.core_answer, s2)
+    check("round trip 保持 completion",
+          s2.completion_fact_ids == ["f1", "f2"], s2.completion_fact_ids)
+    a = s.to_archive()
+    check("archive spec_version=3", a.get("spec_version") == 3, a.get("spec_version"))
+    check("archive 带合同", a.get("completion_fact_ids") == ["f1", "f2"], a)
+    check("has_completion_contract() 为真", s.has_completion_contract())
+    check("completion_facts() 返回真对象",
+          [f.id for f in s.completion_facts()] == ["f1", "f2"],
+          s.completion_facts())
+
+
+def test_v5_old_archive_reads_as_no_contract():
+    print("\n[v5-2] 老 archive 宽容读 -> 无合同(legacy 路径)")
+    # 一把键都没有的 v4 archive
+    old = {"id": "p", "puzzle": PUZZLE, "answer": "老谜底",
+           "facts": [{"id": "f1", "text": "x", "kind": "core"}],
+           "solve_atoms": [], "fair_clues": [], "hints": []}
+    s = PuzzleSpec.from_dict(old)
+    check("core_answer 空", s.core_answer == "", s.core_answer)
+    check("completion 空", s.completion_fact_ids == [], s.completion_fact_ids)
+    check("判为无合同(走 legacy)", not s.has_completion_contract())
+    # 老数据继续走旧 gate: 缺 cause/mechanism 仍应被拒
+    vr = validate_spec(good_spec(completion_fact_ids=[]))
+    check("无合同 -> 仍要求 cause+mechanism 齐全", vr.ok, vr.why())
+
+
+def test_v5_support_cannot_be_completion():
+    print("\n[v5-3 / Case E] support/exclusion 不能作为通关要求")
+    vr = validate_spec(v5_spec(completion_fact_ids=["f3"]))
+    check("support 当合同 -> 拒", not vr.ok, vr.why())
+    check("理由点了 kind", "kind" in vr.why(), vr.why())
+    vr2 = validate_spec(v5_spec(completion_fact_ids=["f4"]))
+    check("exclusion 当合同 -> 拒", not vr2.ok, vr2.why())
+
+
+def test_v5_completion_capped_at_two():
+    print("\n[v5-4 / Case F] 通关合同最多 2 条")
+    s = v5_spec()
+    # 造第三条 core/hidden fact, 让某条 atom 引用它, **并把它加进合同**。
+    # (只往 facts 里塞是不够的 —— 合同是 completion_fact_ids 本身。)
+    s.facts.append(PuzzleFact(id="f5", text="第三条核心事实", kind="core",
+                              visibility="hidden"))
+    s.solve_atoms[0].fact_ids = ["f1", "f5"]
+    s.completion_fact_ids = ["f1", "f2", "f5"]
+    vr = validate_spec(s)
+    check("3 条合同 -> 拒", not vr.ok, vr.why())
+    check("理由点了条数", "1~2" in vr.why(), vr.why())
+
+
+def test_v5_completion_must_exist_and_be_referenced():
+    print("\n[v5-5] 合同 id 必须存在, 且被 atom 引用")
+    vr = validate_spec(v5_spec(completion_fact_ids=["f1", "f999"]))
+    check("不存在的 id -> 拒", not vr.ok, vr.why())
+    # 没有任何 atom 引用 f2
+    s = v5_spec()
+    s.solve_atoms[1].fact_ids = ["f3"]
+    vr2 = validate_spec(s)
+    check("没有推理抓手 -> 拒", not vr2.ok, vr2.why())
+    check("理由点了抓手", "抓手" in vr2.why(), vr2.why())
+
+
+def test_v5_core_answer_bounds():
+    print("\n[v5-6] core_answer 非空 / 限长 / 不换行")
+    vr = validate_spec(v5_spec(core_answer=""))
+    check("空 core_answer -> 拒", not vr.ok, vr.why())
+    vr2 = validate_spec(v5_spec(core_answer="长" * 81))
+    check("超 80 字 -> 拒", not vr2.ok, vr2.why())
+    vr3 = validate_spec(v5_spec(core_answer="第一行\n第二行"))
+    check("换行 -> 拒", not vr3.ok, vr3.why())
+    vr4 = validate_spec(v5_spec(core_answer="恰好一句话的核心答案。"))
+    check("正常 core_answer -> 过", vr4.ok, vr4.why())
+
+
+def test_v5_key_role_atom_is_enough():
+    print("\n[v5-7] 身份题可以用 key, 不必硬造 cause/mechanism")
+    s = v5_spec()
+    # 把它改成身份题: 一条 required key atom, 没有 cause/mechanism
+    s.solve_atoms = [
+        SolveAtom(id="a1", role="key", text="门外女人是父亲的亲生女儿",
+                  fact_ids=["f1"]),
+    ]
+    # 一条 atom 就够 —— 这正是 v5 下限降到 1 的意义
+    s.completion_fact_ids = ["f1"]
+    s.fair_clues = [FairClue(quote="只在退潮的那几个小时亮", supports_atoms=["a1"])]
+    vr = validate_spec(s)
+    check("key-only 题通过 v5 校验", vr.ok, vr.why())
+    # 但同一条题若**没有**合同, 仍走旧 gate -> 必须被拒
+    vr2 = validate_spec(good_spec(
+        solve_atoms=[SolveAtom(id="a1", role="key", text="x", fact_ids=["f1"])],
+        completion_fact_ids=[]))
+    check("无合同时 key 不顶用(legacy gate 不变)", not vr2.ok, vr2.why())
+
+
 # ======================================================================
 def test_spec_roundtrip():
     print("[PuzzleSpec: JSON round trip]")
@@ -98,7 +212,7 @@ def test_spec_roundtrip():
     check("signature 保持", s2.signature.domain == "maritime", s2.signature)
     # archive 形态
     a = s.to_archive()
-    check("archive 带 spec_version=2", a.get("spec_version") == 2, a.get("spec_version"))
+    check("archive 带 spec_version=3", a.get("spec_version") == 3, a.get("spec_version"))
     # 老 archive(只有 puzzle/answer)也要能读
     old = PuzzleSpec.from_dict({"puzzle": "老谜面。为什么?", "answer": "老谜底。"})
     check("老 archive 能读", old.puzzle == "老谜面。为什么?" and old.answer == "老谜底。",
@@ -1426,6 +1540,14 @@ def test_old_records_without_provenance_still_load():
 def main():
     tests = [
         test_spec_roundtrip,
+        # ---- v5: 通关合同 ----
+        test_v5_completion_contract_roundtrip,
+        test_v5_old_archive_reads_as_no_contract,
+        test_v5_support_cannot_be_completion,
+        test_v5_completion_capped_at_two,
+        test_v5_completion_must_exist_and_be_referenced,
+        test_v5_core_answer_bounds,
+        test_v5_key_role_atom_is_enough,
         # ---- Q8a ----
         test_to_archive_roundtrip_is_lossless,
         test_old_records_without_provenance_still_load,

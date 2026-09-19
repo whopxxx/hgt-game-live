@@ -1535,7 +1535,7 @@ def test_archive_writes_full_schema():
               "solve_atoms", "fair_clues", "hints", "qa", "winner",
               "reason", "metrics"):
         check(f"archive 有 {k}", k in rec, sorted(rec))
-    check("spec_version=2", rec.get("spec_version") == 2, rec.get("spec_version"))
+    check("spec_version=3", rec.get("spec_version") == 3, rec.get("spec_version"))
     check("prompt_version 落盘",
           rec.get("prompt_version") == RIDDLE_PROMPT_VERSION, rec)
     check("policy_version 落盘",
@@ -2445,6 +2445,50 @@ def test_runtime_spec_key_is_stable_and_distinguishes():
     check("不抛异常(空输入)", isinstance(runtime_spec_key(), str))
 
 
+def test_runtime_spec_key_includes_completion_contract():
+    """Case L: v5 通关合同**必须**进运行时身份。
+
+    这条是本批最容易漏、后果最隐蔽的一条:
+
+        同一个谜面 + 同一个谜底, 只改了 completion_fact_ids
+        -> 这已经是另一道题了(观众要建立的事实不同, 通关时刻不同)
+
+    若它不进哈希, `expect_spec_key` 复核会认为"还是那一稿" ——
+    一道按**旧**合同在飞的 ANSWER 会把 established 写进**新**合同的题里。
+    这是 identity bug, 与"新谜底 + 旧 facts"同一类。
+    """
+    print("\n[UX-L] runtime_spec_key 必须包含通关合同")
+    from story.puzzle import runtime_spec_key
+    f = [{"id": "f1", "text": "事实一"}, {"id": "f2", "text": "事实二"}]
+    a = [{"id": "a1", "text": "原因"}]
+    base = runtime_spec_key("谜面", "谜底", f, a, [],
+                            core_answer="这是核心答案",
+                            completion_fact_ids=["f1"])
+    # ---- 只改 core_answer ----
+    check("只改 core_answer -> 不同 key",
+          runtime_spec_key("谜面", "谜底", f, a, [],
+                           core_answer="换了一句话的核心答案",
+                           completion_fact_ids=["f1"]) != base)
+    # ---- 只改 completion_fact_ids ----
+    check("只改 completion_fact_ids -> 不同 key",
+          runtime_spec_key("谜面", "谜底", f, a, [],
+                           core_answer="这是核心答案",
+                           completion_fact_ids=["f1", "f2"]) != base)
+    # ---- 顺序不改变身份(它是集合语义) ----
+    check("completion 顺序不同 -> **同** key(集合语义)",
+          runtime_spec_key("谜面", "谜底", f, a, [],
+                           core_answer="这是核心答案",
+                           completion_fact_ids=["f2", "f1"])
+          == runtime_spec_key("谜面", "谜底", f, a, [],
+                              core_answer="这是核心答案",
+                              completion_fact_ids=["f1", "f2"]))
+    # ---- 空合同 = legacy, 且与"有合同"不同 ----
+    check("空合同与有合同不同 key",
+          runtime_spec_key("谜面", "谜底", f, a, []) != base)
+    check("不抛异常(只给合同)",
+          isinstance(runtime_spec_key(completion_fact_ids=["f1"]), str))
+
+
 def test_runtime_spec_key_covers_structure():
     """RF-6: key 必须覆盖**完整** canonical 结构, 不只是 id+text。
 
@@ -2638,6 +2682,7 @@ def main():
              test_expect_round_none_keeps_legacy_behavior,
              test_stale_return_cannot_advance_archive_identity,
              test_runtime_spec_key_is_stable_and_distinguishes,
+             test_runtime_spec_key_includes_completion_contract,
              test_runtime_spec_key_covers_structure,
              test_engine_tracks_current_spec_key,
              test_async_payloads_carry_identity,

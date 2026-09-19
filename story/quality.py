@@ -51,7 +51,21 @@ from .puzzle import (
 #:   - 兜底题结构化为 PuzzleSpec。
 #: 所以 v2 与 v3 的 archive **不可直接比较**: v2 的 signature.time_shape
 #: 是"被强制成 instant", v3 的是"如实观察"。
-QUALITY_POLICY_VERSION = "quality-v4"
+#:
+#: v5(Solve UX):
+#:   - **通关合同与文学谜底分开**: `PuzzleSpec.core_answer` +
+#:     `completion_fact_ids`(1~2 条, 只允许 core/hidden);
+#:   - `solve_atoms` 降级为提示/解释/复盘结构 —— 不再要求
+#:     "恰好一条 cause + 一条 mechanism", 改为"至少一条 required atom",
+#:     并允许 `role=key`(身份/时间/目标翻转类题的原子事实);
+#:   - 通关改由**代码集合覆盖**判定(房间累计已确认事实), 不再走
+#:     Final Judge 的 cause_hit + mechanism_hit gate;
+#:   - Reviewer 必须回传四项 `quality_checks`, 任一为 false 则整稿拒收。
+#:
+#: 所以 v4 与 v5 的题**不可直接比较**: v4 的题是在"必须硬造 cause+
+#: mechanism"的前提下产出的, 它的 atoms/signature 描述的不是这道题
+#: 真实的解法形状。
+QUALITY_POLICY_VERSION = "quality-v5"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -104,6 +118,14 @@ class ValidationResult:
 # ======================================================================
 # 1. spec 结构校验(方案 §21)
 # ======================================================================
+#: v5 通关合同里 `core_answer` 的硬上限(汉字数)。推荐 <=60, 上限 80。
+#: 为什么要有硬上限: "一句话核心答案"如果写成两三百字, 观众听不出重点,
+#: 而揭晓是**确定性**地念它(不再经 LLM 加工) —— 长答案会直接拖垮体验。
+CORE_ANSWER_MAX_LEN = 80
+#: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
+MAX_COMPLETION_FACTS = 2
+
+
 def validate_spec(spec: PuzzleSpec,
                   min_atoms: int = 2, max_atoms: int = 4,
                   max_core_hidden: int = 3,
@@ -147,9 +169,16 @@ def validate_spec(spec: PuzzleSpec,
             r.fail(f"fact {f.id} visibility 非法: {f.visibility}")
 
     # ---- solve_atoms ----
+    #
+    # v5 有通关合同时下限**降到 1**。理由: 身份/时间/目标翻转题的核心
+    # 原子事实天然只有一条("门外女人是父亲的亲生女儿"), 硬要求 2 条会
+    # 逼生成器再凑一条 —— 那正是本批要消除的"为满足校验而造 atom"。
+    # 建议下限保持 2 条, 但这**只作用于无合同的 legacy 题**(老 fixture
+    # 与老 archive 不该被这条新规则影响)。
     atoms = spec.solve_atoms or []
-    if not (min_atoms <= len(atoms) <= max_atoms):
-        r.fail(f"solve_atoms 数量 {len(atoms)} 不在 {min_atoms}~{max_atoms}")
+    lo = 1 if spec.completion_fact_ids else min_atoms
+    if not (lo <= len(atoms) <= max_atoms):
+        r.fail(f"solve_atoms 数量 {len(atoms)} 不在 {lo}~{max_atoms}")
     seen_a = set()
     for a in atoms:
         if not a.id:
@@ -165,12 +194,81 @@ def validate_spec(spec: PuzzleSpec,
             if fid not in seen_f:
                 r.fail(f"atom {a.id} 引用了不存在的 fact: {fid}")
 
-    # ---- 必须有 required cause + required mechanism(方案 §21/§4) ----
+    # ---- 通关合同(v5) 与 atom 要求 ----
+    #
+    # 这里把"通关需要什么"与"atoms 长什么样"彻底解耦。历史包袱:
+    # v5 之前这一段的判据是"必须恰好一条 required cause + 一条 required
+    # mechanism", 于是**每道题都被强行写成因果机制题** —— 身份题只能
+    # 硬造一个 cause/mechanism 去满足校验, 而 Final Judge 又拿这套假
+    # atoms 当通关闸门。这正是"AI 太保守"的根因之一。
+    #
+    # 新语义:
+    #   completion_fact_ids = 胜利合同(代码做集合覆盖判定)
+    #   solve_atoms         = 提示 / 解释 / 复盘结构
+    #
+    # ⚠️ **向后兼容**: 没有合同的 spec(老 archive / 老 fixture /
+    # `from_legacy_riddle_result`)继续走旧 gate。绝不能把老数据一刀切
+    # 判死 —— 盘上几百道 v4 题与全部现有测试 fixture 都会炸。
     req = [a for a in atoms if a.required]
-    if not any(a.role == "cause" for a in req):
-        r.fail("缺少 required 的 cause atom")
-    if not any(a.role == "mechanism" for a in req):
-        r.fail("缺少 required 的 mechanism atom")
+    has_contract = bool(spec.completion_fact_ids)
+    if has_contract:
+        # 合同要求"至少一条 required atom 顶着", 但**不再指定角色**:
+        # 身份/时间/目标翻转类题用 key, 只有真有因果链的题才用
+        # cause/mechanism。
+        if not req:
+            r.fail("没有 required 的 solve_atom(至少要有一条)")
+    else:
+        if not any(a.role == "cause" for a in req):
+            r.fail("缺少 required 的 cause atom")
+        if not any(a.role == "mechanism" for a in req):
+            r.fail("缺少 required 的 mechanism atom")
+
+    # ---- v5 通关合同硬校验 ----
+    if has_contract:
+        comp = list(spec.completion_fact_ids)
+        # (a) core_answer: 必须能"一句话说清", 所以非空 + 限长 + 单行
+        ca = (spec.core_answer or "").strip()
+        if not ca:
+            r.fail("有通关合同但 core_answer 为空(谜底必须能一句话说清)")
+        else:
+            if len(ca) > CORE_ANSWER_MAX_LEN:
+                r.fail(f"core_answer 有 {len(ca)} 字, 超过 "
+                       f"{CORE_ANSWER_MAX_LEN} 字上限(要一句话, 不要一段话)")
+            if "\n" in spec.core_answer or "\r" in spec.core_answer:
+                r.fail("core_answer 不能换行(揭晓时会原样念给观众)")
+        # (b) 条数 1~2: **不放宽成 4、5 条**。压不进 2 条说明题太绕,
+        #     正确处置是 rewrite, 不是把门槛降低。
+        if not (1 <= len(comp) <= MAX_COMPLETION_FACTS):
+            r.fail(f"completion_fact_ids 有 {len(comp)} 条, 应为 1~"
+                   f"{MAX_COMPLETION_FACTS} 条(超过说明这题太绕, 应重出)")
+        seen_c: set = set()
+        for fid in comp:
+            if fid in seen_c:
+                r.fail(f"completion_fact_ids 有重复 id: {fid}")
+            seen_c.add(fid)
+            if fid not in seen_f:
+                r.fail(f"completion_fact_ids 引用了不存在的 fact: {fid}")
+                continue
+            f = next((x for x in facts if x.id == fid), None)
+            if f is None:
+                continue
+            # (c) 只允许 core + hidden。support/exclusion 是背景与排除项,
+            #     永远不得作为通关要求 —— 否则"说出任意一条背景"就能赢。
+            if f.kind != "core":
+                r.fail(f"completion fact {fid} 的 kind={f.kind!r}, "
+                       f"只有 core 可以作为通关要求")
+            if f.visibility != "hidden":
+                r.fail(f"completion fact {fid} 的 visibility="
+                       f"{f.visibility!r}, 只有 hidden 可以作为通关要求"
+                       f"(public 的谜面已经告诉了观众)")
+        # (d) 公平性: 每条 completion fact 必须被某条 atom 引用 ——
+        #     否则它就是一个"完全没有题面抓手"的通关条件, 观众无从推。
+        if comp and atoms:
+            atom_facts = {fid for a in atoms for fid in (a.fact_ids or [])}
+            orphan = [fid for fid in comp if fid not in atom_facts]
+            if orphan:
+                r.fail("completion fact 没有任何 solve_atom 引用它"
+                       "(观众没有推理抓手): " + ", ".join(orphan))
 
     # ---- core hidden facts 上限 ----
     n_core = len(spec.core_hidden_facts())

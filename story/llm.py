@@ -264,10 +264,24 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
         long_term_profession=sig.long_term_profession,
         repeated_ritual=sig.repeated_ritual)
 
+    # ---- v5 通关合同 ----
+    # core_answer 必须**单行**且首尾无空白: 揭晓时逐字念给观众, 换行会
+    # 打乱上屏排版。这里做一次归一(而非校验)—— 校验在 validate_spec。
+    core_answer = " ".join(
+        str(d.get("core_answer", "") or "").split()).strip()
+    comp_raw = d.get("completion_fact_ids") or []
+    comp_ids: list = []
+    for x in comp_raw:
+        fid = str(x).strip()
+        if fid and fid not in comp_ids:
+            comp_ids.append(fid)
+
     return PuzzleSpec(
         title=str(title if title is not None else d.get("title", "") or "").strip(),
         puzzle=_strip_puzzle_tail(str(d.get("puzzle", "") or "").strip()),
         answer=str(d.get("answer", "") or "").strip(),
+        core_answer=core_answer,
+        completion_fact_ids=comp_ids,
         facts=facts, solve_atoms=atoms, fair_clues=clues,
         hints=[str(h).strip() for h in (d.get("hints") or [])
                if str(h).strip()][:3],
@@ -787,9 +801,9 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v4"
-CHECK_PROMPT_VERSION = "check-v4"
-ANSWER_PROMPT_VERSION = "answer-v3"
+RIDDLE_PROMPT_VERSION = "riddle-v5"
+CHECK_PROMPT_VERSION = "check-v5"
+ANSWER_PROMPT_VERSION = "answer-v4"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
 REVEAL_PROMPT_VERSION = "reveal-v2"
@@ -800,12 +814,49 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 2. 再定 **≤3 条**核心隐藏事实(即将来 facts 里 kind=core 的那些)。
 3. 建 facts(6~10 条): 主持判断「是/不是/无关」的事实空间, 别凑数。
    至少 1 条 kind=exclusion(排除常见错误路线)。
-4. 定 solve_atoms(2~4 条): **恰好一条 cause、一条 mechanism**,
-   用 fact_ids 指向上面的事实。
-5. 写 answer(3-6 句, 正面回答那个反常)。
-6. **最后才写 puzzle**(2-3 句, 第三人称, 结尾问句)。
-7. 从 puzzle 原文里摘 fair_clues(**逐字**)并注明支持哪条 atom。
-8. 最后写 3 条 hints(≤30 字, 由浅入深, 不说破)。
+4. **定通关合同 `completion_fact_ids`(1~2 条)** —— 从上面 kind=core 且
+   hidden 的事实里挑出"解出这题**最少**必须知道的那 1~2 条"。
+   ⚠️ 压不进 2 条就说明这题太绕, **换一个更简单的骨架重出**, 不要硬塞。
+5. 写 `core_answer`(一句话, ≤60 字, 不换行): 普通观众一听就懂的核心答案,
+   必须**直接回答谜面最后那个问题**。
+6. 写 answer(2-4 句, 第一句正面解释核心反常)。
+7. 定 solve_atoms(2~4 条): 这是**对谜底的分析拆分**, 给提示与复盘用,
+   **不是**玩家逐字通关的模板。用 fact_ids 指向上面的事实。
+   只有确实存在因果链的题才用 cause/mechanism; 身份、物品、时间、目标等
+   核心翻转用 `key`。**不要为了凑角色硬造因果关系。**
+8. **最后才写 puzzle**(2-3 句, 第三人称, 结尾问句)。
+9. 从 puzzle 原文里摘 fair_clues(**逐字**)并注明支持哪条 atom。
+10. 最后写 3 条 hints(≤30 字, 由浅入深, 不说破)。
+
+═══ completion_fact_ids 是**通关合同**, 不是"谜底要点" ═══
+它回答的是: **房间最少要公开确认哪几件事, 这道题就算解出来了?**
+- 1~2 条。超过 2 条说明题太绕 —— 请换骨架, 不要放宽成 4、5 条。
+- 只能指向 kind=core 且 visibility=hidden 的 fact。
+  **support / exclusion 永远不能作为通关要求。**
+- 每条都必须被某条 solve_atom 引用(否则观众没有推理抓手)。
+- 它是**累计**的: 房间已经确认过的会算数, 最后补齐缺口的观众立即获胜。
+  所以不要写"必须一个人同时说出 A 和 B"这种要求 —— 那是旧模型。
+
+═══ facts 必须原子化 ═══
+一条 fact = **一个**可以独立被问到、独立被确认的命题。
+不要把两件事焊进一条 fact:
+  ✗ "她与父亲有血缘关系, 是父亲的亲生女儿"
+     (观众问"她与父亲有关系吗"答"是", 只确认了前半句)
+  ✓ 拆成两条: "门外女人是父亲的亲生女儿" / "门外女人昨晚与父亲同桌吃饭"
+
+═══ 谜面陈述**必须为真**(v5 新增硬规则) ═══
+谜面中由**全知叙述者直接陈述**的事实, 必须在 canonical world 里字面为真。
+允许: 隐瞒 / 省略 / 双关 / 角色误解 / "在他看来……" / "他确信……" /
+      "家里人一直以为……"(**有归属**的陈述)
+禁止: 谜面直接说 A, 谜底再说其实不是 A。
+
+  ✗ "她绝不可能听到那句话"        谜底: "她昨晚就在饭桌上亲耳听到"
+  ✓ "在开门的人看来, 她绝不可能听到那句话"
+
+  ✗ "公司正式发布新规"            谜底: "其实只是几个同事私下约定"
+  ✗ "她第一天嘴快说漏了"          谜底: "其实她从一开始就是故意演的"
+
+如果答案需要推翻这些**无归属**的叙述者断言, 这题不公平, 必须重写。
 
 ═══ 谜底要"意外", 但**必须能推** ═══
 - 观众读完该是"啊??"然后"哦——原来如此"。
@@ -850,20 +901,22 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 
 例(只示范信息怎么组织 —— **别抄题材**):
 谜面 "灯塔守塔人只在退潮的那几个小时亮灯, 涨潮后反而熄掉。为什么?"
+core_answer "他是在标出退潮时露出水面的礁石, 不是给船引路。"
 谜底 退潮时礁石露出水面, 他亮灯是标出礁石位置; 涨潮后礁石被淹, 继续亮
      反而会让船只误判航向。
-facts f1 退潮时礁石露出或接近水面(core) / f2 灯的真正作用是标示礁石位置
-     (core) / f3 涨潮后继续亮灯反而误导船只(support) / f4 不是为了纪念
-     死者(exclusion)
+facts f1 退潮时礁石露出或接近水面(core/hidden) / f2 灯的真正作用是标示
+     礁石位置(core/hidden) / f3 涨潮后继续亮灯反而误导船只(support) /
+     f4 不是为了纪念死者(exclusion)
+completion [f1, f2]        ← 房间确认这两条就算解出(累计, 不必同一人)
 atoms a1 [cause] 退潮使危险礁石成为需要标出的目标 (→f1)
-      a2 [mechanism] 灯是在标礁石, 不是给船引路 (→f2,f3)
+      a2 [key] 灯是在标礁石, 不是给船引路 (→f2)
 clues "只在退潮的那几个小时亮" → a1 / "涨潮后反而熄掉" → a2
 
 第三人称; 反常点要具体到能追问; 谜底要正面解释它。
 自己编新题, 不要写"海龟汤""葬礼上杀姐姐"这类流传很广的老题。
 
-按工具字段填: title / puzzle / answer / facts / solve_atoms /
-fair_clues / hints / signature。"""
+按工具字段填: title / puzzle / answer / core_answer / facts /
+completion_fact_ids / solve_atoms / fair_clues / hints / signature。"""
 
 
 ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提问。
@@ -987,6 +1040,14 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 #: nested required 和 `_apply_review` 的 fail-closed 检查覆盖, 否则新
 #: 维度会重演"缺字段 -> from_dict 静默补默认值 -> 配额被绕过"的老问题。
 #: 显式写出来, 加字段的人就会看到它。
+#: Reviewer 的 `quality_checks` 契约字段。四项必须全 true 代码才收稿。
+#: 与 `_TOOL_CHECK` 的 nested required **两层都要** —— schema 由模型遵守,
+#: 不能把正确性押在它身上(与 `_OBSERVED_SIGNATURE_FIELDS` 同一套推理)。
+_QUALITY_CHECK_FIELDS = (
+    "narrator_truthful", "mechanism_consistent",
+    "core_answer_direct", "completion_contract_minimal",
+)
+
 _OBSERVED_SIGNATURE_FIELDS = (
     "mechanism_family", "solution_shape", "domain", "emotion_mode",
     "relation", "time_shape", "death", "past_trauma",
@@ -1003,7 +1064,36 @@ _TOOL_RIDDLE = {
             "title": {"type": "string", "description": "谜题短标题(可不填)"},
             "puzzle": {"type": "string",
                        "description": "谜面: 2-3 句话的反常情境, 结尾必须是一个问句"},
-            "answer": {"type": "string", "description": "谜底: 3-6 句话的合理解释"},
+            "answer": {"type": "string",
+                       "description": (
+                           "谜底(完整解释): 2-4 句。**第一句必须正面解释"
+                           "核心反常**。不要写与理解谜底无关的 DNA、往事、"
+                           "心理戏、职业背景等装饰细节 —— 那些不影响"
+                           "core_answer 的细节不能成为通关条件。")},
+            "core_answer": {
+                "type": "string",
+                "description": (
+                    "**核心答案**: 普通观众一听就知道\"这题到底怎么回事\"的"
+                    "一句话。必须**直接回答谜面最后那个问题**, 不能依赖额外"
+                    "脑补。推荐 <=60 汉字, 硬上限 80。**不换行**。\n"
+                    "例: \"这是一次预设的测试飞行, 复飞本身就是考核项目。\"\n"
+                    "它是揭晓时**第一句**念给观众的话 —— 写得绕等于没写。"),
+            },
+            "completion_fact_ids": {
+                "type": "array", "minItems": 1, "maxItems": 2,
+                "items": {"type": "string"},
+                "description": (
+                    "**通关合同**: 观众房间必须真正建立的 1~2 条核心事实"
+                    "(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
+                    "房间已公开确认的事实会**累计**, 最后补齐缺口的观众立即"
+                    "触发揭晓 —— 不要求某一个人独自说全。\n"
+                    "所以这里要填的是\"解出这题最少必须知道什么\", "
+                    "**不是**\"完整谜底需要解释什么\"。\n"
+                    "support / exclusion **绝不能**填在这里(它们是背景与"
+                    "排除项, 不是解法)。\n"
+                    "⚠️ 若压不进 2 条, 说明这题太绕 —— 请**换一个更简单的"
+                    "骨架**, 不要把 4、5 条都塞进来(代码会拒稿)。"),
+            },
             "hints": {
                 "type": "array", "minItems": 3, "maxItems": 3,
                 "items": {"type": "string"},
@@ -1051,12 +1141,15 @@ _TOOL_RIDDLE = {
                         "id": {"type": "string", "description": "如 a1, a2 …"},
                         "role": {
                             "type": "string",
-                            "enum": ["cause", "mechanism", "support"],
+                            "enum": ["key", "cause", "mechanism", "support"],
                             "description": (
-                                "cause    = 那个反常结果的起因; "
+                                "key       = 这道题的**核心翻转**本身"
+                                "(身份/时间/目标/物品被误认), **没有因果链"
+                                "的题就用它**; "
+                                "cause     = 那个反常结果的起因; "
                                 "mechanism = 这个起因**如何**导致反常行为(把它和"
                                 "起因连起来的那一步); "
-                                "support  = 补充事实(可选)"),
+                                "support   = 补充事实(可选)"),
                         },
                         "text": {"type": "string",
                                  "description": "这条原子事实, 一句话"},
@@ -1072,10 +1165,14 @@ _TOOL_RIDDLE = {
                     "required": ["id", "role", "text", "fact_ids"],
                 },
                 "description": (
-                    "玩家必须说中的 2-4 条原子事实。**必须恰好有一条 cause "
-                    "和一条 mechanism** —— 代码会要求玩家同时说中这两条才算"
-                    "通关, 只说中其中一条不算。每条都要用 fact_ids 指向上面"
-                    "的 fact。"),
+                    "对谜底的**分析拆分**(2-4 条), 用 fact_ids 指向上面的"
+                    "fact。\n"
+                    "⚠️ 它**不是**玩家逐字通关的模板 —— 通关由 "
+                    "`completion_fact_ids` 决定。这里写的是\"这题怎么拆\", "
+                    "用来给提示选方向、给揭晓做复盘结构。\n"
+                    "角色选择: **只有确实存在因果链的题**才用 cause + "
+                    "mechanism; 身份、物品、时间、目标等核心翻转用 `key`。"
+                    "不要为了凑角色硬造因果关系。"),
             },
             "fair_clues": {
                 "type": "array", "minItems": 1, "maxItems": 4,
@@ -1146,7 +1243,8 @@ _TOOL_RIDDLE = {
                     "跨题配额会被污染。"),
             },
         },
-        "required": ["puzzle", "answer", "hints", "facts", "solve_atoms",
+        "required": ["puzzle", "answer", "core_answer", "hints", "facts",
+                     "completion_fact_ids", "solve_atoms",
                      "fair_clues", "signature"],
     },
 }
@@ -1262,7 +1360,24 @@ _TOOL_CHECK = {
             "puzzle": {"type": "string",
                        "description": "修好的谜面。pass 时原样回传"},
             "answer": {"type": "string",
-                       "description": "修好的谜底。pass 时原样回传"},
+                       "description": "修好的谜底(2-4 句)。pass 时原样回传"},
+            "core_answer": {
+                "type": "string",
+                "description": (
+                    "修好的**一句话核心答案**(≤60 汉字, 不换行, 必须直接"
+                    "回答谜面最后那个问题)。pass 时原样回传。\n"
+                    "⚠️ 你若改了谜面/谜底/核心机制, 这一项**必须重出** —— "
+                    "新谜底配旧 core_answer 会让揭晓念出与题目不符的话。"),
+            },
+            "completion_fact_ids": {
+                "type": "array", "minItems": 1, "maxItems": 2,
+                "items": {"type": "string"},
+                "description": (
+                    "**通关合同**: 观众房间必须真正建立的 1~2 条核心事实"
+                    "(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
+                    "pass 时原样回传; 改了核心机制就**必须重出**。"
+                    "support/exclusion 不能出现在这里。"),
+            },
             "hints": {"type": "array", "items": {"type": "string"},
                       "description": "修好的 3 条提示。pass 时原样回传"},
             "facts": {
@@ -1295,8 +1410,10 @@ _TOOL_CHECK = {
                                "description": "原样回传; 重出时重编 a1/a2…"},
                         "role": {
                             "type": "string",
-                            "enum": ["cause", "mechanism", "support"],
-                            "description": "cause = 反常的起因; "
+                            "enum": ["key", "cause", "mechanism", "support"],
+                            "description": "key = 核心翻转本身(身份/时间/"
+                                           "目标/物品被误认), 没有因果链的题用它; "
+                                           "cause = 反常的起因; "
                                            "mechanism = 这个起因如何导致那个反常行为",
                         },
                         "text": {"type": "string"},
@@ -1393,10 +1510,56 @@ _TOOL_CHECK = {
                     "procedural_rule_dependency",
                 ],
             },
+            "quality_checks": {
+                "type": "object",
+                "properties": {
+                    "narrator_truthful": {
+                        "type": "boolean",
+                        "description": (
+                            "**谜底没有推翻谜面中无归属的事实陈述。**\n"
+                            "谜面里由全知叙述者直接说的事实, 必须在 canonical"
+                            " world 里字面为真。\n"
+                            "  ✗ 谜面说\"她绝不可能听到那句话\", 谜底说\"她昨晚"
+                            "亲耳听到\" -> false\n"
+                            "  ✓ 谜面说\"在开门的人看来, 她绝不可能听到\" -> true\n"
+                            "有归属的陈述(在他看来/他确信/家里人一直以为)"
+                            "不算撒谎。"),
+                    },
+                    "mechanism_consistent": {
+                        "type": "boolean",
+                        "description": (
+                            "核心物理/时间/**方向**/数量/因果真的成立。\n"
+                            "凡答案依赖东/西方向、时区早晚、前后顺序、数量累计、"
+                            "速度距离、简单物理过程, **必须实际走一遍方向**。\n"
+                            "例: 向东跨时区, 当地钟通常相对出发时区越来越晚; "
+                            "若故事结论要求相反方向, 必须能解释, 否则 false。\n"
+                            "不需要专业知识, 只需要基本因果/符号方向不自相矛盾。"),
+                    },
+                    "core_answer_direct": {
+                        "type": "boolean",
+                        "description": (
+                            "core_answer 普通人一句能懂, 且**直接回答谜面末尾"
+                            "那个问题**(不绕、不依赖额外脑补)。"),
+                    },
+                    "completion_contract_minimal": {
+                        "type": "boolean",
+                        "description": (
+                            "completion_fact_ids 只包含**真正通关所需**的 1~2 个"
+                            "事实(只指向 core/hidden, 不含 support/exclusion)。"),
+                    },
+                },
+                "required": ["narrator_truthful", "mechanism_consistent",
+                             "core_answer_direct",
+                             "completion_contract_minimal"],
+                "description": (
+                    "**四项必须全部为 true, 代码才接受这一稿。** 这不是"
+                    "参考项 —— 任一项 false 而 decision 写 pass, 会被整稿"
+                    "拒收(假绿比 rewrite 更糟: 它会直接进正式 Q&A)。"),
+            },
             "note": {"type": "string",
                      "description": "改了什么、为什么(一句话)"},
         },
-        "required": ["decision", "observed_signature"],
+        "required": ["decision", "observed_signature", "quality_checks"],
     },
 }
 
@@ -1431,19 +1594,23 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix 
 
 选 rewrite 时填 `rewrite_reason`, **不要**给 puzzle/answer。
 
-═══ 改了核心就必须重出整套 ═══
-facts / solve_atoms / fair_clues / observed_signature 是**一套**。
+═══ 改了核心就必须重出整套(v5 起是六样) ═══
+`facts` / `core_answer` / `completion_fact_ids` / `solve_atoms` /
+`fair_clues` / `observed_signature` 是**一套**。
 只要你改动了 answer 或核心机制:
 - `facts` 必须重出 —— 它是**正式 Q&A 的判定依据**。留着旧事实表
   会让主持人依据**过期事实**回答观众, 比以前更危险, 因为现在很自信。
+- `core_answer` 必须重出 —— 它会在揭晓时被**逐字**念给观众。新谜底配
+  旧 core_answer = 当着全房间的面念错答案。
+- `completion_fact_ids` 必须重出 —— 它是**通关合同**。留着旧的, 观众
+  要建立的还是旧题的事实, 而题已经变了。
 - `solve_atoms` 必须重出, 且 fact_ids 要指向**新的** fact id。
 - `fair_clues` 的 quote 必须**逐字**出自**改后的**谜面(代码会验)。
 - `observed_signature` 必须**如实重新判断** —— 你把题改成了什么形状
   就写什么。**不要照抄原稿**, 那是给跨题配额用的, 报假的会污染全局分布。
 
-⚠ **只要谜面或谜底有任何一个字变了, 上面四样就必须全部给出。**
-少给一样, 代码会**整稿拒掉**(不会退回旧值替你补) —— 因为"新谜底 +
-旧事实表"会让主持人非常自信地说错话。宁可重出一稿。
+⚠ **只要谜面或谜底有任何一个字变了, 上面六样就必须全部给出。**
+少给一样, 代码会**整稿拒掉**(不会退回旧值替你补)。
 
 没动核心就原样回传它们(含 id 与 fact_ids)。
 
@@ -1477,6 +1644,39 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
    如实判断这道题是不是**主要靠**题面之外的制度性设定成立(某机构的
    规定 / 必须遵守的流程 / 仪式规矩)。**普通的生活常识与物理规律不算。**
    把结论填进 `observed_signature.procedural_rule_dependency`。
+
+═══ v5: `quality_checks` 四项 —— **必须全部为 true 代码才收稿** ═══
+这是一个结构化字段, 不是让你写感想。任一项 false 而 decision 写 pass,
+会被**整稿拒收** —— 因为那意味着"你知道有问题却选了放行"。
+
+**1. narrator_truthful —— 谜底没有推翻谜面中无归属的事实陈述**
+谜面里由**全知叙述者直接说**的事实, 必须在 canonical world 里字面为真。
+允许隐瞒、省略、双关、角色误解; 允许**有归属**的陈述
+("在他看来……" / "他确信……" / "家里人一直以为……")。
+禁止谜面直接说 A, 谜底再说其实不是 A。
+  ✗ 谜面 "她绝不可能听到那句话"      谜底 "她昨晚就在饭桌上亲耳听到"
+     -> false(这句话没有归属, 是叙述者在断言)
+  ✓ 谜面 "在开门的人看来, 她绝不可能听到那句话"  -> true
+  ✗ "公司正式发布新规"    谜底 "其实只是几个同事私下约定" -> false
+  ✗ "她第一天嘴快说漏了"  谜底 "其实她从一开始就是故意演的" -> false
+若谜底需要推翻这种断言才能成立, 这题**不公平** —— 应该 rewrite。
+
+**2. mechanism_consistent —— 核心物理/时间/方向/数量/因果真的成立**
+凡答案依赖**方向 / 时区早晚 / 前后顺序 / 数量累计 / 速度距离 / 简单物理
+过程**, 你必须**实际在脑子里走一遍**。
+  例: 向东跨时区, 当地钟通常相对**出发**时区越来越**晚**。
+      若故事结论要求相反方向, 必须能解释, 否则 false。
+不需要你上网查专业知识 —— 只要求基本因果与符号方向**不自相矛盾**。
+(实测: 时区题就是因为跳过了这一步才漏过去的。)
+
+**3. core_answer_direct**
+core_answer 普通人**一句能懂**, 并且**直接回答谜面末尾那个问题**。
+绕圈子、"其实就是说……"才能明白的, 是 false。
+
+**4. completion_contract_minimal**
+completion_fact_ids 只包含**真正通关所需**的 1~2 个事实, 只指向
+kind=core 且 visibility=hidden。混进 support/exclusion, 或者为了保险
+塞到 4、5 条, 都是 false(那会让通关变得要么太易要么太绕)。
 
 ═══ 情绪 ≠ 揭晓结构(评审时也要分开) ═══
 - `emotion_mode` 是**气氛**(读起来是伤感/温暖/中性/荒诞…)。
@@ -1546,8 +1746,15 @@ class RiddleResult:
     error: Optional[str] = None
     usage: Optional[dict] = None
     model: Optional[str] = None
-    # 通关判定用的原子事实: 玩家必须说中其中 **cause + mechanism** 才算猜中。
-    # 没有它, 裁判只能从一段文学谜底里"凭感觉"理解核心, 于是频繁宽判。
+    #: **v5 通关合同** —— 一句话核心答案。揭晓时**逐字**先念它(不再经
+    #: LLM 加工), 保证"人话"先出现。空 = 这道题没有 v5 合同。
+    core_answer: str = ""
+    #: **v5 通关合同** —— 房间必须真正建立的 1~2 条 core/hidden fact。
+    #: 空 = legacy 题, 走旧的 solution_candidate + Final Judge 路径。
+    completion_fact_ids: list = field(default_factory=list)
+    # 谜底的**分析拆分**(提示/解释/复盘)。⚠️ v5 起它**不是**通关条件 ——
+    # 通关由 completion_fact_ids 的集合覆盖判定。没有它, 裁判只能从一段
+    # 文学谜底里"凭感觉"理解核心, 于是频繁宽判。
     solve_atoms: list = field(default_factory=list)
     # 谜面里已经写着、知道答案后回看能指向谜底的具体事实。
     # 用来挡"答案完全依赖题面外的私人往事"那种不可推理的题。
@@ -1965,6 +2172,9 @@ class PuzzleWriter:
         bp = blueprint or spec.blueprint
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"
+                f"【核心答案 core_answer】{spec.core_answer or '(空)'}\n"
+                f"【通关合同 completion_fact_ids】"
+                f"{spec.completion_fact_ids or '(空)'}\n"
                 f"【提示】{' / '.join(spec.hints) or '(空)'}")
         if spec.facts:
             user += "\n【facts(判定依据)】\n" + "\n".join(
@@ -2095,6 +2305,20 @@ class PuzzleWriter:
         if not new_answer:
             new_answer = spec.answer
 
+        # ---- v5 通关合同: 与 facts/atoms/clues **同一套** ----
+        #
+        # 早先这里没有这两项。后果与"新谜底 + 旧事实表"完全同构:
+        # 审稿人换掉了核心机制, 但 completion_fact_ids 还是旧的 ——
+        # 于是观众要建立的还是旧题的事实, 而谜底已经变了。
+        #
+        # `core_answer` 同理: 它会在揭晓时被**逐字**念给观众。
+        new_core = " ".join(str(ti.get("core_answer", "") or "").split()).strip()
+        if not new_core:
+            new_core = spec.core_answer
+        # 判据用"审稿人到底给没给", 而不是"变没变" —— 见下面的 bad 列表。
+        gave_core = bool(str(ti.get("core_answer", "") or "").strip())
+        gave_comp = ti.get("completion_fact_ids") is not None
+
         # 拒稿时也要能看出是哪一项没同步 —— 生成器会照着重出。
         bad: list = []
 
@@ -2122,6 +2346,40 @@ class PuzzleWriter:
                 bad.append("fair_clues")
             else:
                 clues = list(spec.fair_clues)
+
+        # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
+        comp_raw = ti.get("completion_fact_ids")
+        comp = [str(x).strip() for x in (comp_raw or []) if str(x).strip()]
+        # 去重但保序 —— 重复 id 会让集合覆盖判定看着"要两条", 其实是同一条。
+        _seen_comp: list = []
+        for _fid in comp:
+            if _fid not in _seen_comp:
+                _seen_comp.append(_fid)
+        comp = _seen_comp
+        if not comp:
+            if changed and not gave_comp:
+                bad.append("completion_fact_ids")
+            else:
+                comp = list(spec.completion_fact_ids or [])
+        if changed and not gave_core:
+            bad.append("core_answer")
+
+        # ---- quality_checks: **fail closed** ----
+        #
+        # 四项必须全部为 true。这是"假绿"的唯一防线:
+        # 模型完全可以 decision="pass" 而同时报 narrator_truthful=false
+        # (它看出了问题, 但选了最省事的决定)。若代码照单全收, 那稿会
+        # 直接进正式 Q&A —— 比 rewrite 更糟。
+        #
+        # 缺失 / 非 dict / 任一项非 True(含缺键) 一律拒。
+        qc = ti.get("quality_checks")
+        if not isinstance(qc, dict):
+            bad.append("quality_checks 缺失")
+        else:
+            _qc_bad = [n for n in _QUALITY_CHECK_FIELDS
+                       if qc.get(n) is not True]
+            if _qc_bad:
+                bad.append("quality_checks 未全过(" + ", ".join(_qc_bad) + ")")
 
         # ---- signature: 审稿人的 observed_signature 优先 ----
         # 它读过改后的题, 比原稿的指纹更可信 —— 而配额就靠这个。
@@ -2195,6 +2453,8 @@ class PuzzleWriter:
 
         return PuzzleSpec(
             id=spec.id, title=spec.title, puzzle=new_puzzle, answer=new_answer,
+            core_answer=new_core,
+            completion_fact_ids=comp,
             facts=facts, solve_atoms=atoms, fair_clues=clues,
             hints=[str(h).strip() for h in (ti.get("hints") or [])
                    if str(h).strip()][:3] or list(spec.hints),
