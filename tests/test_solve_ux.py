@@ -352,7 +352,12 @@ class FakeClient:
         self.calls.append({"system": system, "user": user, "tool": tool})
         if not self._results:
             return LLMResult(error="no more canned results")
-        return self._results.pop(0)
+        r = self._results.pop(0)
+        # 允许把"异常"当成一个 canned 结果投进去 —— 真实网关会抛, 而
+        # "重判抛异常"必须和"重判超时"走同一条失败处置(C1 的用例之一)。
+        if isinstance(r, BaseException):
+            raise r
+        return r
 
 
 def _verdict(established=None, cand=False, verdict="是"):
@@ -2725,6 +2730,76 @@ def test_a2_recheck_failure_becomes_unavailable():
               out[0].established_fact_ids if out else None)
 
 
+def test_c1_recheck_failure_is_terminal_without_contract():
+    """**C1**: 重判**技术失败** + **无合同** -> 仍然恰好 2 次, 第三次绝不被消费。
+
+    这是 C0 漏掉的第二条 3-call 路径。C0 只把 return 放进 `if done:` 里,
+    于是失败路径继续往下走, 落到 legacy Final Judge —— 而
+    `_recheck_failed` **故意保留** `solution_candidate=True`(失败不重判
+    candidate), 正好满足 Judge 的入口条件 `r0.solution_candidate`。
+    结果是 `Answer -> failed recheck -> Judge` = 3 次。
+
+    为什么用**无合同**的 spec: 有合同时失败路径落到 `_completion_verify`,
+    那条已被 C0-G 的 `<=2` 覆盖; 无合同才是裸奔到 Judge 的那条。
+
+    第三个 canned response 是**故意**塞进去的诱饵: 如果实现还往下走,
+    它会被消费掉, `len(calls)` 就是 3。断言"第三个绝不被消费"比只断言
+    次数更直接地钉住了这条路径的终点。
+    """
+    print("\n[C1] 无合同 + 重判失败 -> 2 次(第三次是诱饵)")
+    spec = auction_spec()
+    # 必须让 Judge 真的**成功**, 否则它失败也会被计数, 分不清是"没调"
+    # 还是"调了但没判中"。一个明确判中的第三层才是有效诱饵。
+    bait = LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                                 "mechanism_hit": True}, model="m")
+    for label, bad in (
+            ("timeout", LLMResult(error="timeout", model="m")),
+            ("空 tool input", LLMResult(tool_input=None, model="m")),
+            ("异常", RuntimeError("boom")),
+            ("schema 不符", LLMResult(tool_input={"other": 1}, model="m"))):
+        fc = FakeClient([_verdict(cand=True, verdict="无关"), bad, bait])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
+                          spec=spec,
+                          completion_fact_ids=[],       # ← 无合同
+                          core_answer=spec.core_answer,
+                          room_established_fact_ids=[])
+        check(f"{label}: 恰好 2 次", len(fc.calls) == 2, len(fc.calls))
+        check(f"{label}: 第三个诱饵**从未**被消费",
+              len(fc.calls) < 3, len(fc.calls))
+        check(f"{label}: 判未判定(不是「无关」, 也不是 solved)",
+              out and out[0].verdict == "未判定" and out[0].verdict != "猜中",
+              out[0].verdict if out else None)
+        check(f"{label}: status=unavailable",
+              out and getattr(out[0], "status", "") == "unavailable",
+              getattr(out[0], "status", "") if out else None)
+
+
+def test_c1_recheck_success_is_terminal_without_contract():
+    """**C1**: 重判**成功** + **无合同** -> 2 次, 第三次诱饵不被消费。
+
+    C0 已经堵了这条(成功路径无条件 return), 这里补一条同族对照:
+    成功与失败**都必须**终局 —— 返回值只描述"重判成功没有", 不描述
+    "能不能继续"。
+    """
+    print("\n[C1] 无合同 + 重判成功 -> 2 次")
+    spec = auction_spec()
+    bait = LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                                 "mechanism_hit": True}, model="m")
+    fc = FakeClient([_verdict(cand=True, verdict="无关"),
+                     _recheck("是", ids=[]), bait])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
+                      spec=spec,
+                      completion_fact_ids=[],
+                      core_answer=spec.core_answer,
+                      room_established_fact_ids=[])
+    check("恰好 2 次", len(fc.calls) == 2, len(fc.calls))
+    check("第三个诱饵从未被消费", len(fc.calls) < 3, len(fc.calls))
+    check("重判结果生效(是)", out and out[0].verdict == "是",
+          out[0].verdict if out else None)
+
+
 def test_c0_call_budget_matrix():
     """**C0-G**: 所有 contract 路径的调用数上界冻结。
 
@@ -3034,6 +3109,9 @@ def main():
         test_c0_recheck_seeded_ids_are_already_verified,
         test_c0_recheck_never_produces_solve,
         test_c0_call_budget_matrix,
+        # ---- C1: 重判一旦触发即终局(成功与失败都 return) ----
+        test_c1_recheck_failure_is_terminal_without_contract,
+        test_c1_recheck_success_is_terminal_without_contract,
     ]
     for t in tests:
         t()

@@ -3619,26 +3619,31 @@ class PuzzleWriter:
         if (str(getattr(r0, "status", "") or "") == "ok"
                 and r0.solution_candidate is True
                 and r0.verdict == P.IRRELEVANT):
-            done = self._candidate_recheck(
+            # ---- C1 closeout: **进入重判即终局, 成功失败都 return** ----
+            #
+            # 这条分支一旦触发, "第一层的输出整体不可信"就已经成立 ——
+            # 无论重判本身成功还是技术失败, 都不存在再用第一层结果继续
+            # 往下走的理由。两种失败模式的代价不对称:
+            #
+            #   - 有合同: 失败后继续 -> 落到 `_completion_verify`(第 3 次
+            #     串行 LLM)。8s x 3 = 24s 贴着 qa_inflight_timeout=25s。
+            #   - 无合同: 失败后继续 -> 落到下面的 legacy Final Judge。
+            #     `_recheck_failed` **故意保留** `solution_candidate=True`
+            #     (只有重判**成功**才重写它), 而 Judge 的入口条件正是
+            #     `r0.solution_candidate` —— 于是又是一次调用。
+            #
+            # 第二条是实测出来的: C0 只堵了成功路径, 失败路径仍然 3 次。
+            # 修法就是把 return 提到 `done` 判断**之外** —— 与其去猜
+            # "失败时该不该清 solution_candidate"(那会改变 candidate 这个
+            # **分析指标**的含义, 见 director._round_metrics 的
+            # solution_candidate_count), 不如承认这条路径没有继续的意义。
+            self._candidate_recheck(
                 r0, spec=spec, completion_fact_ids=completion_fact_ids,
                 room_established_fact_ids=room_established_fact_ids,
                 core_answer=core_answer, transcript=transcript,
                 user_name=user_name, text=text,
                 timeout=timeout, max_retries=max_retries)
-            # 重判**已经**做完 completion 语义确认(它自己就是这条异常路径
-            # 的专门 verifier)。成功即**终局** —— 直接 return:
-            #
-            #   - 有合同: 否则会再进 `_completion_verify`(第 3 次串行 LLM);
-            #   - 无合同: 否则会掉进下面的 legacy Final Judge —— 重判刚把
-            #     `solution_candidate` 判成 true, 正好满足它的入口条件,
-            #     于是又是一次调用。这条路径同样必须止步。
-            #
-            # 失败(返回 False)时不 return: 那时 verdict 已改成"未判定",
-            # `solution_candidate` 保持不变, 下面的分支会照常按未判定处理
-            # (legacy 分支要求 verdict 非空才继续, 而"未判定"会被
-            # `_fill_coverage` 那条路兜住)。
-            if done:
-                return results, res.error
+            return results, res.error
 
         # ---- v5/v6/A1: 有通关合同 -> **绝不**调 Final Judge ----
         #
@@ -3715,7 +3720,15 @@ class PuzzleWriter:
 
         返回 `True` 表示"这次调用**成功且已终局**" —— 调用方据此跳过
         `_completion_verify`(否则就是第 3 次 LLM)。返回 `False` 表示
-        技术失败(已改判"未判定"), 调用方也不该再往下走完成复核。
+        技术失败(已改判"未判定")。
+
+        ⚠️ **C1 closeout: 调用方无论拿到 True 还是 False 都必须 return。**
+        返回值只描述"重判成功没有", 不描述"能不能继续往下走" ——
+        这条分支一旦触发, 第一层输出整体不可信, 没有任何继续的理由。
+        早先只在 `done` 为真时 return, 于是失败路径又调了一次
+        (有合同 -> `_completion_verify`; 无合同 -> legacy Final Judge,
+        因为 `_recheck_failed` 故意保留 `solution_candidate=True`)。
+        返回值保留只为可观测性与既有测试, **不要**据此再写分支。
 
         ## 为什么必须重判
 
@@ -3865,7 +3878,14 @@ class PuzzleWriter:
 
     @staticmethod
     def _recheck_failed(r0: "QAResult", text: str, why: str) -> None:
-        """重判失败 -> 未判定(绝不留着自相矛盾的「无关」)。"""
+        """重判失败 -> 未判定(绝不留着自相矛盾的「无关」)。
+
+        ⚠️ 这里**故意不**清 `solution_candidate`: 那个字段是**分析指标**
+        (director 的 `solution_candidate_count` 用它回答"candidate 闸门
+        省了多少调用"), 把它按失败清掉等于伪造复盘数据。既然保留了它,
+        就不能让下游再有"按 candidate 分流"的第二次调用 —— 这正是 C1
+        把 return 提到 `done` 判断之外的原因, 而不是在这里补一个清字段。
+        """
         log.warning("候选重判失败(%s), 该条改判未判定: %.30r", why, text)
         r0.verdict = P.UNAVAILABLE
         r0.status = "unavailable"
