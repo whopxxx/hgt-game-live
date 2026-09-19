@@ -267,10 +267,17 @@ class PoolPrefetcher:
             inputs = self._generation_inputs()
 
             # ---- ⑥ 库存 / 可播数 ----
+            # ⚠️ C3: 阶段目标必须在 probe **之前**算出来 —— `_effective_targets()`
+            # 在 REVEALED 下要 2 道可播, 而 `playable_count(limit=N)` 是
+            # 硬早退(`n >= limit` 就 break)。传 1 就永远数不到 2, latch
+            # 的"可播够了"停止条件永不成立 -> 一路补到硬上限。
+            #
+            # 所以这两行**不能**保持原来的顺序(先 probe 再在 ⑧ 里算目标)。
+            target, need_playable = self._effective_targets()
             stock = self._stock()
             if stock is None:
                 return
-            playable = self._playable(inputs)
+            playable = self._playable(inputs, limit=need_playable)
 
             # ---- ⑦ 硬上限(先于 latch 判) ----
             # 到顶就彻底停, 即使 playable 仍是 0。理由见 config 里
@@ -284,6 +291,10 @@ class PoolPrefetcher:
                     if now >= self._max_warn_at:
                         # 节流: tick 是 4Hz, 不节流会把这行刷成日志洪水。
                         self._max_warn_at = now + self._max_warn_s
+                        # C3: 这里刻意仍用 `_playable_min`(最低生存要求),
+                        # 不用 `need_playable`(当前阶段目标)。到硬上限还
+                        # 值得报警的是"连一道都播不出来", 而不是"没凑够
+                        # 揭晓期的 2 道" —— 后者只是没赚到额外余量。
                         log.warning(
                             "题池达到硬上限(%d)但当前仍无可播题"
                             "(stock=%d playable=%d) —— 停下, 不再生成。"
@@ -309,7 +320,10 @@ class PoolPrefetcher:
             # `_reveal_target` / `_reveal_playable_target`。其余阶段沿用
             # QA 的保守目标。"多播一道"的判定也更容易 —— 只要 playable
             # 还没到 reveal 目标就继续补。
-            target, need_playable = self._effective_targets()
+            #
+            # ⚠️ C3: `target` / `need_playable` 已在 ⑥ 之前算好(并用于
+            # 那次 probe 的 limit), 这里只消费, 不要重算 —— 重算本身
+            # 没错, 但会让人以为 limit 是别处定的。
             need = (stock < self._min_size
                     or (playable < need_playable
                         and stock < self._max_size))
@@ -435,7 +449,7 @@ class PoolPrefetcher:
             log.exception("读库存异常, 本次不补池")
             return None
 
-    def _playable(self, inputs: dict) -> int:
+    def _playable(self, inputs: dict, limit: Optional[int] = None) -> int:
         """**下一题此刻能播几道** —— 与 `_stock()` 是两个不同的指标。
 
         `stock` 是长期库存(与窗口无关), playable 依赖当下的
@@ -444,20 +458,40 @@ class PoolPrefetcher:
         认为健康, 一道都不补。
 
         用**同一份** `inputs` 去 probe 和生成(见 `_on_tick_locked_ish`
-        的 ⑤)。`limit=playable_min` 早退: 只需要知道"够不够最低要求"。
+        的 ⑤)。
+
+        ## ⚠️ `limit` 必须跟着**当前阶段的目标**走(C3)
+
+        `PuzzlePool.playable_count()` 的 `limit` 是**硬早退**
+        (`if n >= limit: break`), 不是"上限提示"。所以传 1 就只能
+        返回 0 或 1 —— 永远数不到 2。
+
+        这正是 C3 之前那个静默失效: `_effective_targets()` 在 REVEALED
+        下要求 `playable >= _reveal_playable_target`(默认 2), 但这里
+        固定传 `_playable_min`(默认 1), 于是 `playable < need_playable`
+        **恒真** -> latch 的"可播数够了"那条停止条件永远无法满足 ->
+        补池一路补到硬上限 10 才因 `stock >= _max_size` 停下。
+
+        旧测试没抓到, 是因为它把 `pool_reveal_playable_target` 人为设成
+        1 —— 那等于把这条路径的触发条件删掉了(夹具不具备触发条件的
+        断言是假的)。
+
+        默认参数保持 `None` -> 退化为 `_playable_min`: 让 QA 阶段的
+        调用与 C3 之前**逐位相同**, 不偷偷改变既有的早退行为。
 
         读不到就当 fail **closed**(返回 0 = 缺货): 此时若误判成"够",
         补池会停, 而实际可能一道都播不出来; 反过来误判成"缺"最多是
         多生成一道, 代价小得多。
         """
-        if self._playable_min <= 0:
+        want = self._playable_min if limit is None else int(limit)
+        if want <= 0:
             # 关掉了这个触发条件 —— 返回一个"永远够"的哨兵值, 让
             # latch 只由 stock 决定(与 Q9 原行为逐位相同)。
-            return self._playable_min
+            return want
         try:
             n = self.pool.playable_count(
                 inputs.get("recent_signatures"), inputs.get("avoid"),
-                limit=self._playable_min)
+                limit=want)
             return int(n or 0)
         except Exception:                       # noqa: BLE001
             log.exception("读可播数异常, 按 0(缺货)处理")
@@ -699,7 +733,11 @@ class PoolPrefetcher:
                 # 滞回的两个输入。只看 stock 的话, "stock=5 playable=0"
                 # (候选全被当前窗口挡住)这种现场指纹在计数里完全看不见。
                 "stock": self._stock(),
-                "playable": self._playable(self._generation_inputs()),
+                # C3: 这里报的 playable 必须与 latch 判据用**同一个 limit**,
+                # 否则复盘时会看到"playable=1 但补池还在跑"这种自相矛盾的
+                # 指纹 —— 而那个矛盾恰恰是 C3 之前那个 bug 的样子。
+                "playable": self._playable(self._generation_inputs(),
+                                           limit=self._effective_targets()[1]),
                 "playable_min": self._playable_min,
                 "max_size": self._max_size,
                 # U1: 揭晓窗口的专用目标(内省/复盘用)。

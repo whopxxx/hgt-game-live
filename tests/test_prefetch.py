@@ -14,6 +14,7 @@ Q9 后台补池(prefetch)。核心约束:
 from __future__ import annotations
 
 from concurrent.futures import Future
+from dataclasses import replace
 
 import json
 import os
@@ -29,7 +30,8 @@ from story.puzzle import (  # noqa: E402
     PuzzleSpec, SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
-from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
+from story.quality import (  # noqa: E402
+    FAMILY_SHAPES, QUALITY_POLICY_VERSION)
 from story.state import Phase  # noqa: E402
 
 FAIL = [0]
@@ -501,9 +503,46 @@ def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
     return pf
 
 
-def fill(pool, n):
+def fill(pool, n, base=100):
+    """往池里灌 n 道互不相同的题。
+
+    ⚠️ `base` 是为了让**同一个池**可以被灌多次: `variant(i)` 从 i 生成
+    题面与事实表, 重复的 i 会造出结构重复的题, 被池的动态门拒掉 ——
+    于是"再灌 4 道"实际一道都没进去, 断言里的 stock 就成了假的。
+    """
     for i in range(n):
-        pool.add(variant(100 + i))
+        pool.add(variant(base + i))
+
+
+#: 轮换用的 family —— 每道题换一个 `(family, shape)`, 才能真正**共存**。
+#: `variant(i)` 自己固定用 hidden_function, 于是多道 variant 之间是
+#: 结构重复的, 池的动态门只放得进一道。需要"池里有 N 道**可播**"的
+#: 用例(比如 playable>=2)必须用下面这个。
+_MIX_FAMILIES = ["information_gap", "rule_constraint", "causal_reversal",
+                 "goal_reversal", "identity_misread", "object_misuse",
+                 "time_reinterpretation", "space_reinterpretation"]
+
+
+def mixed_variant(i: int) -> PuzzleSpec:
+    """第 i 道合格题, **轮换 (mechanism_family, solution_shape)**。
+
+    `variant(i)` 全部共用 hidden_function/hidden_function_explains_behavior,
+    所以它们互相都是 structural duplicate —— 池只收得下第一道。
+    凡是要"真的数出 >= 2 道可播"的断言, 必须用这个夹具, 否则
+    playable 恒为 1, 断言测的是夹具不是实现。
+    """
+    s = variant(600 + i)
+    fam = _MIX_FAMILIES[i % len(_MIX_FAMILIES)]
+    sh = FAMILY_SHAPES[fam][0]
+    s.blueprint = replace(s.blueprint, mechanism_family=fam, solution_shape=sh)
+    s.signature = replace(s.signature, mechanism_family=fam, solution_shape=sh)
+    return s
+
+
+def fill_mixed(pool, n, base=0):
+    """灌 n 道**结构互不重复**的题 —— playable 才会真的随 n 增长。"""
+    for i in range(n):
+        pool.add(mixed_variant(base + i))
 
 
 def test_latch_walk_min2_target5():
@@ -1737,29 +1776,157 @@ def test_u1_reveal_uses_higher_target():
 
     QA 期间 target=5; 揭晓窗口补到 7 —— 那是唯一"引擎完全空闲"的时间
     窗, 观众在看答案, 补池不与直播抢网关。
+
+    ⚠️ C3 修正: 这条用例早先构造的是"stock=6, 但 6 道全是同一个
+    `variant()` 造的**结构重复**题"。那 6 道互相挡着, 于是真正的
+    playable 只有 1 —— latch 是靠 `playable < 2` 启动的, **不是**靠
+    reveal_target。当时 probe 又把 playable 数成 1(`limit=_playable_min`),
+    两个错误互相抵消, 断言看起来是绿的。
+
+    C3 把 probe 修对之后, "6 道同构题" 的 playable 变成 1(真值),
+    而 `stock=6 < reveal_target=7` **本身并不驱动启动腿**
+    (见 `_on_tick_locked_ish` 里关于"否决 stock < target"的说明)。
+    所以这条用例改成它本来想测的东西: 用**结构互不重复**的题撑起
+    playable >= 2, 然后看 QA/reveal 两个目标组下**停止条件**的差别。
     """
     print("\n[U1-A] REVEALED 用更高的补池目标")
     with tmpdir() as d:
-        # QA: stock=6 >= target=5 -> 不该补
+        # QA: stock=6 >= target=5, 且 6 道都可播 -> 不该补
         ex = _SyncExecutor()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
                   probe=lambda: _qa_probe(), pool_reveal_target_size=7)
-        fill(pf.pool, 6)
+        fill_mixed(pf.pool, 6)
+        check("QA: 6 道互不重复 -> stock=6",
+              pf.pool.stock_count() == 6, pf.pool.stock_count())
         pf.on_tick()
-        check("QA: stock=6 已到 target(5) -> 不补",
+        check("QA: stock=6 已到 target(5) 且可播充足 -> 不补",
               len(ex.submitted) == 0, len(ex.submitted))
-        # REVEALED: 同一个 stock=6 < reveal_target=7 -> 该启动
-        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor(),
+        check("QA: latch 没启动", pf.stats()["refill_active"] is False,
+              pf.stats()["refill_active"])
+        # REVEALED: 同一个 stock=6 < reveal_target=7 —— 但启动腿不看
+        # stock<target, 所以这里**不会**因为 7 而启动。真正会驱动的是
+        # playable < reveal_playable_target(2)。用 1 道可播来构造。
+        #
+        # ⚠️ 必须开**新的临时目录**: pool 的默认路径是 `d` 下的
+        # `pool.jsonl`, 复用 `d` 会让 pf2 打开的还是上面那 6 道。
+    with tmpdir() as d2:
+        pf2 = mkpf(d2, pool=PuzzlePool.open(mkcfg(d2)),
+                   executor=_SyncExecutor(),
                    probe=lambda: _reveal_probe(remaining=50.0),
-                   pool_reveal_target_size=7)
-        fill(pf2.pool, 6)
+                   pool_reveal_target_size=7,
+                   pool_reveal_playable_target=2)
+        fill_mixed(pf2.pool, 1)                 # playable=1 < 2
         pf2.on_tick()
-        check("**REVEALED: stock=6 < reveal_target(7) -> 启动**",
+        check("**REVEALED: playable=1 < 2 -> 启动**",
               pf2.stats()["refill_active"] is True,
               pf2.stats()["refill_active"])
         check("并且真的提交了",
               len(pf2._executor.submitted) == 1,
               len(pf2._executor.submitted))
+        # 补到 7 道后可播充足 -> 停(证明更高目标确实在起作用)
+        #
+        # ⚠️ `_SyncExecutor` 立即执行: 上面那次 submit 已经生成并入库了
+        #    一道 -> stock 已经是 2。所以这里只再灌 5 道到 7。灌 6 道会
+        #    得到 stock=8, 断言会看起来像"冲到了 10"的 bug。
+        fill_mixed(pf2.pool, 5, base=100)       # 2 + 5 = 7
+        check("补到 stock=7", pf2.pool.stock_count() == 7,
+              pf2.pool.stock_count())
+        pf2.on_tick()
+        check("**REVEALED: stock>=7 且 playable>=2 -> 清 latch**",
+              pf2.stats()["refill_active"] is False,
+              pf2.stats()["refill_active"])
+
+
+def test_c3_reveal_playable_probe_counts_past_one():
+    """**C3**: REVEALED 的 probe 必须真的数得到 2 —— 用**真实题池**验证。
+
+    C3 之前 `_playable()` 固定 `limit=self._playable_min`(默认 1), 而
+    `PuzzlePool.playable_count(limit=N)` 是**硬早退**
+    (`if n >= limit: break`) —— 传 1 就只能返回 0 或 1。于是
+    `_effective_targets()` 要求的 `playable >= 2` **永远无法满足**,
+    latch 的"可播够了"停止条件永不成立, 补池一路补到硬上限 10。
+
+    旧测试(U1-B)没抓到, 因为它只检查 `_effective_targets()` 返回
+    `(7, 2)` 这个**配置值**, 并且用一个把 `pool_reveal_playable_target`
+    设为 1 的夹具 —— 那等于把这条路径的触发条件删掉了。
+    夹具不具备触发条件时, 断言是假的。
+
+    这里必须用**真实 PuzzlePool**: 只有真实实现才有"数到 limit 就
+    早退"这个行为, 桩对象不会复现它。
+    """
+    print("\n[C3] REVEALED 的 playable probe 真的能数到 2")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
+                  probe=lambda: _reveal_probe(remaining=50.0),
+                  pool_playable_min=1, pool_reveal_playable_target=2,
+                  pool_reveal_target_size=7)
+        # ⚠️ 必须用 mixed: `fill()` 的 variant 全是同一个 (family, shape),
+        #    互相结构重复, playable 恒为 1 —— 拿它测 ">= 2" 测的是夹具。
+        fill_mixed(pool, 3)
+        inputs = pf._generation_inputs()
+        # 直接问真实池: 3 道都合法且没被窗口挡住 -> 至少 2 道可播。
+        raw1 = pool.playable_count(inputs.get("recent_signatures"),
+                                   inputs.get("avoid"), limit=1)
+        raw2 = pool.playable_count(inputs.get("recent_signatures"),
+                                   inputs.get("avoid"), limit=2)
+        check("真实池 limit=1 早退 -> 最多 1", raw1 <= 1, raw1)
+        check("真实池 limit=2 能数到 2", raw2 >= 2, raw2)
+        # 被修的那条路径: probe 必须跟着阶段目标走。
+        check("**probe(limit=need_playable) 真的返回 >= 2**",
+              pf._playable(inputs, limit=2) >= 2,
+              pf._playable(inputs, limit=2))
+        # 默认参数仍退化为 _playable_min(不偷偷改变 QA 阶段的早退行为)。
+        check("probe 不传 limit 时退化为 _playable_min(1)",
+              pf._playable(inputs) <= 1, pf._playable(inputs))
+        # --- 端到端: stock=7 且 playable>=2 -> 停止, 不继续冲到 10 ---
+        fill_mixed(pool, 4, base=100)         # 共 7 道
+        check("stock=7 已到 reveal_target", pool.stock_count() == 7,
+              pool.stock_count())
+        pf.on_tick()
+        st = pf.stats()
+        check("**stock=7 且 playable>=2 -> latch 清掉, 不再补**",
+              st["refill_active"] is False, st["refill_active"])
+        check("没有提交任何生成(没有冲到 max=10)",
+              len(pf._executor.submitted) == 0, len(pf._executor.submitted))
+        check("stats 报的 playable 与判据同源(>=2)",
+              st["playable"] >= 2, st["playable"])
+
+
+def test_c3_reveal_playable_probe_stops_at_two_not_ten():
+    """**C3-b**: 只数到 1 时仍要补; 一旦到 2 就停 —— 恰好卡在目标上。
+
+    这条与 C3-a 互补: 前者证明"能数到 2", 这条证明"数到 2 就够,
+    不再多补"。缺了后者, 一个"永远返回 0/1"的实现也能让 latch 一直
+    开着而测试全绿(那正是修复前的状态)。
+    """
+    print("\n[C3-b] playable 恰好到 2 就停")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
+                  probe=lambda: _reveal_probe(remaining=50.0),
+                  pool_playable_min=1, pool_reveal_playable_target=2,
+                  pool_reveal_target_size=7, pool_min_size=2)
+        fill_mixed(pool, 1)                  # playable=1 < 2 -> 必须补
+        pf.on_tick()
+        check("playable=1 < 2 -> 启动", pf.stats()["refill_active"] is True,
+              pf.stats()["refill_active"])
+        check("真的提交了一次", len(pf._executor.submitted) == 1,
+              len(pf._executor.submitted))
+        # ⚠️ `_SyncExecutor` 是**立即执行**的: 上面那次 submit 已经真的
+        #    生成并入库了一道 -> stock 从 1 变 2。这里要补到 7 就得再灌
+        #    5 道, 不是 6 道。少算一道会让 stock=8, 断言看起来像"冲到 10"
+        #    的 bug, 其实是夹具算术错了。
+        fill_mixed(pool, 5, base=100)        # 2 + 5 = 7
+        check("stock=7 已到 reveal_target", pool.stock_count() == 7,
+              pool.stock_count())
+        pf._executor.submitted.clear()
+        pf.on_tick()
+        check("stock=7 且 playable>=2 -> 停",
+              pf.stats()["refill_active"] is False,
+              pf.stats()["refill_active"])
+        check("停在目标上, 没冲到 max_size=10",
+              pool.stock_count() == 7, pool.stock_count())
 
 
 def test_u1_reveal_playable_target():
@@ -1863,12 +2030,20 @@ def test_u1_reveal_never_blocks_next_puzzle():
     """
     print("\n[U1-H] 下一题不等补池 future")
     with tmpdir() as d:
-        from story.prefetch import _PENDING
         pool = PuzzlePool.open(mkcfg(d))
-        fill(pool, 3)
+        # ⚠️ C3: 早先这里灌 3 道同构 variant, 靠 probe **数错**
+        #    (limit=playable_min=1 -> playable 恒报 1) 才让 latch 启动。
+        #    probe 修对之后 `stock=3/playable=2` 是**真的够了**, 不会补
+        #    —— 那条断言也就失去了意义(测的是夹具, 不是实现)。
+        #
+        #    要验的是"在途任务存在时 pop_next 不被挡", 所以夹具必须
+        #    真的把 latch 打开。用 `pool_min_size=5 > stock=3` 这条腿
+        #    启动, 与 probe 数得准不准无关。
+        fill_mixed(pool, 3)
         ex = _ManualExecutor()
         pf = mkpf(d, pool=pool, executor=ex,
-                  probe=lambda: _reveal_probe(remaining=50.0))
+                  probe=lambda: _reveal_probe(remaining=50.0),
+                  pool_min_size=5)
         for _ in range(3):
             pf.on_tick()
         check("**确实有在途任务(未完成)**", pf._future is not None)
@@ -1973,6 +2148,9 @@ def main():
         # ---- U1: 揭晓窗口专用目标 + deadline guard ----
         test_u1_reveal_uses_higher_target,
         test_u1_reveal_playable_target,
+        # ---- C3: probe 的 limit 必须跟着阶段目标走 ----
+        test_c3_reveal_playable_probe_counts_past_one,
+        test_c3_reveal_playable_probe_stops_at_two_not_ten,
         test_u1_qa_still_uses_conservative_target,
         test_u1_deadline_guard_blocks_new_requests,
         test_u1_deadline_guard_ignores_non_reveal,
