@@ -254,6 +254,18 @@ class RawCuratedPuzzle:
     #: 内容安全筛查结果。"" = 没发现问题; 否则是需要人工看的原因。
     safety_flag: str = ""
 
+    # ---- H1-E 去重标记(**只标记, 不删除**) ----
+    #: "" = 不是重复; "near_duplicate" = 与某条 surface 高度相似。
+    #:
+    #: 刻意放在**同一个 dataclass** 上而不是另开一份"重复清单": 去重
+    #: 结论是这条记录的属性, 分开存就得靠 external_id 两边对账, 而那
+    #: 正是"两份判据迟早漂移"的老问题。
+    dup_reason: str = ""
+    #: 与哪一条重复(对方的 external_id)。
+    dup_of: str = ""
+    #: 相似度(0~1)。仅 near_duplicate 有意义。
+    dup_score: float = 0.0
+
     def to_dict(self) -> dict:
         return asdict(self)
 

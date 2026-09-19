@@ -520,6 +520,244 @@ def test_se_answer_partial_gap_is_logged():
 
 
 # ======================================================================
+# 6b. H1-E 三层去重
+# ======================================================================
+def test_dedup_exact_collapses_identical():
+    """① exact: 归一后完全相同的只留一份。"""
+    print("\n[H1-E] exact 去重")
+    from tools.curated_dedup import dedup
+    recs = [RawCuratedPuzzle(external_id=f"x{i}", source="S",
+                             surface="他每天看锅确认记号", bottom="B")
+            for i in range(4)]
+    kept, dupes, st = dedup(recs)
+    check("只留 1 条", len(kept) == 1, len(kept))
+    check("去掉 3 条", st["exact_removed"] == 3, st)
+    check("exact 层不产 dupes(是直接合并)", len(dupes) == 0, len(dupes))
+
+
+def test_dedup_near_marks_but_never_deletes():
+    """② near: **只标记, 不删除** —— 判重会错, 不能悄悄丢题。"""
+    print("\n[H1-E] near 只标记不删")
+    from tools.curated_dedup import dedup
+    a = RawCuratedPuzzle(external_id="a", source="S",
+                         surface="守塔人只在退潮时亮灯涨潮后熄灯",
+                         bottom="C")
+    b = RawCuratedPuzzle(external_id="b", source="T",
+                         surface="守塔人只在退潮时亮灯涨潮后熄灯了",
+                         bottom="D")          # 谜底不同!
+    c = RawCuratedPuzzle(external_id="c", source="S",
+                         surface="完全不同的沙漠靶场白旗测风", bottom="E")
+    kept, dupes, st = dedup([a, b, c])
+    check("近重复进 dupes 而非被删", len(dupes) == 1, len(dupes))
+    check("dupes 里带 dup_of", dupes[0].dup_of == "a", dupes[0].dup_of)
+    check("dupes 里带相似度", dupes[0].dup_score > 0, dupes[0].dup_score)
+    check("dup_reason 标成 near_duplicate",
+          dupes[0].dup_reason == "near_duplicate", dupes[0].dup_reason)
+    check("**b 没有被丢掉**(还留在 dupes 里可人工过)",
+          any(r.external_id == "b" for r in dupes))
+    check("不同的题正常保留", any(r.external_id == "c" for r in kept))
+
+
+def test_dedup_is_order_independent():
+    """**去重结果不能依赖输入顺序** —— 否则确定性落盘当场作废。
+
+    这是真实踩到的坑: 两条文字几乎相同但不完全相同的记录(差一个空格)
+    归一后 key 不同, 落到 near 层, 而 near 层是"与已保留的第一条比"。
+    不排序的话 `dedup([A,B])` 与 `dedup([B,A])` 会保留不同的那条,
+    于是同一份输入换个顺序产出不同的 curated_raw。
+    """
+    print("\n[H1-E] **去重与输入顺序无关**")
+    import itertools
+    from tools.curated_dedup import dedup
+    recs = [
+        RawCuratedPuzzle(external_id="a1", source="S",
+                         surface="他每天看锅确认记号", bottom="B"),
+        RawCuratedPuzzle(external_id="a3", source="T",
+                         surface="他 每天看锅确认记号", bottom="B",
+                         question_author="Y"),
+        RawCuratedPuzzle(external_id="b1", source="S",
+                         surface="守塔人只在退潮时亮灯涨潮熄灯", bottom="C"),
+        RawCuratedPuzzle(external_id="b2", source="T",
+                         surface="守塔人只在退潮时亮灯涨潮熄灯了", bottom="D"),
+    ]
+    outcomes = set()
+    for perm in itertools.permutations(recs):
+        kept, dupes, _st = dedup(list(perm))
+        outcomes.add((tuple(sorted(r.external_id for r in kept)),
+                      tuple(sorted(r.external_id for r in dupes))))
+    check(f"**全 {len(list(itertools.permutations(recs)))} 种排列只产出 1 种结果**",
+          len(outcomes) == 1, outcomes)
+
+
+def test_dedup_prefers_richer_record():
+    """同一题多份时保留**信息更全**的(有作者 > 没作者)。
+
+    ⚠️ 注意这里构造的差异是**归一后 key 相同**的(只差首尾空白), 所以
+    它在 ① exact 层就被合并 —— 那正是我们想要的: 首尾空白是排版噪音,
+    不该让同一道题进到模糊层去靠相似度猜。
+    """
+    print("\n[H1-E] 保留信息更全的那份")
+    from tools.curated_dedup import dedup
+    poor = RawCuratedPuzzle(external_id="poor", source="S",
+                            surface="同一道题的题面", bottom="B")
+    rich = RawCuratedPuzzle(external_id="rich", source="T",
+                            surface="同一道题的题面 ", bottom="B",
+                            question_author="某人")
+    check("首尾空白不算不同题(归一后同 key)",
+          poor.dedup_key() == rich.dedup_key())
+    kept, dupes, st = dedup([poor, rich])
+    check("合并成 1 条", len(kept) == 1, len(kept))
+    check("计入 exact_removed", st["exact_removed"] == 1, st)
+    check("**保留的是有作者的那份**", kept[0].external_id == "rich",
+          kept[0].external_id)
+    # 乱序也要选同一条
+    kept2, _d2, _s2 = dedup([rich, poor])
+    check("乱序仍选同一条", kept2[0].external_id == "rich",
+          kept2[0].external_id)
+
+
+def test_dedup_cross_source_report():
+    print("\n[H1-E] 来源分布统计")
+    from tools.curated_dedup import cross_source_report
+    recs = [RawCuratedPuzzle(external_id="1", source="A"),
+            RawCuratedPuzzle(external_id="2", source="A"),
+            RawCuratedPuzzle(external_id="3", source="B")]
+    check("按 source 计数",
+          cross_source_report(recs) == {"A": 2, "B": 1},
+          cross_source_report(recs))
+
+
+def test_build_corpus_end_to_end():
+    """H1-E 收口: 合并两个来源 + 去重 + 许可门 -> curated_raw。
+
+    全部在临时目录里用**假来源文件**跑, 不联网、不碰 data_external/。
+    """
+    print("\n[H1-E] build_curated_corpus 端到端")
+    from tools import build_curated_corpus as BC
+    d = tempfile.mkdtemp()
+    try:
+        # 造两个来源: 一个 TurtleBench 风格, 一个 SE 风格, 且**跨来源重复**
+        tb_dir = os.path.join(d, "turtlebench", "normalized")
+        se_dir = os.path.join(d, "puzzling_se", "normalized")
+        os.makedirs(tb_dir, exist_ok=True)
+        os.makedirs(se_dir, exist_ok=True)
+
+        tb = [RawCuratedPuzzle(
+            external_id="turtlebench:aaa", source="TurtleBench1.5k",
+            source_kind="dataset", surface="他每天看锅确认记号",
+            bottom="锅里的状态是记号", language="zh",
+            question_license="Apache-2.0", answer_license="Apache-2.0",
+            question_license_inference="api",
+            answer_license_inference="api")]
+        # SE 里同题(文字略改) + 一道不同的题 + 一道许可不可用的
+        se = [
+            RawCuratedPuzzle(
+                external_id="pse:q:1", source="Puzzling Stack Exchange",
+                source_kind="stackexchange", surface="他每天看锅确认记号 ",
+                bottom="锅里的状态是记号", language="en",
+                question_license="CC BY-SA 4.0",
+                answer_license="CC BY-SA 4.0",
+                question_license_inference="api",
+                answer_license_inference="api"),
+            RawCuratedPuzzle(
+                external_id="pse:q:2", source="Puzzling Stack Exchange",
+                source_kind="stackexchange", surface="完全不一样的沙漠靶场白旗",
+                bottom="白旗是测风参照物", language="en",
+                question_license="CC BY-SA 3.0",
+                answer_license="CC BY-SA 4.0",
+                question_license_inference="api",
+                answer_license_inference="api"),
+            RawCuratedPuzzle(
+                external_id="pse:q:3", source="Puzzling Stack Exchange",
+                source_kind="stackexchange", surface="许可不可用的题",
+                bottom="x", language="en",
+                question_license="CC BY-NC 9.9",
+                answer_license="CC BY-NC 9.9",
+                question_license_inference="unrecognized",
+                answer_license_inference="unrecognized"),
+        ]
+        write_jsonl_deterministic(os.path.join(tb_dir, "turtlebench.jsonl"), tb)
+        write_jsonl_deterministic(os.path.join(se_dir, "puzzling_se.jsonl"), se)
+
+        rc = BC.main(["--root", d, "--log-level", "ERROR"])
+        check("退出码 0", rc == 0, rc)
+
+        out = os.path.join(d, "normalized", "curated_raw.jsonl")
+        rows = [json.loads(l) for l in open(out, encoding="utf-8") if l.strip()]
+        ids = sorted(r["external_id"] for r in rows)
+        check("**许可不可用的被拦下(q:3 不在)**",
+              "pse:q:3" not in ids, ids)
+        check("许可不可用的进了 license_rejected",
+              os.path.exists(os.path.join(d, "normalized",
+                                          "license_rejected.jsonl")))
+        check("跨来源同题被合并(只剩 2 条)", len(rows) == 2, ids)
+        # 全局排序(H1-D 要求合并后仍是确定的)
+        check("**合并后全局有序**",
+              ids == sorted(ids), ids)
+        # 重复候选被写出(不删)
+        dup_p = os.path.join(d, "normalized", "duplicate_candidates.jsonl")
+        check("重复候选文件存在", os.path.exists(dup_p))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_build_corpus_is_deterministic():
+    """同一份输入跑两次 -> curated_raw 字节相同。"""
+    print("\n[H1-E] build_curated_corpus 确定性")
+    from tools import build_curated_corpus as BC
+    outputs = []
+    for run in range(2):
+        d = tempfile.mkdtemp()
+        try:
+            for sub, items in (
+                ("turtlebench", [
+                    RawCuratedPuzzle(external_id=f"tb{i}", source="TurtleBench1.5k",
+                                     surface=f"题面{i}", bottom=f"谜底{i}",
+                                     question_license="Apache-2.0",
+                                     answer_license="Apache-2.0",
+                                     question_license_inference="api",
+                                     answer_license_inference="api")
+                    for i in range(3)]),
+                ("puzzling_se", [
+                    RawCuratedPuzzle(external_id=f"se{i}",
+                                     source="Puzzling Stack Exchange",
+                                     surface=f"另一题面{i}", bottom=f"另一谜底{i}",
+                                     question_license="CC BY-SA 4.0",
+                                     answer_license="CC BY-SA 4.0",
+                                     question_license_inference="api",
+                                     answer_license_inference="api")
+                    for i in range(3)]),
+            ):
+                p = os.path.join(d, sub, "normalized",
+                                 f"{sub}.jsonl")
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                write_jsonl_deterministic(p, items)
+            BC.main(["--root", d, "--log-level", "ERROR"])
+            with open(os.path.join(d, "normalized", "curated_raw.jsonl"),
+                      "rb") as f:
+                outputs.append(f.read())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    check("**两次运行字节相同**", outputs[0] == outputs[1])
+    check("确实有内容", len(outputs[0]) > 0)
+
+
+def test_build_corpus_refuses_empty():
+    """没有来源文件 -> 报错退出, **不写空文件**。"""
+    print("\n[H1-E] 空输入 -> 报错而非静默空产出")
+    from tools import build_curated_corpus as BC
+    d = tempfile.mkdtemp()
+    try:
+        rc = BC.main(["--root", d, "--log-level", "ERROR"])
+        check("退出码非 0", rc != 0, rc)
+        check("**没有产出 curated_raw**",
+              not os.path.exists(os.path.join(d, "normalized",
+                                              "curated_raw.jsonl")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ======================================================================
 # 7. SE 记录构造
 # ======================================================================
 def test_se_skips_questions_without_accepted_answer():
@@ -654,6 +892,15 @@ def main():
         test_exact_dedup_key,
         test_turtlebench_dedup_collapses_to_unique_stories,
         test_turtlebench_external_id_is_content_stable,
+        # ---- H1-E 去重 ----
+        test_dedup_exact_collapses_identical,
+        test_dedup_near_marks_but_never_deletes,
+        test_dedup_is_order_independent,
+        test_dedup_prefers_richer_record,
+        test_dedup_cross_source_report,
+        test_build_corpus_end_to_end,
+        test_build_corpus_is_deterministic,
+        test_build_corpus_refuses_empty,
         # ---- 安全 ----
         test_safety_screen,
         test_turtlebench_safety_paths,
