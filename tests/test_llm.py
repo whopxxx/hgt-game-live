@@ -13,6 +13,7 @@ from story.llm import (  # noqa: E402
     RIDDLE_PROMPT_VERSION, LLMResult, PuzzleWriter,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
+from story.puzzle import FairClue  # noqa: E402
 
 FAIL = [0]
 
@@ -57,6 +58,7 @@ class FakeClient:
                  temperature=None, timeout=None, max_retries=None):
         self.calls.append({"system": system, "user": user, "tool": tool,
                            "temperature": temperature,
+                           "max_tokens": max_tokens,
                            "timeout": timeout, "max_retries": max_retries})
         name = (tool or {}).get("name")
         if name == "emit_truth_audit":
@@ -621,26 +623,46 @@ def test_reviewer_no_fix_falls_back_to_regen():
 
 
 def test_riddle_check_retries_empty_tool_use():
-    print("[出题: 质检拿到空 tool_input 要重出]")
-    # 网关抖动的表现: tool_use 块存在但 input 为空。
-    # 这**不算通过**, 应该重出一稿 —— 否则质检形同虚设。
-    P2 = "二稿谜面, 另一个具体事件。为什么?"
+    """**G2-F**: 审稿拿到空 tool_input(网关抖动) -> **重试同一稿**, 不换稿。
+
+    这不是"这题不好", 是**这次调用没成功**。旧实现把它记成"第 1 稿要求
+    重出", 于是丢掉一份可能完全合格的稿子去重新生成一道新题 ——
+    一次网关抖动变成整整一轮生成成本。
+
+    修好之后: generator call 仍然只有 **1** 次(emit_riddle 出现一次),
+    审稿被重试(emit_review 两次), 第二次成功。
+
+    ⚠️ 重试时 `max_tokens` 抬高一档(3500 -> 4500): 截断的成因就是预算
+    不够。
+    """
+    print("[出题: 质检空 tool_input -> 重试同一稿(G2-F)]")
+    P1 = _GOOD_PUZ
     fc = FakeClient([
         LLMResult(tool_input=riddle()),
-        # 审稿: 空 tool_input(抖动) -> 视为未通过
+        # 第 1 次审稿: 空 tool_input(抖动) -> 技术失败
         LLMResult(tool_input={}, text="I'll analyze this puzzle"),
-        # 第二稿
-        LLMResult(tool_input=riddle(puzzle=P2)),
-        LLMResult(tool_input=review_ok(P2)),
+        # 第 2 次审稿(**同一稿**): 正常通过
+        LLMResult(tool_input=review_ok(P1)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
-    check("空 tool_input 不算通过, 重出后成功",
-          r.puzzle is not None and "二稿" in r.puzzle, r)
-    check("共 4 次调用(生成/质检/生成/质检)", len(gen_calls(fc)) == 4, len(gen_calls(fc)))
+    check("重试后成功出题", r.puzzle is not None and P1[:6] in r.puzzle, r)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 只调了 1 次(没有换稿)**",
+          names.count("emit_riddle") == 1, names)
+    check("**审稿调了 2 次(重试同一稿)**",
+          names.count("emit_review") == 2, names)
+    check("前三次是 出题/审稿/审稿(之后才 truth audit)",
+          names[:3] == ["emit_riddle", "emit_review", "emit_review"], names)
     check("第 2 次调用确实是审稿",
           fc.calls[1]["tool"]["name"] == "emit_review",
           fc.calls[1]["tool"]["name"])
+    # 重试那一发的 max_tokens 必须被抬高 —— 截断的成因就是预算不够,
+    # 用同一个预算重试等于把同一个错误再犯一次。
+    check("**重试抬高了 max_tokens(3500 -> 4500)**",
+          fc.calls[2]["max_tokens"] == 4500, fc.calls[2]["max_tokens"])
+    check("首次审稿仍是 3500(不动基线)",
+          fc.calls[1]["max_tokens"] == 3500, fc.calls[1]["max_tokens"])
 
 
 def test_first_person_story_rejected():
@@ -2814,8 +2836,14 @@ def test_truth3_attributed_belief_passes():
 
 
 def test_truth4_audit_technical_failure_rejects():
-    """**Truth-4**: audit 空返回 / malformed -> 拒稿, **不能假绿**。"""
-    print("\n[Q1-Truth-4] audit 技术失败 -> 拒稿")
+    """**Truth-4 + G2-F**: audit 空返回 / malformed -> 拒稿, **不能假绿**。
+
+    G2-F 之后多了一层重试: 技术失败会**在同一个 candidate 上**再试一次。
+    所以夹具里必须放**两条**坏 audit —— 只放一条的话第二次会落到
+    `FakeClient` 的"自动通过"兜底上, 于是这条用例会变成"测夹具"。
+    (`test_g2f_audit_retry_same_candidate` 单独验重试本身。)
+    """
+    print("\n[Q1-Truth-4] audit 技术失败 -> 重试一次仍失败 -> 拒稿")
     def _bad_audit(ti):
         """给这一条打上 audit 标记(否则 FakeClient 会当它是给别的工具的)。"""
         d = dict(ti or {})
@@ -2836,11 +2864,16 @@ def test_truth4_audit_technical_failure_rejects():
             LLMResult(tool_input=riddle(), model="m"),
             LLMResult(tool_input=review_ok()),
             bad,
+            # G2-F: 重试那一发也是坏的 -> 两次都技术失败才收手
+            _bad_audit(dict(bad.tool_input or {})),
         ])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         spec = w.gen_spec(blueprint=fc.default_blueprint,
                           max_attempts=1, budget_s=5)
         check(f"{label}: **拒稿(fail closed)**", not spec.puzzle, spec.puzzle)
+        check(f"{label}: **generator 只跑了 1 稿(不换稿)**",
+              [c["tool"]["name"] for c in fc.calls].count("emit_riddle") == 1,
+              [c["tool"]["name"] for c in fc.calls])
 
     # "超时"这条要单独走: error 而不是 tool_input。
     # ⚠️ `error` 型的结果**没法带标记**, 所以让它排在队首 —— 队列里第
@@ -3381,6 +3414,344 @@ def test_g1_budget_and_attempts_are_honored():
           not (spec.metrics or {}).get("interrupted"), spec.metrics)
 
 
+# ======================================================================
+# G2 —— 可修问题不再整题重造
+# ======================================================================
+def _qip(quote, puzzle):
+    """`quote_in_puzzle` 的短别名(测试里用得多)。"""
+    from story.puzzle import quote_in_puzzle
+    return quote_in_puzzle(quote, puzzle)
+
+
+def _v5_fixture():
+    """一份**当前政策**下结构合格的 spec, 供 `validate_spec` 直测用。
+
+    与 `riddle()`(出题返回的 dict)不同 —— 这是已经解析好的
+    `PuzzleSpec` 对象, 用来单独验校验层的行为, 不经过 LLM。
+    """
+    from story.puzzle import (PuzzleFact, PuzzleSpec, PuzzleSignature,
+                              SolveAtom, FairClue, DiscoveryBeat)
+    from story.quality import QUALITY_POLICY_VERSION
+    return PuzzleSpec(
+        title="灯塔",
+        puzzle=_GOOD_PUZ,
+        answer="退潮时礁石露出, 亮灯是标礁石位置。",
+        core_answer="他亮灯是为了标出退潮时露出的礁石。",
+        completion_fact_ids=["f1", "f2"],
+        hints=["a", "b", "c"],
+        facts=[
+            PuzzleFact(id="f1", text="退潮时礁石露出水面", kind="core",
+                       visibility="hidden"),
+            PuzzleFact(id="f2", text="灯的真正作用是标示礁石位置",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f3", text="涨潮后亮灯会误导船只", kind="support",
+                       visibility="public"),
+            PuzzleFact(id="f4", text="不是为了纪念死者", kind="exclusion",
+                       visibility="public"),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="cause", text="退潮使礁石需要标出",
+                      fact_ids=["f1"], required=True),
+            SolveAtom(id="a2", role="mechanism", text="灯是标礁石不是引路",
+                      fact_ids=["f2", "f3"], required=True),
+        ],
+        fair_clues=[FairClue(quote="只在退潮的那几个小时亮灯",
+                             supports_atoms=["a1"])],
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text="先注意到灯只在退潮时亮",
+                          fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text="再想到灯是在标礁石, 不是引路",
+                          fact_ids=["f2"]),
+        ],
+        signature=PuzzleSignature(
+            mechanism_family="hidden_function",
+            solution_shape="hidden_function_explains_behavior",
+            domain="maritime", relation="stranger",
+            emotion_mode="neutral", time_shape="instant",
+            reveal_mode="meaning_flip"),
+        quality_policy_version=QUALITY_POLICY_VERSION,
+    )
+
+
+def _fix_tool(**kw):
+    """造一条 `emit_hint_fix` 的返回。"""
+    return LLMResult(tool_input={"hints": kw.get("hints") or
+                                 ["往时间上想。", "注意顺序。", "想想地点。"]})
+
+
+def test_g2a_core_answer_81_is_repaired_not_regenerated():
+    """**G2-A 最关键 regression**: core_answer=81 只花 **1** 次生成。
+
+    实播日志里 `core_answer 81 字` 反复出现, 每次都丢掉整道题重新出稿。
+    但 80 字是**最终**门, 而"这句话太长"是 reviewer 一句话能改好的事。
+
+    断言的是**请求计数**, 不是"最终过了": 修好之后 generator 只跑 1 稿。
+    """
+    print("\n[G2-A] core_answer=81 -> 修当前稿, generator 只跑 1 次")
+    P = _GOOD_PUZ
+    long_core = "他" * 81
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(core_answer=long_core), model="m"),
+        # 审稿: fix —— 只压缩 core_answer, 其余原样
+        LLMResult(tool_input=review_fix(P, core_answer="一句话核心答案。"),
+                  model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 只跑了 1 稿**",
+          names.count("emit_riddle") == 1, names)
+    check("最终 core_answer <= 80",
+          len(spec.core_answer or "") <= 80, spec.core_answer)
+    check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
+
+
+def test_g2a_core_answer_121_is_hard_fail():
+    """`> 120` 才算真的写偏了(一段话而不是一句话) -> 换稿。"""
+    print("\n[G2-A2] core_answer=121 -> 硬失败换稿")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(core_answer="他" * 121), model="m"),
+        LLMResult(tool_input=riddle(puzzle="二稿谜面, 另一个事件。为什么?"),
+                  model="m"),
+        LLMResult(tool_input=review_ok("二稿谜面, 另一个事件。为什么?"),
+                  model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=3)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**第一稿没进审稿就换了**",
+          names[:1] == ["emit_riddle"] and names.count("emit_riddle") == 2,
+          names)
+    check("采用了第二稿", "二稿" in (spec.puzzle or ""), spec.puzzle[:30])
+
+
+def test_g2b_clue_quote_repaired_in_place():
+    """**G2-B**: quote 不在谜面 -> 就地改 quote, **不换稿**。"""
+    print("\n[G2-B] clue quote 不在谜面 -> 就地修")
+    P = _GOOD_PUZ
+    bad_clues = [{"quote": "这句话谜面里根本没有", "supports_atoms": ["a1"]}]
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(fair_clues=bad_clues), model="m"),
+        # 审稿: fix —— 从当前谜面重新逐字摘
+        LLMResult(tool_input=review_fix(P), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 只跑了 1 稿**",
+          names.count("emit_riddle") == 1, names)
+    check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
+    check("最终 quote 真的在谜面里",
+          all(_qip(c.quote, spec.puzzle)
+              for c in (spec.fair_clues or [])),
+          [c.quote for c in (spec.fair_clues or [])])
+
+
+def test_g2b_reviewer_must_not_change_puzzle_for_quote():
+    """**G2-B 禁令**: 修 quote 时**不得**改谜面去迁就它。
+
+    这里断言的是**反馈措辞**真的把两条禁令写进去了 —— 模型看到什么
+    决定它怎么做, 而"改谜面"是一条看起来最省事的路。
+    """
+    print("\n[G2-B2] 反馈写明两条禁令")
+    from story.quality import validate_spec
+    s = _v5_fixture()
+    s.fair_clues = [FairClue(quote="谜面里没有的句子", supports_atoms=["a1"])]
+    vr = validate_spec(s)
+    check("进 fixable", bool(vr.fixable), vr.fixable)
+    joined = " ".join(vr.fixable)
+    check("**写明不得改动谜面**", "不得改动谜面" in joined, joined)
+    check("**写明不得编造句子**", "编造" in joined, joined)
+
+
+def test_g2c_linkage_is_fixable_but_missing_content_is_not():
+    """**G2-C**: 区分"metadata 没连好" 与 "内容不存在"。
+
+    前者 reviewer 接一根线就能修; 后者是内容缺失, reviewer 改不出来
+    (它不能凭空造一条事实, 那等于替生成器写题)。
+    """
+    print("\n[G2-C] 连线缺失可修 / 内容缺失硬拒")
+    from story.quality import validate_spec
+    # (a) 事实在、atom 也在, 只是没连上 -> fixable
+    s = _v5_fixture()
+    s.solve_atoms[1].fact_ids = ["f3"]          # f2 失去引用
+    vr = validate_spec(s)
+    check("**连线缺失 -> ok 且 fixable**", vr.ok and bool(vr.fixable),
+          (vr.ok, vr.fixable))
+    check("反馈说明是连线问题",
+          any("连线" in e or "引用" in e for e in vr.fixable), vr.fixable)
+    # (b) fact 根本不存在 -> 硬拒
+    s2 = _v5_fixture()
+    s2.completion_fact_ids = ["f1", "f404"]
+    vr2 = validate_spec(s2)
+    check("**内容缺失 -> 硬拒**", not vr2.ok, vr2.why())
+    check("理由点了'不存在'",
+          any("不存在" in e for e in vr2.errors), vr2.errors)
+
+
+def test_g2d_hint_too_long_gets_narrow_repair():
+    """**G2-D**: 只剩 hints 太长 -> 一次**只改 hints** 的窄修复。
+
+    为此丢掉整道题(连同已经通过的 facts/atoms/clues/beats)是最亏的
+    一笔账 —— 那是"重新生成一整道题再赌一次"的成本。
+    """
+    print("\n[G2-D] hints 超长 -> 窄修复, 不换稿")
+    P = _GOOD_PUZ
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(hints=["x" * 31, "b", "c"]), model="m"),
+        # 审稿: pass, 但 hints 仍然超长 -> 触发窄修复
+        LLMResult(tool_input=review_ok(P, hints=["x" * 31, "b", "c"]),
+                  model="m"),
+        _fix_tool(hints=["往时间上想。", "注意顺序。", "想想地点。"]),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 只跑了 1 稿**",
+          names.count("emit_riddle") == 1, names)
+    check("**调了一次 emit_hint_fix**",
+          names.count("emit_hint_fix") == 1, names)
+    check("最终三条提示都 <= 30 字",
+          all(len(h) <= 30 for h in (spec.hints or [])), spec.hints)
+    check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
+
+
+def test_g2d_narrow_repair_refuses_when_other_issues_remain():
+    """**G2-D 边界**: fixable 里混着**别的**问题 -> 窄修复**不动手**。
+
+    否则它会掩盖"审稿人没干完活"这件事 —— 补了 hints 让校验通过,
+    而 core_answer 还是超长的那一稿就这么溜进直播了。
+    """
+    print("\n[G2-D2] 混着别的问题 -> 不窄修复")
+    P = _GOOD_PUZ
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(hints=["x" * 31, "b", "c"]), model="m"),
+        # 审稿 pass 但 hints 仍超长 —— 而且 core_answer 也超长
+        LLMResult(tool_input=review_ok(P, hints=["x" * 31, "b", "c"],
+                                       core_answer="他" * 100), model="m"),
+        # 第二稿(应该走到这里)
+        LLMResult(tool_input=riddle(puzzle="二稿谜面, 另一个事件。为什么?"),
+                  model="m"),
+        LLMResult(tool_input=review_ok("二稿谜面, 另一个事件。为什么?"),
+                  model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=3)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**没有调 emit_hint_fix(问题不止 hints)**",
+          names.count("emit_hint_fix") == 0, names)
+    check("走了换稿路径", names.count("emit_riddle") == 2, names)
+
+
+def test_g2e_kind_visibility_swap_is_normalized():
+    """**G2-E**: kind/visibility 明显填反 -> 原地换回来。
+
+    实播日志 `fact fN kind 非法: public` —— `public` 显然是 **visibility**
+    值。只有两个字段**互相**都是对方的合法取值时才能安全交换; 其它非法
+    取值一律交 Reviewer, 代码不猜。
+    """
+    print("\n[G2-E] kind/visibility 填反 -> 原地交换")
+    from story.quality import validate_spec
+    # ⚠️ 用**非 completion** 的 fact 来试: f1/f2 是通关要求, 它们必须
+    # 是 hidden —— 拿它们做交换会撞上另一条(正确的)规则, 测的就不是
+    # G2-E 了。f3 是 support/public, 交换它不触发任何别的门。
+    s = _v5_fixture()
+    s.facts[2].kind = "public"        # 填反了
+    s.facts[2].visibility = "support"  # 填反了
+    vr = validate_spec(s)
+    check("**交换后通过(不再报 kind 非法)**", vr.ok, vr.why())
+    check("**字段真的被换回来了**",
+          s.facts[2].kind == "support" and s.facts[2].visibility == "public",
+          (s.facts[2].kind, s.facts[2].visibility))
+    # 非互换情形的非法值 -> 仍然硬拒(不猜)
+    s2 = _v5_fixture()
+    s2.facts[2].kind = "weird"
+    vr2 = validate_spec(s2)
+    check("**拼错的 kind 仍硬拒(代码不猜)**", not vr2.ok, vr2.why())
+    # 只有一半像 -> 也不能猜(一个合法一个不合法 = 不是"填反")
+    s3 = _v5_fixture()
+    s3.facts[2].kind = "public"
+    s3.facts[2].visibility = "public"   # 两个都是 visibility 值
+    vr3 = validate_spec(s3)
+    check("**两个都是 visibility 值 -> 不交换, 硬拒**", not vr3.ok, vr3.why())
+
+
+def test_g2f_reviewer_technical_failure_retries_same_candidate():
+    """**G2-F**（本批最高价值 regression 之一）: 审稿技术失败 ->
+    重试**同一稿**, generator 调用数**不增加**。
+
+    实播: `Reviewer 输出触顶 max_tokens=3500, 工具调用没写完` 被记成
+    "第 1 稿要求重出" —— 丢掉一份可能完全合格的稿子去重新生成一道新题。
+    """
+    print("\n[G2-F1] 审稿技术失败 -> 同稿重试, generator 不增加")
+    P = _GOOD_PUZ
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(), model="m"),
+        # 第 1 次审稿: 输出触顶(空 tool_input + error)
+        LLMResult(tool_input={},
+                  error="输出触顶(max_tokens=3500, 实出 3499), "
+                        "工具调用没写完; 需要调大 max_tokens",
+                  model="m"),
+        # 重试: **同一稿** -> 通过
+        LLMResult(tool_input=review_ok(P), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 仍只有 1 次**",
+          names.count("emit_riddle") == 1, names)
+    check("审稿 2 次(第 2 次是重试)", names.count("emit_review") == 2, names)
+    check("重试抬高 max_tokens",
+          fc.calls[2]["max_tokens"] == 4500, fc.calls[2]["max_tokens"])
+    check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
+
+
+def test_g2f_audit_technical_failure_retries_same_candidate():
+    """**G2-F**: truth audit 技术失败同样重试同一稿, 不换题。"""
+    print("\n[G2-F2] audit 技术失败 -> 同稿重试")
+    P = _GOOD_PUZ
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(), model="m"),
+        LLMResult(tool_input=review_ok(P), model="m"),
+        # audit 第 1 次: malformed
+        LLMResult(tool_input={"__truth_audit__": True,
+                              "narrator_truthful": "yes"}, model="m"),
+        # audit 第 2 次(同一稿): 通过
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 仍只有 1 次**",
+          names.count("emit_riddle") == 1, names)
+    check("**audit 调了 2 次**",
+          names.count("emit_truth_audit") == 2, names)
+    check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
+
+
+def test_g2f_no_draft_requests_are_capped():
+    """**G2-F**: no-draft 的**请求数**上限(不能只靠 90 秒 budget)。
+
+    "没出稿"不计 candidate attempt 是对的(它没形成有效稿子), 但它
+    消耗了真实 HTTP 请求 —— 只靠 budget 兜底, 90 秒里十几次白打。
+    """
+    print("\n[G2-F3] no-draft 请求数上限")
+    no_draft = LLMResult(tool_input={}, text="I'll create a fresh riddle...")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),          # 出稿
+        LLMResult(tool_input=review_rewrite()),  # 打回
+        no_draft, no_draft, no_draft, no_draft, no_draft, no_draft,
+        no_draft, no_draft,
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=4,
+                      max_no_draft_retries=2)
+    drafts = [c["tool"]["name"] for c in fc.calls].count("emit_riddle")
+    check("**no-draft 到上限就收手(不是打满 8 轮 guard)**",
+          drafts <= 4, drafts)
+    check("确实没出题", not spec.puzzle, spec.puzzle[:20])
+
+
 def main():
     for t in (test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
@@ -3506,6 +3877,18 @@ def main():
               test_truth4b_conflicts_nonempty_forces_reject,
               test_truth5_v6_pool_quarantined_but_v7_eligible,
               # ---- Q2: quality-v8 题目允许复杂, 通关仍然简单 ----
+              # ---- G2: 可修问题不再整题重造 ----
+              test_g2a_core_answer_81_is_repaired_not_regenerated,
+              test_g2a_core_answer_121_is_hard_fail,
+              test_g2b_clue_quote_repaired_in_place,
+              test_g2b_reviewer_must_not_change_puzzle_for_quote,
+              test_g2c_linkage_is_fixable_but_missing_content_is_not,
+              test_g2d_hint_too_long_gets_narrow_repair,
+              test_g2d_narrow_repair_refuses_when_other_issues_remain,
+              test_g2e_kind_visibility_swap_is_normalized,
+              test_g2f_reviewer_technical_failure_retries_same_candidate,
+              test_g2f_audit_technical_failure_retries_same_candidate,
+              test_g2f_no_draft_requests_are_capped,
               test_q2_discovery_beats_schema_and_prompts,
               test_q2_v7_pool_quarantined_but_v8_eligible,
               test_q2_reviewer_all_four_new_fields_required,

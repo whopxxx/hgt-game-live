@@ -192,20 +192,53 @@ def test_v5_completion_must_exist_and_be_referenced():
     print("\n[v5-5] 合同 id 必须存在, 且被 atom 引用")
     vr = validate_spec(v5_spec(completion_fact_ids=["f1", "f999"]))
     check("不存在的 id -> 拒", not vr.ok, vr.why())
-    # 没有任何 atom 引用 f2
+    # ---- G2-C: "atom 没连上" 是 fixable, 不是硬失败 ----
+    #
+    # 早先这两条都归 `errors`(硬拒 -> 整稿重出)。但"事实在、atom 也在、
+    # 只是 fact_ids 漏标了一个 id"是**连线**问题 —— reviewer 接一根线
+    # 就能修好, 重出整题是浪费, 而且实播里这种稿子反复出现。
+    #
+    # 注意上面那条(**引用不存在的 fact**)仍然是硬失败: 那是内容缺失,
+    # reviewer 改不出来(它不能凭空造一条事实)。
     s = v5_spec()
     s.solve_atoms[1].fact_ids = ["f3"]
     vr2 = validate_spec(s)
-    check("没有推理抓手 -> 拒", not vr2.ok, vr2.why())
-    check("理由点了抓手", "抓手" in vr2.why(), vr2.why())
+    check("**atom 没连上 -> 不再硬拒**", vr2.ok, vr2.why())
+    check("**而是进 fixable**", bool(vr2.fixable), vr2.fixable)
+    check("理由点了抓手/fact 引用",
+          any(("抓手" in e) or ("引用" in e) for e in vr2.fixable),
+          vr2.fixable)
+    # 反向: 内容真的缺 -> 仍然硬拒(不能把两类混起来)
+    s3 = v5_spec(completion_fact_ids=["f1", "f404"])
+    vr3 = validate_spec(s3)
+    check("**引用了不存在的 fact 仍是硬拒**", not vr3.ok, vr3.why())
+    check("理由点了'不存在'",
+          any("不存在" in e for e in vr3.errors), vr3.errors)
 
 
 def test_v5_core_answer_bounds():
     print("\n[v5-6] core_answer 非空 / 限长 / 不换行")
     vr = validate_spec(v5_spec(core_answer=""))
     check("空 core_answer -> 拒", not vr.ok, vr.why())
+    # ---- G2-A: 81~120 字是**可修**的, 不是整稿重出 ----
+    #
+    # 实播日志里 `core_answer 81 字` / `97 字` 反复出现, 每次都丢掉整道
+    # 题并重新出稿。但 80 字是**最终**门, 而"这句话太长"是 reviewer
+    # 一句话就能改好的事 —— 故事/facts/atoms/clues 全部照旧成立。
     vr2 = validate_spec(v5_spec(core_answer="长" * 81))
-    check("超 80 字 -> 拒", not vr2.ok, vr2.why())
+    check("**81 字 -> 不再硬拒**", vr2.ok, vr2.why())
+    check("**81 字进 fixable**", bool(vr2.fixable), vr2.fixable)
+    check("反馈点名只压缩 core_answer",
+          any("只压缩" in e and "core_answer" in e for e in vr2.fixable),
+          vr2.fixable)
+    # 边界: 恰好 80 字通过, 一个字都不多
+    vr80 = validate_spec(v5_spec(core_answer="长" * 80))
+    check("恰好 80 字 -> 过(最终门不放宽)", vr80.ok and not vr80.fixable,
+          (vr80.ok, vr80.fixable))
+    # > 120 字才是真的写偏了
+    vr121 = validate_spec(v5_spec(core_answer="长" * 121))
+    check("**121 字 -> 硬拒(一段话而不是一句话)**", not vr121.ok,
+          vr121.why())
     vr3 = validate_spec(v5_spec(core_answer="第一行\n第二行"))
     check("换行 -> 拒", not vr3.ok, vr3.why())
     vr4 = validate_spec(v5_spec(core_answer="恰好一句话的核心答案。"))
@@ -305,12 +338,29 @@ def test_missing_required_mechanism_rejected():
 
 def test_fair_clue_quote_must_be_in_puzzle():
     print("[validate_spec: fair_clue 的 quote 必须真在谜面里]")
+    # ---- G2-B: quote 不在谜面 -> **可修**, 不是整稿重出 ----
+    #
+    # 这是"摘录"问题, 不是故事问题: 推理关系是对的, 只是引用的那句话
+    # 没有逐字对上谜面。交给 reviewer 从**当前谜面**重新摘 —— 两条禁令
+    # 写死在反馈里: 不得改谜面迁就 quote, 不得编造谜面没有的句子。
     s = good_spec()
     s.fair_clues = [FairClue(quote="这句话谜面里根本没有出现过",
                              supports_atoms=["a1"])]
     r = validate_spec(s)
-    check("被拒", not r.ok, r.errors)
-    check("指出 quote 不在谜面", any("不在谜面" in e for e in r.errors), r.errors)
+    check("**不再硬拒**", r.ok, r.errors)
+    check("**进 fixable**", bool(r.fixable), r.fixable)
+    check("指出 quote 不在谜面",
+          any("不在谜面" in e for e in r.fixable), r.fixable)
+    check("**写明不得改谜面迁就 quote**",
+          any("不得改动谜面" in e for e in r.fixable), r.fixable)
+    check("**写明不得编造句子**",
+          any("编造" in e for e in r.fixable), r.fixable)
+    # 缺 quote 同样可修(而不是硬拒)
+    s3 = good_spec()
+    s3.fair_clues = [FairClue(quote="", supports_atoms=["a1"])]
+    r3 = validate_spec(s3)
+    check("空 quote -> fixable 而非硬拒", r3.ok and bool(r3.fixable),
+          (r3.ok, r3.fixable))
     # 轻度归一: 标点/空白/全角差异不算不同
     s2 = good_spec()
     s2.fair_clues = [FairClue(quote="只在退潮的那几个小时亮", supports_atoms=["a1"])]
@@ -356,11 +406,17 @@ def test_hints_must_be_three_and_short():
     s = good_spec()
     s.hints = ["a", "b"]
     check("2 条被拒", not validate_spec(s).ok)
+    # ---- G2-D: 只是"太长"不该丢掉整道题 ----
+    # 最终门(<=30 字)不变, 但处置改成 fixable —— 这是改写一句话的事,
+    # 而且 gen_spec 在"其余都过了、只剩 hints"时还会走一次窄修复。
     s2 = good_spec()
     s2.hints = ["a", "b", "x" * 31]
     r = validate_spec(s2)
-    check("超长被拒", not r.ok, r.errors)
-    check("指出超长", any("30 字" in e for e in r.errors), r.errors)
+    check("**超长不再硬拒**", r.ok, r.errors)
+    check("**进 fixable**", bool(r.fixable), r.fixable)
+    check("指出超长", any("30 字" in e for e in r.fixable), r.fixable)
+    check("**写明只改 hints**",
+          any("只" in e and "缩短" in e for e in r.fixable), r.fixable)
 
 
 def test_puzzle_format_checks():

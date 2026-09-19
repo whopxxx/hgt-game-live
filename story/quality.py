@@ -18,6 +18,7 @@ reviewer 没有完整全局状态, 让它管"最近连续几题"只会得到幻�
 
 from __future__ import annotations
 
+import logging
 import random
 from collections import Counter
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ from .puzzle import (
     PuzzleBlueprint, PuzzleSignature, PuzzleSpec, has_closing_question,
     has_meta_text, is_first_person, quote_in_puzzle,
 )
+
+log = logging.getLogger(__name__)
 
 #: 每次改配额规则都要动这里, 并写进 archive —— 下一轮直播才能比较版本。
 #:
@@ -130,6 +133,44 @@ class ValidationResult:
         """转成给审稿人的"已知问题"文本。"""
         return "; ".join(self.fixable)
 
+    def puzzle_touching_fix(self) -> list:
+        """**必须改动谜面**才能修好的 fixable 问题(人称/问句/meta)。
+
+        为什么要把这一类单独分出来: 审稿人的 `fix` 分支要求"给出改后的
+        谜面" —— 那是它证明自己**真的改过东西**的方式, 对"谜面是第一
+        人称"这类毛病完全正确。
+
+        但大多数 fixable 问题**根本不在谜面上**: 压缩 core_answer、
+        从谜面重新摘一个 quote、缩短 hint、补一根 atom 连线。对着这些
+        要求"交一个新谜面"是荒谬的, 于是旧代码把每一次"只压缩
+        core_answer"都判成 `审稿未给出改稿` -> rewrite -> **整题重出**。
+
+        ## 判据是"白名单"而不是"黑名单"
+
+        这里**只列必须动谜面的那几条**, 而不是去给其它每一条打
+        "不涉及谜面"的标记。理由: 将来新增一条 fixable 规则时, 忘了
+        打标记的后果是"它被当成需要动谜面"(保守, 最多多要一次改稿);
+        反过来若用"不涉及"标记, 忘了标的后果是"它被当成不需要动谜面"
+        (放任一次真的没改). 保守的那个方向才是对的。
+
+        标记写在那三条 `can_fix()` 的文案里(`_PUZZLE_TOUCH_MARK`)。
+        """
+        return [f for f in self.fixable if _PUZZLE_TOUCH_MARK in f]
+
+    def only_puzzle_free_fixes(self) -> bool:
+        """这次修复是否**完全**不需要动谜面(且确实有要修的东西)。"""
+        return bool(self.fixable) and not self.puzzle_touching_fix()
+
+
+#: 标在"**必须改动谜面**"的修复文案里的记号。
+#: 见 `ValidationResult.puzzle_touching_fix` —— 这是白名单, 不是黑名单。
+#:
+#: 为什么用文本标记而不是另加一个字段: `fixable` 的**消费方**只有一处
+#: (转成审稿人的 must_fix 文本), 多一个平行字段就得两处各写一遍判据,
+#: 而它们迟早会漂移 —— 那正是 L1 里 `_candidate_block_reason_locked`
+#: 的同一个教训。
+_PUZZLE_TOUCH_MARK = "[需改谜面]"
+
 
 # ======================================================================
 # 1. spec 结构校验(方案 §21)
@@ -138,6 +179,20 @@ class ValidationResult:
 #: 为什么要有硬上限: "一句话核心答案"如果写成两三百字, 观众听不出重点,
 #: 而揭晓是**确定性**地念它(不再经 LLM 加工) —— 长答案会直接拖垮体验。
 CORE_ANSWER_MAX_LEN = 80
+#: ---- G2-A: core_answer 的**可修**上限 ----
+#:
+#: 80 字是最终硬门, **不放宽**。但 81~120 字不是"故事坏了", 它是
+#: "这句话太长, 压缩一下" —— 一个 reviewer 一句话就能改好的问题。
+#:
+#: 实播日志里反复出现 `core_answer 81 字` / `core_answer 97 字`, 每一次
+#: 都丢掉**整道题**并重新出稿(再花 1 次生成 + 1 次审稿 + 1 次 audit)。
+#: 那不是质量政策在起作用, 那是把"改一句话"的活干成了"重造一遍"。
+#:
+#: 所以分档:
+#:     <= 80      通过
+#:     81 ~ 120   fixable —— 交给 reviewer **只压缩 core_answer**
+#:     > 120      这是真的写偏了(一段话而不是一句话), 硬失败
+CORE_ANSWER_FIXABLE_MAX_LEN = 120
 #: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
 #:
 #: ⚠️ 它**不是**整道题的复杂度上限。v8 起这一点由 `discovery_beats`
@@ -170,11 +225,14 @@ def validate_spec(spec: PuzzleSpec,
     # 整题重出会把一道好题丢掉(实测: 只差一个人称)。
     if spec.puzzle:
         if not has_closing_question(spec.puzzle):
-            r.can_fix("谜面结尾不是问句, 末尾补一句'为什么?'")
+            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面结尾不是问句, "
+                      f"末尾补一句'为什么?'")
         if is_first_person(spec.puzzle):
-            r.can_fix("谜面是第一人称叙事, 改成第三人称客观事实")
+            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面是第一人称叙事, "
+                      f"改成第三人称客观事实")
         if has_meta_text(spec.puzzle):
-            r.can_fix("谜面混进了【谜底】/【提示】之类的元文本, 删掉它们")
+            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面混进了【谜底】/【提示】"
+                      f"之类的元文本, 删掉它们")
 
     # ---- facts ----
     facts = spec.facts or []
@@ -188,7 +246,23 @@ def validate_spec(spec: PuzzleSpec,
         if not f.text:
             r.fail(f"fact {f.id} 文本为空")
         if f.kind not in FACT_KINDS:
-            r.fail(f"fact {f.id} kind 非法: {f.kind}")
+            # ---- G2-E: kind/visibility 明显互换 -> **原地换回来** ----
+            #
+            # 实播日志里反复出现 `fact fN kind 非法: public`。而 `public`
+            # 显然是一个 **visibility** 值 —— 模型把两个字段填反了。
+            #
+            # 这是**唯一**一种代码可以安全自作主张的情况: 只有当
+            #     kind 是合法 visibility **且** visibility 是合法 kind
+            # 时, 交换两个字段是无歧义的(两个值都各得其所)。其它任何
+            # 非法取值(拼错、枚举外的词、空字符串)一律**交 Reviewer 修**,
+            # 代码不猜 —— 猜错会把一条事实的性质悄悄改掉。
+            if (f.kind in FACT_VISIBILITY
+                    and f.visibility in FACT_KINDS):
+                log.info("fact %s 的 kind/visibility 填反了(%r/%r), "
+                         "原地交换", f.id, f.kind, f.visibility)
+                f.kind, f.visibility = f.visibility, f.kind
+            else:
+                r.fail(f"fact {f.id} kind 非法: {f.kind}")
         if f.visibility not in FACT_VISIBILITY:
             r.fail(f"fact {f.id} visibility 非法: {f.visibility}")
 
@@ -276,9 +350,26 @@ def validate_spec(spec: PuzzleSpec,
         if not ca:
             r.fail("有通关合同但 core_answer 为空(谜底必须能一句话说清)")
         else:
-            if len(ca) > CORE_ANSWER_MAX_LEN:
+            # ---- G2-A: 分档处置, 最终门不放宽 ----
+            # <= 80 通过; 81~120 交给 reviewer **只压缩这句话**;
+            # > 120 才是真的写偏了(一段话而不是一句话)。
+            #
+            # 为什么 81 字不该丢掉整道题: 实播日志里它反复出现, 每次
+            # 代价是"重新出稿 + 再审稿 + 再 audit"。而它要改的东西只是
+            # 一句话的长度 —— 故事、facts、atoms、clues 全部照旧成立。
+            if len(ca) > CORE_ANSWER_FIXABLE_MAX_LEN:
                 r.fail(f"core_answer 有 {len(ca)} 字, 超过 "
-                       f"{CORE_ANSWER_MAX_LEN} 字上限(要一句话, 不要一段话)")
+                       f"{CORE_ANSWER_FIXABLE_MAX_LEN} 字(这已经是一段话, "
+                       f"不是一句话了 —— 请重新提炼核心答案)")
+            elif len(ca) > CORE_ANSWER_MAX_LEN:
+                # 明确告诉 reviewer 该干什么, 以及**不该**干什么 ——
+                # 它有权改的只有这一句话。
+                r.can_fix(
+                    f"core_answer 有 {len(ca)} 字, 超过 {CORE_ANSWER_MAX_LEN} "
+                    f"字上限: **只压缩 core_answer 本身**到 "
+                    f"{CORE_ANSWER_MAX_LEN} 字以内, 保持同一含义; "
+                    f"不要改动谜面/谜底/facts/completion_fact_ids/"
+                    f"discovery_beats。")
             if "\n" in spec.core_answer or "\r" in spec.core_answer:
                 r.fail("core_answer 不能换行(揭晓时会原样念给观众)")
         # (b) 条数 1~2: **不放宽成 4、5 条**。
@@ -319,12 +410,40 @@ def validate_spec(spec: PuzzleSpec,
                        f"(public 的谜面已经告诉了观众)")
         # (d) 公平性: 每条 completion fact 必须被某条 atom 引用 ——
         #     否则它就是一个"完全没有题面抓手"的通关条件, 观众无从推。
+        #
+        # ---- G2-C: 区分"内容不存在" 与 "metadata 没连好" ----
+        # 这两种情况的处置完全不同:
+        #
+        #   completion fact **在 facts 里不存在** -> 硬失败。
+        #       不是连线问题, 是内容缺失 —— reviewer 改不出来(它不能
+        #       凭空造一条事实, 那等于替生成器写题)。
+        #
+        #   fact 存在, 只是**没有 atom 引用它** -> fixable。
+        #       这是一个**连线**问题: 事实在、atom 也在, 只是 `fact_ids`
+        #       漏标了。reviewer 完全有能力把它接上, 而重出整题是浪费。
+        #
+        # ⚠️ 上面 (b) 已经对"引用了不存在的 fact"报过 fail, 所以走到
+        #    这里 orphan 里的 id 一定都真实存在 —— 但**不能依赖那个
+        #    顺序假设**: 这里显式再查一次 `seen_f`, 免得将来有人调整
+        #    校验顺序就把这条静默变成"必定 fixable"。
         if comp and atoms:
             atom_facts = {fid for a in atoms for fid in (a.fact_ids or [])}
             orphan = [fid for fid in comp if fid not in atom_facts]
-            if orphan:
-                r.fail("completion fact 没有任何 solve_atom 引用它"
-                       "(观众没有推理抓手): " + ", ".join(orphan))
+            missing = [fid for fid in orphan if fid not in seen_f]
+            linkable = [fid for fid in orphan if fid in seen_f]
+            if missing:
+                r.fail("completion fact 引用了不存在的 fact(内容缺失, "
+                       "不是连线问题): " + ", ".join(missing))
+            if linkable:
+                r.can_fix(
+                    "completion fact 没有被任何 solve_atom 引用(事实与 "
+                    "atom 都在, 只是连线漏了): " + ", ".join(linkable)
+                    + " —— 请在现有 atom 的 fact_ids 里补上它, 或在确实"
+                      "缺少对应 atom 时补一条 **引用已有 fact** 的 atom。"
+                      "**不得**为了通过结构检查而编造推理关系。")
+        elif comp and not atoms:
+            # 有合同却一条 atom 都没有: reviewer 无从"连线", 这是真缺内容。
+            r.fail("有通关合同但没有 solve_atom(观众没有推理抓手)")
 
     # ---- core hidden facts 上限 ----
     n_core = len(spec.core_hidden_facts())
@@ -332,15 +451,36 @@ def validate_spec(spec: PuzzleSpec,
         r.fail(f"core hidden facts 有 {n_core} 条, 超过 {max_core_hidden}")
 
     # ---- fair_clues: 必须真的在谜面里 ----
+    #
+    # ---- G2-B: quote 不在谜面 -> **可修**, 不是整稿重出 ----
+    #
+    # 实播日志里 `fair_clue quote 不在谜面` 反复出现, 每次丢掉整道题。
+    # 但这是**摘录**问题, 不是故事问题: 推理关系是对的, 只是引用的
+    # 那句话没有逐字对上谜面(多一个字、少一个标点、或者模型顺手
+    # 改写了一下)。
+    #
+    # 交给 reviewer: **从当前谜面重新逐字摘取**。两条禁令必须写死在
+    # 反馈里, 否则它会走捷径:
+    #
+    #     ✗ 改谜面去迁就这个 quote  —— 那是让题面服务于校验
+    #     ✗ 编一个谜面里根本没有的 quote —— 那等于伪造线索
+    #
+    # 修完必须**再过一次**这个确定性校验(gen_spec 的 ④ 已经这么做了);
+    # 仍然不在谜面里, 才 reject candidate。
     clues = spec.fair_clues or []
     if not clues:
         r.fail("没有 fair_clue(谜面里必须有可回溯的线索)")
     for c in clues:
         if not c.quote:
-            r.fail("fair_clue 缺 quote")
+            r.can_fix(
+                "fair_clue 缺 quote: 请从当前谜面里**逐字**摘一段作为 "
+                "quote —— 不得改动谜面, 也不得编造谜面里没有的句子。")
             continue
         if spec.puzzle and not quote_in_puzzle(c.quote, spec.puzzle):
-            r.fail(f"fair_clue 的 quote 不在谜面里: {c.quote[:30]}")
+            r.can_fix(
+                f"fair_clue 的 quote 不在谜面里({c.quote[:30]}): 请从**当前"
+                f"谜面**重新逐字摘取一段。不得改动谜面去迁就这个 quote, "
+                f"也不得编造谜面里没有的句子。")
         for aid in (c.supports_atoms or []):
             if aid not in seen_a:
                 r.fail(f"fair_clue 引用了不存在的 atom: {aid}")
@@ -378,6 +518,10 @@ def validate_spec(spec: PuzzleSpec,
     # ⚠️ 位置: 必须在 `clues` 绑定**之后**。早先它被放在合同校验块里
     # (那一段在 fair_clues 之前), 于是任何有合同的 spec 走到这里都会
     # UnboundLocalError —— 一个只在"校验真的跑到底"时才暴露的错。
+    #
+    # ---- G2-C: 同上, 区分"没有公平线索" 与 "线索没连到通关路径" ----
+    # 两者都是 fixable 的候选, 但**反馈措辞**必须不同 —— reviewer 拿到
+    # 的指令决定了它是"去接一根线"还是"承认这题缺线索, 请求重写"。
     if has_contract and atoms and clues:
         completion_ids = set(spec.completion_fact_ids)
         completion_atom_ids = {
@@ -387,18 +531,31 @@ def validate_spec(spec: PuzzleSpec,
             aid for c in clues for aid in (c.supports_atoms or [])}
         if completion_atom_ids and clued_atom_ids:
             if not (completion_atom_ids & clued_atom_ids):
-                r.fail("没有任何 fair_clue 指向通关事实的推理路径"
-                       "(线索指不到 completion, 题目不公平)"
-                       f" [completion atoms={sorted(completion_atom_ids)}"
-                       f", clued={sorted(clued_atom_ids)}]")
+                r.can_fix(
+                    "没有任何 fair_clue 指向通关事实的推理路径"
+                    "(线索指不到 completion, 题目不公平)"
+                    f" [completion atoms={sorted(completion_atom_ids)}"
+                    f", clued={sorted(clued_atom_ids)}] —— 请把这些 clue 的 "
+                    f"supports_atoms 接到通关路径上的 atom; 如果谜面里"
+                    f"**根本没有**能通向通关事实的公平线索, 那是内容缺失, "
+                    f"请把 decision 设为 rewrite 而不是硬接一根不存在的线。")
 
     # ---- hints ----
+    # ---- G2-D: 只是"太长"不该丢掉整道题 ----
+    # 30 字上限继续保留(最终门不变)。但一条提示超长是**改写一句话**
+    # 的事 —— 优先让当前 Reviewer 的 fix bundle 顺手缩短; 若它其余部分
+    # 已经 PASS、只剩 hints 不合格, gen_spec 会走一次**只修 hints** 的
+    # 窄修复(见 `_repair_hints`)。那一步明确禁止改
+    # puzzle / answer / core_answer / facts / completion / atoms / beats。
     hints = spec.hints or []
     if len(hints) != 3:
         r.fail(f"hints 应为 3 条, 实为 {len(hints)}")
     for i, h in enumerate(hints):
         if len(h or "") > max_hint_len:
-            r.fail(f"第 {i + 1} 条提示超过 {max_hint_len} 字")
+            r.can_fix(f"第 {i + 1} 条提示超过 {max_hint_len} 字"
+                      f"({len(h)} 字): 请**只**把它缩短到 {max_hint_len} 字"
+                      f"以内并保持提示意图, 不要改动谜面/谜底/核心答案/"
+                      f"facts/completion_fact_ids/discovery_beats。")
 
     # ---- quality-v8: discovery_beats ----
     #

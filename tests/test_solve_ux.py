@@ -575,13 +575,13 @@ def test_case_i_narrator_truthfulness_fail_closed():
             narrator_truthful=v), model="m")])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         spec = PuzzleSpec(puzzle="x?", answer="y")
-        merged, why, rewrite = w._review_spec(spec)
+        merged, why, rewrite, _tech = w._review_spec(spec)
         check(f"narrator_truthful={v!r} -> 整稿拒", merged is None, merged)
         check(f"  且判为淘汰({v!r})", rewrite is True, rewrite)
     # 全部为 true 时正常通过
     fc = FakeClient([LLMResult(tool_input=_pass_review(), model="m")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    merged, why, rewrite = w._review_spec(PuzzleSpec(
+    merged, why, rewrite, _tech = w._review_spec(PuzzleSpec(
         puzzle="门外站着一个女人, 开门的人一见她就愣住了。为什么?",
         answer="门外女人是父亲的亲生女儿。"))
     check("四项全 true -> 通过", merged is not None, why)
@@ -592,7 +592,7 @@ def test_case_j_mechanism_consistency_fail_closed():
     fc = FakeClient([LLMResult(tool_input=_pass_review(
         mechanism_consistent=False), model="m")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    merged, why, rewrite = w._review_spec(PuzzleSpec(puzzle="x?", answer="y"))
+    merged, why, rewrite, _tech = w._review_spec(PuzzleSpec(puzzle="x?", answer="y"))
     check("mechanism_consistent=false -> 整稿拒", merged is None, merged)
     check("判为淘汰", rewrite is True, rewrite)
     check("理由点名了这一项", "mechanism_consistent" in (why or ""), why)
@@ -601,7 +601,7 @@ def test_case_j_mechanism_consistency_fail_closed():
         "decision": "pass",
         "observed_signature": _pass_review()["observed_signature"]}, model="m")])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
-    merged2, why2, _ = w2._review_spec(PuzzleSpec(puzzle="x?", answer="y"))
+    merged2, why2, _, _tech = w2._review_spec(PuzzleSpec(puzzle="x?", answer="y"))
     check("quality_checks 整个缺失 -> 拒", merged2 is None, merged2)
 
 
@@ -855,9 +855,22 @@ def test_closeout_b4_clue_must_reach_completion():
     bad.fair_clues = [FairClue(quote="开门的人一见她就愣住了",
                                supports_atoms=["a2"])]   # 指不到 f1
     vr = validate_spec(bad)
-    check("clue 指不到 completion -> 拒", not vr.ok, vr.why())
+    # ---- G2-C: "线索指不到通关路径"归 **fixable**, 不是硬拒 ----
+    #
+    # 事实在、atom 在、clue 也在, 只是 clue 的 supports_atoms 指错了
+    # 分支 —— 这是**连线**问题, reviewer 接一根线就能修好。硬拒等于
+    # 为一根线丢掉整道题。
+    #
+    # ⚠️ 但它**必须仍然不合格**(`fixable` 非空), 否则这一稿会带着
+    # "线索指不到通关事实"直接上直播。
+    check("**clue 指不到 completion -> 仍需修(fixable)**",
+          bool(vr.fixable), (vr.ok, vr.fixable))
+    check("**不再是硬错误**", vr.ok, vr.why())
     check("理由点名了推理路径",
-          "推理路径" in vr.why() or "不公平" in vr.why(), vr.why())
+          any("推理路径" in f or "不公平" in f for f in vr.fixable),
+          vr.fixable)
+    check("**写明谜面真没线索时要 rewrite 而不是硬接**",
+          any("rewrite" in f for f in vr.fixable), vr.fixable)
     # 正例: clue 指向 a1(它引用 f1)。
     # ⚠️ a2 必须仍然引用合同成员 f2 —— 否则"每条 completion fact 都要被
     # atom 引用"那条规则会先开火, 测的就不是 clue 路径了。
@@ -963,7 +976,7 @@ def test_closeout_p1_legacy_reviewer_unchanged():
     legacy = ident_spec()
     legacy.quality_policy_version = "quality-v4"
     legacy.completion_fact_ids = []
-    merged, why, rewrite = w._review_spec(legacy)
+    merged, why, rewrite, _tech = w._review_spec(legacy)
     check("legacy: 没改就沿用 -> 不因缺 bundle 被拒",
           not (merged is None and "同步合同" in (why or "")), (merged, why))
 
@@ -973,7 +986,7 @@ def test_closeout_p1_legacy_reviewer_unchanged():
     # "Reviewer 没回 beats" 被拒 —— 那时沿用(空)是正确的兼容行为。
     # 判据必须是**政策版本**(与 `is_v5_review` 同口径), 不是"有没有
     # 这个 key"。
-    merged2, why2, _ = w._review_spec(legacy)
+    merged2, why2, _, _tech = w._review_spec(legacy)
     check("**legacy: 漏回 beats -> 仍放行(旧政策没这个概念)**",
           not (merged2 is None and "discovery_beats" in (why2 or "")),
           (merged2, why2))
@@ -1094,21 +1107,21 @@ def test_final_closeout_v5_empty_values_rejected():
     for field in ("puzzle", "answer", "core_answer"):
         t = _copy.deepcopy(base)
         t[field] = ""
-        merged, why, rewrite = run(t)
+        merged, why, rewrite, _t = run(t)
         check(f"{field}='' -> 拒", merged is None, (field, merged))
         check(f"  {field} 的拒绝理由点名空/无效",
               "为空/无效" in (why or ""), why)
         # 纯空白也算空
         t2 = _copy.deepcopy(base)
         t2[field] = "   "
-        merged2, why2, _ = run(t2)
+        merged2, why2, _, _t = run(t2)
         check(f"{field}='   ' -> 拒", merged2 is None, (field, merged2))
 
     # ---- 列表字段置空 ----
     for field in ("completion_fact_ids", "facts", "solve_atoms", "fair_clues"):
         t = _copy.deepcopy(base)
         t[field] = []
-        merged, why, rewrite = run(t)
+        merged, why, rewrite, _t = run(t)
         check(f"{field}=[] -> 拒", merged is None, (field, merged))
         check(f"  {field} 的拒绝理由点名空/无效",
               "为空/无效" in (why or ""), why)
@@ -1116,15 +1129,15 @@ def test_final_closeout_v5_empty_values_rejected():
     # ---- 类型错误也算无效 ----
     t3 = _copy.deepcopy(base)
     t3["facts"] = "不是列表"
-    merged3, why3, _ = run(t3)
+    merged3, why3, _, _t = run(t3)
     check("facts 类型错误 -> 拒", merged3 is None, merged3)
     t4 = _copy.deepcopy(base)
     t4["core_answer"] = 123
-    merged4, why4, _ = run(t4)
+    merged4, why4, _, _t = run(t4)
     check("core_answer 类型错误 -> 拒", merged4 is None, merged4)
 
     # ---- 正例: 完整非空 bundle 仍通过 ----
-    merged5, why5, _ = run(_copy.deepcopy(base))
+    merged5, why5, _, _t = run(_copy.deepcopy(base))
     check("完整非空 bundle -> 通过", merged5 is not None, (merged5, why5))
     if merged5 is not None:
         check("  用的是**新** facts(没被旧值覆盖)",
@@ -1158,7 +1171,7 @@ def test_final_closeout_legacy_fallback_still_works():
     }
     fc = FakeClient([LLMResult(tool_input=legacy_ti, model="m")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    merged, why, rewrite = w._review_spec(legacy)
+    merged, why, rewrite, _tech = w._review_spec(legacy)
     check("legacy 省略字段 -> 走 fallback, 不因空值被拒",
           not (merged is None and "为空/无效" in (why or "")), (merged, why))
     check("legacy 仍能返回 spec", merged is not None, why)

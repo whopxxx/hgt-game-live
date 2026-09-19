@@ -40,6 +40,7 @@ from .quality import (
     QUALITY_POLICY_VERSION, Quotas, ValidationResult, cross_puzzle_gate,
     ngrams, too_similar, validate_blueprint, validate_reveal_adherence,
     validate_spec,
+    _PUZZLE_TOUCH_MARK,
 )
 from .state import QAResult
 
@@ -872,6 +873,14 @@ class AnthropicMessagesClient:
 # ======================================================================
 RIDDLE_PROMPT_VERSION = "riddle-v8"
 CHECK_PROMPT_VERSION = "check-v8"
+#: ---- G2-F: 审稿技术失败重试时的 max_tokens ----
+#:
+#: 实播里审稿的输出触顶 3500 导致工具调用没写完。成因就是预算不够 ——
+#: 抬高一档重试**同一个 candidate**, 远比重新生成一道题便宜。
+#:
+#: ⚠️ 只用于**重试**, 不动首次调用的预算: 首次 3500 是长期基线, 整体
+#: 抬高会让每一稿都变慢(而且大部分稿子并不需要)。
+REVIEW_RETRY_MAX_TOKENS = 4500
 ANSWER_PROMPT_VERSION = "answer-v7"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
@@ -1220,6 +1229,30 @@ HINT_SYSTEM = """你在主持中文「海龟汤」推理直播。观众卡住了
     ✗ "因为退潮时礁石会露出来。"(把答案说出来了)
 - 与已给过的提示不同, 也不要把同一句话说第二遍。
 直接输出这一句提示。"""
+
+
+#: ---- G2-D: hints 的**窄修复**专用 system ----
+#:
+#: 与 `HINT_SYSTEM` 是两件事, 不要合并:
+#:
+#:     HINT_SYSTEM   生成一条**新的**方向性提示(要选方向、要防剧透)
+#:     HINT_FIX_SYSTEM 把**已有的**三条提示压缩到字数以内(不改方向)
+#:
+#: 后者是一个"改写"任务, 输入里已经有谜面/谜底只是**供理解语境** ——
+#: 明令不得改动, 因为这一步没有任何机制能重新验证它们。
+HINT_FIX_SYSTEM = """你在给中文「海龟汤」直播**压缩提示文案**。
+
+给你三条**已经写好的**提示, 它们的**方向是对的**, 只是超了 30 字上限。
+
+严格做到:
+- **保持每条提示的原意与方向**, 只压缩措辞。
+- 每条 **30 字以内**(这是硬上限, 超一个字都不合格)。
+- 三条都必须给出。
+- **不得**改成别的内容、不得加新方向、不得合并或拆分。
+- **不得**剧透谜底 —— 谜面/谜底只是给你理解语境的, **一个字都不要改**。
+- 输出中文。
+
+只输出这三条提示。"""
 
 
 REVEAL_SYSTEM = """你在主持中文「海龟汤」推理直播。本题结束, 向观众揭晓谜底。
@@ -1632,6 +1665,24 @@ _TOOL_HINT = {
             "hint": {"type": "string", "description": "一句话提示, 30 字以内, 不剧透谜底"},
         },
         "required": ["hint"],
+    },
+}
+
+#: ---- G2-D: hints 窄修复的强制工具 ----
+#: 三条一起给 —— 分开给会让"到底改了几条"变得不确定, 而校验要求恰好 3 条。
+_TOOL_HINT_FIX = {
+    "name": "emit_hint_fix",
+    "description": "把三条提示压缩到 30 字以内(保持原意与方向)",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "hints": {
+                "type": "array", "minItems": 3, "maxItems": 3,
+                "items": {"type": "string",
+                          "description": "一条提示, 30 字以内, 保持原意"},
+            },
+        },
+        "required": ["hints"],
     },
 }
 
@@ -2689,6 +2740,12 @@ class PuzzleWriter:
         # 共享的一份, 而 Q9 之后 live 与 prefetch 各有一个 writer。
         self._last_review_decision: str = ""
         self._last_review_issues: Optional[list] = None
+        #: G2-F: 本次审稿**实际发了几次**模型调用(含一次技术重试)。
+        #: `gen_spec` 的 metrics 记的是这个数, 不是"审了几稿" ——
+        #: 否则"一稿审两次(第二次才成功)"会被记成审了两稿。
+        self._last_review_call_count: int = 0
+        #: `_review_spec` 的 `technical` 出口(见 `_review_spec_with_retry`)。
+        self._last_review_technical: bool = False
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -2698,7 +2755,8 @@ class PuzzleWriter:
                  check: bool = True, max_attempts: int = 4,
                  budget_s: float = 90.0,
                  enforce_blueprint: Optional[bool] = None,
-                 should_continue: Optional[Callable[[], bool]] = None
+                 should_continue: Optional[Callable[[], bool]] = None,
+                 max_no_draft_retries: int = 2
                  ) -> PuzzleSpec:
         """出一个谜题, 返回**结构化 `PuzzleSpec`**(方案 §13)。
 
@@ -2756,6 +2814,10 @@ class PuzzleWriter:
         bad: list = []
         attempts = 0
         guard = 0
+        #: G2-F: 连续"没形成有效稿件"的次数。这类轮次**不计** candidate
+        #: attempt(它没形成稿子), 但确实烧了 HTTP 请求 —— 见下面的上限。
+        no_draft_count = 0
+        max_no_draft = max(0, int(max_no_draft_retries))
         # ---- 方案 §35 的过程指标 ----
         # 这些数字必须**按题**归档: 下一轮复盘要能直接算
         # "一题平均花几稿 / 审稿打回率 / 出题慢在哪一段",
@@ -2804,12 +2866,27 @@ class PuzzleWriter:
             # ---- G1 检查点 ①: 下一稿之前 ----
             if _stop():
                 break
+            # ---- G2-F: no-draft 也必须有**独立**上限 ----
+            #
+            # "没出稿"(模型回了 `I'll create a fresh riddle...` 这类独白
+            # 而不是工具调用)**不计** candidate attempt —— 这是对的, 它
+            # 没形成有效稿子。但它**消耗了一次真实 HTTP 请求**。
+            #
+            # 只靠 `budget_s` 兜底是不够的: 90 秒里如果一个都没成功, 那
+            # 就是十几次白打。所以另设一个请求数上限, 到顶就结束本轮。
+            if no_draft_count > max_no_draft:
+                log.warning("出题连续 %d 次没出稿(只烧请求不产稿), "
+                            "结束本轮", no_draft_count)
+                _remember(seen_why,
+                          f"连续 {no_draft_count} 次未形成有效稿件")
+                break
             reject_why = "\n".join(f"- {w}" for w in seen_why)
             spec = self._gen_spec_once(avoid, avoid_reason=reject_why,
                                        bad_puzzles=bad, blueprint=bp,
                                        enforce_blueprint=enforce_blueprint)
             if not spec.puzzle:
                 log.info("出题第 %d 轮没出稿(不计数): %s", guard, spec.error)
+                no_draft_count += 1
                 last = spec
                 if spec.error:
                     _remember(seen_why, spec.error)
@@ -2858,13 +2935,30 @@ class PuzzleWriter:
             if _stop():
                 break
             _tr = _t.monotonic()
-            reviewed, why, need_rewrite = self._review_spec(
-                spec, bp, must_fix=vr.must_fix())
+            reviewed, why, need_rewrite, technical = self._review_spec_with_retry(
+                spec, bp, must_fix=vr.must_fix(),
+                should_continue=should_continue,
+                own_fix_focus=list(vr.fixable))
             m["review_latency_ms_total"] += int((_t.monotonic() - _tr) * 1000)
-            m["review_calls"] += 1
+            m["review_calls"] += self._last_review_call_count
             m["review_decision"] = (self._last_review_decision or "").lower()
             if self._last_review_issues:
                 m["review_issues"] = list(self._last_review_issues)
+            if reviewed is None and technical:
+                # 技术失败已经在 `_review_spec_with_retry` 里重试过一次,
+                # 仍未成功 —— 收手时**必须**把这一稿判成"重试耗尽"而不是
+                # 语义拒绝。差别在于下一稿拿到的理由文案: "网关没返回"
+                # 不会告诉生成器任何关于题目的信息, 而"题目烂"会。
+                log.warning("出题第 %d 稿: 审稿连续技术失败, 本稿放弃: %s",
+                            attempts, why[:100])
+                m["review_technical_fail"] = m.get("review_technical_fail", 0) + 1
+                _remember(seen_why, "审稿调用技术失败(网关/截断): " + why[:100])
+                # ⚠️ **不** bad.append(spec.puzzle): 这一稿没有被评审过,
+                #    把它当成"已试过的题面"会让下一稿被迫换一个完全
+                #    不同的方向 —— 而上一稿可能根本没问题。
+                last = spec
+                last.error = f"审稿技术失败: {why}"
+                continue
             if reviewed is None:
                 # 审稿人说 rewrite(或没给出可用结果) -> 换骨架重出。
                 # **不修补** —— 这才是"结构性烂题"的出口(方案 §18)。
@@ -2882,6 +2976,21 @@ class PuzzleWriter:
             vr2 = validate_spec(spec)
             vb2 = (validate_blueprint(spec, bp) if enforce_blueprint
                    else ValidationResult())
+            # ---- G2-D: "只剩 hints 太长" -> 一次**窄修复** ----
+            # 审稿人其他都改好了, 只剩提示超长 —— 为这一条丢掉整道题
+            # (连同已经通过的 facts/atoms/clues/discovery_beats) 是最亏的
+            # 一笔账。这里单独再要一次**只改 hints** 的修复。
+            #
+            # 这一步严格禁止改 puzzle/answer/core_answer/facts/
+            # completion/atoms/beats —— 窄修复只能窄, 否则它就成了一个
+            # 绕过整条质量链的后门。
+            spec, repaired = self._repair_hints_if_only_issue(
+                spec, vr2, vb2, enforce_blueprint=enforce_blueprint, bp=bp)
+            if repaired:
+                m["hint_repairs"] = m.get("hint_repairs", 0) + 1
+                vr2 = validate_spec(spec)
+                vb2 = (validate_blueprint(spec, bp) if enforce_blueprint
+                       else ValidationResult())
             if not vr2.ok or not vb2.ok or vr2.fixable:
                 why2 = "; ".join(vr2.errors + vr2.fixable + vb2.errors)
                 log.info("出题第 %d 稿改稿后仍不合格: %s", attempts, why2[:120])
@@ -2927,14 +3036,30 @@ class PuzzleWriter:
             # ---- G1 检查点 ③: truth audit 之前 ----
             if _stop():
                 break
-            ta = self.audit_truthfulness(spec)
+            ta = self._audit_with_retry(spec, should_continue=should_continue)
             if ta is not None:
                 m["truth_audit_calls"] = m.get("truth_audit_calls", 0) + 1
+                if ta.get("technical"):
+                    m["truth_audit_technical"] = (
+                        m.get("truth_audit_technical", 0) + 1)
                 m["truth_audit_ok"] = bool(ta.get("narrator_truthful")
                                            and ta.get("mechanism_consistent"))
                 if not m["truth_audit_ok"]:
                     why = ta.get("why") or "叙事真实性审计不过"
                     m["truth_audit_issues"] = list(ta.get("conflicts") or [])
+                    if ta.get("technical"):
+                        # ---- G2-F: 技术失败**不是**"这题叙事有问题" ----
+                        # 已经在 `_audit_with_retry` 里重试过一次, 仍未成功。
+                        # 收手时**不**把这一稿的谜面加进 `bad` —— 它从来
+                        # 没有被真正审计过, 不该影响下一稿的方向。
+                        m["truth_audit_ok"] = False
+                        log.warning("出题第 %d 稿: truth audit 连续技术失败, "
+                                    "本稿放弃: %s", attempts, str(why)[:100])
+                        _remember(seen_why,
+                                  "叙事真实性审计技术失败(网关): " + str(why)[:100])
+                        last = spec
+                        last.error = "叙事真实性审计技术失败: " + str(why)[:120]
+                        continue
                     log.info("出题第 %d 稿 truth audit 不过: %s",
                              attempts, str(why)[:120])
                     _remember(seen_why, "叙事真实性: " + str(why)[:120])
@@ -3150,11 +3275,158 @@ class PuzzleWriter:
             usage=res.usage, model=res.model)
 
     # ------------------------------------------------------------------
+    def _repair_hints_if_only_issue(self, spec: PuzzleSpec,
+                                    vr: ValidationResult,
+                                    vb: ValidationResult,
+                                    enforce_blueprint: bool = False,
+                                    bp: Optional[PuzzleBlueprint] = None
+                                    ) -> tuple[PuzzleSpec, bool]:
+        """G2-D: **只**修 hints 的一次窄修复。返回 `(spec, 是否真的修了)`。
+
+        ## 触发条件(必须**全部**满足, 一条不满足就不动手)
+
+            1. `vr.ok`  —— 没有结构性错误(内容层面没问题)
+            2. `vb.ok`  —— blueprint 没被违反
+            3. `vr.fixable` **非空且全部**是 hint 相关的问题
+            4. `vr.fixable` 里**没有**其它类别(core_answer / quote /
+               linkage 都必须在审稿那一轮已经改好)
+
+        只满足前三条是不够的: 若 fixable 里还混着"quote 不在谜面",
+        那说明审稿人没干完活, 这时候替它补 hints 只会掩盖问题。
+
+        ## 为什么值得单独一次调用
+
+        实播日志: 一道题 facts/atoms/clues/beats 全部合格, 只因一条提示
+        32 字(上限 30)被丢掉, 然后重新生成一整道题 —— 那一整轮的成本
+        是这次窄修复的十几倍, 而结果还更差(新题可能连结构都不过)。
+
+        ## 这一步**只能**改 hints
+
+        返回的任何其它字段一律忽略 —— 包括 `puzzle` / `answer` /
+        `core_answer` / `facts` / `completion_fact_ids` / `solve_atoms` /
+        `fair_clues` / `discovery_beats`。理由很直接: 这些字段每一个都有
+        自己的验证门, 而这一步**不重新跑**那些门(跑不动 —— 比如改了
+        facts 就得重新审稿)。窄修复必须**窄**, 否则它就是一个绕过整条
+        质量链的后门。
+
+        任何异常/超时/返回不合法 -> 返回 `(spec, False)`, 让上层走原来
+        那条"改稿后仍不合格"的路。**绝不**因为修复失败而放宽标准。
+        """
+        if not vr.ok or not vb.ok or not vr.fixable:
+            return spec, False
+        # ③④: fixable 必须**全部**是 hint 相关 —— 混进别的就说明审稿
+        #     没干完活, 这时补 hints 是在掩盖问题。
+        if not all("提示" in f for f in vr.fixable):
+            return spec, False
+        try:
+            res = self.client.messages(
+                HINT_FIX_SYSTEM,
+                "【当前提示(必须全部重写为 <=30 字, 保持原意)】\n"
+                + "\n".join(f"{i + 1}. {h}" for i, h in enumerate(spec.hints or []))
+                + "\n\n【谜面(仅供理解语境, **不得改动**)】\n" + (spec.puzzle or "")
+                + "\n\n【谜底(仅供理解语境, **不得改动**)】\n" + (spec.answer or ""),
+                max_tokens=800, tool=_TOOL_HINT_FIX,
+                temperature=self._temperature("review_temperature"))
+            ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
+            hs = ti.get("hints")
+            if not isinstance(hs, list):
+                log.warning("hints 窄修复返回不合法, 放弃(按原样继续): %r",
+                            str(res.tool_input)[:120])
+                return spec, False
+            new_hints = [str(h).strip() for h in hs if str(h).strip()]
+            if len(new_hints) != 3:
+                log.warning("hints 窄修复没有给出 3 条(%d), 放弃",
+                            len(new_hints))
+                return spec, False
+            # 三条都必须真的缩短到上限内 —— 否则"修了"是假的。
+            if any(len(h) > 30 for h in new_hints):
+                log.warning("hints 窄修复后仍超 30 字, 放弃")
+                return spec, False
+            old = list(spec.hints or [])
+            spec.hints = new_hints
+            log.info("hints 窄修复: %s -> %s", old, new_hints)
+            return spec, True
+        except Exception:                       # noqa: BLE001
+            log.exception("hints 窄修复异常, 放弃(按原样继续)")
+            return spec, False
+
+    def _review_spec_with_retry(self, spec: PuzzleSpec,
+                                blueprint: Optional[PuzzleBlueprint] = None,
+                                must_fix: str = "",
+                                should_continue: Optional[Callable[[], bool]] = None,
+                                own_fix_focus: Optional[list] = None
+                                ) -> tuple[Optional[PuzzleSpec], str, bool, bool]:
+        """**同一个 candidate** 上重试技术失败, 返回 4-tuple。
+
+        ## 为什么要单独一层
+
+        实播真实发生(`Reviewer 输出触顶 max_tokens=3500, 工具调用没写完`):
+        审稿**根本没审成**, 而旧实现把它记成"第 1 稿要求重出" —— 于是丢掉
+        一份可能完全合格的稿子, 去重新生成一道新题。一次网关/预算问题
+        变成了整整一轮生成成本。
+
+        判据很清楚:
+
+            语义拒绝  -> 审稿读懂了, 说这题不行     -> 交回生成器换骨架
+            技术失败  -> 审稿没读完/没写完/没按 schema 交 -> **重试这一稿**
+
+        重试时把 `max_tokens` 抬高一档(3500 -> 4500): 截断的成因就是预算
+        不够, 而重试一次远比重新生成一道题便宜。**generator call count
+        不增加** —— 这是 G2 的关键验收指标。
+
+        ## 只重试一次
+
+        第二次仍然技术失败 -> 老实返回技术失败。继续重试下去会让一个
+        持续故障的网关把 `budget_s` 吃光, 而那一整轮什么也没产出。
+        收手时调用方(`gen_spec`)会把它记成 `review_technical_fail`
+        **而不是** rewrite, 并且**不**把这一稿的谜面加进 `bad` —— 它
+        没有被评审过, 不该影响下一稿的方向。
+
+        ## 让路
+
+        `should_continue` 为 False 时**不重试**: 重试也是一次几十秒的
+        调用, 直播已经忙起来了。
+
+        `_last_review_call_count` 记录**实际发出的调用次数**(1 或 2),
+        供 metrics 用 —— 否则"一稿审两次"会被记成审了两稿。
+        """
+        calls = 0
+        try:
+            out = self._review_spec(spec, blueprint, must_fix=must_fix,
+                                    own_fix_focus=own_fix_focus)
+            calls += 1
+            reviewed, why, need_rewrite, technical = out
+            if not technical:
+                return reviewed, why, need_rewrite, False
+            # ---- 技术失败: 先问要不要让路 ----
+            if should_continue is not None:
+                try:
+                    if not should_continue():
+                        log.info("审稿技术失败, 但直播已变忙 -> 不重试, 让路")
+                        self._last_review_technical = True
+                        return reviewed, why, need_rewrite, True
+                except Exception:               # noqa: BLE001
+                    log.exception("should_continue 抛异常, 不做技术重试")
+                    self._last_review_technical = True
+                    return reviewed, why, need_rewrite, True
+            log.warning("审稿技术失败(%s), 同一稿重试一次(抬 max_tokens)", why[:80])
+            out2 = self._review_spec(spec, blueprint, must_fix=must_fix,
+                                     max_tokens=REVIEW_RETRY_MAX_TOKENS,
+                                     own_fix_focus=own_fix_focus)
+            calls += 1
+            reviewed2, why2, rewrite2, technical2 = out2
+            if technical2:
+                log.warning("审稿第二次仍技术失败: %s", why2[:80])
+            return reviewed2, why2, rewrite2, technical2
+        finally:
+            self._last_review_call_count = calls
+
     def _review_spec(self, spec: PuzzleSpec,
                      blueprint: Optional[PuzzleBlueprint] = None,
-                     must_fix: str = ""
-                     ) -> tuple[Optional[PuzzleSpec], str, bool]:
-        """交给审稿人。返回 (新 spec 或 None, 说明, 是否要推倒重出)。
+                     must_fix: str = "", max_tokens: int = 3500,
+                     own_fix_focus: Optional[list] = None
+                     ) -> tuple[Optional[PuzzleSpec], str, bool, bool]:
+        """交给审稿人。返回 (新 spec 或 None, 说明, 是否重出, 是否技术失败)。
 
         审稿人是 **pass / fix / rewrite** 三选一(方案 §17/§18):
 
@@ -3168,6 +3440,22 @@ class PuzzleWriter:
           私人往事、违反 blueprint 等。不修补, 直接换骨架。
 
         第三个返回值是"要不要重出"。
+
+        ## G2-F: 第四个返回值 —— **技术失败** ≠ 语义拒绝
+
+        这是本批最容易被搞混的一对概念:
+
+            语义拒绝(semantic)  审稿**读懂了**, 判定这题不行 -> 换骨架重出
+            技术失败(technical) 审稿**根本没审成**(超时 / 空 tool_input /
+                               输出触顶被截断 / schema 坏了) -> **重试同一稿**
+
+        旧实现把两者合并成 `(None, why, True)`, 于是实播里
+        "Reviewer 输出触顶 max_tokens=3500、工具调用没写完"被记成
+        "第 1 稿要求重出" —— **丢掉一份可能完全合格的稿子**, 去重新生成
+        一道新题。那不是质量政策在起作用, 那是把网关抖动当成了题目问题。
+
+        `max_tokens` 可以调高一档重试: 截断的成因就是预算不够, 而重试
+        一次远比重新生成一道题便宜。
         """
         # ---- 侧信道清零(必须在**任何**返回之前) ----
         # `gen_spec` 会把这俩记进本题 metrics。若某条早退路径(空 tool_input /
@@ -3177,6 +3465,7 @@ class PuzzleWriter:
         # metrics 里的东西**一定**是本题的。
         self._last_review_decision = ""
         self._last_review_issues = None
+        self._last_review_technical = False
 
         bp = blueprint or spec.blueprint
         user = (f"【谜面】{spec.puzzle}\n"
@@ -3230,8 +3519,20 @@ class PuzzleWriter:
                 hard = "谜面结尾没有问句, 末尾补一句'为什么?'之类的提问"
         if hard:
             user += f"\n\n【已知问题, 必须改掉】{hard}"
+        elif own_fix_focus and not any(
+                _PUZZLE_TOUCH_MARK in f for f in own_fix_focus):
+            # ---- G2-A / G2-D: 告诉它**可以不动谜面** ----
+            # 只压缩 core_answer / 缩短 hint 时, 谜面没有任何理由改变。
+            # 不说这一句的话, 模型会为了"证明自己改过东西"而顺手重写
+            # 谜面 —— 那会连带让 facts/atoms/clues/beats 全部失配, 于是
+            # 一次"压缩一句话"变成一次整稿重造。
+            user += ("\n\n【本次修复**不需要改动谜面**】"
+                     "上面点名的问题与谜面无关。请**把 puzzle 原样回传**"
+                     "(可以省略该字段), 只修改被点名的那一项; "
+                     "**不要**顺手改写谜面, 否则 facts/atoms/clues/"
+                     "discovery_beats 会全部失配。")
 
-        res = self.client.messages(CHECK_SYSTEM, user, max_tokens=3500,
+        res = self.client.messages(CHECK_SYSTEM, user, max_tokens=max_tokens,
                                    tool=_TOOL_CHECK,
                                    temperature=self._temperature(
                                        "review_temperature"))
@@ -3248,9 +3549,12 @@ class PuzzleWriter:
                 # (下面 `fix` 分支会因为没有 puzzle 而走 rewrite, 这里
                 # 说清楚, 免得被当成 bug 反复"修"。)
                 if not ti.get("ok") and not ti.get("puzzle"):
-                    return None, str(ti.get("note", "") or "审稿未通过"), True
+                    return (None, str(ti.get("note", "") or "审稿未通过"),
+                            True, False)
             else:
-                return None, res.error or "审稿拿到空/无效 tool_input", True
+                self._last_review_technical = True
+                return (None, res.error or "审稿拿到空/无效 tool_input",
+                        True, True)
 
         decision = str(ti.get("decision", "")).strip().lower()
         note = str(ti.get("note", "") or "")
@@ -3264,17 +3568,31 @@ class PuzzleWriter:
         # ---- rewrite: 不修补, 交回生成器 ----
         if decision == "rewrite":
             reason = str(ti.get("rewrite_reason", "") or "").strip() or note
-            return None, reason or "审稿要求推倒重出", True
+            return None, reason or "审稿要求推倒重出", True, False
 
         if decision not in ("pass", "fix"):
-            return None, f"审稿返回未知 decision: {decision!r}", True
+            return None, f"审稿返回未知 decision: {decision!r}", True, False
 
         # ---- pass: 但代码点名要改的必须真的改了 ----
+        # ---- G2-A/B/D: 判定"这次修复要不要动谜面" ----
+        #
+        # `hard` 里是**全部** must_fix 文本 —— 包括那些与谜面无关的
+        # (压缩 core_answer / 重摘 quote / 缩短 hint)。所以"谜面没变"
+        # 只有在**确实有与谜面有关的毛病**时才算没干活。
+        #
+        # 判据是**白名单**: 只有人称/问句/meta 这三条真的需要改谜面
+        # (见 `_PUZZLE_TOUCH_MARK`)。将来新增 fixable 规则时忘了标,
+        # 后果只是"被当成需要动谜面"(保守), 而不是反过来放任一次没改。
+        _touching = [f for f in (own_fix_focus or [])
+                     if _PUZZLE_TOUCH_MARK in f]
+        _puzzle_irrelevant_fix = bool(own_fix_focus) and not _touching
+
         if decision == "pass":
-            if hard:
+            if hard and not _puzzle_irrelevant_fix:
                 new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
                 if not new_p or new_p == spec.puzzle:
-                    return None, f"审稿称 pass 但未处理已知问题: {hard}", True
+                    return (None, f"审稿称 pass 但未处理已知问题: {hard}",
+                            True, False)
             else:
                 new_p = spec.puzzle
             # P0-2: pass **也必须**吸收审稿人的 observed_signature。
@@ -3284,19 +3602,51 @@ class PuzzleWriter:
             # validate_blueprint 于是"验过了"。那是自己验自己。
             merged, err = self._apply_review(spec, ti, bp, new_p)
             if merged is None:
-                return None, err or "", True
-            return merged, note, False
+                # ⚠️ 回传 bundle 不完整 **不算技术失败**。
+                #
+                # 划界很关键: 技术失败是"这次调用根本没成功"(超时 / 空
+                # tool_input / 输出触顶)。而这里模型**成功回了一个
+                # decision=fix**, 只是 bundle 缺字段 —— 那是它没有遵守
+                # schema, 属于**语义层**的拒绝, 与 P0-1 冻结的契约一致
+                # (缺字段就整稿拒绝, 绝不沿用旧值拼出混合版本)。
+                #
+                # 把它当成技术失败去重试同一稿, 会得到同一个残缺 bundle
+                # —— 白烧一次调用, 还绕过了"不许沿用旧字段"那条硬规则。
+                return None, err or "审稿回传 bundle 不完整", True, False
+            return merged, note, False, False
 
         # ---- fix: 必须有改后的谜面 ----
-        new_p = _strip_puzzle_tail(str(ti.get("puzzle", "") or "").strip())
+        #
+        # ---- G2-A/文案类修复: 允许"谜面不变"的 fix ----
+        # 有些 fixable 问题**与谜面无关**: core_answer 太长、hint 超长。
+        # 这时要求审稿人"给出改后的谜面"是荒谬的 —— 它没有理由改谜面,
+        # 而旧代码因此把每一次"只压缩 core_answer"都判成
+        # `审稿未给出改稿`(-> rewrite -> 整题重出)。
+        #
+        # 判据必须**窄**: 只有当代码点名要改的问题**全部**与谜面无关时,
+        # 才允许 `puzzle` 原样回传。否则"改了谜面"这件事就没人保证了。
+        # `must_fix` 是代码**已经确定**的毛病(人称/问句/meta 等) ——
+        # 那些**必须**动谜面。所以这里判的是: 除了那些之外, 剩下的
+        # fixable 是否**全部**与谜面无关。
+        _touching = [f for f in (own_fix_focus or [])
+                     if _PUZZLE_TOUCH_MARK in f]
+        _puzzle_irrelevant_fix = bool(own_fix_focus) and not _touching
+        raw_p = str(ti.get("puzzle", "") or "").strip()
+        new_p = _strip_puzzle_tail(raw_p)
+        if not new_p and _puzzle_irrelevant_fix and not hard:
+            # 审稿人没给谜面 —— 这是允许的, 因为要改的东西不在谜面上。
+            new_p = spec.puzzle
         if not new_p or not _looks_chinese(new_p):
-            return None, note or "审稿未给出改稿", True
-        if hard and new_p == spec.puzzle:
-            return None, f"审稿未处理已知问题: {hard}", True
+            return None, note or "审稿未给出改稿", True, False
+        if hard and new_p == spec.puzzle and not _puzzle_irrelevant_fix:
+            # ⚠️ `hard` 里是**全部** must_fix 文本 —— 包括那些与谜面无关的
+            # (压缩 core_answer / 缩短 hint)。所以"谜面没变"只有在
+            # **确实有与谜面有关的毛病**时才算没干活。见 G2-A。
+            return None, f"审稿未处理已知问题: {hard}", True, False
         merged, err = self._apply_review(spec, ti, bp, new_p)
         if merged is None:
-            return None, err or "", True
-        return merged, note or "审稿已修改", False
+            return None, err or "审稿回传 bundle 不完整", True, False
+        return merged, note or "审稿已修改", False, False
 
     @staticmethod
     def _apply_review(spec: PuzzleSpec, ti: dict,
@@ -4366,10 +4716,65 @@ class PuzzleWriter:
 
     @staticmethod
     def _audit_failed(why: str) -> dict:
-        """审计技术失败 -> fail closed 的结果(不是 None)。"""
+        """审计技术失败 -> fail closed 的结果(不是 None)。
+
+        ## G2-F: 这里必须**明确标出**这是技术失败
+
+        与审稿同一个道理: `audit` 说"这题叙事不真实"和
+        `audit` **根本没跑成**(超时 / 返回不合法)是两件事:
+
+            真实的 conflicts         -> semantic reject -> 换稿
+            timeout / malformed      -> audit retry **同一稿**
+
+        旧实现两者都产出 `narrator_truthful=False`, 上层无从区分, 于是
+        一次网关抖动就丢掉一份可能完全合格的稿子。
+
+        `technical=True` 是给 `gen_spec` 看的**机器可读**标记 ——
+        `why` 文本是给人看的, 不要把控制流建在字符串匹配上。
+        """
         log.warning("truth audit 失败(%s), 按不过处理(fail closed)", why)
         return {"narrator_truthful": False, "mechanism_consistent": False,
-                "conflicts": [], "why": why}
+                "conflicts": [], "why": why, "technical": True}
+
+    def _audit_with_retry(self, spec: "PuzzleSpec",
+                          should_continue: Optional[Callable[[], bool]] = None
+                          ) -> Optional[dict]:
+        """**同一个 candidate** 上重试 truth audit 的技术失败。
+
+        与 `_review_spec_with_retry` 同一形状、同一理由:
+
+            audit 报了真实 conflicts  -> 语义拒绝, 交回生成器换稿
+            audit 超时/返回不合法      -> 技术失败, **重试这一稿**
+
+        旧实现把后者也当"审计不过", 于是重新生成一道题 —— 而那道题
+        完全没有问题, 是一次输出不合法而已。
+
+        ## 只重试一次, 且让路优先
+
+        持续故障的网关不会因为多试一次就好; 而 `budget_s` 是共享的,
+        无限重试会让一轮什么也产出不了。`should_continue` 为 False
+        时**不重试** —— 重试也是一次几十秒的调用。
+
+        返回最后一次的审计结果(可能仍是技术失败), 或 None(audit 没跑)。
+        """
+        ta = self.audit_truthfulness(spec)
+        if ta is None:
+            return None
+        if not ta.get("technical"):
+            return ta
+        # 技术失败 —— 先问要不要让路
+        if should_continue is not None:
+            try:
+                if not should_continue():
+                    log.info("truth audit 技术失败, 但直播已变忙 -> 不重试")
+                    return ta
+            except Exception:                   # noqa: BLE001
+                log.exception("should_continue 抛异常, 不做 audit 重试")
+                return ta
+        log.warning("truth audit 技术失败(%s), 同一稿重试一次",
+                    str(ta.get("why"))[:80])
+        ta2 = self.audit_truthfulness(spec)
+        return ta2 if ta2 is not None else ta
 
     @staticmethod
     def _clean_fact_ids(raw, spec: "PuzzleSpec") -> list:
