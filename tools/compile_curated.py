@@ -91,6 +91,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="只打印语料/账本统计, 不调 LLM")
     ap.add_argument("--show-samples", type=int, default=0,
                     help="打印 N 道 accepted 样本(验收人工看用)")
+    # ---- §十五/§十六: 确定性分层抽样 + 逐条报告 ----
+    ap.add_argument("--sample", type=int, default=0,
+                    help=("从待处理 candidate 里做**固定 seed 的确定性"
+                          "分层抽样**, 取 N 条(按内容哈希分桶, 覆盖全体"
+                          " id 空间, 不是字典序头部)"))
+    ap.add_argument("--report-json", default="",
+                    help=("把**逐条**结果写成 JSON(§十六: 全部 candidate "
+                          "的 external_id/surface/bottom/最终状态/拒因; "
+                          "accepted 另给 core_answer/style/compile_checks/"
+                          "review_checks)"))
     ap.add_argument("--no-llm", action="store_true",
                     help="不使用 LLM(只能干跑)")
     ap.add_argument("--log-level", default="INFO")
@@ -158,6 +168,7 @@ def _print_report(rep: dict, led: DecisionLedger) -> None:
     print(f"  账本累计(policy={CURATED_POLICY_VERSION}):")
     print(f"    accepted {st['accepted']} / rejected {st['rejected']} / "
           f"defer {st['technical_defer']} / interrupted {st['interrupted']}")
+    _print_source_quality(led)
     settle = led.settle_stats(CURATED_POLICY_VERSION)
     if settle["by_stage"]:
         print()
@@ -171,6 +182,55 @@ def _print_report(rep: dict, led: DecisionLedger) -> None:
                                 key=lambda kv: -kv[1]))[:12]:
             print(f"    {k:44s} {v}")
     print()
+
+
+def _print_source_quality(led: DecisionLedger) -> None:
+    """§十四: 把 source quality 拆成**几个不同的数字**。
+
+    ⚠️ 这一段的重点不是"多打几行", 而是**不再只报 accepted/processed**。
+    把网关抖动 / schema 错误 / hint 生成失败 / fair_clue 接线失败算成
+    "源质量差"是**统计错误** —— 一次网络抖动会让 yield 看起来掉一半,
+    而源本身没变。
+
+    真正的 source yield:
+
+        accepted / (accepted + content_rejected)
+
+    分母**不含** defer / interrupted。
+    """
+    q = led.source_quality(CURATED_POLICY_VERSION)
+    print()
+    print("  源质量拆分(§十四 —— 不要把技术失败算成源差):")
+    print(f"    processed        : {q['processed']}")
+    print(f"    accepted         : {q['accepted']}")
+    print(f"    content_rejected : {q['content_rejected']}"
+          f"   <- **真**内容不合格")
+    print(f"    technical_defer  : {q['technical_defer']}"
+          f"   (含 compile_invalid {q['compile_invalid']})")
+    print(f"    interrupted      : {q['interrupted']}")
+    y = q["source_yield"]
+    print(f"    **source yield** : "
+          + ("n/a(还没有内容判决)" if y is None else f"{y:.1%}")
+          + "  = accepted / (accepted + content_rejected)")
+    # ---- H4-D §十二: 信号分布(不是死因) ----
+    #
+    # ⚠️ 这一段的措辞很重要。信号**不拒题**, 所以这里回答的是
+    # "收进来的题有多少偏简单", 而不是"有多少题因为偏简单被拒"。
+    # 后者在 v5 里**恒为 0** —— 混着说会让人以为门还卡在那儿。
+    sig = led.signal_stats(CURATED_POLICY_VERSION)
+    if sig["accepted_with_signal"] or sig["accepted_clean"]:
+        print()
+        print("  信号分布(§十二 —— 信号**不拒题**, 只用于以后排序):")
+        print(f"    accepted 且无任何信号 : {sig['accepted_clean']}"
+              f"   (层次/反转都齐)")
+        for k, v in sorted(sig["accepted_with_signal"].items(),
+                           key=lambda kv: -kv[1]):
+            print(f"    accepted 带信号 {k:26s} {v}")
+        if sig["rejected_with_signal"]:
+            print("    rejected 也带信号(说明它不是死因):")
+            for k, v in sorted(sig["rejected_with_signal"].items(),
+                               key=lambda kv: -kv[1]):
+                print(f"      {k:28s} {v}")
 
 
 def _print_samples(pool_path: str, n: int) -> None:
@@ -254,7 +314,25 @@ def main(argv=None) -> int:
 
     if a.budget_seconds is not None:
         cfg.curated_budget_seconds = float(a.budget_seconds)
-    lc = build_lazy_curator(cfg, pool, writer, lambda: {},
+    # ---- 预热是**离线批处理**, 没有直播可以让路 ----
+    #
+    # 探针必须显式声明"我在跑离线任务", 而不是返回一个空 dict。
+    #
+    # ⚠️ 这个坑是实测踩到的: H3-D 给 `should_start` 加了 phase 白名单
+    # 之后, 空探针(没有 `phase` 键)会被判成"不在允许的 phase" →
+    # **整个预热一条都不审**, 报告里只留一句
+    # `stop_reason: phase=None 不允许后台审题`。而 `--show-samples`
+    # 照样打印(它读的是池文件里**上一轮**的旧样本), 所以表面上像是
+    # "跑完了", 实际上一次 LLM 都没调。
+    #
+    # 语义上这是对的: `phase` 是**直播场景**的让路判据, 离线预热里
+    # 根本没有直播。所以这里用一个明确的"离线空闲"探针, 而不是让
+    # 白名单去猜。
+    offline_free = {"phase": "qa", "pending": 0, "inflight": 0,
+                    "hint_inflight": False, "reveal_inflight": False,
+                    "ai_player_in_flight": False, "riddle_inflight": False,
+                    "stopped": False, "reveal_remaining_seconds": None}
+    lc = build_lazy_curator(cfg, pool, writer, lambda: dict(offline_free),
                             corpus_path=a.corpus, ledger_path=a.decisions)
     if lc is None:
         log.error("无法装配 LazyCurator(语料为空或已关闭)。")
@@ -266,6 +344,13 @@ def main(argv=None) -> int:
 
     t0 = time.monotonic()
     calls0 = _count_llm_calls(lc)
+    # ---- §十五: 确定性分层抽样(替换候选集, **不再是字典序头部**) ----
+    if a.sample and a.sample > 0:
+        from story.lazy_curator import stratified_sample
+        before = len(lc.candidates)
+        lc.candidates = stratified_sample(lc.candidates, int(a.sample))
+        print(f"\n  [§十五] 分层抽样: {before} -> {len(lc.candidates)} 条"
+              f"(固定 seed / 按内容哈希分桶, 可复现)")
     rep = lc.step(max_candidates=max(0, int(a.max_candidates)))
     elapsed = time.monotonic() - t0
 
@@ -299,9 +384,113 @@ def main(argv=None) -> int:
     write_meta(os.path.join(os.path.dirname(a.corpus) or ".",
                             "compile_report.json"), **out)
     _print_report(out, led)
+    # ---- §十六: 逐条报告(全部 candidate 的最终状态 + 拒因) ----
+    if a.report_json:
+        _write_item_report(a.report_json, getattr(lc, "candidates", []),
+                           led, out)
     if a.show_samples:
         _print_samples(a.pool_out, a.show_samples)
     return 0
+
+
+def _write_item_report(path: str, recs: list, led: DecisionLedger,
+                       out: dict) -> None:
+    """§十六: 把**逐条**结果写成 JSON。
+
+    每条给: external_id / surface / bottom / 最终状态 / 内容 reject reason。
+    accepted 的**再**给 core_answer / style / reasoning_shape /
+    compile_checks / review_checks。
+
+    ⚠️ `surface` / `bottom` 是 canonical 原文, 必须**全文**给 —— 只给
+    标题的话人工无法判断"门有没有误杀"(Reject Audit 的教训)。
+    """
+    import json
+    items = []
+    for r in recs:
+        eid = str(getattr(r, "external_id", "") or "")
+        d = led.last(r, CURATED_POLICY_VERSION) or {}
+        dec = str(d.get("decision") or "unprocessed")
+        row = {
+            "external_id": eid,
+            "source": str(getattr(r, "source", "") or ""),
+            "surface": getattr(r, "surface", "") or "",
+            "bottom": getattr(r, "bottom", "") or "",
+            "decision": dec,
+            "stage": str(d.get("stage") or ""),
+            "reasons": list(d.get("reasons") or []),
+            # §十四: 这一条落在哪个桶里(报告要能按它分组)
+            "bucket": _bucket_of(d),
+        }
+        if dec == "accepted":
+            spec = _pool_spec_by_id(out.get("pool_out", ""), eid)
+            if spec:
+                row.update({
+                    "core_answer": spec.get("core_answer"),
+                    "answer": spec.get("answer"),
+                    "style_tags": spec.get("style_tags"),
+                    "content_style": spec.get("content_style"),
+                    "reasoning_shape": _reasoning_shape(spec),
+                })
+        checks = d.get("checks")
+        if isinstance(checks, dict) and checks:
+            row["compile_checks"] = checks.get("compile") or {}
+            row["review_checks"] = checks.get("review") or {}
+            # ---- H4-D §十二: 信号单独给一格 ----
+            #
+            # 它**不是**拒绝理由 —— 只是一道题"偏简单"的记录。审批端要看
+            # 的是"被 accepted 的题里有多少是单点脑筋急转弯", 所以它必须
+            # 与 reject reason 分开呈现, 否则会被误读成死因。
+            sig = checks.get("signals")
+            if isinstance(sig, dict) and sig:
+                row["signals"] = sig
+        items.append(row)
+    payload = dict(out)
+    payload["items"] = items
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  -> 逐条报告 {len(items)} 条: {path}")
+
+
+def _bucket_of(d: dict) -> str:
+    """把一条决策归入 §十四 的桶(报告口径)。"""
+    dec = str(d.get("decision") or "")
+    st = str(d.get("stage") or "")
+    if dec == "accepted":
+        return "accepted"
+    if dec == "rejected":
+        return "content_rejected"
+    if dec == "interrupted":
+        return "interrupted"
+    if dec == "technical_defer":
+        from tools.curated_ledger import COMPILE_INVALID_STAGES
+        return ("compile_invalid" if st in COMPILE_INVALID_STAGES
+                else "technical_defer")
+    return "unprocessed"
+
+
+def _pool_spec_by_id(pool_path: str, eid: str) -> dict:
+    """从池文件里按 external_id 取 spec(accepted 的补充信息用)。"""
+    if not pool_path or not os.path.exists(pool_path):
+        return {}
+    for row in read_jsonl(pool_path):
+        spec = row.get("spec") if isinstance(row, dict) else None
+        if isinstance(spec, dict) and str(spec.get("external_id")) == eid:
+            return spec
+    return {}
+
+
+def _reasoning_shape(spec: dict) -> dict:
+    """§十六 的 `reasoning_shape`: atoms 的 role 分布 + facts 计数。"""
+    atoms = spec.get("solve_atoms") or []
+    roles: dict = {}
+    for a in atoms:
+        if isinstance(a, dict):
+            k = str(a.get("role") or "?")
+            roles[k] = roles.get(k, 0) + 1
+    return {"roles": roles,
+            "n_facts": len(spec.get("facts") or []),
+            "n_beats": len(spec.get("discovery_beats") or []),
+            "completion_fact_ids": spec.get("completion_fact_ids") or []}
 
 
 # ======================================================================
@@ -313,6 +502,19 @@ class _FakePoolForPrewarm:
     为什么不直接用 `PuzzlePool.open(cfg)`: 那会把池的**账本**一起打开,
     而预热是离线的(没有直播在跑), 让离线脚本去碰直播的 used 账本是
     不必要的风险。这里只需要 pool_path / stock_count / playable_count。
+
+    ## H3-D §八: 库存必须按 **live 的 policy eligibility** 数
+
+    早先的实现是 `len(self._rows())` —— 池文件里有多少行就算多少。
+    policy bump 之后这**立刻是错的**:
+
+        文件里有 10 条 curated-v2 + 2 条 curated-v3, 当前 policy=v3
+        live 真正能播的只有 2 条
+        而 CLI 报 stock=10 -> 认为库存充足 -> 一道都不预热
+
+    结果是"预热跑完了, 直播一看库存还是空的"。所以这里复用**同一个**
+    准入门(`PuzzlePool._validate_pool_spec`)—— 它正是 live 侧决定
+    "能不能播"的那一扇。只读, 不碰 used 账本。
     """
 
     def __init__(self, path):
@@ -320,16 +522,34 @@ class _FakePoolForPrewarm:
         self.used_path = path + ".used"
         self._path = path
 
-    def _rows(self):
-        return read_jsonl(self._path) if os.path.exists(self._path) else []
+    def _eligible(self) -> list:
+        """过得了 live 准入门的 spec。**这是唯一的计数口径。**"""
+        from story.pool import PuzzlePool
+        rows = read_jsonl(self._path) if os.path.exists(self._path) else []
+        voided = PuzzlePool._voided_keys(rows)
+        out = []
+        for i, row in enumerate(rows):
+            spec = PuzzlePool._spec_from_record(row, voided, i)
+            if spec is None:
+                continue
+            try:
+                ok, _why = PuzzlePool._validate_pool_spec(spec)
+            except Exception:                   # noqa: BLE001
+                continue
+            if ok:
+                out.append(spec)
+        return out
 
     def stock_count(self, limit=None):
-        # 预热进程里"库存"= 池文件里的条目数(v2 政策门由写入端保证)
-        n = len(self._rows())
+        n = len(self._eligible())
         return n if limit is None else min(n, limit)
 
     def playable_count(self, *a, **k):
-        return len(self._rows())
+        # 预热进程里没有 recent 窗口, 所以"可播"== "过准入门"。
+        # 这正是直播侧 `stock_count` 的语义, 而不是 `playable_count`
+        # 那条更严的(它还要过 cross_puzzle_gate)。预热刻意用宽的
+        # 那个: 窗口是**运行时**的, 离线不该假装知道。
+        return len(self._eligible())
 
 
 def _wrap_attempts(compiler, max_attempts: int) -> None:

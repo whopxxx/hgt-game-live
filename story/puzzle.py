@@ -644,6 +644,32 @@ class PuzzleSpec:
     #:
     #: 空串 = 不是 curated 题(或来自没有版本概念的旧代码)。
     curated_policy_version: str = ""
+    #: **curated 内容哈希**(H3-D3 §一-4)。= 来源侧 `surface + bottom` 的
+    #: 稳定哈希, 与 `tools.curated_ledger.content_hash_of` **同一份算法**。
+    #:
+    #: ## 为什么 accepted 必须绑定它, 不能只按 external_id
+    #:
+    #: 决策账本的判据键一直是 `(external_id, content_hash, policy)` 三元组
+    #: —— 因为 SE 帖子**可以被编辑**, 而问题号不变。但题池准入门
+    #: (`_validate_pool_spec`) 早先只按 `external_id + policy` 查账本,
+    #: 于是出现一个**真实的漏洞**:
+    #:
+    #:     第 1 轮: q123 内容 A 被 accepted -> 池里放进 A
+    #:     作者把 q123 编辑成内容 B
+    #:     第 2 轮: 重新编译 B -> 又 accepted -> 池里放进 B
+    #:     现在池里有 A 和 B 两条, 而账本里 A 的 accepted 行**仍然在**
+    #:
+    #: 更糟的是反过来: 一道题内容 A 被 **rejected**, 作者改成 B, 重审
+    #: 后 B 被 accepted —— 这时 A 的 rejected 行不影响 B, 是对的; 但如果
+    #: 只看 external_id, "A 被 accepted" 会**错误地**给 B 发通行证。
+    #:
+    #: 所以池行必须自带它**自己那份内容**的哈希, 准入门拿它去账本里
+    #: 找**同一个三元组**。同 external_id 的旧内容 accepted, 不得授权新内容。
+    #:
+    #: 空串 = 老 archive(没有这把键)。此时按**保守**处理: curated 题
+    #: 一律不可播 —— 与 curated_policy_version 缺失同一条原则, 老库存
+    #: 自动失去 eligibility, 不需要人工清理。
+    curated_content_hash: str = ""
 
     # ------------------------------------------------------------------
     # 便捷访问 —— engine / llm 需要"原子事实的文本列表"这类视图
@@ -732,6 +758,10 @@ class PuzzleSpec:
             # 自己的池当成"没有政策版本"隔离掉。
             "content_style": list(self.content_style or []),
             "curated_policy_version": self.curated_policy_version,
+            # H3-D3 §一-4: 内容哈希必须随 archive 走 —— 题池准入门拿它
+            # 去账本里找**同一个三元组**。不落盘 -> 读回来是空串 ->
+            # 按保守处理, 整批 curated 题全部失去 eligibility。
+            "curated_content_hash": self.curated_content_hash,
             # ---- 生成溯源(见 _PROVENANCE_KEYS 的说明) ----
             "usage": self.usage,
             "model": self.model,
@@ -809,6 +839,10 @@ class PuzzleSpec:
                            if str(x).strip()],
             curated_policy_version=str(
                 d.get("curated_policy_version", "") or ""),
+            # ---- H3-D3: 老 archive 没有这把键 -> 空 -> curated 题按
+            # 保守处理不可播(见 `curated_content_hash` 的说明)。
+            curated_content_hash=str(
+                d.get("curated_content_hash", "") or ""),
             # ---- 生成溯源 ----
             # 用 `.get()` 而不是 `d[...]`: 现存 archive 里绝大多数
             # (实测 data/puzzle.jsonl 105 条中 103 条)是这四把键出现

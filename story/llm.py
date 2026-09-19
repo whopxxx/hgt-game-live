@@ -599,6 +599,41 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
     return bool(sig and (sig.mechanism_family or sig.solution_shape))
 
 
+def _blueprint_block_for_review(bp) -> str:
+    """审稿 prompt 的 Blueprint 段落(§二, curated-v4)。
+
+    抽成模块级纯函数是为了**可测**: 这段文案决定了审稿人会不会拿一份
+    目标骨架去判一道**已有**的 canonical 题, 而那正是 H4-A 审计发现的
+    误杀来源。测试必须能直接断言这段文案, 而不是靠"读一遍源码"。
+
+        AI 原创题: 印硬约束 —— 代码**先选**了骨架, 生成器照着写。
+        curated 题: 印**观察声明** —— 题目已存在, 没有 target 骨架。
+                     observed classification != target requirement。
+
+    ⚠️ 判据是**身份**(`_unconstrained` 标记), 不是值比较 ——
+    `PuzzleBlueprint()` 的默认值长得和无约束一模一样, 但它对原创链
+    是**真指令**。
+    """
+    if getattr(bp, "_unconstrained", False):
+        return (
+            "\n\n【本题**没有** target Blueprint —— 不要按骨架判它】\n"
+            "这是一道具**已有** canonical 谜面/谜底的题, 我们只是把它"
+            "结构化, 不是重新创作。\n"
+            "**禁止**因为下面这些与某个目标骨架不一致而要求它重出:\n"
+            "  relation / domain / emotion_mode / time_shape / "
+            "mechanism_family / solution_shape\n"
+            "  death / past_trauma / repeated_ritual / "
+            "long_term_profession 的**配额**\n"
+            "这些字段只作为**观察到的分类**记录(observed_signature), "
+            "供以后选题多样性用 —— "
+            "**observed classification != target requirement**。\n"
+            "判它只看一件事: **它本身是不是一道合格的直播海龟汤**"
+            "(谜面有无清楚反常点 / 谜底是否唯一解释 / 能否靠是/否问答"
+            "逼近 / 有无认知反转 / 是否适合直播)。")
+    return ("\n\n【本题 Blueprint 硬约束(题若违反它就是不合格)】\n"
+            + bp.describe())
+
+
 def _facts_block(spec: "PuzzleSpec", completion_fact_ids=None) -> str:
     """把 spec 的 facts 渲染成给裁决模型的"判定依据"块。
 
@@ -1344,9 +1379,15 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 #: nested required 和 `_apply_review` 的 fail-closed 检查覆盖, 否则新
 #: 维度会重演"缺字段 -> from_dict 静默补默认值 -> 配额被绕过"的老问题。
 #: 显式写出来, 加字段的人就会看到它。
-#: Reviewer 的 `quality_checks` 契约字段。**八项**必须全 true 代码才收稿。
+#: Reviewer 的 `quality_checks` 契约字段。**十三项都要填**, 但 v5 起
+#: **只有九项会拒稿** —— 见 `_CURATED_HARD_CHECK_FIELDS`。
 #: 与 `_TOOL_CHECK` 的 nested required **两层都要** —— schema 由模型遵守,
 #: 不能把正确性押在它身上(与 `_OBSERVED_SIGNATURE_FIELDS` 同一套推理)。
+#:
+#: ⚠️ **这十三项不是"每次都全查"**: 后四项(题型四问)只对 **curated**
+#: 题有意义 —— 见 `_CURATED_QUALITY_CHECK_FIELDS`。全量十三项在
+#: `_QUALITY_CHECK_FIELDS` 里是为了让"契约清单"只有一处, 实际门控由
+#: `_quality_check_contract(spec)` 按题分派。
 _QUALITY_CHECK_FIELDS = (
     "narrator_truthful", "mechanism_consistent",
     "core_answer_direct", "completion_contract_minimal",
@@ -1355,7 +1396,187 @@ _QUALITY_CHECK_FIELDS = (
     # **不新增第四个内容审核 LLM**(任务书明确)。
     "concrete_anomaly", "clue_recontextualized",
     "dramatic_payoff", "reasoning_beats_nonredundant",
+    # ---- H3-D3: 题型四问(§六) ----
+    # 原先由**独立的一次调用** (`CuratedCompiler.story_review`) 回答, 于是
+    # accepted 路径要 4 次 LLM。H3-D3 §一-2 要求降到 3 次, 所以并进这次
+    # 审稿调用。
+    #
+    # ⚠️ 并进来之后**独立性并没有丢**: 独立性的来源是"这两个判断问的
+    # 是不同的问题"(题型 vs 结构), 而不是"分两次 HTTP 发出去"。反过来,
+    # 分两次调用还有个真实代价 —— 分两次时只要**任一次**说合格就过,
+    # 等于把"一个模型判错"变成"两个模型都判错"才拦得住; 并进来之后
+    # 是同一次答复里的四个字段, fail-closed 语义反而更紧。
+    "story_reconstruction", "multi_step_deduction",
+    "single_trick", "no_external_knowledge_dependency",
 )
+
+#: **H4-D §七: curated 题真正 fail-closed 的字段。**
+#:
+#: 这是 v5 送审契约的核心。它必须与 `tools.curated_compiler` 的清单
+#: **语义一致**, 否则"外层放宽了、Reviewer 还在里面把稿子拒掉" ——
+#: 任务书 §七 点名的正是这个陷阱。
+#:
+#: curated 侧的硬门(两个元组):
+#:
+#:     CURATED_HARD_CHECKS        clear_anomaly / unique_explanation /
+#:                                yes_no_progress / no_obscure_system /
+#:                                no_external_media / livestream_safe
+#:     no_external_knowledge_dependency   (§四 的公平性硬门)
+#:
+#: ⚠️ **为什么这里显式写出字符串而不是 import 那两个元组**:
+#: `story/llm.py` 是**生产链**, 而 `tools/curated_compiler.py` 是**离线
+#: 编译工具**(依赖语料文件、CLI 参数、pandas 之类)。生产代码 import
+#: 工具模块会在部署时引入一条脆弱依赖。所以这里复制清单, 并**在测试里
+#: 断言两边一致** —— 让漂移在 CI 上炸掉, 而不是在运行时表现成"某道题
+#: 莫名其妙进不来"。
+#:
+#: ⚠️ **H4-D1 §一: 这个元组曾经是一张"假映射"。**
+#:
+#: H4-D 第一版为了让"清单项数对得上", 把 curated 侧那六条硬门**逐位
+#: 对应**到 `quality_checks` 里已经存在的六个字段:
+#:
+#:   concrete_anomaly             <- clear_anomaly
+#:   clue_recontextualized        <- unique_explanation
+#:   core_answer_direct           <- yes_no_progress
+#:   completion_contract_minimal  <- no_obscure_system
+#:   dramatic_payoff              <- no_external_media      ← 语义不成立
+#:   reasoning_beats_nonredundant <- livestream_safe        ← 语义不成立
+#:
+#: 前四条**勉强大致成立**(都在问"这题能不能玩"), 后两条是**硬凑**:
+#:
+#:   - `dramatic_payoff` 问的是"揭晓够不够有力", 与"要不要看外部图片/
+#:     附件"没有任何关系。一道**必须看图才能答**的题完全可能有很强的
+#:     dramatic payoff —— 于是它在 Reviewer 这一层**过关**, 而它本该被
+#:     拒。假映射的代价不是"多拒了", 是"**漏放了**"。
+#:   - `reasoning_beats_nonredundant` 问的是"有没有 2~4 个真正不同的
+#:     发现阶段" —— 这**正是** §三 明确降级成 soft signal 的那条
+#:     `multi_step_deduction` 的另一种说法。把它当硬门 = 把刚拆掉的门
+#:     从后门装回去。而且它与 `livestream_safe`(毒不毒/血不血)无关。
+#:
+#: 换句话说: **靠字段数量相同, 假装两边 policy 一致**。当时的测试只
+#: 断言 `len(curated) == 6 + 1 + 2`, 所以完全错误的映射也能通过 —— 那
+#: 正是任务书 §四 点名要修的测试缺陷。
+#:
+#: 现在改成**方案 A: 语义直译** —— curated Reviewer 用一组**与编译侧
+#: 同名**的字段, 名字就是它要问的问题。没有映射表, 就没有画错映射的
+#: 机会。见下。
+_CURATED_HARD_CHECK_FIELDS = (
+    # ---- 六个内容门(与 `tools.curated_compiler.CURATED_HARD_CHECKS`
+    #      同名同序 —— 测试断言**逐字相等**, 不是长度相等) ----
+    "clear_anomaly", "unique_explanation", "yes_no_progress",
+    "no_obscure_system", "no_external_media", "livestream_safe",
+    # ---- §四 的公平性硬门 ----
+    "no_external_knowledge_dependency",
+    # ---- 叙事真实性 —— **不随政策放宽** ----
+    #
+    # ⚠️ 这两条必须留着。`narrator_truthful` 是"谜面可以误导但不能
+    # 撒谎"那条不变量的执行点; `mechanism_consistent` 是"谜底不能自相
+    # 矛盾"。§十 明写"不要因为放宽题型标准而放宽 safety", §十六 也把
+    # "谜底胡编"列为不可接受。放宽的是**趣味门槛**, 不是**真实性门槛**。
+    "narrator_truthful", "mechanism_consistent",
+)
+
+#: H4-D §三: curated 的**纯信号**字段 —— 会被记录(账本 + 报告),
+#: **缺失也不技术失败**, 更不拒稿。
+#:
+#: ⚠️ 与 `_CURATED_HARD_CHECK_FIELDS` 不重叠是**刻意的**: 一个字段
+#: 要么是门要么是信号, 两边都有会让"这道题为什么被拒"变得无法回答。
+#:
+#: ⚠️ **H4-D1 §三: `dramatic_payoff` / `reasoning_beats_nonredundant`
+#: 也在这里。** 它们在 H4-D 第一版里被当成 `no_external_media` /
+#: `livestream_safe` 的替身, 因而是硬门; 现在它们回到本来的身份 ——
+#: **"值不值得玩"的质量信号**。
+#:
+#: 这两个字段对**自由生成链**仍然是硬门(`_QUALITY_CHECK_FIELDS[:8]`),
+#: 对 curated 题不再是。双标是刻意的: 原创题是我们自己生成的, 可以说
+#: "不够精彩就重出"; 外部题已经存在, 只能判"能不能播"。
+#:
+#: 理由: 它们问的是"够不够精彩", 而 §六 的产品决策是"轻量、快速、
+#: 观众容易参与、揭晓有趣"就够了。一道单点脑筋急转弯不可能有
+#: `reasoning_beats_nonredundant=true` —— 若它还是硬门, 那种题就被
+#: 全灭, 与 §三/§十六 直接冲突。
+_CURATED_SIGNAL_FIELDS = (
+    "dramatic_payoff", "reasoning_beats_nonredundant",
+    "story_reconstruction", "multi_step_deduction", "single_trick",
+)
+
+#: 题型四问 —— 只对 curated 题生效的子集。
+#:
+#: ## 为什么必须按题分派, 不能直接全查
+#:
+#: 自由生成那条链**没有**题型问题: 它出的每一道题都是由
+#: `RIDDLE_SYSTEM` 按海龟汤骨架现场写的, 不存在"这篇文章其实是个物理
+#: 脑筋急转弯"的输入风险。而如果把四项无条件加进 fail-closed 门:
+#:
+#:   1. 自由生成链的 schema (_TOOL_CHECK) 与代码门会**同时**要求它们,
+#:      于是每一次自由生成都要多答四个与它无关的问题 —— 白白增加
+#:      截断/漏填概率, 而漏填即拒稿(全灭);
+#:   2. 更糟的是语义: 那四项的判据写着"核心解法依赖职业规定 -> false",
+#:      而自由生成链**允许**规则类骨架(只是压低配额)。把它们设成
+#:      硬门等于偷偷改掉了那条链的质量政策 —— 那是产品决策, 不是
+#:      本批要动的东西。
+#:
+#: ## H4-D §七 / H4-D1 §二: curated 的门是**它自己的一套**
+#:
+#: v2~v4 里 curated 走全量十三项(即 `_QUALITY_CHECK_FIELDS`)。v5 起
+#: 只走 `_CURATED_HARD_CHECK_FIELDS` —— 题型四问从门降成信号。
+#:
+#: ⚠️ **H4-D 第一版在这里犯过一个错**: 它给 curated 复用了六个旧字段
+#: (`concrete_anomaly` / `clue_recontextualized` / `core_answer_direct` /
+#: `completion_contract_minimal` / `dramatic_payoff` /
+#: `reasoning_beats_nonredundant`), 靠"项数相同"假装与编译侧 policy
+#: 一致。后两项的语义是错的 —— 详见 `_CURATED_HARD_CHECK_FIELDS`。
+#: 现在 curated 用**与编译侧同名**的六条, 没有映射表可画错。
+#:
+#: ⚠️ 自由生成链(前八项)**原样不动**: 那是 AI 原创创作标准, 任务书
+#: §九 明写"这次只改 curated external puzzle"。原创以后仍然可以保持
+#: 更高的创作标准 —— "现成题有趣就能用, AI 原创既然是自己生成, 可以
+#: 要求更好", 两套标准是合理的。
+#:
+#: 也就是说 `dramatic_payoff` / `reasoning_beats_nonredundant` 现在是
+#: **双标的**: 对 AI 原创是硬门(前八项), 对 curated 是信号。
+def _quality_check_contract(spec: Any) -> tuple:
+    """这道题该按哪一份 `quality_checks` 清单验收。
+
+    ⚠️ curated 那份与 `tools.curated_compiler.CURATED_HARD_CHECKS`
+    **同名同序**。测试 `test_curated_reviewer_contract_is_semantically_honest`
+    断言的是**逐字相等**, 不是长度相等 —— 长度相等正是 H4-D 第一版
+    漏掉这个 bug 的原因。
+    """
+    if str(getattr(spec, "source_type", "") or "") == "curated":
+        return _CURATED_HARD_CHECK_FIELDS
+    return _QUALITY_CHECK_FIELDS[:8]
+
+
+def _is_curated(spec: Any) -> bool:
+    """这道题是不是外部题库搬进来的(curated)题。
+
+    ⚠️ **单一判据**: `_quality_check_contract` / schema 选取 / prompt
+    分派都读它, 不各写一份 `getattr(spec, "source_type", ...) == "curated"`。
+    三处各写一份的话, 改判据时漏掉一处就会出现"代码按 curated 判、
+    schema 按自由生成发"这种自相矛盾的组合。
+    """
+    return str(getattr(spec, "source_type", "") or "") == "curated"
+
+
+def _curated_content_gate_fields() -> tuple:
+    """curated Reviewer 的**内容门**那六条(不含冷知识与真实性)。
+
+    给测试与报告用。单独抽一个函数而不是切切片, 是因为元组里还混着
+    `no_external_knowledge_dependency` / `narrator_truthful` /
+    `mechanism_consistent` 三条, 直接切会写死一个容易漂移的下标。
+    """
+    from tools.curated_compiler import CURATED_HARD_CHECKS
+    return tuple(CURATED_HARD_CHECKS)
+
+
+#: 模块级常量形式(测试与报告读它, 不调函数)。
+#:
+#: ⚠️ 它与 `_CURATED_HARD_CHECK_FIELDS` 的**前六项**是同一件事, 但
+#: 分开命名是刻意的: 前者是"Reviewer 的完整门"(9 项), 这个是"内容门"
+#: (6 项)。测试要断言的正是"这六项与编译侧逐字相同" —— 拿 9 项去比
+#: 编译侧的 6 项会永远不等, 而拿"前六项"去比则要靠一个下标。
+CURATED_CONTENT_GATES = _curated_content_gate_fields()
 
 _OBSERVED_SIGNATURE_FIELDS = (
     "mechanism_family", "solution_shape", "domain", "emotion_mode",
@@ -1364,6 +1585,9 @@ _OBSERVED_SIGNATURE_FIELDS = (
     "reveal_mode", "procedural_rule_dependency",
 )
 
+# ======================================================================
+# H3-D: curated 故事门的**独立复核**(§六)
+# ======================================================================
 _TOOL_RIDDLE = {
     "name": "emit_riddle",
     "description": "输出一个海龟汤谜题",
@@ -1980,7 +2204,81 @@ _TOOL_CHECK = {
                             "时间、空间、身份、声音、位置、顺序。\n"
                             "  例: \"他在同一个路口等了三年, 每天只等十分钟\"\n"
                             "  反例: \"某单位为什么会有那条规定?\"(抽象, 无画面)\n"
-                            "只是抽象的制度疑问 -> false。"),
+                            "只是抽象的制度疑问 -> false。\n"
+                            "⚠️ 只对**自由生成**题是硬门; curated 题走 "
+                            "`clear_anomaly`。"),
+                    },
+                    # ---- H4-D1 §二: curated 专用六问(语义直译) ----
+                    #
+                    # ⚠️ 与 `tools.curated_compiler.CURATED_HARD_CHECKS`
+                    # **同名同序**。同名是设计: 没有"哪个字段对应哪个门"
+                    # 的映射表, 就没有画错映射的机会。
+                    #
+                    # H4-D 第一版在这里用的是 `concrete_anomaly` 等六个旧
+                    # 字段, 其中 `dramatic_payoff <- no_external_media`、
+                    # `reasoning_beats_nonredundant <- livestream_safe` 两条
+                    # **语义不成立**(详见 `_CURATED_HARD_CHECK_FIELDS`)。
+                    #
+                    # ⚠️ 发给模型的 schema 按题分派: curated 题**看不到**
+                    # 自由生成那几项, 自由生成题**看不到**这六项。不见得
+                    # 是省 token, 是避免它按错的那一套回答 —— 一个 curated
+                    # 题被同时问了 `concrete_anomaly` 和 `clear_anomaly`
+                    # 时, 模型完全可能只答一个, 而另一个按 required 缺项
+                    # 就把整稿拒了。
+                    "clear_anomaly": {
+                        "type": "boolean",
+                        "description": (
+                            "**谜面是否形成一个清楚的反常点?**\n"
+                            "观众听完会想\"这不对劲\"。\n"
+                            "抽象的制度疑问 / 平淡无异常的叙述 -> false。"),
+                    },
+                    "unique_explanation": {
+                        "type": "boolean",
+                        "description": (
+                            "**谜底是否能具体、合理地解释谜面的主要反常点?**\n"
+                            "⚠️ **不是**要求\"现实世界只能有这一种可能\" —— "
+                            "任何正常故事在现实中都可能有别的解释, 用数学"
+                            "意义的唯一解卡题会把大量能玩的题判死。\n"
+                            "要的是: 谜底**不是随口编的一个同样可能的背景**, "
+                            "它得真的指向谜面那个反常点。\n"
+                            "自问: 听完谜底, 那个\"不对劲\"的地方被解释掉了吗? "
+                            "还是只是换了个说法? 后者 -> false。"),
+                    },
+                    "yes_no_progress": {
+                        "type": "boolean",
+                        "description": (
+                            "**能否通过是/否问答逐步逼近谜底?**\n"
+                            "纯靠猜数字 / 只能靠观众自己顿悟 / 问什么都推不动"
+                            " -> false。"),
+                    },
+                    "no_obscure_system": {
+                        "type": "boolean",
+                        "description": (
+                            "**是否不依赖冷门职业制度、设备冷门功能、某系统"
+                            "真实用途这类\"查了才知道\"的知识?**\n"
+                            "⚠️ 与 `no_external_knowledge_dependency` 方向"
+                            "相同但分工不同: 这条问\"机制本身是不是靠一个冷门"
+                            "系统成立的\"; 那条问\"观众有没有机会推出来\"。"
+                            "两条都判。"),
+                    },
+                    "no_external_media": {
+                        "type": "boolean",
+                        "description": (
+                            "**是否不需要外部图片 / 附件 / 音频 / 链接?**\n"
+                            "必须看到原题的图、必须听某段音频、必须点开某个"
+                            "链接才能答 -> false。\n"
+                            "⚠️ 谜面里**描述**了一个画面不算外部媒体; 这里"
+                            "是说解题**必须**另外拿到一份材料。"),
+                    },
+                    "livestream_safe": {
+                        "type": "boolean",
+                        "description": (
+                            "**是否适合直播?**(§十 —— **不随题型标准放宽**)\n"
+                            "死亡作为普通剧情事实 -> 可以(true)。\n"
+                            "重口、过度刺激、以极端伤害本身作为噱头 -> false。\n"
+                            "以儿童 / 家庭严重暴力作为**核心冲击点** -> false。\n"
+                            "自问: 这段谜底能不能在直播间直接念出来? 念出来"
+                            "会不会变成拿惨案当乐子?"),
                     },
                     "clue_recontextualized": {
                         "type": "boolean",
@@ -2011,18 +2309,89 @@ _TOOL_CHECK = {
                             "用途不是表面用途 / b3 最后理解行为的真实目的。\n"
                             "只有 1 个阶段、或两三个只是换个说法 -> false。"),
                     },
+                    # ---- H3-D3: 题型四问(**同一次调用的附带问题**) ----
+                    #
+                    # 早先是**独立的一次 LLM 调用**(`story_review`), 于是
+                    # 一条 accepted 路径要 4 次调用(compile / 复核 / 审稿 /
+                    # 审计)。任务书 H3-D3 §一-2 明确要求降到 3 次。
+                    #
+                    # 为什么可以合进这里而**不算**"第四个审核 LLM": 复核
+                    # 与审稿本来就是**同一个 Reviewer 客户端、同一份模型**,
+                    # 差别只在问的问题。并进同一次调用后, 独立性靠的是
+                    # **判据本身不同**(题型 vs 结构), 而不是靠"两次 HTTP"。
+                    #
+                    # ⚠️ 与 story_review 那版的一处**真实差别**: 那次调用
+                    # 只给谜面/谜底(刻意不给 facts/beats, 免得模型去评论
+                    # 结构); 这里它能看到全稿。所以措辞必须明确"只判题型,
+                    # 不要因为结构好就放行" —— 见下面每一条的 description。
+                    "story_reconstruction": {
+                        "type": "boolean",
+                        "description": (
+                            "**题型判定: 玩家最终恢复的是不是一个故事?**\n"
+                            "(人物身份/关系/时间/空间/目的/因果/视角/"
+                            "物品意义)\n"
+                            "纯粹发现一条物理规律 / 数学技巧 / 冷知识 / "
+                            "职业规定 -> false。\n"
+                            "自问: 揭晓后观众脑子里是**多了一个故事**, "
+                            "还是**多了一个知识点**?\n"
+                            "⚠️ 不要因为这道题结构填得漂亮就填 true —— "
+                            "这一项只问题型。"),
+                    },
+                    "multi_step_deduction": {
+                        "type": "boolean",
+                        "description": (
+                            "**题型判定: 是否有至少两个彼此不同、都会改变"
+                            "玩家理解**的发现阶段?\n"
+                            "同一机制的因果展开(烧油->变轻->没超重)只算"
+                            "一个, 填 false。\n"
+                            "自问: 第二个发现有没有让我**回头重新理解**"
+                            "第一个?\n"
+                            "⚠️ 与 `reasoning_beats_nonredundant` 的分工: "
+                            "那一项问的是 discovery_beats 有没有写好; "
+                            "这一项问的是**这道题本质上**有没有两个阶段。"),
+                    },
+                    "single_trick": {
+                        "type": "boolean",
+                        "description": (
+                            "⚠️ **反向: true = 坏**。整个谜底只有一个知识点"
+                            " / 知道一个小技巧就结束 / 只有一条规则 -> true。\n"
+                            "好的海龟汤这里应填 false。"),
+                    },
+                    "no_external_knowledge_dependency": {
+                        "type": "boolean",
+                        "description": (
+                            "**题型判定: 普通观众只靠谜面 + 是/否问答 + "
+                            "普通生活常识**有没有机会解出来?\n"
+                            "核心解法依赖以下任一 -> false: 专业知识 / "
+                            "物理冷知识 / 职业规定 / 机构制度 / 设备特殊"
+                            "功能 / 平台或软件规则 / 文字游戏 / 单一机关"
+                            "用途。\n"
+                            "**普通生活常识不算外部知识**(会饿、会累、会"
+                            "撒谎、东西会坏、时间会过去)。\n"
+                            "自问: 一个没读过科普、没干过那个职业的普通"
+                            "观众, 能不能靠问是/否问题推出来?\n"
+                            "⚠️ \"现实里真有这样的规定\" 与 \"逻辑上讲得通\""
+                            " **都不构成**通过的理由。"),
+                    },
                 },
-                "required": ["narrator_truthful", "mechanism_consistent",
-                             "core_answer_direct",
-                             "completion_contract_minimal",
-                             "concrete_anomaly", "clue_recontextualized",
-                             "dramatic_payoff",
-                             "reasoning_beats_nonredundant"],
+                # ⚠️ 这是 `_TOOL_CHECK` 的**默认** required(自由生成那一套)。
+                # 实际发给模型的那份由 `check_tool(spec)` 按题裁切 —— 它
+                # 会把 `properties` 与 `required` 一起换掉。留全量在这里是
+                # 为了 `_TOOL_CHECK` 单独可用(mutation 测试 / 别处引用),
+                # 且让"契约清单"仍然只有一处定义。
+                "required": _QUALITY_CHECK_FIELDS,
                 "description": (
-                    "**八项必须全部为 true, 代码才接受这一稿。** 这不是"
-                    "参考项 —— 任一项 false 而 decision 写 pass, 会被整稿"
-                    "拒收(假绿比 rewrite 更糟: 它会直接进正式 Q&A)。"
-                    "前四项查\"正确不正确\", 后四项查\"好不好玩\"。"),
+                    "**按题分派的清单** —— 哪些字段决定收不收, 见 "
+                    "`CHECK_SYSTEM` 里的同名小节。\n"
+                    "决定收不收的字段, 任一项 false 而 decision 写 pass, "
+                    "会被整稿拒收(假绿比 rewrite 更糟: 它会直接进正式 "
+                    "Q&A)。\n"
+                    "⚠️ **只填这一份 schema 列出的字段。** 不要按记忆补别的"
+                    " —— 不在这份清单里的字段, 代码不读, 也可能因为方向"
+                    "(反向字段)不同而把你的意思读反。\n"
+                    "信号类字段如实填即可, **不影响收稿** —— 单点脑筋急"
+                    "转弯在直播里很好用。(注意 `single_trick` 是反向: "
+                    "true = 更简单。)"),
             },
             "note": {"type": "string",
                      "description": "改了什么、为什么(一句话)"},
@@ -2030,6 +2399,55 @@ _TOOL_CHECK = {
         "required": ["decision", "observed_signature", "quality_checks"],
     },
 }
+
+#: ⚠️ 这里在模块加载时求值是**安全**的, 因为 `_TOOL_CHECK` 里那个
+#: `required` 只是**默认值**(自由生成那一套)。真正发给模型的那份由
+#: `check_tool(spec)` 按题裁切。
+#:
+#: (早先这里写成一个中间变量 `_CHECK_REQUIRED_FIELDS`, 但它在
+#: `_TOOL_CHECK` 之后才定义 -> 模块加载即 NameError。教训: `_TOOL_CHECK`
+#: 是个字面量字典, 它只能引用**已经在它之前**定义的名字。)
+def check_tool(spec: Any = None) -> dict:
+    """按题目来源裁出这次审稿该用的 `_TOOL_CHECK` schema。
+
+    ## 为什么要按题裁 schema, 而不是"一份 schema 问全部"
+
+    H4-D 第一版给 curated 复用了六个自由生成字段, 靠项数对齐假装
+    policy 一致(见 `_CURATED_HARD_CHECK_FIELDS`)。改成语义直译之后,
+    两边各有一套**互相不重叠**的字段:
+
+        curated 有 clear_anomaly,         没有 concrete_anomaly
+        自由生成 有 concrete_anomaly,      没有 clear_anomaly
+
+    如果 schema 仍然一次问全部字段, 模型会同时看到
+    `clear_anomaly` 与 `concrete_anomaly` 两道几乎同义的题, 完全可能
+    只答一个 —— 而 `required` 里缺项就是整稿拒。那不是内容不合格,
+    是**schema 在逼模型漏填**。
+
+    所以: 发什么题, 就只问那一套。这也是"契约清单只有一处"那条原则
+    的延伸 —— 清单还是一处, 只是**按题切片**。
+
+    ## 返回值
+
+    **浅拷贝**: 只换掉 `input_schema.properties.quality_checks` 与它的
+    `required`。别动 `_TOOL_CHECK` 本身 —— 它是模块级常量, 被 mutation
+    测试与多处引用共享, 就地改会让"自由生成链"在跑过一道 curated 题之后
+    永久变成 curated 的 schema(顺序依赖的隐藏状态)。
+
+    `spec=None` 按自由生成处理(向后兼容: 老调用点没有 spec)。
+    """
+    import copy as _copy
+    props = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
+    curated = spec is not None and _is_curated(spec)
+    keep = (set(_CURATED_HARD_CHECK_FIELDS) | set(_CURATED_SIGNAL_FIELDS)
+            if curated else set(_QUALITY_CHECK_FIELDS))
+    tool = _copy.deepcopy(_TOOL_CHECK)
+    qc = tool["input_schema"]["properties"]["quality_checks"]
+    qc["properties"] = {k: v for k, v in props["properties"].items()
+                        if k in keep}
+    qc["required"] = [k for k in (_CURATED_HARD_CHECK_FIELDS if curated
+                                  else _QUALITY_CHECK_FIELDS) if k in keep]
+    return tool
 
 CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix / rewrite** 三选一。
 
@@ -2117,9 +2535,47 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
    规定 / 必须遵守的流程 / 仪式规矩)。**普通的生活常识与物理规律不算。**
    把结论填进 `observed_signature.procedural_rule_dependency`。
 
-═══ v5: `quality_checks` 八项 —— **必须全部为 true 代码才收稿** ═══
-这是一个结构化字段, 不是让你写感想。任一项 false 而 decision 写 pass,
-会被**整稿拒收** —— 因为那意味着"你知道有问题却选了放行"。
+═══ v5: `quality_checks` —— **按题分派, 见本次请求附带的清单** ═══
+
+`schema` 里列出的字段就是**这一道题**要回答的全部字段, 里面的
+`required` 就是决定收不收的那些。**只回答列出来的字段。**
+
+**决定收不收的字段**(任一项 false 而 decision 写 pass, 会被**整稿
+拒收** —— 那意味着"你知道有问题却选了放行"):
+
+    自由生成题(AI 原创):
+      narrator_truthful / mechanism_consistent / core_answer_direct /
+      completion_contract_minimal / concrete_anomaly /
+      clue_recontextualized / dramatic_payoff /
+      reasoning_beats_nonredundant
+
+    外部题库题(curated):
+      clear_anomaly / unique_explanation / yes_no_progress /
+      no_obscure_system / no_external_media / livestream_safe /
+      no_external_knowledge_dependency /
+      narrator_truthful / mechanism_consistent
+
+⚠️ **两套清单不是同一回事, 不要混。** 外部题库题的六条内容门问的是
+"这道**已经存在**的题能不能播"(有没有反常点 / 谜底解释不解释得通 /
+能不能问答推进 / 要不要冷门系统 / 要不要外部图片 / 适不适合直播)。
+自由生成题的 `concrete_anomaly` 那几项问的是"这道**我们自己写的**题
+够不够好", 标准更高 —— 因为那是我们生成的, 不够好可以重出。现成题
+没有重出的余地, 只能判能不能用。
+
+**只是信号的字段**(外部题库题才有; 如实填, 填什么都不影响收稿):
+
+    dramatic_payoff / reasoning_beats_nonredundant /
+    story_reconstruction / multi_step_deduction / single_trick
+
+⚠️ 一道来自外部题库的题如果是**简单的单点脑筋急转弯**, 那
+`story_reconstruction=false` / `multi_step_deduction=false` /
+`single_trick=true` / `reasoning_beats_nonredundant=false` **完全正常**,
+题**照样收**。别为了让稿子"看起来更好"而美化信号, 也别因为信号不好
+就判它不合格 —— 直播要的是能玩, 不是文学性。
+
+⚠️ 信号里**唯一**有否决权的是 `no_external_knowledge_dependency`
+(它在上面 curated 的门里, 不在这一节) —— 它问的是"能不能玩", 不是
+"够不够精彩"。
 
 **1. narrator_truthful —— 谜底没有推翻谜面中无归属的事实陈述**
 
@@ -2755,6 +3211,18 @@ class PuzzleWriter:
         # 共享的一份, 而 Q9 之后 live 与 prefetch 各有一个 writer。
         self._last_review_decision: str = ""
         self._last_review_issues: Optional[list] = None
+        #: H3-D3: 本次审稿回传的 `quality_checks`(原样, 未做判定)。
+        #:
+        #: 为什么需要它: curated 编译链要在**审稿之后**把题型四问单独
+        #: 再判一次(与编译期的 `story_gate` 构成 AND)。但那四个字段
+        #: 在 spec 上不留痕 —— `_apply_review` 只把 observed_signature
+        #: 合并进 spec, quality_checks 是**一次性的判定输入**。所以由
+        #: writer 把最后一次的答复挂出来, 供 `compile_one` 读取。
+        #:
+        #: ⚠️ 与 `_last_review_decision` 同一套"侧信道"约定: 每次
+        #: `_review_spec` 入口清零, 每条出口都写 —— 否则上一题的
+        #: quality_checks 会被下一题读到, 那等于用别人的答案过门。
+        self._last_review_checks: Optional[dict] = None
         #: G2-F: 本次审稿**实际发了几次**模型调用(含一次技术重试)。
         #: `gen_spec` 的 metrics 记的是这个数, 不是"审了几稿" ——
         #: 否则"一稿审两次(第二次才成功)"会被记成审了两稿。
@@ -3591,6 +4059,7 @@ class PuzzleWriter:
         # metrics 里的东西**一定**是本题的。
         self._last_review_decision = ""
         self._last_review_issues = None
+        self._last_review_checks = None
         self._last_review_technical = False
 
         bp = blueprint or spec.blueprint
@@ -3633,8 +4102,23 @@ class PuzzleWriter:
             user += ("\n【现有 observed_signature(改完核心就**如实重判**, "
                      "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
                                                    ensure_ascii=False))
-        user += ("\n\n【本题 Blueprint 硬约束(题若违反它就是不合格)】\n"
-                 + bp.describe())
+        # ---- v4(任务书 §二): curated 题**不**受 target Blueprint 约束 ----
+        #
+        # 这一段原先无条件印:
+        #
+        #     【本题 Blueprint 硬约束(题若违反它就是不合格)】
+        #
+        # 对 AI 原创题那是对的: 代码**先选**了骨架, 生成器照着写, 审稿人
+        # 验它有没有照做。
+        #
+        # 对 curated 题那是**错的**: 题目已经存在, 我们只是把它搬进 schema。
+        # 套一份 target 骨架上去, 等于要一道 canonical 题**迎合一个随机
+        # 分配的默认约束** —— 实测这就是"not stranger / not neutral /
+        # not instant / 含 death / 含 past_trauma"这些拒绝的真正来源, 而
+        # 它们与"这道题是不是好海龟汤"**毫无关系**。
+        #
+        # 文案由 `_blueprint_block_for_review` 生成(纯函数, 可测)。
+        user += _blueprint_block_for_review(bp)
 
         # 代码已经确定的毛病, 直接点名让它改
         hard = must_fix or ""
@@ -3646,8 +4130,7 @@ class PuzzleWriter:
         if hard:
             user += f"\n\n【已知问题, 必须改掉】{hard}"
         elif own_fix_focus and not any(
-                _PUZZLE_TOUCH_MARK in f for f in own_fix_focus):
-            # ---- G2-A / G2-D: 告诉它**可以不动谜面** ----
+                _PUZZLE_TOUCH_MARK in f for f in own_fix_focus):            # ---- G2-A / G2-D: 告诉它**可以不动谜面** ----
             # 只压缩 core_answer / 缩短 hint 时, 谜面没有任何理由改变。
             # 不说这一句的话, 模型会为了"证明自己改过东西"而顺手重写
             # 谜面 —— 那会连带让 facts/atoms/clues/beats 全部失配, 于是
@@ -3658,8 +4141,122 @@ class PuzzleWriter:
                      "**不要**顺手改写谜面, 否则 facts/atoms/clues/"
                      "discovery_beats 会全部失配。")
 
+        # ---- H4-D §七: curated 题要**顺带**回答题型三问 ----
+        #
+        # `quality_checks` 里的题型字段(story_reconstruction /
+        # multi_step_deduction / single_trick /
+        # no_external_knowledge_dependency)对**外部题库搬进来的**题才有
+        # 意义 —— 自由生成那条链的骨架本身就保证是故事题。
+        #
+        # ⚠️ 这里**只对 curated 说**。对自由生成也塞这一段的话, 模型会
+        # 花预算去回答四个与它无关的问题, 而且它的答复会被
+        # `_quality_check_contract` 忽略 —— 白写。
+        #
+        # ---- H4-D: 措辞必须跟着政策走 ----
+        #
+        # 旧措辞写着"判据不是'它成不成立', 而是'它**公不公平**'"、
+        # "'现实里真有这样的规定'都不构成通过的理由" —— 那是**旧政策**,
+        # 会把单点脑筋急转弯和普通常识题一起判死。v5 起:
+        #
+        #   前三项(story_reconstruction / multi_step_deduction /
+        #   single_trick)= **信号**, 如实填但不影响收稿;
+        #   第四项(no_external_knowledge_dependency)= **硬门**, 判据
+        #   放宽到"普通观众能不能靠常识推出来"。
+        #
+        # ⚠️ 仍然要说清 `single_trick` 是**反向**字段(true = 更简单):
+        # 不说的话模型会按惯性全填 true, 信号数据就废了。
+        # ---- H4-D1 §二: 外部题库题走**它自己那一套**字段 ----
+        #
+        # ⚠️ 这里必须与 `check_tool(spec)` 发出去的 schema 说**同一件事**。
+        # 早先这段只讲了三项信号 + 一项硬门, 而 schema 里其实还塞着
+        # `concrete_anomaly` / `dramatic_payoff` 等**六个自由生成字段**
+        # (H4-D 第一版的假映射)。模型看到 14 个字段、prompt 只解释 4 个,
+        # 剩下 10 个只能靠猜 —— 而猜错的代价是整稿被拒。
+        #
+        # 现在: schema 按题裁, prompt 按题讲。两边都只出现同一套名字。
+        if _is_curated(spec):
+            user += (
+                "\n\n【本题来自外部题库 —— 按**这一套**字段判定】\n"
+                "\n"
+                "═══ 决定收不收的九项(任一项 false -> `accepted=false`)═══\n"
+                "\n"
+                "  clear_anomaly            谜面有没有一个**清楚的反常点**? "
+                "观众听完会想'这不对劲'。\n"
+                "  unique_explanation       谜底能不能**具体、合理地解释**那个"
+                "反常点?\n"
+                "     ⚠️ **不是**要求'现实世界只能有这一种可能' —— 任何正常"
+                "故事在现实中都可能有别的解释, 用数学意义的唯一解卡题会把"
+                "大量能玩的题判死。\n"
+                "     要的是: 谜底不是**随口编的一个同样可能的背景**, 它得"
+                "真的指向那个反常点。听完只是'换了个说法' -> false。\n"
+                "  yes_no_progress          能不能靠**是/否问答逐步逼近**谜底?\n"
+                "  no_obscure_system        机制本身是不是靠一个**冷门职业"
+                "制度 / 设备冷门功能 / 某系统真实用途**才成立的?\n"
+                "  no_external_media        解题是不是**必须另外拿到**一张图 / "
+                "一段音频 / 一个链接?(谜面里*描述*画面不算)\n"
+                "  livestream_safe          能不能在直播间直接念出来?\n"
+                "     死亡作为普通剧情事实 -> **可以**(true)。\n"
+                "     重口 / 过度刺激 / 以极端伤害本身作噱头 -> false。\n"
+                "     以儿童、家庭严重暴力作为**核心冲击点** -> false。\n"
+                "  no_external_knowledge_dependency  普通观众只靠谜面 + "
+                "是/否问答 + **普通生活常识**, 能不能推出来?\n"
+                "  narrator_truthful        谜底有没有推翻谜面里**无归属**的"
+                "事实陈述?(有归属的不算: '在他看来' / '家里人一直以为')\n"
+                "  mechanism_consistent     核心物理 / 时间 / **方向** / 数量 / "
+                "因果真的成立? 凡依赖方向、早晚、顺序的, **实际走一遍**。\n"
+                "\n"
+                "═══ 只是信号(如实填, 填什么都不影响收不收)═══\n"
+                "\n"
+                "  dramatic_payoff             揭晓够不够有力?\n"
+                "  reasoning_beats_nonredundant 有没有 2~4 个真正不同的发现"
+                "阶段?\n"
+                "  story_reconstruction        谜底揭开后观众多了**一个故事**"
+                "还是只多了**一个知识点**?\n"
+                "  multi_step_deduction        有没有至少两个彼此不同、都会"
+                "改变理解的发现阶段?\n"
+                "  single_trick                ⚠️ **反向**: true = 只有一个"
+                "知识点 / 一个技巧就结束\n"
+                "\n"
+                "═══ 这是直播娱乐题库, 不是文学奖 ═══\n"
+                "\n"
+                "**简单、经典、单反转、脑筋急转弯式的题目都可以收。**\n"
+                "不要因为 `not_a_story` / `no_multi_step` / "
+                "`single_trick` / `no_reversal` 就判它不合格 —— 那是"
+                "**风格差异**, 不是质量缺陷。一道'十八楼够不到按钮'式"
+                "的单点题在直播里**很好用**: 观众能参与、揭晓说得通、"
+                "有点趣味。\n"
+                "\n"
+                "所以: 信号照实填, 题照收。**不要为了让题显得更好而美化"
+                "信号, 也不要因为信号不好而 accepted=false。**\n"
+                "⚠️ 特别注意: `dramatic_payoff=false` / "
+                "`reasoning_beats_nonredundant=false` **本身不是拒稿理由**。"
+                "一道轻量单点题必然这两项都 false, 而它正是我们要的。\n"
+                "\n"
+                "═══ 冷知识(no_external_knowledge_dependency)的判据 ═══\n"
+                "\n"
+                "**允许**(不算外部知识): 日常生活常识 / 简单直觉物理 / "
+                "常见物品用途 / 普通社会经验。\n"
+                "**不允许**(算外部知识 -> 填 false): 专业知识 / 行业"
+                "内部规定 / 具体法律或医学知识 / 冷门设备功能 / 罕见"
+                "科学知识 / 特定网站软件平台机制 / 只有知道某个专有"
+                "事实才能解。\n"
+                "\n"
+                "自问: **揭晓之后, 普通观众是会说'哦, 原来如此', 还是会"
+                "问'这个规则是什么, 我根本没听过'?**\n"
+                "  前者 -> 可以。\n"
+                "  后者 -> `no_external_knowledge_dependency=false`, 拒。\n"
+                "\n"
+                "⚠️ 题里出现医生/电梯/汽车/物理现象**都没问题** —— "
+                "不合格的是**解题必须知道那个外部知识点**。\n"
+                "⚠️ **文字 / 符号技巧本身不算外部知识依赖** —— 谜底是一个"
+                "字形、数字或符号上的小把戏, 只要普通观众揭晓后能看懂, "
+                "就**可以收**(§五 的产品裁决)。真正要拒的是'必须知道某个"
+                "特定平台渲染 / 软件行为 / 极冷门编码规则'。")
+
         res = self.client.messages(CHECK_SYSTEM, user, max_tokens=max_tokens,
-                                   tool=_TOOL_CHECK,
+                                   # H4-D1 §二: schema 按题裁 —— curated 题
+                                   # 只问 curated 那一套(见 `check_tool`)。
+                                   tool=check_tool(spec),
                                    temperature=self._temperature(
                                        "review_temperature"))
         ti = _unwrap_tool_input(res.tool_input)
@@ -3690,6 +4287,11 @@ class PuzzleWriter:
         # 占满了, 再加一个会逼着所有调用点跟着改。
         self._last_review_decision = decision
         self._last_review_issues = issues
+        # H3-D3: 原样留下 quality_checks, 供 curated 链在审稿之后单独
+        # 复核题型四问。**在 decision 分支之前**写 —— 否则 rewrite 那条
+        # 出口会把它漏掉, 而 curated 链读到的就是上一题的残留。
+        _qc = ti.get("quality_checks")
+        self._last_review_checks = dict(_qc) if isinstance(_qc, dict) else None
 
         # ---- rewrite: 不修补, 交回生成器 ----
         if decision == "rewrite":
@@ -3938,20 +4540,46 @@ class PuzzleWriter:
         if (changed or is_v5_review) and not gave_core:
             bad.append("core_answer")
 
-        # ---- quality_checks: **fail closed** ----
+        # ---- quality_checks: **fail closed, 但只对"门"那几项** ----
         #
-        # 四项必须全部为 true。这是"假绿"的唯一防线:
+        # 决定收不收的那几项必须全部为 true。这是"假绿"的唯一防线:
         # 模型完全可以 decision="pass" 而同时报 narrator_truthful=false
         # (它看出了问题, 但选了最省事的决定)。若代码照单全收, 那稿会
         # 直接进正式 Q&A —— 比 rewrite 更糟。
         #
-        # 缺失 / 非 dict / 任一项非 True(含缺键) 一律拒。
+        # 缺失 / 非 dict / 任一项取错值 一律拒。
+        #
+        # H3-D3: 清单按题目来源分派 —— curated 走它自己那一份, 自由生成
+        # 走前八项。分派的理由见 `_quality_check_contract` 的说明。
+        #
+        # ---- H4-D §七 / H4-D1 §二: curated 的门**是它自己的一套** ----
+        #
+        # v2~v4 里 curated 走全量十三项, 于是 `single_trick=true`(单点
+        # 脑筋急转弯)整稿被拒 —— 而那种题在直播里很好用。v5 起 curated
+        # 只走 `_CURATED_HARD_CHECK_FIELDS`: 六个**与编译侧同名**的内容门
+        # + 冷知识门 + 两条真实性, 其余全是信号。
+        #
+        # ⚠️ H4-D 第一版这里走的是 `concrete_anomaly` / `dramatic_payoff`
+        # 等六个**自由生成**字段, 靠项数对齐假装 policy 一致 —— 其中
+        # `dramatic_payoff <- no_external_media`、`reasoning_beats_nonredundant
+        # <- livestream_safe` 语义不成立。见 `_CURATED_HARD_CHECK_FIELDS`。
+        #
+        # ⚠️ 信号字段**缺失不算技术失败**(§七): 不填就是不填, 不拒稿。
+        # 所以这里遍历的清单里**一项信号都没有** —— 缺信号不会被点名。
+        #
+        # ⚠️ **方向**: 门里每一项都是"true = 好"。早先这里写的是
+        # `qc.get(n) is not True` 而清单里混着**反向**项
+        # (`single_trick`: true = 坏), 那会把一道好题(单点技巧 = False)
+        # 判成"未全过", 于是**每一道题都被拒**。现在门与信号分开, 反向项
+        # 不在门里 —— 但仍然用 `check_value_ok` 保持与 curated 侧同一份
+        # 方向定义(将来若有反向项进门, 这里不会重演)。
         qc = ti.get("quality_checks")
         if not isinstance(qc, dict):
             bad.append("quality_checks 缺失")
         else:
-            _qc_bad = [n for n in _QUALITY_CHECK_FIELDS
-                       if qc.get(n) is not True]
+            from tools.curated_compiler import check_value_ok
+            _qc_bad = [n for n in _quality_check_contract(spec)
+                       if not check_value_ok(n, qc.get(n))]
             if _qc_bad:
                 bad.append("quality_checks 未全过(" + ", ".join(_qc_bad) + ")")
 
@@ -4096,6 +4724,16 @@ class PuzzleWriter:
             # 的准入政策门, 表现为"编译成功了却播不出来"。
             content_style=list(spec.content_style or []),
             curated_policy_version=spec.curated_policy_version,
+            # ---- H3-D3: 内容哈希也必须带过 ----
+            # **同一类错误的第三次**。`_apply_review` 重建 spec, 没显式
+            # 列出的字段静默回默认值。这次漏的是 `curated_content_hash`,
+            # 而它正是题池准入门查账本用的第三元: 丢了它, 池门算出的 key
+            # 在账本里永远查不到 -> **整批 curated 题"编译成功却播不出来"**,
+            # 而且日志上只会说"缺 curated_content_hash"。
+            #
+            # (实测: 一次 20 道的小样本跑完, 4 道 accepted 全部带着空
+            # hash 落盘。这条注释是那次踩坑留下的。)
+            curated_content_hash=spec.curated_content_hash,
             metrics=dict(spec.metrics or {}),
             usage=spec.usage, model=spec.model), ""
 

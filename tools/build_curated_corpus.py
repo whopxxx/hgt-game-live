@@ -70,6 +70,11 @@ log = logging.getLogger("hgt.corpus")
 #: 也还是读真实目录。测试因此根本没法用临时目录隔离(会读到生产语料)。
 #: 相对 root 之后, `--root` 才真的是"去哪找输入、往哪写输出"。
 SOURCES = (
+    # H4-A: 主源排在前面(见 `lazy_curator.source_priority`)。
+    # 顺序在这里**无关**(最终全局排序), 但列在前面让人一眼看到
+    # "现在的主源是哪个"。
+    ("haiguitang", os.path.join("haiguitang", "normalized",
+                                "haiguitang.jsonl")),
     ("turtlebench", os.path.join("turtlebench", "normalized",
                                  "turtlebench.jsonl")),
     ("puzzling_se", os.path.join("puzzling_se", "normalized",

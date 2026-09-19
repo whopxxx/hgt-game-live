@@ -70,14 +70,20 @@ def mk_rec(**kw) -> RawCuratedPuzzle:
 
 
 def _qc_v2(**kw):
-    """一份**能过 curated-v2 全部判据**的 quality_checks。
+    """一份**能过 curated 当前全部判据**的 quality_checks。
 
     H3-A 起判据从九条变成十二条, 其中 `single_trick` 是**反向**的
-    (true = 坏)。所以不能再用 `{k: True for k in CURATED_CHECKS}`
-    —— 那会把 single_trick 填成 True, 于是每一道题都被故事门拒掉,
+    (true = 坏); H3-D 又加了 `no_external_knowledge_dependency` 变成
+    十三条。所以不能再用 `{k: True for k in CURATED_CHECKS}` ——
+    那会把 single_trick 填成 True, 于是每一道题都被故事门拒掉,
     看起来像"编译器全坏了"。
+
+    ⚠️ 按 `CURATED_CHECKS_V3` **遍历**而不是手写清单: 手写的那份会在
+    下次加判据时静默过期(这份 fixture 会变成"缺一项", 而生产里每道
+    好题都被拒)。名字保留 `_qc_v2` 是因为调用点很多, 它现在是"当前
+    政策的合格判据"的意思。
     """
-    qc = {k: True for k in CC.CURATED_CHECKS_V2}
+    qc = {k: True for k in CC.CURATED_CHECKS_V3}
     qc["single_trick"] = False
     qc.update(kw)
     return qc
@@ -168,18 +174,31 @@ def _writer(results, **kw):
 
 
 def _qc_v8(**kw):
-    """`_apply_review` 要求的 v8 八项(与 curated 的九条是**两套**) 。
+    """审稿回复的 `quality_checks` —— **curated 题走过的那一套**。
 
-    注意这两套判据是**不同**的:
-        curated 九条  -> H2-B 的"这题适不适合搬进直播"(ACCEPT/REJECT)
-        v8 八项       -> `_apply_review` 对**任何** spec 的交付门
-                          (narrator_truthful / mechanism_consistent / …)
-    curated 题同样要过后者 —— 它复用同一套审稿人, 不是旁路。
+    ⚠️ H4-D1 §二: curated 的门**不再是** `concrete_anomaly` /
+    `dramatic_payoff` 那六项(那是 H4-D 第一版的假映射, 见
+    `story.llm._CURATED_HARD_CHECK_FIELDS`), 而是与编译侧**同名**的
+    六条内容门 + 冷知识门 + 两条真实性, 共九项。
+
+    ⚠️ 这份 fixture 必须与 `story.llm._CURATED_HARD_CHECK_FIELDS`
+    **逐字一致** —— 少一项, `_apply_review` 会因为"缺字段"拒稿, 而这
+    正是 H4-D1 之前 12 条测试同时红掉的原因。测试
+    `test_curated_reviewer_contract_is_semantically_honest` 守这条。
+
+    信号五项(`dramatic_payoff` / `reasoning_beats_nonredundant` /
+    `story_reconstruction` / `multi_step_deduction` / `single_trick`)
+    **也给**, 因为真实回复会给; 但它们是信号, 取任何值都不拒稿。
     """
-    d = {"narrator_truthful": True, "mechanism_consistent": True,
-         "core_answer_direct": True, "completion_contract_minimal": True,
-         "concrete_anomaly": True, "clue_recontextualized": True,
-         "dramatic_payoff": True, "reasoning_beats_nonredundant": True}
+    d = {"clear_anomaly": True, "unique_explanation": True,
+         "yes_no_progress": True, "no_obscure_system": True,
+         "no_external_media": True, "livestream_safe": True,
+         "no_external_knowledge_dependency": True,
+         "narrator_truthful": True, "mechanism_consistent": True,
+         # ---- 信号(给全, 但取什么都不影响准入) ----
+         "dramatic_payoff": True, "reasoning_beats_nonredundant": True,
+         "story_reconstruction": True, "multi_step_deduction": True,
+         "single_trick": False}
     d.update(kw)
     return d
 
@@ -193,12 +212,116 @@ def _sig_with_observed(**kw):
     return d
 
 
-def _review_pass():
-    """审稿 pass —— 原样回传整套 bundle(与 `_apply_review` 的要求一致)。"""
+def _review_pass(**kw):
+    """审稿 pass —— 原样回传整套 bundle(与 `_apply_review` 的要求一致)。
+
+    `quality_checks=...` 可以整体替换那十二项(测题型四问时用)。
+    """
     d = _compile_tool()
+    qc = kw.pop("quality_checks", None) or _qc_v8()
     d.update({"decision": "pass", "observed_signature": _sig_with_observed(),
-              "quality_checks": _qc_v8()})
+              "quality_checks": qc})
+    d.update(kw)
     return LLMResult(tool_input=d, model="m")
+
+
+def _review_with_story_gate(**story_kw):
+    """审稿回复: **结构全过, 但题型四问按给定值**。
+
+    H3-D3 起题型问就藏在这份 `quality_checks` 里, 所以"复核拒稿"必须
+    由审稿**那一次**答复表达。十八楼/吉普车那类题的真实形态正是这样:
+    编译侧十三条全填"没问题", 只有这四项看得出它是 single_trick。
+    """
+    return _review_pass(quality_checks=_qc_v8(**story_kw))
+
+
+# ======================================================================
+# H3-D §六: 复核是**独立**的判断, 且必须真的生效
+# ======================================================================
+def test_story_review_signal_does_not_block_compilation():
+    """**H4-D §三/§六: 复核的题型信号必须**不再**拦下编译。**
+
+    ⚠️ 这条**反转**了 v4 的
+    `test_story_review_rejection_blocks_compilation`。那是对的 ——
+    政策变了, 测试跟着产品走(任务书 §五)。
+
+    v4 里 Reviewer 说 `single_trick=true` 就整稿被拒, 于是十八楼那种
+    "轻量直播竞猜"永远进不来。v5 起它只是一个**信号**。
+
+    断言三件事:
+      1. **有 spec**(没被拦下) —— 这是 v5 的核心;
+      2. 信号**确实被记下了**(降级 != 丢弃) —— §十二 以后要排序;
+      3. 仍然没有第四次 LLM(题型问在审稿里, H3-D3 的预算契约不变)。
+    """
+    print("\n[H4-D §三] 复核信号不再拦下编译")
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_with_story_gate(
+                         story_reconstruction=False,
+                         multi_step_deduction=False,
+                         single_trick=True,
+                         no_external_knowledge_dependency=True)])
+    from tools.curated_compiler import CuratedCompiler
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
+    check("**有 spec(信号不拦题)**", spec is not None, info)
+    # 信号必须记下来 —— 否则"降级"就变成了"丢弃", 以后无法排序
+    check("**审稿侧信号已记录**",
+          "single_trick" in (info.get("review_signal") or []),
+          info.get("review_signal"))
+    # ⚠️ 编译侧这里是**干净的**(`_compile_tool` 的 qc 里 single_trick=
+    # False)。两侧信号**互相独立**正是设计意图: 编译模型和 Reviewer 是
+    # 两次独立判断, 合并它们会让"两个独立视角"退化成"一个"。
+    check("编译侧独立记录(这份 fixture 里它是干净的)",
+          not (info.get("story_signal") or []),
+          info.get("story_signal"))
+    check("**stage 不是 story_review**(它不再是拒绝 stage)",
+          info.get("stage") != "story_review", info.get("stage"))
+    names = [(c["tool"] or {}).get("name") for c in fc.calls]
+    check("**没有第四次 LLM**(题型问在审稿里)",
+          names.count("emit_review") == 1, names)
+    check("**没有任何独立的复核调用**",
+          "review_story_gate" not in names, names)
+
+
+def test_review_missing_story_fields_does_not_block_compilation():
+    """**H4-D §七: 审稿回复里**没有**题型字段 -> 不拒稿, 也不技术失败。**
+
+    ⚠️ 这条**反转**了 v4 的
+    `test_review_missing_story_fields_blocks_compilation`。
+
+    任务书原话:
+
+        故事/反转/层次类字段: 虽可返回, 但不是 pass/fail 条件。
+        缺少这些 soft 字段也不要技术失败。
+
+    v4 里缺这四个字段 = 复核缺失 = technical_defer。v5 起它们只是信号,
+    不填就是不填 —— 一道题**不该因为 Reviewer 少答了一个风格问题**
+    而被判"这次没审成"。
+
+    断言:
+      1. **有 spec**;
+      2. `story_review_missing` **不出现**在 reject_reasons 里;
+      3. 没有任何信号被记成"负面"(缺项 = 无信号)。
+    """
+    print("\n[H4-D §七] 审稿缺题型字段 -> 不拒稿, 不技术失败")
+    qc = _qc_v8()
+    # ⚠️ 只去掉**纯信号**那三个。`no_external_knowledge_dependency` 是
+    # §四 的**硬门**, 去掉它本来就该拒 —— 把它一起 pop 掉会让这条测试
+    # 变成"门少了才算过", 那是与 §七 相反的结论。
+    for k in ("story_reconstruction", "multi_step_deduction",
+              "single_trick"):
+        qc.pop(k)
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass(quality_checks=qc)])
+    from tools.curated_compiler import CuratedCompiler
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
+    check("**有 spec(缺信号字段不拦题)**", spec is not None, info)
+    check("**story_review_missing 不是拒因**",
+          "story_review_missing" not in (info.get("reject_reasons") or []),
+          info.get("reject_reasons"))
+    check("**没被标成技术失败**", info.get("technical") is not True, info)
+    check("缺项 = 无信号(不是负面信号)",
+          not (info.get("review_signal") or []),
+          info.get("review_signal"))
 
 
 # ======================================================================
@@ -222,6 +345,37 @@ def test_never_calls_emit_riddle():
     check("用的是 emit_curated", "emit_curated" in names, names)
     check("编译成功", spec is not None, info)
     check("info 标 accepted", info.get("accepted") is True, info)
+
+
+def test_accepted_path_is_exactly_three_llm_calls():
+    """§一-2: 一条 accepted 路径**恰好 3 次** LLM 调用。
+
+        1. emit_curated    (编译)
+        2. emit_review     (审稿 —— 题型四问**并进这一次**)
+        3. emit_truth_audit(审计)
+
+    ## 这条守的是什么
+
+    H3-D 里"故事复核"是**独立的一次调用**, 于是变成 4 次。任务书
+    H3-D3 §一-2 明确要求降到 3 次。这条测试把次数**钉死**:
+    将来谁再加一次调用, 它立刻变红。
+
+    ⚠️ 也顺手断言"没有任何独立的复核工具" —— 复核并进来之后,
+    `review_story_gate` 这个名字不该再出现在工具调用里。
+    """
+    print("\n[H3-D3] accepted 路径恰好 3 次 LLM 调用")
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    from tools.curated_compiler import CuratedCompiler
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
+    check("编译成功", spec is not None, info)
+    names = [(c["tool"] or {}).get("name") for c in fc.calls]
+    check("**恰好 3 次调用**", len(names) == 3, names)
+    check("**顺序是 compile -> review -> audit**",
+          names == ["emit_curated", "emit_review", "emit_truth_audit"],
+          names)
+    check("**没有独立的复核调用**",
+          "review_story_gate" not in names, names)
 
 
 def test_prompt_carries_canonical_source():
@@ -277,32 +431,65 @@ def test_chinese_source_not_told_to_translate():
 # ======================================================================
 # 2. AI 审题门(H2-B)
 # ======================================================================
-def test_ai_gate_rejects_on_false_check():
-    """十二条里任意一条不合格 -> 拒(fail closed)。
+def test_hard_gate_rejects_on_false_check():
+    """**H4-D §二: 六条硬门 + 第13条**逐条 fail closed。
 
-    ⚠️ `single_trick` 方向相反: 它的**不合格**取值是 `True`。
-    用同一句 `qc[k] = False` 去试它, 恰好是**合格**取值 —— 那种测试
-    会永远绿, 而它本该是最关键的一条。
+    ⚠️ 范围从"十二条"缩到**七条** —— 这正是 v5 的政策。剩下的六条
+    (`not_pure_puzzle` / `has_reversal` / `detail_recontextualized` /
+    故事三问)是**信号**, 它们不合格**不拒题**(由
+    `test_soft_signals_are_not_gates` 反向守着)。
     """
-    print("\n[H2-B] 十二条判据逐条 fail closed")
-    for k in CC.CURATED_CHECKS_V2:
+    print("\n[H4-D §二] 硬门逐条 fail closed")
+    hard = list(CC.CURATED_HARD_CHECKS) + [
+        "no_external_knowledge_dependency"]
+    for k in hard:
         qc = _qc_v2()
-        qc[k] = True if k in CC._INVERTED_CHECKS else False
+        qc[k] = False
         ok, why = CC.check_tool_result({"accepted": True,
                                         "quality_checks": qc})
+        # 第 13 条的 reason 文本用的是短名, 所以只断言"拒了"
         check(f"{k} 不合格 -> 拒", not ok, why)
 
 
-def test_ai_gate_requires_all_checks():
-    print("\n[H2-B] 十二条缺一不可")
-    check("十二条齐全且全合格 -> 过",
+def test_soft_signals_are_not_gates():
+    """**H4-D §三: 信号不合格**不**拒题** —— 与上一条成对。
+
+    ⚠️ 只测上一条(门要拒)是不够的: 把整份清单都当门也能让上一条绿。
+    这一条测的是反方向 —— **信号被排除在门之外**。
+
+    `single_trick` 的方向在这里特别容易搞错: 它的"坏"取值是 `True`,
+    所以这里显式用 `True`。
+    """
+    print("\n[H4-D §三] 信号不合格 -> 不拒题")
+    for k in CC.CURATED_SOFT_SIGNALS:
+        qc = _qc_v2()
+        # `single_trick` 反向(True = 坏), 其余正向(False = 坏)
+        qc[k] = True if k in CC._INVERTED_CHECKS else False
+        ok, why = CC.check_tool_result({"accepted": True,
+                                        "quality_checks": qc})
+        check(f"**{k} 不合格 -> 仍然收**", ok, why)
+
+
+def test_hard_gate_requires_its_checks():
+    """硬门**缺一不可**(fail closed); 信号**缺了无所谓**。"""
+    print("\n[H4-D §二] 硬门缺一不可 / 信号缺了无所谓")
+    check("全部齐全且硬门全合格 -> 过",
           CC.check_tool_result({"accepted": True,
                                 "quality_checks": _qc_v2()})[0])
-    # 缺一条
-    qc = _qc_v2()
-    del qc["livestream_safe"]
-    ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
-    check("**缺一条 -> 拒**", not ok, why)
+    # 缺一条**硬门**
+    for k in CC.CURATED_HARD_CHECKS:
+        qc = _qc_v2()
+        del qc[k]
+        ok, why = CC.check_tool_result({"accepted": True,
+                                        "quality_checks": qc})
+        check(f"**缺硬门 {k} -> 拒**", not ok, why)
+    # 缺一条**信号** -> 仍然过
+    for k in CC.CURATED_SOFT_SIGNALS:
+        qc = _qc_v2()
+        del qc[k]
+        ok, why = CC.check_tool_result({"accepted": True,
+                                        "quality_checks": qc})
+        check(f"**缺信号 {k} -> 仍然过**", ok, why)
     # 完全没有 quality_checks
     ok, why = CC.check_tool_result({"accepted": True})
     check("**没有 quality_checks -> 拒**", not ok, why)
@@ -322,18 +509,36 @@ def test_ai_gate_rejects_explicit_reject():
     check("**没给理由也拒**", not ok, why)
 
 
-def test_ai_gate_is_fail_closed_on_self_contradiction():
-    """accepted=true 但某条 false(自相矛盾)-> 以 quality_checks 为准, 拒。
+def test_hard_gate_is_fail_closed_on_self_contradiction():
+    """accepted=true 但某条**硬门** false(自相矛盾)-> 以逐条判据为准, 拒。
 
-    这是最危险的一种: 模型嘴上说"行", 逐条判据里却写着"没有反转"。
-    信那个总结布尔就会把一道没有反转的题放进池子 —— 正是本批要消灭的。
+    这是最危险的一种: 模型嘴上说"行", 逐条判据里却写着"内容不适合直播"。
+    信那个总结布尔就会把一道不安全的题放进池子。
+
+    ⚠️ v5 起**信号**的自相矛盾**不拒**(见下 `test_..._signal_...`)。
+    这两条合起来才说明"fail closed"的范围被准确收窄了, 而不是被削弱。
     """
-    print("\n[H2-B] **自相矛盾时以逐条判据为准**")
+    print("\n[H4-D §二] **硬门自相矛盾时以逐条判据为准**")
     qc = _qc_v2()
-    qc["has_reversal"] = False
+    qc["livestream_safe"] = False
     ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
     check("**拒(不信 accepted)**", not ok, why)
-    check("点名 has_reversal", "has_reversal" in " ".join(why), why)
+    check("点名 livestream_safe", "livestream_safe" in " ".join(why), why)
+
+
+def test_signal_self_contradiction_does_not_reject():
+    """**H4-D §三**: 信号与 `accepted` 矛盾时**不拒题**(信号没那个权力)。
+
+    模型 `accepted=true` 而 `has_reversal=false` —— v4 里这是"自相矛盾",
+    拒稿。v5 里它**完全正常**: 一道题可以没有反转但仍然很好玩, 而模型
+    如实报了"没反转"。这正是政策要允许的情况。
+    """
+    print("\n[H4-D §三] 信号与 accepted 矛盾 -> 不拒")
+    qc = _qc_v2()
+    qc["has_reversal"] = False
+    qc["story_reconstruction"] = False
+    ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
+    check("**仍然收**(信号没有否决权)", ok, why)
 
 
 def test_explicit_ai_reject_does_not_retry():
@@ -354,9 +559,16 @@ def test_explicit_ai_reject_does_not_retry():
     check("stage 标 ai_gate", info["stage"] == "ai_gate", info)
 
 
-def test_self_contradiction_retries_then_gives_up():
-    """自相矛盾 -> 重试(多半是漏填), 但重试耗尽仍要拒。"""
-    print("\n[H2-B] 自相矛盾重试到上限仍拒")
+def test_missing_hard_check_rejects_without_retry():
+    """缺**硬门** -> 重试(多半是漏填), 但重试耗尽仍要拒。
+
+    ⚠️ 与信号的区别很重要: 硬门缺项**可能**是模型漏填(而不是真判 false),
+    所以重试一次划算。信号缺项**不重试也不拒** —— 它压根不重要。
+
+    这条替换了 v4 的 `test_self_contradiction_retries_then_gives_up`
+    (那条用的是 `livestream_safe` 缺项, 语义相同, 只是名字与理由更新了)。
+    """
+    print("\n[H4-D §二] 缺硬门 -> 重试到上限仍拒")
     bad_qc = _qc_v2()
     bad_qc.pop("livestream_safe", None)     # 用"缺一项"更贴近真实漏填
     w, fc = _writer([
@@ -369,7 +581,16 @@ def test_self_contradiction_retries_then_gives_up():
     spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[],
                                                 max_attempts=2)
     check("最终没收", spec is None)
-    check("重试了 2 次", len(fc.calls) == 2, len(fc.calls))
+    # ⚠️ **一次**, 不是两次。v4 里"缺一条判据"会走"自相矛盾 -> 重试"那条
+    # 分支(`continue`), 于是烧掉 max_attempts 次调用。v5 起硬门缺项在
+    # `check_tool_result` 里就被判成 `hard_gate` 并**立即返回**(不重试) ——
+    # 因为硬门缺项与"模型说行、其实不行"是同一类**结构性**判定: 再怎么
+    # 重问, 那六条问的还是同一道题的同一件事。
+    #
+    # 这条断言把那个预算契约钉死: 一次。改成 2 就说明有人把硬门缺项重新
+    # 归到了"重试"那一支, 而那是白烧好题的配额。
+    check("**只调了一次**(硬门缺项不重试)", len(fc.calls) == 1,
+          len(fc.calls))
 
 
 # ======================================================================
@@ -663,16 +884,22 @@ def main():
     tests = [
         # 铁律
         test_never_calls_emit_riddle,
+        # H3-D §六: 复核
+        test_story_review_signal_does_not_block_compilation,
+        test_review_missing_story_fields_does_not_block_compilation,
+        test_accepted_path_is_exactly_three_llm_calls,
         test_prompt_carries_canonical_source,
         test_english_flagged_for_translation,
         test_chinese_source_not_told_to_translate,
         # AI 门
-        test_ai_gate_rejects_on_false_check,
-        test_ai_gate_requires_all_checks,
+        test_hard_gate_rejects_on_false_check,
+        test_soft_signals_are_not_gates,
+        test_hard_gate_requires_its_checks,
         test_ai_gate_rejects_explicit_reject,
-        test_ai_gate_is_fail_closed_on_self_contradiction,
+        test_hard_gate_is_fail_closed_on_self_contradiction,
+        test_signal_self_contradiction_does_not_reject,
         test_explicit_ai_reject_does_not_retry,
-        test_self_contradiction_retries_then_gives_up,
+        test_missing_hard_check_rejects_without_retry,
         # H2-E
         test_fair_clue_must_be_verbatim_from_puzzle,
         test_missing_fair_clue_rejected,

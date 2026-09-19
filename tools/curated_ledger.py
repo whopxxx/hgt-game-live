@@ -85,6 +85,67 @@ TERMINAL = frozenset({ACCEPTED, REJECTED})
 RETRYABLE = frozenset({TECHNICAL_DEFER, INTERRUPTED})
 ALL_DECISIONS = frozenset({ACCEPTED, REJECTED, TECHNICAL_DEFER, INTERRUPTED})
 
+#: §五/§六/§十四: 这些 stage 的死因是**编译期结构问题**, 不是内容判决。
+#:
+#: 定义放在**账本**里(而不是 lazy_curator 或 compiler): 它是**报告口径**
+#: 的一部分 —— `source_quality()` 要按它把 "compile_invalid" 从
+#: technical_defer 里单独数出来。三处各写一份必然漂移, 而漂移的代价是
+#: 报告里的数字与实际决策语义不符。
+#:
+#: ⚠️ 这只是**报告标签**, 决策仍然是 `technical_defer`(可重试)。
+#: §六 明确: Ledger **不增加第五种永久状态**。
+COMPILE_INVALID_STAGES = frozenset({
+    "validate",               # 结构硬门(与出题链同一套)
+    "curated_validate",       # fair_clue 逐字 / provenance
+    "post_review_validate",   # 审后结构校验
+    "post_review_curated",    # 审后 curated 校验
+    "reveal_adherence",       # reveal 结构没执行目标
+    "too_similar",            # 与最近某题文本太像(分布问题, 非内容)
+})
+
+#: 结构问题的**文本指纹** —— 用于"reason 说是结构问题, 但 stage 更浅"
+#: 的那种情况。
+#:
+#: ## 为什么光看 stage 不够(实测)
+#:
+#: `compile_one` 会记录"走到过的最深一道门"(`_deepest`), 而
+#: `reject_reasons` 取的是**最后一次**尝试的原因。两者来自不同稿件时
+#: 就会错配。实跑抓到一条:
+#:
+#:     stage  = truth_audit          (最深走到审计)
+#:     reason = 第 2 条提示超过 30 字 (另一次尝试死在 hint 长度)
+#:
+#: 只看 stage 会把它算成"审计没过"(像内容问题), 而它**其实是**一条
+#: hint 超长 —— 结构问题。分类必须读 reason 文本才能纠正。
+#:
+#: ⚠️ 这些指纹只在**没有更硬的内容判决理由**时才用于归类:
+#: `_classify` 先让 `ai_gate` / `hard_gate` 这些**确定性内容门**胜出,
+#: 免得一个恰好提到"提示"两字的内容拒绝被误归。
+COMPILE_INVALID_REASON_MARKS = (
+    "提示超过",           # hint 长度
+    "hints 应为",         # hint 数量
+    "fair_clue",          # quote 溯源
+    "completion fact",    # 合同连线
+    "core hidden facts",  # 内部上限
+    "没有被任何 solve_atom 引用",
+    "工具调用返回空 input",
+)
+
+
+def looks_like_compile_invalid(stage: str, reasons: Optional[list]) -> bool:
+    """这条决策的**死因**是编译期结构问题吗?
+
+    stage 命中即算; 否则看 reasons 里有没有结构问题的文本指纹。
+    见 `COMPILE_INVALID_REASON_MARKS` 的说明。
+    """
+    if str(stage or "") in COMPILE_INVALID_STAGES:
+        return True
+    for r in (reasons or []):
+        s = str(r)
+        if any(m in s for m in COMPILE_INVALID_REASON_MARKS):
+            return True
+    return False
+
 
 def content_hash_of(rec: Any, *, n: int = 12) -> str:
     """一条候选记录的**内容**哈希(surface + bottom)。
@@ -108,12 +169,31 @@ def make_decision(rec: Any, *, decision: str, stage: str = "",
                   reasons: Optional[list] = None,
                   policy_version: str = "",
                   style_tags: Optional[list] = None,
+                  checks: Optional[dict] = None,
                   ts: Optional[float] = None) -> dict:
     """构造一行账本记录。
 
     ⚠️ `decision` 必须是四种之一 —— 拼错的值会让那条记录**两个集合都
     进不去**(既非终态也非可重试), 于是它既不重审也不被跳过, 行为
     取决于下游怎么读。所以这里直接拒绝非法值, 而不是"宽容接受"。
+
+    ## `checks` —— 题型审核证据(§十二)
+
+    Reject Audit 的取证结论: `compile` 四字段与 `Reviewer` 四字段
+    **运行完就丢**。它们存在于内存, 写账本时被丢掉 —— 于是事后无法回答
+    "这道题当时那四项到底判了什么"。
+
+    现在它们作为**可选**字段落盘:
+
+        {"compile": {...四字段...}, "review": {...四字段...}}
+
+    ⚠️ 三条硬约束:
+      1. **不进前端** —— 它只进账本, 由 `DecisionLedger` 读, 不序列化
+         进 Snapshot / 不下发;
+      2. **不影响 decision identity** —— `decision_key` 只读
+         `(external_id, content_hash, policy_version)`, 不含 `checks`;
+      3. **append-only 继续** —— 旧账本没有这个键是合法的, 读出 `{}`。
+         不需要迁移(迁移会重写历史, 而历史是 append-only 的全部意义)。
     """
     if decision not in ALL_DECISIONS:
         raise ValueError(f"非法 decision: {decision!r}(必须是 {sorted(ALL_DECISIONS)})")
@@ -126,6 +206,9 @@ def make_decision(rec: Any, *, decision: str, stage: str = "",
         "stage": str(stage or ""),
         "reasons": [str(r) for r in (reasons or []) if r],
         "style_tags": [str(s) for s in (style_tags or []) if s],
+        # 只留字典; 没有就写空 dict(不是 None) —— 让下游读的时候不必
+        # 到处判 None。
+        "checks": dict(checks) if isinstance(checks, dict) else {},
         "ts": float(ts if ts is not None else time.time()),
     }
 
@@ -237,16 +320,19 @@ class DecisionLedger:
     # ------------------------------------------------------------------
     def record(self, rec: Any, *, decision: str, policy_version: str,
                stage: str = "", reasons: Optional[list] = None,
-               style_tags: Optional[list] = None) -> bool:
+               style_tags: Optional[list] = None,
+               checks: Optional[dict] = None) -> bool:
         """写一条决策并**立即**更新内存索引。
 
         先落盘再更新内存: 反过来的话, 写盘失败时内存会以为"审过了",
         于是一次磁盘故障就让那道题在本轮被静默跳过 —— 而下游(是否
         入池)已经发生了。顺序必须是"盘上先成立"。
+
+        `checks` 是**可选**的审计证据(§十二), 不影响 decision identity。
         """
         d = make_decision(rec, decision=decision, stage=stage,
                           reasons=reasons, policy_version=policy_version,
-                          style_tags=style_tags)
+                          style_tags=style_tags, checks=checks)
         if not append_decision(self.path, d):
             return False
         self.rows.append(d)
@@ -286,3 +372,110 @@ class DecisionLedger:
                 slug = str(r).split(":")[0].strip()[:40] or "unknown"
                 by_reason[slug] = by_reason.get(slug, 0) + 1
         return {"by_stage": by_stage, "by_reason": by_reason}
+
+    def source_quality(self, policy_version: str) -> dict:
+        """§十四: source yield 必须拆成**几个不同的数字**, 不能只报
+        `accepted / processed`。
+
+        ## 为什么这一个函数很要紧
+
+        "12.5% 通过率"那个数字把**三种完全不同的东西**混成了一个:
+
+            源的内容真的不行          -> content_rejected
+            网关抖了 / schema 坏了    -> technical_defer(其中 compile_invalid)
+            直播抢资源                -> interrupted
+
+        把它们混起来算"源质量差"是**统计错误**: 一次网关抖动会让 yield
+        看起来掉一半, 而源本身没变。Reject Audit 正是卡在这里 ——
+        30 条 rejected 里有 6 条其实是编译接线问题, 不是内容判决。
+
+        `compile_invalid` **包含在** `technical_defer` 里(决策仍是可重试),
+        但**单独统计** —— 否则"这一类到底有多少"永远看不见。
+
+        真正的 source yield:
+
+            accepted / (accepted + content_rejected)
+
+        —— 分母里**不含** defer / interrupted。
+        """
+        counts = {ACCEPTED: 0, REJECTED: 0, TECHNICAL_DEFER: 0,
+                  INTERRUPTED: 0}
+        compile_invalid = 0
+        by_stage: dict = {}
+        for (_eid, _h, pol), d in self._idx.items():
+            if pol != policy_version:
+                continue
+            dec = d.get("decision")
+            if dec not in counts:
+                continue
+            counts[dec] += 1
+            st = str(d.get("stage") or "unknown")
+            by_stage[st] = by_stage.get(st, 0) + 1
+            if dec == TECHNICAL_DEFER and looks_like_compile_invalid(
+                    st, d.get("reasons")):
+                compile_invalid += 1
+        acc = counts[ACCEPTED]
+        crej = counts[REJECTED]
+        denom = acc + crej
+        return {
+            "processed": sum(counts.values()),
+            "accepted": acc,
+            "content_rejected": crej,
+            "technical_defer": counts[TECHNICAL_DEFER],
+            "compile_invalid": compile_invalid,
+            "interrupted": counts[INTERRUPTED],
+            "by_stage": by_stage,
+            # 真正的源 yield —— 分母**不含** defer / interrupted。
+            "source_yield": (acc / denom) if denom else None,
+        }
+
+    def signal_stats(self, policy_version: str) -> dict:
+        """H4-D §十二: 统计**信号**(不含准入理由)的分布。
+
+        ## 为什么要单独一个函数
+
+        v5 起"这道题是不是故事 / 有没有反转 / 是不是单点技巧"不再拒题,
+        于是它们从**死因**变成了**风格统计**。审批端要回答的问题也随之
+        变了:
+
+            旧: "被拒的题里有多少是因为不够曲折?"   (已无意义)
+            新: "收进来的题里有多少是单点脑筋急转弯?" (这才是有用的)
+
+        第二个问题只能从 signals 里读, 而它**不能**与 reject reason 混在
+        一起 —— 一个 `single_trick` 出现在 rejected 那条里是死因, 出现在
+        accepted 那条里是风格。混着统计会得出"single_trick 拒了很多题"
+        这种**与事实相反**的结论。
+
+        返回:
+            {
+              "accepted_with_signal": {signal: count},
+              "accepted_clean": int,           # 无任何信号的题数
+              "rejected_with_signal": {signal: count},
+            }
+        """
+        acc_sig: dict = {}
+        rej_sig: dict = {}
+        acc_clean = 0
+        for (_eid, _h, pol), d in self._idx.items():
+            if pol != policy_version:
+                continue
+            dec = d.get("decision")
+            if dec not in (ACCEPTED, REJECTED):
+                continue
+            sig = (d.get("checks") or {}).get("signals") or {}
+            names: list = []
+            for _k, _v in sig.items():
+                names.extend(str(x) for x in (_v or []))
+            if dec == ACCEPTED:
+                if not names:
+                    acc_clean += 1
+                for nm in names:
+                    acc_sig[nm] = acc_sig.get(nm, 0) + 1
+            else:
+                for nm in names:
+                    rej_sig[nm] = rej_sig.get(nm, 0) + 1
+        return {
+            "accepted_with_signal": acc_sig,
+            "accepted_clean": acc_clean,
+            "rejected_with_signal": rej_sig,
+        }

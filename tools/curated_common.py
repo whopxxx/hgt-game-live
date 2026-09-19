@@ -100,6 +100,17 @@ KNOWN_LICENSES = frozenset({
     "Apache-2.0", "CC0-1.0", "Public Domain",
 })
 
+#: 项目明确批准的来源(H4-A §七)。这些来源**没有**可识别的开放许可证,
+#: 但使用依据是"项目负责人明确批准"—— 那是一个**独立合法状态**,
+#: 不是许可证的别名。
+#:
+#: ⚠️ 它**不是**白名单直通: 这些来源的题一样要过 curated-v3 全部十三条。
+#: 这里只解决"版权上能不能收", 不解决"这题好不好"。
+#:
+#: 同样重要的是: 它**不允许**为了通过检查而伪造一个不存在的
+#: CC BY-SA / MIT / Apache —— 伪造版权信息比"许可未知"严重得多。
+PROJECT_APPROVED_BASIS = frozenset({"project_approved_public_dataset"})
+
 
 def se_license_for_ts(ts: Optional[int]) -> str:
     """按发布时间回退推断 SE 许可证(仅当 API 没回 content_license 时用)。"""
@@ -254,6 +265,25 @@ class RawCuratedPuzzle:
     #: 内容安全筛查结果。"" = 没发现问题; 否则是需要人工看的原因。
     safety_flag: str = ""
 
+    #: **授权依据**(H4-A §七)。与 `question_license` 是**两件不同的事**:
+    #:
+    #:     question_license  "这份内容按哪个开放许可证发布"
+    #:     usage_basis       "我们凭什么用它"
+    #:
+    #: 大多数来源两者一致(SE 的 CC BY-SA、TurtleBench 的 Apache)。
+    #: 但 `neurostellar/haiguitang` **没有声明任何 license**
+    #: (API 实测 `cardData.license == None`), 而项目负责人明确批准
+    #: 使用/参考该来源。那是一个**独立合法状态**, 不是许可证的别名。
+    #:
+    #: ⚠️ 绝不允许为了通过 `license_ok()` 而**伪造**一个不存在的
+    #: CC BY-SA / MIT / Apache —— 伪造版权信息比"许可未知"严重得多。
+    #: 所以这里显式建模成第三个字段, 由 `license_ok()` 认它。
+    #:
+    #: 取值:
+    #:     ""                                   没有额外依据(走 license 判定)
+    #:     "project_approved_public_dataset"    项目明确批准的数据源
+    usage_basis: str = ""
+
     # ---- H1-E 去重标记(**只标记, 不删除**) ----
     #: "" = 不是重复; "near_duplicate" = 与某条 surface 高度相似。
     #:
@@ -286,9 +316,28 @@ class RawCuratedPuzzle:
                 normalize_for_dedup(self.bottom))
 
     def license_ok(self) -> bool:
-        """版权上能不能进 curated 池?"""
+        """版权/授权上能不能进 curated 池?
+
+        ## 两条独立的合法路径(§七)
+
+            ① 认得的开放许可证(`question_license` 在 KNOWN_LICENSES 里,
+               且 inference 是 api / created_at)
+            ② 项目明确批准的来源(`usage_basis` 在 PROJECT_APPROVED_BASIS 里)
+
+        第 ② 条**不是**"为了绕过许可检查"的后门: 它是"这个来源的授权
+        依据不是某个开放许可证"这件事的**如实建模**。把 haiguitang 硬填
+        成 CC BY-SA 会让版权记录变成假的 —— 那比"来源已批准但无 license
+        字段"危险得多。
+
+        ⚠️ 注意 `usage_basis` **不**放宽任何内容质量判据。它只回答版权
+        问题: 这些来源的题一样要过 curated-v3 全部十三条。
+        """
+        if str(self.usage_basis or "") in PROJECT_APPROVED_BASIS:
+            return True
         return license_is_usable(self.question_license,
                                  self.question_license_inference)
+
+
 
 
 # ======================================================================
@@ -337,9 +386,19 @@ def sort_records(records: list) -> list:
 
     **不能**按抓取顺序 —— API 分页顺序/并发返回顺序都会变, 那会让
     "同样输入"产出不同字节。字典序才是稳的。
+
+    ⚠️ 也接受**普通 dict**: 拒收清单(`rejected_source.jsonl`)是
+    `{"row":…, "reason":…}` 这种诊断记录, 不是 `RawCuratedPuzzle`。
+    它们同样要确定性落盘, 所以这里按 dict 取 `.get()`。
     """
-    return sorted(records, key=lambda r: (str(r.source or ""),
-                                          str(r.external_id or "")))
+    def _key(r):
+        if isinstance(r, dict):
+            return (str(r.get("source") or ""),
+                    str(r.get("external_id") or r.get("row") or ""))
+        return (str(getattr(r, "source", "") or ""),
+                str(getattr(r, "external_id", "") or ""))
+
+    return sorted(records, key=_key)
 
 
 def write_jsonl_deterministic(path: str, records: list,
