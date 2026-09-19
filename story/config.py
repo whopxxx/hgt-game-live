@@ -126,6 +126,24 @@ class Config:
     #:     keep_all=False + interaction_enabled=False -> Like/Gift 不进业务链
     interaction_enabled: bool = True
 
+    # ---- 12B-Auth: WS 登录态(单变量 A/B) ----
+    #: 抖音登录态 Cookie 串, 用于 WS handshake。**只从环境变量读**。
+    #:
+    #: 为什么 env-only, 不给 CLI: 命令行参数会进 shell history、进程
+    #: command line(`ps`/任务管理器可见)、截图、以及别人发的复现命令里。
+    #: Cookie 是**凭据**, 泄漏一次等于账号被拿走。要走 CLI 的话只能是
+    #: `--cookie-file PATH`, 那是另一个 commit 的事。
+    #:
+    #: `repr=False`: dataclass 的默认 `__repr__` 会打出所有字段, 而我们的
+    #: 日志/异常里到处是 f"{cfg}" —— 那等于把凭据写进每一行日志。
+    #: 这是**硬要求**, 不是风格偏好, 所以这里显式关掉, 并有测试钉住。
+    #:
+    #: 空 -> 游客态(与历史行为完全一致)。
+    douyin_live_cookie: Optional[str] = field(
+        default_factory=lambda: os.environ.get("DOUYIN_LIVE_COOKIE") or None,
+        repr=False,
+    )
+
     # ---- 代理(抓取弹幕用) ----
     # 抖音必须走代理时填这里。留空则自动读环境变量
     # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY。

@@ -76,8 +76,9 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
     """只把需要的事件写成 JSONL, 其余丢弃。"""
 
     def __init__(self, live_id, out_path, keep_all=False,
-                 interaction_enabled=False):
-        super().__init__(live_id, abogus_file=os.path.join(_VENDOR, "a_bogus.js"))
+                 interaction_enabled=False, login_cookie=None):
+        super().__init__(live_id, abogus_file=os.path.join(_VENDOR, "a_bogus.js"),
+                         login_cookie=login_cookie)
         self.out_path = out_path
         self.keep_all = keep_all
         #: Step 11: Like/Gift 是否**解析并交给业务回调**。

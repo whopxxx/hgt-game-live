@@ -952,6 +952,15 @@ class Director:
         print("  竖屏 AI 海龟汤直播")
         print("=" * 64)
         print(f"  输入源      : {cfg.source_label}")
+        #: 认证态**只打一个词** —— 绝不打 Cookie 本体/长度/前缀/hash。
+        #: 见 vendor/douyin_fetcher/ws_cookie.py 的敏感边界说明。
+        if cfg.live_id:
+            try:
+                from vendor.douyin_fetcher.ws_cookie import describe_ws_auth
+            except Exception:                       # pragma: no cover
+                from douyin_fetcher.ws_cookie import describe_ws_auth
+            print(f"  WS 认证态   : ws_auth="
+                  f"{describe_ws_auth(getattr(cfg, 'douyin_live_cookie', None))}")
         if cfg.proxy:
             print(f"  代理        : {cfg.proxy}")
         else:

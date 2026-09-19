@@ -107,15 +107,29 @@ def generateMsToken(length=182):
 
 class DouyinLiveWebFetcher:
     
-    def __init__(self, live_id, abogus_file='a_bogus.js'):
+    def __init__(self, live_id, abogus_file='a_bogus.js',
+                 login_cookie=None):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940，
                         其中的261378947940即是live_id
+        :param login_cookie: 登录态 Cookie 串(可选)。**不要**从命令行传入,
+                            只从环境变量经 Config 透传 —— 见 ws_cookie.py。
+                            None/空 = 游客态(与历史行为等价)。
         """
         self.abogus_file = abogus_file
         self.__ttwid = None
         self.__room_id = None
+        #: WS handshake 的登录态 Cookie(凭据!)。绝不打日志/进异常/落库。
+        self._login_cookie = login_cookie or None
+        #: WS handshake 用的匿名身份 cookie 链。**惰性**获取: `ttwid` 属性
+        #: 走网络(见下), 而 `__ac_nonce` / `__ac_signature` 上游只有在
+        #: `build_webcast_url()` 那条路径上才取。连接时若还没取过, 就现取
+        #: 一次; 取失败只是少两个字段, 不该让连接构建炸掉。
+        #: 缓存住是因为 `__ac_nonce` 本来就是会话级的, 每次连接重新取会多
+        #: 打一次 HTTP, 而且会让 A/B 多出一个非受控变量。
+        self._ws_ac_nonce = None
+        self._ws_ac_signature = None
         #: WS bootstrap 状态(动态获取)。None = 还没取过。
         #: 见 `_fetch_bootstrap_state`。
         self.__bootstrap = None
@@ -386,6 +400,40 @@ class DouyinLiveWebFetcher:
             print(f"【bootstrap】取 bootstrap 状态失败, 回退旧常量: {err}")
             return None
 
+    def _build_ws_cookie_header(self) -> str:
+        """组装 WS handshake 的 Cookie header 值(匿名 / 登录态)。
+
+        为什么放在传输层: 这是**认证职责**。Engine / Director 不该知道
+        "cookie 长什么样", 它们只负责把"有没有登录态"传下来。
+
+        匿名链保留 ttwid / __ac_nonce / __ac_signature —— 这三个是服务端
+        认身份用的字段。登录态存在时, 登录 cookie 里的同名项**优先**
+        (例如登录 cookie 自带 ttwid 时, 用登录的那个, 不产生重复 name)。
+
+        `__ac_nonce` / `__ac_signature` 是**惰性**取的: 只在还没取过时现取
+        一次并缓存。取失败静默降级(少这两个字段), 不让连接构建抛异常 ——
+        否则一个签名端点抽风就能让整场直播连不上, 比"认证不完整"糟得多。
+
+        ⚠️ 返回值是凭据, 只交给 WebSocketApp; 不要打日志/进异常/落库。
+        """
+        from ws_cookie import build_ws_cookie_header
+        if self._ws_ac_nonce is None:
+            try:
+                self._ws_ac_nonce = self.get_ac_nonce()
+            except Exception:
+                self._ws_ac_nonce = ""
+        if self._ws_ac_signature is None:
+            try:
+                self._ws_ac_signature = self.get_ac_signature(self._ws_ac_nonce)
+            except Exception:
+                self._ws_ac_signature = ""
+        base = {
+            "ttwid": self.ttwid,
+            "__ac_nonce": self._ws_ac_nonce,
+            "__ac_signature": self._ws_ac_signature,
+        }
+        return build_ws_cookie_header(base, self._login_cookie)
+
     def _connectWebSocket(self):
         """
         连接抖音直播间websocket服务器，请求直播间数据
@@ -432,14 +480,14 @@ class DouyinLiveWebFetcher:
                f"&cursor={cursor}"
                f"&internal_ext={internal_ext}"
                f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
-               f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
+               f"&user_unique_id={self.user_unique_id}&im_path=/webcast/im/fetch/&identity=audience"
                f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0")
-        
+
         signature = generateSignature(wss)
         wss += f"&signature={signature}"
-        
+
         headers = {
-            "cookie": f"ttwid={self.ttwid}",
+            "cookie": self._build_ws_cookie_header(),
             'user-agent': self.user_agent,
         }
         self.ws = websocket.WebSocketApp(wss,

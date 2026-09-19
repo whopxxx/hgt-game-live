@@ -187,9 +187,11 @@ class CallbackFetcher(DanmakuFetcher):
                  keep_all: bool = False, proxy: Optional[str] = None,
                  no_proxy: Optional[str] = None,
                  on_interaction: Optional[Callable] = None,
-                 interaction_enabled: bool = False):
+                 interaction_enabled: bool = False,
+                 login_cookie: Optional[str] = None):
         super().__init__(live_id, out_path, keep_all=keep_all,
-                         interaction_enabled=interaction_enabled)
+                         interaction_enabled=interaction_enabled,
+                         login_cookie=login_cookie)
         self._on_chat = on_chat
         self._on_control = on_control
         #: Step 11: Like/Gift 的业务回调。空 = 只落库(老行为)。
@@ -501,7 +503,9 @@ class LiveSource:
                             no_proxy=self.cfg.no_proxy,
                             on_interaction=self._on_interaction,
                             interaction_enabled=getattr(
-                                self.cfg, "interaction_enabled", False))
+                                self.cfg, "interaction_enabled", False),
+                            login_cookie=getattr(
+                                self.cfg, "douyin_live_cookie", None))
         f._on_frame = self._on_frame
         f._on_first_frame = self._on_first_frame
         return f
