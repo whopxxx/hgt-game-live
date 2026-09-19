@@ -179,6 +179,41 @@ window.addEventListener("load", async () => {
     check(document.querySelector(".qa-row .q .who").textContent.includes("观众0"),
           "缺少发言者名字");
 
+    // AI 玩家次数与普通 QA 行：轻量展示，不新增面板、不遮挡谜面。
+    send({puzzle_index: 2, story_index: 2, puzzle: "AI 玩家布局测试。",
+          ai_player: {questions_available: 3, questions_earned: 7,
+                      questions_used: 4, likes_progress: 23,
+                      likes_per_question: 100, in_flight: false},
+          qa_log: [{qid: 1, user_name: "AI玩家", text: "地点重要吗？",
+                    verdict: "是", comment: "", kind: "ai_player"}],
+          qa_total: 1});
+    check(document.getElementById("stats").textContent
+            .includes("AI玩家提问次数 3"),
+          "应完整显示 AI玩家提问次数 3: "
+          + document.getElementById("stats").textContent);
+    const aiRow = document.querySelector(".qa-row.kind-ai_player");
+    check(aiRow && aiRow.textContent.includes("AI玩家：地点重要吗？")
+            && aiRow.textContent.includes("是"),
+          "AI ask 行应完整显示: " + (aiRow && aiRow.textContent));
+    const puzzleCenter = document.elementFromPoint(540, 300);
+    check(puzzleCenter && (puzzleCenter.closest("#top")
+          || puzzleCenter.id === "puzzle"),
+          "AI 次数/问答不得遮挡谜面");
+
+    const longSolve = "我猜他每天检查门上的位置，是为了确认有没有人进过房间。"
+      .repeat(5);
+    send({puzzle_index: 3, story_index: 3, puzzle: "AI solve 换行测试。",
+          ai_player: {questions_available: 2},
+          qa_log: [{qid: 2, user_name: "AI玩家", text: longSolve,
+                    verdict: "猜中了", comment: "", kind: "ai_player"}],
+          qa_total: 1});
+    const solveRow = document.querySelector(".qa-row.kind-ai_player");
+    const solveBox = solveRow.getBoundingClientRect();
+    const aiQaRect = document.getElementById("qa").getBoundingClientRect();
+    check(solveRow.textContent.includes("猜中了"), "AI solve 结果应显示‘猜中了’");
+    check(solveBox.left >= aiQaRect.left - 1 && solveBox.right <= aiQaRect.right + 1,
+          "AI solve 长文本不得横向溢出 QA 区");
+
     // ② 提示行: 只在问答流里出现一次, 不再有单独的提示条(避免重复显示)
     send({qa_log: mkQa(2).concat([{qid: -1, user_name: "提示", text: "注意汤的味道",
           verdict: "", comment: "", kind: "hint"}]), qa_total: 3, hint_count: 1,

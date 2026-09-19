@@ -308,6 +308,11 @@ html, body {
 /* 「未判定」= 系统故障, 不是对观众猜测的评价 —— 用中性的橙灰,
    跟"该你反思"的红色、"方向错了"的灰色都区分开。 */
 .v-未判定    { background: rgba(150,120,70,.85); color: #fff6e4; }
+.v-猜中了    { background: #d4af6e; color: #14100a; box-shadow: 0 0 30px rgba(212,175,110,.55); }
+
+/* AI 玩家仍是一条普通问答，只做轻微区分。 */
+.qa-row.kind-ai_player { border-left-color: rgba(126,170,210,.65); }
+.qa-row.kind-ai_player .q .who { color: #a9d7ff; }
 
 /* 提示行 */
 .qa-row.kind-hint { border-left-color: rgba(212,175,110,.6); }

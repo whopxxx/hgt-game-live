@@ -415,6 +415,10 @@ class Director:
                             token, round_index, spec_key,
                             kind=move[0], text=move[1])
                 elif stage == "ask":
+                    if not self.engine.ai_player_second_call_allowed(
+                            token, round_index, spec_key):
+                        self.push()
+                        return
                     if self.writer is None:
                         results = [QAResult(
                             qid=0,
@@ -440,6 +444,10 @@ class Director:
                         failed=(r is None or r.status != "ok"),
                         error=(err if r is None else None))
                 elif stage == "solve":
+                    if not self.engine.ai_player_second_call_allowed(
+                            token, round_index, spec_key):
+                        self.push()
+                        return
                     if self.writer is None:
                         jr = None
                     else:

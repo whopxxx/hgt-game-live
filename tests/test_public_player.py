@@ -33,6 +33,7 @@ HIDDEN_NAMES = (
     "blueprint", "spec", "host_writer", "writer",
     "touched_fact_ids", "cause_hit", "mechanism_hit", "matched_atoms",
     "solution_candidate",
+    "completion_fact_ids", "core_answer", "established_fact_ids",
 )
 
 
@@ -175,6 +176,35 @@ def test_ask_only_sends_public_data():
           cli.calls[0]["temperature"])
 
 
+def test_live_roles_are_distinct_and_hidden_values_are_stripped():
+    print("\n[PP-6b] Live transcript 区分观众/AI玩家/提示")
+    cli = _Client(tool_input={"kind": "ask", "text": "下一问"})
+    core = PublicPlayerCore(cli)
+    tr = [
+        {"role": "puzzle", "text": "公开谜面"},
+        {"role": "audience", "name": "张三", "text": "地点重要吗？",
+         "facts": ["SECRET_FACT"]},
+        {"role": "host", "verdict": "是", "text": "",
+         "answer": "SECRET_ANSWER"},
+        {"role": "ai_player", "text": "和时间有关吗？",
+         "solve_atoms": ["SECRET_ATOM"]},
+        {"role": "host", "verdict": "不是", "text": ""},
+        {"role": "hint", "text": "注意先后顺序",
+         "completion": "SECRET_COMPLETION"},
+    ]
+    core.ask("公开谜面", tr)
+    prompt = cli.calls[0]["user"]
+    check("真人不会被写成‘你问’",
+          "观众 张三：地点重要吗？" in prompt
+          and "你问: 地点重要吗？" not in prompt, prompt)
+    check("AI 自己和提示可见",
+          "AI玩家：和时间有关吗？" in prompt
+          and "提示：注意先后顺序" in prompt, prompt)
+    for secret in ("SECRET_FACT", "SECRET_ANSWER", "SECRET_ATOM",
+                   "SECRET_COMPLETION"):
+        check(f"prompt 不含 {secret}", secret not in prompt, prompt)
+
+
 def test_ask_rejects_invalid_output():
     """输出不合法 -> None(技术失败), 不是崩, 也不是编一个。"""
     print("\n[PP-7] 非法输出 -> None")
@@ -222,6 +252,7 @@ def main():
         test_sanitizer_strips_internal_coverage,
         test_build_prompt_ignores_extra_hidden_keys,
         test_ask_only_sends_public_data,
+        test_live_roles_are_distinct_and_hidden_values_are_stripped,
         test_ask_rejects_invalid_output,
         test_playtest_reuses_public_layer,
     ]

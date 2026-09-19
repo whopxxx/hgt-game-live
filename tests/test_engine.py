@@ -3523,8 +3523,250 @@ def test_h1_cli_flags_wired():
           d.hint_min_gap_seconds)
 
 
+# ======================================================================
+# AI 玩家：Like 次数、公开信息、独立胜负路径
+# ======================================================================
+def _ai_start(eng, credits=1):
+    eng._ai_player_ledger.earn(credits)
+    acts = eng.tick()
+    moves = [a for a in acts if a.kind == ActionKind.AI_PLAYER]
+    return moves[0].payload if moves else None
+
+
+def _ai_move(eng, p, kind, text):
+    acts = eng.submit_ai_player_move(
+        p["token"], p["expect_round"], p["expect_spec_key"],
+        kind=kind, text=text)
+    nxt = [a for a in acts if a.kind == ActionKind.AI_PLAYER]
+    return nxt[0].payload if nxt else None
+
+
+def test_ai_player_like_high_water_and_gift_zero():
+    print("\n[AI-1] Like high-water 接线；Gift 永远 +0")
+    from story.ingest import InteractionEvent
+    eng = RoundEngine(mkcfg())
+    gains = []
+    for total in (487, 523, 523, 320, 523, 810):
+        gains.append(len(eng.submit_interaction(
+            InteractionEvent(kind="like", total=total))))
+    snap = eng.snapshot().to_json()["ai_player"]
+    check("487→523→810 共获得 4 次", snap["questions_earned"] == 4,
+          (gains, snap))
+    check("当前百赞进度 10/100", snap["likes_progress"] == 10, snap)
+    for _ in range(100):
+        eng.submit_interaction(InteractionEvent(
+            kind="gift", combo_count=9, repeat_count=9, total_count=999))
+    check("100 个 Gift 仍 +0",
+          eng.snapshot().ai_player["questions_earned"] == 4,
+          eng.snapshot().ai_player)
+    check("公开快照没有 reservation 身份",
+          not ({"reservation", "token", "round_index", "spec_key"}
+               & set(snap)), snap)
+
+
+def test_ai_player_ask_consumes_without_human_completion():
+    print("\n[AI-2] ask 成功消费 1，且不污染真人 completion/统计")
+    eng, _ = boot(mkcfg(ai_player_min_gap_seconds=45))
+    eng._completion_fact_ids = {"f1"}
+    p = _ai_start(eng, credits=3)
+    check("派发公开玩家动作", p and p["stage"] == "move", p)
+    host = _ai_move(eng, p, "ask", "地点重要吗？")
+    check("第二步是 Host 裁决", host and host["stage"] == "ask", host)
+    acts = eng.submit_ai_player_result(
+        host["token"], host["expect_round"], host["expect_spec_key"],
+        "ask", host["text"], verdict="是")
+    snap = eng.snapshot()
+    check("AI 行完整上屏", snap.qa_log[-1] == {
+        "qid": 1, "user_name": "AI玩家", "text": "地点重要吗？",
+        "verdict": "是", "comment": "", "kind": "ai_player"},
+        snap.qa_log[-1])
+    check("available 3→2", snap.ai_player["questions_available"] == 2,
+          snap.ai_player)
+    check("只消费一次", snap.ai_player["questions_used"] == 1,
+          snap.ai_player)
+    check("不写真人 established", eng._established_fact_ids == set(),
+          eng._established_fact_ids)
+    check("不增加真人问答统计",
+          snap.stat_questions == 0 and snap.stat_answered == 0,
+          (snap.stat_questions, snap.stat_answered))
+    check("仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("只广播，不伪装成人类 ANSWER",
+          all(a.kind == ActionKind.BROADCAST for a in acts), kinds(acts))
+
+
+def test_ai_player_solve_wrong_and_right_are_independent():
+    print("\n[AI-3] solve 猜错/猜中都是真实独立动作")
+    wrong, _ = boot(mkcfg())
+    wrong._completion_fact_ids = {"f1"}
+    p = _ai_start(wrong)
+    judge = _ai_move(wrong, p, "solve", "我猜是完整解释，但猜错了。")
+    wrong.submit_ai_player_result(
+        judge["token"], judge["expect_round"], judge["expect_spec_key"],
+        "solve", judge["text"], solved=False)
+    sw = wrong.snapshot()
+    check("猜错仍 QA", wrong.phase == Phase.QA and not sw.solved, wrong.phase)
+    check("猜错显示‘不是’", sw.qa_log[-1]["verdict"] == "不是",
+          sw.qa_log[-1])
+    check("猜错消费 1", sw.ai_player["questions_used"] == 1, sw.ai_player)
+    check("猜错不写真人 established", not wrong._established_fact_ids,
+          wrong._established_fact_ids)
+
+    right, _ = boot(mkcfg())
+    right._completion_fact_ids = {"f1"}
+    p = _ai_start(right, credits=4)
+    judge = _ai_move(right, p, "solve", "我猜这是完整正确谜底。")
+    acts = right.submit_ai_player_result(
+        judge["token"], judge["expect_round"], judge["expect_spec_key"],
+        "solve", judge["text"], solved=True)
+    sr = right.snapshot()
+    check("猜中 -> solved_by=AI玩家",
+          sr.solved and sr.solved_by == "AI玩家", (sr.solved, sr.solved_by))
+    check("猜中进入 REVEALING", right.phase == Phase.REVEALING, right.phase)
+    check("显示‘猜中了’", sr.qa_log[-1]["verdict"] == "猜中了",
+          sr.qa_log[-1])
+    check("消费 1、剩 3", sr.ai_player["questions_used"] == 1
+          and sr.ai_player["questions_available"] == 3, sr.ai_player)
+    check("独立胜利不伪造真人 established/contribution",
+          not right._established_fact_ids
+          and not sr.qa_archive[-1]["completion_contribution_fact_ids"],
+          (right._established_fact_ids, sr.qa_archive[-1]))
+    check("产生正常 REVEAL 动作",
+          any(a.kind == ActionKind.REVEAL for a in acts), kinds(acts))
+
+
+def test_ai_player_priority_cooldown_failure_giveup_and_stale():
+    print("\n[AI-4] 真人优先、冷却、失败退回、give_up、stale")
+    # 真人 pending/inflight 时不启动。
+    busy, _ = boot(mkcfg())
+    busy._ai_player_ledger.earn(1)
+    busy.submit_danmaku("u", "真人", "#先回答我")
+    acts = busy.tick()
+    check("真人 pending 优先",
+          any(a.kind == ActionKind.ANSWER for a in acts)
+          and not any(a.kind == ActionKind.AI_PLAYER for a in acts), kinds(acts))
+
+    # 第一步回来时真人突然进来：不启动 Host，退回次数。
+    race, _ = boot(mkcfg(ai_player_retry_seconds=15))
+    p = _ai_start(race)
+    race.submit_danmaku("u", "真人", "#突然的问题")
+    acts = race.submit_ai_player_move(
+        p["token"], p["expect_round"], p["expect_spec_key"],
+        kind="ask", text="地点重要吗？")
+    check("真人插队后不启动 Host",
+          not any(a.kind == ActionKind.AI_PLAYER for a in acts), kinds(acts))
+    check("次数退回", race.snapshot().ai_player["questions_available"] == 1,
+          race.snapshot().ai_player)
+
+    late_race, _ = boot(mkcfg())
+    p = _ai_start(late_race)
+    host = _ai_move(late_race, p, "ask", "地点重要吗？")
+    late_race.submit_danmaku("u", "真人", "#刚好这时进来")
+    check("Director 发第二次 HTTP 前仍会再次让路",
+          not late_race.ai_player_second_call_allowed(
+              host["token"], host["expect_round"], host["expect_spec_key"]))
+    check("最后一道检查也退回次数",
+          late_race.snapshot().ai_player["questions_available"] == 1,
+          late_race.snapshot().ai_player)
+
+    # 成功后至少等 45 秒。
+    cool, clk = boot(mkcfg(ai_player_min_gap_seconds=45))
+    p = _ai_start(cool, credits=5)
+    host = _ai_move(cool, p, "ask", "地点重要吗？")
+    cool.submit_ai_player_result(
+        host["token"], host["expect_round"], host["expect_spec_key"],
+        "ask", host["text"], verdict="是")
+    check("成功后立刻不连刷",
+          not any(a.kind == ActionKind.AI_PLAYER for a in cool.tick()))
+    clk.advance(44.9)
+    check("45 秒内仍不启动",
+          not any(a.kind == ActionKind.AI_PLAYER for a in cool.tick()))
+    clk.advance(.1)
+    check("45 秒后允许下一次",
+          any(a.kind == ActionKind.AI_PLAYER for a in cool.tick()))
+
+    # 技术失败退回；give_up 本题停用。
+    fail, clk = boot(mkcfg(ai_player_retry_seconds=15))
+    p = _ai_start(fail)
+    fail.submit_ai_player_move(
+        p["token"], p["expect_round"], p["expect_spec_key"],
+        error="timeout")
+    check("技术失败不消费且退回",
+          fail.snapshot().ai_player["questions_available"] == 1
+          and fail.snapshot().ai_player["questions_used"] == 0,
+          fail.snapshot().ai_player)
+    clk.advance(15)
+    p = [a.payload for a in fail.tick()
+         if a.kind == ActionKind.AI_PLAYER][0]
+    fail.submit_ai_player_move(
+        p["token"], p["expect_round"], p["expect_spec_key"],
+        kind="give_up", text="暂时想不出")
+    check("give_up 不消费", fail.snapshot().ai_player["questions_used"] == 0,
+          fail.snapshot().ai_player)
+    clk.advance(100)
+    check("give_up 后本题不再尝试",
+          not any(a.kind == ActionKind.AI_PLAYER for a in fail.tick()))
+
+    # 跨题迟到回包：旧预约已释放，不能落到下一题且次数不丢。
+    stale, clk = boot(mkcfg(reveal_hold_seconds=1))
+    old = _ai_start(stale)
+    stale._enter_revealing_locked(clk.t, "skip", "")
+    stale.submit_reveal("谜底", now=clk.t)
+    clk.advance(1)
+    stale.tick()
+    stale.submit_riddle("第二题", "第二题谜底", now=clk.t)
+    before = list(stale.snapshot().qa_log)
+    stale.submit_ai_player_result(
+        old["token"], old["expect_round"], old["expect_spec_key"],
+        "solve", "旧题答案", solved=True, now=clk.t)
+    ss = stale.snapshot()
+    check("旧回包不上屏/不 solved",
+          ss.qa_log == before and not ss.solved and ss.puzzle == "第二题", ss.qa_log)
+    check("旧次数已恢复", ss.ai_player["questions_available"] == 1,
+          ss.ai_player)
+    current = _ai_start(stale, credits=0)
+    for label, token, rnd, key in (
+            ("token", "wrong", current["expect_round"],
+             current["expect_spec_key"]),
+            ("round", current["token"], current["expect_round"] + 1,
+             current["expect_spec_key"]),
+            ("spec", current["token"], current["expect_round"], "wrong")):
+        acts = stale.submit_ai_player_result(
+            token, rnd, key, "ask", "错误身份", verdict="是", now=clk.t)
+        check(f"错 {label} 不得上屏/兑现/释放当前预约",
+              acts == [] and stale._ai_player_ledger.detective_reservation
+              is not None and stale.snapshot().ai_player["questions_used"] == 0,
+              (acts, stale.snapshot().ai_player))
+
+
+def test_ai_player_public_snapshot_only_contains_public_transcript():
+    print("\n[AI-5] 公开输入含真人/AI/提示，不含 hidden truth")
+    eng, _ = boot(mkcfg())
+    eng._append_qa_locked(QARec(
+        qid=1, user_name="张三", text="地点重要吗？", verdict="是",
+        kind="qa", established_fact_ids=["SECRET_FACT"],
+        completion_contribution_fact_ids=["SECRET_COMPLETION"]))
+    eng._append_qa_locked(QARec(
+        qid=2, user_name="AI玩家", text="和时间有关吗？", verdict="不是",
+        kind="ai_player", matched_atoms=["SECRET_ATOM"]))
+    eng._append_qa_locked(QARec(
+        qid=-1, user_name="提示", text="注意时间顺序", verdict="", kind="hint"))
+    public = eng.snapshot_ai_player_input()
+    blob = repr(public)
+    check("公开 transcript 含真人、AI 与提示",
+          all(x in blob for x in ("张三", "地点重要吗", "和时间有关吗",
+                                  "注意时间顺序")), public)
+    check("不含任何 hidden truth",
+          all(x not in blob for x in ("SECRET_FACT", "SECRET_COMPLETION",
+                                      "SECRET_ATOM", "同伴的肉汤骗局")), blob)
+
+
 def main():
     tests = [test_start_and_riddle,
+             test_ai_player_like_high_water_and_gift_zero,
+             test_ai_player_ask_consumes_without_human_completion,
+             test_ai_player_solve_wrong_and_right_are_independent,
+             test_ai_player_priority_cooldown_failure_giveup_and_stale,
+             test_ai_player_public_snapshot_only_contains_public_transcript,
              # ---- H1: 时间 OR 真人成功问答数 ----
              test_h1_a_question_count_triggers_hint,
              test_h1_b_time_after_question_does_not_repeat,

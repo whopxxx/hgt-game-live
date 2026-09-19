@@ -1416,6 +1416,22 @@ class RoundEngine:
         with self._lock:
             return self._public_ai_player_input_locked()
 
+    def ai_player_second_call_allowed(
+            self, token: str, round_index: int, spec_key: str,
+            now: Optional[float] = None) -> bool:
+        """Director 真正发 Host/Judge HTTP 前的最后一次真人优先检查。"""
+        now = self._now(now)
+        with self._lock:
+            if not self._ai_player_identity_ok_locked(
+                    token, round_index, spec_key):
+                self._ai_player_ledger.release(token, round_index, spec_key)
+                return False
+            if self._human_pressure_locked():
+                self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, "真人提问优先")
+                return False
+            return True
+
     def _public_ai_player_input_locked(self) -> dict[str, Any]:
         transcript: list[dict[str, Any]] = [
             {"role": "puzzle", "text": self._puzzle}]
