@@ -274,10 +274,26 @@ class Config:
     pool_reveal_target_size: int = 7
     pool_reveal_playable_target: int = 2
     # 距下一题不足这个秒数就不再**启动**新请求(在途的不用强杀)。
-    # 为什么: 60 秒到点时下一题**绝不能等待** future —— 它必须
-    # "池里有就直接上, 没有就回落现场生成"。留 15 秒给最后一道题
-    # 落地, 免得 deadline 那一刻正好有一个跑了一半的 future 挂着。
-    pool_reveal_start_guard_seconds: float = 15.0
+    #
+    # ⚠️ G1: 它必须**至少覆盖一轮补池的完整预算**(prefetch budget +
+    # 安全余量), 否则等于没挡 —— 实播事故:
+    #
+    #     18:45:07 揭晓结束、下一题开始(SETTING)
+    #     18:44:49 启动的那次 prefetch 还在跑
+    #     18:45:58 它才跑完第 4 稿失败
+    #
+    # 也就是 live 现场生成与后台补池**同时**占了 51 秒的网关。当时
+    # guard 只有 15s, 而一轮 prefetch 可能跑几十秒 —— "只剩 18 秒"
+    # 照样会启动一个最多几十秒的后台任务, 那个任务注定跨过 deadline,
+    # 与下一题的现场生成正面相撞。
+    #
+    # 所以默认值抬到 30s(= `pool_prefetch_budget_seconds` 25 + 余量),
+    # 并且 `PoolPrefetcher` 会取 `max(本值, budget + 余量)` 兜底 ——
+    # 配置调大 budget 却忘了调 guard 时, 不会静默退回旧行为。
+    pool_reveal_start_guard_seconds: float = 30.0
+    # 一轮 prefetch 的**安全余量**: guard 至少要比 budget 多这么多,
+    # 让"启动的那次生成"有希望在 deadline 之前真的结束。
+    pool_prefetch_guard_margin_seconds: float = 5.0
     # 补池的硬上限: 库存到这儿就停, **即使 playable 仍然是 0**。
     # 为什么必须有: 若那批题是被"某个窗口条件"整体挡住的(比如最近
     # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
@@ -289,11 +305,41 @@ class Config:
     # 停掉后台生成、同时继续播已有的题(pool_enabled=False 做不到 ——
     # 它把池子整个关掉)。
     pool_prefetch_enabled: bool = True
-    # 补池失败(gen_spec 失败 / pool.add 失败 / 意外异常)后的退避秒数。
+    # 补池失败(gen_spec 失败 / pool.add 失败 / 意外异常)后的**首次**
+    # 退避秒数。后续连续失败按 `pool_prefetch_backoff_schedule_s` 递增。
     # 为什么必须有: tick 是 4Hz。没有退避时, 网关或磁盘持续故障的
     # 每一次 tick 都会重新提交一个生成任务 —— 那是每秒 4 次的失败
     # 风暴, 比不补池糟得多(它还会和直播出题抢同一个网关配额)。
     pool_prefetch_backoff_s: float = 30.0
+    # ---- G1: 连续失败的退避序列(秒) ----
+    #
+    # 实播指纹: 固定 30 秒退避 + 每轮固定 4 稿, 于是日志长成
+    #
+    #     18:46:47 开 -> 18:47:37 败
+    #     18:48:07 开 -> 18:49:09 败
+    #     18:49:39 开 -> 18:50:24 败
+    #
+    # —— 谷底是**同一个上下文**(同样的 recent window / 同样的配额
+    # 饱和状态)在反复重试, 每次都烧完整一轮多稿预算。固定间隔既
+    # 不够长(问题不是瞬时的), 也不够短(真想恢复时又白等 30 秒)。
+    #
+    # 改成递增: 30 -> 60 -> 120 -> 240 -> 300, 之后封顶 300。
+    # 成功入池**立刻重置**回第一档; `interrupted`(让路)**不算失败**,
+    # 不动这个序列。
+    pool_prefetch_backoff_schedule_s: tuple = (30.0, 60.0, 120.0, 240.0,
+                                               300.0)
+    # ---- G1: 后台补池的**独立**预算 ----
+    #
+    # 关键: 后台补池过去直接调 `gen_spec()` 的默认参数 (max_attempts=4,
+    # budget_s=90) —— 那是**直播现场出题**的预算, 因为 live 出一道题
+    # 观众就在干等, 值得多试几稿。而后台补池是"有空就补一道", 多试
+    # 一稿的全部收益只是池子里多一道题, 成本却是与直播抢网关 + 跨过
+    # deadline 继续跑。
+    #
+    # 所以后台**少尝试**, 不是降低题质: 同样的硬门一道不少, 只是
+    # 两稿都不合格就放弃, 等下一轮, 而不是一路打到第 4 稿。
+    pool_prefetch_max_attempts: int = 2
+    pool_prefetch_budget_seconds: float = 25.0
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -488,6 +534,55 @@ class Config:
                 f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "
                 f"补池失败后不会退避, 4Hz 的 tick 会打成失败风暴。"
             )
+        # ---- G1: 补池预算 / guard 自洽 ----
+        if self.pool_prefetch_max_attempts < 1:
+            warns.append(
+                f"pool_prefetch_max_attempts({self.pool_prefetch_max_attempts}) "
+                f"< 1: 后台补池连一稿都不会出, 池子永远补不上。"
+            )
+        if self.pool_prefetch_budget_seconds <= 0:
+            warns.append(
+                f"pool_prefetch_budget_seconds("
+                f"{self.pool_prefetch_budget_seconds}) <= 0: 同上的效果 —— "
+                f"补池每次都立刻超预算退出。"
+            )
+        if self.pool_prefetch_guard_margin_seconds < 0:
+            warns.append(
+                f"pool_prefetch_guard_margin_seconds("
+                f"{self.pool_prefetch_guard_margin_seconds}) 为负, 已按 0 处理。"
+            )
+        # guard 必须至少覆盖一轮补池预算。不满足时 `PoolPrefetcher` 会
+        # **取 max() 兜底**(不是静默照旧), 所以这里只提示"你配的这个
+        # 数被抬高了", 让运维知道生效值不是他写的那个。
+        _min_guard = (self.pool_prefetch_budget_seconds
+                      + self.pool_prefetch_guard_margin_seconds)
+        if 0 < self.pool_reveal_start_guard_seconds < _min_guard:
+            warns.append(
+                f"pool_reveal_start_guard_seconds("
+                f"{self.pool_reveal_start_guard_seconds}) < 一轮补池预算"
+                f"({_min_guard:.0f}s = budget "
+                f"{self.pool_prefetch_budget_seconds:.0f} + 余量 "
+                f"{self.pool_prefetch_guard_margin_seconds:.0f}): 实际生效值"
+                f"会被抬到 {_min_guard:.0f}s。否则'只剩这么多秒'时启动的"
+                f"后台生成注定跨过 deadline, 与下一题的现场生成抢网关 —— "
+                f"这正是 G1 要消灭的跨场景白烧。"
+            )
+        _sched = tuple(self.pool_prefetch_backoff_schedule_s or ())
+        if not _sched:
+            warns.append(
+                "pool_prefetch_backoff_schedule_s 为空: 补池连续失败不会"
+                "递增退避, 会退回固定间隔反复重试同一个上下文。"
+            )
+        elif any(float(x) <= 0 for x in _sched):
+            warns.append(
+                f"pool_prefetch_backoff_schedule_s({_sched}) 含非正数: "
+                f"那一档等于不退避。"
+            )
+        elif list(_sched) != sorted(_sched):
+            warns.append(
+                f"pool_prefetch_backoff_schedule_s({_sched}) 不是递增的: "
+                f"连续失败时退避反而变短, 与'越失败越该等久'的意图相反。"
+            )
         if self.phase_ack_seconds <= 0:
             warns.append(
                 f"phase_ack_seconds({self.phase_ack_seconds}) <= 0: "
@@ -598,6 +693,18 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_false",
                     help="不后台补池(只用已有/手工灌的题; 默认开启)。"
                          "网关故障时用它停掉后台生成, 池子里的存量题照常播")
+    ap.add_argument("--prefetch-max-attempts", type=int, default=2,
+                    help="后台补池每道题最多出几稿(默认 2)。直播现场出题"
+                         "是 4 稿 —— 那是观众在干等时的预算; 后台补池只是"
+                         "'有空补一道', 多试一稿的收益远小于它和直播抢网关"
+                         "的代价")
+    ap.add_argument("--prefetch-budget", type=float, default=25.0,
+                    help="后台补池每道题的秒预算(默认 25)。与直播现场出题的"
+                         "90s 分开, 免得一轮后台生成跨过下一题的 deadline")
+    ap.add_argument("--pool-reveal-guard", type=float, default=30.0,
+                    help="距下一题不足这个秒数就不再启动新的补池请求"
+                         "(默认 30)。必须 >= --prefetch-budget, 否则会取 max()"
+                         "抬高")
     ap.add_argument("--playtest", dest="playtest_enabled",
                     action="store_true",
                     help="后台补池时先用 AI 玩家试玩一遍, 只有猜得中才入池"
@@ -662,6 +769,9 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         # 只加 flag 不在这里接上 = 又一个 dead config(参数形同虚设,
         # 而 --help 里明明写着)。加 flag 和接线必须同一处完成。
         pool_prefetch_enabled=a.pool_prefetch_enabled,
+        pool_prefetch_max_attempts=a.prefetch_max_attempts,
+        pool_prefetch_budget_seconds=a.prefetch_budget,
+        pool_reveal_start_guard_seconds=a.pool_reveal_guard,
         playtest_enabled=a.playtest_enabled,
         playtest_max_turns=a.playtest_max_turns,
         max_question_len=a.max_question_len,

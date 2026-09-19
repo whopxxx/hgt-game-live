@@ -1294,6 +1294,13 @@ class RoundEngine:
                 "hint_inflight": bool(self._hint_pending),
                 "reveal_inflight": self._reveal_deadline is not None,
                 "reveal_remaining_seconds": reveal_remaining,
+                # ---- G1: 场景指纹 ----
+                # 新一题开始 = 生成约束环境(recent window / 配额饱和状态)
+                # 整体换了一批。补池靠它判断"我那次失败是不是发生在**别的
+                # 上下文**里" —— 若是, 长退避可以重置一次, 而不是机械地
+                # 等满 300 秒再去试一个已经不存在的上下文。
+                # 只读、单调递增; 不含任何 hidden truth。
+                "puzzle_index": int(self._puzzle_index),
                 # 用 `_stopped` 而不是 phase == STOPPED: 后者在 `stop()`
                 # 里与前者同锁同写, 但 `_stopped` 才是那个真正的标志位
                 # (should_stop 也是读它)。补池只关心"还该不该干活"。

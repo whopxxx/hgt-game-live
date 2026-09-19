@@ -25,7 +25,7 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from . import parser as P
 from .config import LLMConfig
@@ -2697,7 +2697,9 @@ class PuzzleWriter:
                  recent: Optional[list] = None,
                  check: bool = True, max_attempts: int = 4,
                  budget_s: float = 90.0,
-                 enforce_blueprint: Optional[bool] = None) -> PuzzleSpec:
+                 enforce_blueprint: Optional[bool] = None,
+                 should_continue: Optional[Callable[[], bool]] = None
+                 ) -> PuzzleSpec:
         """出一个谜题, 返回**结构化 `PuzzleSpec`**(方案 §13)。
 
         与老 `gen_riddle` 的区别: 模型现在要交出 facts / signature,
@@ -2721,6 +2723,31 @@ class PuzzleWriter:
         为什么硬校验要放在 reviewer **之前**: 结构性错误(atoms 引用了不
         存在的 fact)reviewer 改不好, 它只会"改"出一个更不一致的版本。
         先毙掉能省一次调用, 也避免把坏结构喂给 reviewer 当"原稿"。
+
+        ## G1: `should_continue` —— 协作式取消(后台补池专用)
+
+        可选谓词。**每一次尚未发出的昂贵调用之前**都会被检查一次
+        (出稿 / 审稿 / 审稿重试 / truth audit / 试玩 / 下一稿)。返回
+        False 就**立刻收手**, 返回一个 `error` 非空、`puzzle` 为空的
+        spec, 并在 metrics 里标 `interrupted=True`。
+
+        live 出题**不传**(默认 None = 永远继续), 行为逐位不变。
+
+        为什么要协作式而不是强杀: HTTP 请求一旦发出就无法取消
+        (urllib 没有 cancel)。真正的实播事故是 —— 后台补池在
+        REVEALED 启动, 下一题已经开始(SETTING)、直播自己在现场出题,
+        而后台那轮还在继续 **审稿 / 再出一稿**, 两边同时占网关几十秒:
+
+            18:44:49 prefetch 开
+            18:45:07 下一题开始(SETTING), 池里没题 -> live 现场生成
+            18:45:58 旧 prefetch 才跑完第 4 稿失败
+
+        所以"已经飞出去的那一次请求"可以等它回来, 但**它一回来就
+        不能再发下一次**——这正是这个谓词卡住的位置。
+
+        ⚠️ 别把 interrupted 当成 gen_fail: 它**不是失败**。它不是
+        "这道题不好", 而是"现在不该生成"。调用方必须据此**不记失败
+        计数、不退避**(见 `prefetch._apply_result`)。
         """
         import time as _t
         t0 = _t.monotonic()
@@ -2740,6 +2767,25 @@ class PuzzleWriter:
         # 复盘时用 total / review_calls 自己算均值 —— 只存"最后一次"
         # 会把"审了 5 次"的题算得和"审了 1 次"一样快。
         m["review_latency_ms_total"] = 0
+        # ---- G1: 协作式取消的出口 ----
+        # 写成一个闭包, 让"检查点"这件事只有一处定义 —— 分散的
+        # `if should_continue and not should_continue()` 迟早会漏掉某个
+        # 调用点(而漏掉的那个正好是最贵的那次)。
+        interrupted = False
+
+        def _stop() -> bool:
+            """该收手了吗? 谓词本身抛异常按"该收手"处理(fail closed)。"""
+            nonlocal interrupted
+            if should_continue is None:
+                return False
+            try:
+                ok = bool(should_continue())
+            except Exception:                   # noqa: BLE001
+                log.exception("should_continue 抛异常, 按收手处理")
+                ok = False
+            if not ok:
+                interrupted = True
+            return not ok
         # P1(第二轮 review): `blueprint=None` **不再**暗含"用默认 blueprint"。
         # 早先 `blueprint or PuzzleBlueprint()` 会把"没给"变成"固定成
         # information_gap / information_advantage / daily / neutral / instant"
@@ -2754,6 +2800,9 @@ class PuzzleWriter:
             if _t.monotonic() - t0 > budget_s:
                 log.warning("出题超出时间预算(%.0fs), 用已得到的失败结果",
                             budget_s)
+                break
+            # ---- G1 检查点 ①: 下一稿之前 ----
+            if _stop():
                 break
             reject_why = "\n".join(f"- {w}" for w in seen_why)
             spec = self._gen_spec_once(avoid, avoid_reason=reject_why,
@@ -2802,6 +2851,12 @@ class PuzzleWriter:
             # ---- ③ reviewer(需要语义理解的才交给它) ----
             # 格式问题(人称/问句/meta)作为 must_fix 点名让它改 ——
             # 这三样都是"改一句话", 重出整题是浪费。
+            #
+            # ---- G1 检查点 ②: Reviewer 之前 ----
+            # 这是后台补池最常撞上的那一个: 出稿回来时直播已经切进
+            # SETTING, 再往下就是又一轮几十秒的审稿。
+            if _stop():
+                break
             _tr = _t.monotonic()
             reviewed, why, need_rewrite = self._review_spec(
                 spec, bp, must_fix=vr.must_fix())
@@ -2868,6 +2923,10 @@ class PuzzleWriter:
             # 单独抽成一个**只看三样东西**的调用: puzzle / core_answer /
             # answer。不给 recent window / quota / blueprint —— 它只做
             # 单题逻辑一致性, 输入越窄越不容易分心。
+            #
+            # ---- G1 检查点 ③: truth audit 之前 ----
+            if _stop():
+                break
             ta = self.audit_truthfulness(spec)
             if ta is not None:
                 m["truth_audit_calls"] = m.get("truth_audit_calls", 0) + 1
@@ -2921,6 +2980,26 @@ class PuzzleWriter:
             # blueprint 的。值推断两个方向都会错。
             spec.blueprint_specified = bool(enforce_blueprint)
             return spec
+
+        # ---- G1: 让路(协作式取消) —— **不是失败** ----
+        #
+        # 必须与"重试耗尽"分开表达。调用方(`prefetch._apply_result`)
+        # 靠 `interrupted` 这个标记决定**不记失败计数、不退避**:
+        # 它不是"这道题不好", 而是"现在不该生成"。
+        #
+        # ⚠️ 把两者混起来会有真实的运维后果: 直播每忙一次就白记一次
+        # gen_fail, 于是"补池失败率"变成一个只反映直播活跃度的数字,
+        # 而真正的质量故障淹在里面再也看不出来。
+        if interrupted:
+            log.info("出题让路(直播变忙), 停在 %d 稿: %s",
+                     attempts, (last.error if last is not None else "") or "未出稿")
+            m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+            m["ok"] = False
+            m["interrupted"] = True
+            return PuzzleSpec(
+                error="", metrics=dict(m),
+                usage=getattr(last, "usage", None),
+                model=getattr(last, "model", None))
 
         # ---- 重试耗尽: **绝不能**把被拒的稿子当结果返回 ----
         #

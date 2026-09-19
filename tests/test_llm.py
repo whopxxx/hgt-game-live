@@ -3194,6 +3194,193 @@ def test_truth_prompt_hardened_in_riddle_and_check():
           "绝对否定" in CHECK_SYSTEM, "")
 
 
+# ======================================================================
+# G1 —— gen_spec 的协作式取消(live 不传 = 行为不变)
+# ======================================================================
+def test_g1_gen_spec_default_is_bit_identical():
+    """**live 路径逐位不变**: 不传 `should_continue` 时, 一次调用都不多。
+
+    这是本步最重要的"没改坏"断言: 协作式取消是给后台补池用的,
+    live 出题不传谓词, 必须与 G1 之前**完全相同**。
+    """
+    print("\n[G1-L1] 不传 should_continue -> live 行为不变")
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    check("正常出题成功", spec.puzzle == _GOOD_PUZ, spec.puzzle[:30])
+    check("**没有 interrupted 标记**",
+          not (spec.metrics or {}).get("interrupted"), spec.metrics)
+    check("调用次数与 G1 之前一致(出题 + 审稿)",
+          len(gen_calls(fc)) == 2, len(gen_calls(fc)))
+
+
+def test_g1_gen_spec_stops_before_first_draft():
+    """谓词一进门就是 False -> **一次模型调用都不发**。
+
+    这是"下一题已经开始现场生成时, 后台连稿都不该出"的直接表达。
+    """
+    print("\n[G1-L2] 谓词一开始就 False -> 零调用")
+    calls = {"n": 0}
+
+    def nope():
+        calls["n"] += 1
+        return False
+
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, should_continue=nope)
+    check("**一次 LLM 调用都没发**", len(fc.calls) == 0, len(fc.calls))
+    check("**没有谜面**", not spec.puzzle, spec.puzzle[:30])
+    check("**error 留空(让路不是失败)**", not spec.error, repr(spec.error))
+    check("**metrics 标 interrupted**",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+    check("谓词被问过", calls["n"] >= 1, calls["n"])
+
+
+def test_g1_gen_spec_stops_before_reviewer():
+    """**最高价值检查点**: 稿子出来了, 但审稿之前直播变忙 -> 不审稿。
+
+    实播那 51 秒正是这个形状: draft 已发出(无法取消) -> 下一题开始
+    -> 稿子回来 -> 之前系统会**继续审稿 + 再出第二稿**。修好之后
+    这里必须停手。
+    """
+    print("\n[G1-L3] 稿子回来后、审稿之前让路")
+    state = {"allow": True}
+
+    def gate():
+        return state["allow"]
+
+    # 队列里只放"出题"一条 —— 若代码偷偷审稿, FakeClient 会吐
+    # "no more canned results" 并被记成技术失败, 断言能抓到。
+    fc = FakeClient([LLMResult(tool_input=riddle())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+
+    real_gen = w._gen_spec_once
+
+    def gen_once(*a, **kw):
+        out = real_gen(*a, **kw)
+        state["allow"] = False        # 稿子一回来, 直播就忙了
+        return out
+
+    w._gen_spec_once = gen_once
+    spec = w.gen_spec(blueprint=fc.default_blueprint, should_continue=gate)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**只调了 emit_riddle, 没有 emit_review**",
+          names == ["emit_riddle"], names)
+    check("**没有谜面(这一稿没有通过质量链)**", not spec.puzzle,
+          spec.puzzle[:30])
+    check("metrics 标 interrupted",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+    check("**没有 error(让路不是失败)**", not spec.error, repr(spec.error))
+
+
+def test_g1_gen_spec_stops_before_second_draft():
+    """第一稿被审稿打回, 但**下一稿之前**变忙 -> 不再出第二稿。
+
+    这正是实播"4 稿连打"被截断的位置。
+    """
+    print("\n[G1-L4] 第一稿被拒后不再出第二稿")
+    state = {"allow": True}
+
+    def gate():
+        return state["allow"]
+
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        # 审稿要求重出 -> 正常会去出第二稿; 但谓词会让它停在检查点 ①
+        LLMResult(tool_input=review_rewrite("谜底依赖题面外的私人往事")),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    real_review = w._review_spec
+
+    def review(*a, **kw):
+        out = real_review(*a, **kw)
+        state["allow"] = False       # 审稿一返回, 直播就忙了
+        return out
+
+    w._review_spec = review
+    spec = w.gen_spec(blueprint=fc.default_blueprint, should_continue=gate,
+                      max_attempts=4)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**只出了 1 稿(没有第二稿)**",
+          names.count("emit_riddle") == 1, names)
+    check("调了审稿", names.count("emit_review") == 1, names)
+    check("**没有跑到第 4 稿**", len(fc.calls) == 2, len(fc.calls))
+    check("metrics 标 interrupted",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+
+
+def test_g1_gen_spec_stops_before_truth_audit():
+    """审稿通过后、truth audit 之前变忙 -> 不再 audit 也不再进池。"""
+    print("\n[G1-L5] truth audit 之前让路")
+    state = {"allow": True}
+
+    def gate():
+        return state["allow"]
+
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    real_review = w._review_spec
+
+    def review(*a, **kw):
+        out = real_review(*a, **kw)
+        state["allow"] = False
+        return out
+
+    w._review_spec = review
+    spec = w.gen_spec(blueprint=fc.default_blueprint, should_continue=gate)
+    check("**没有 truth audit 调用**",
+          all(c["tool"]["name"] != "emit_truth_audit" for c in fc.calls),
+          [c["tool"]["name"] for c in fc.calls])
+    check("**spec 没有谜面**", not spec.puzzle, spec.puzzle[:30])
+    check("metrics 标 interrupted",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+
+
+def test_g1_probe_exception_is_fail_closed():
+    """谓词自己抛异常 -> 当作"该收手"(fail closed), 绝不让异常冒泡。
+
+    若让异常冒泡, 它会变成 prefetch 的 `exc`(代码 bug) —— 而真相是
+    "探针坏了所以不敢继续"。两类账必须分开。
+    """
+    print("\n[G1-L6] 谓词抛异常 -> fail closed")
+    def boom():
+        raise RuntimeError("探针炸了")
+
+    fc = FakeClient([LLMResult(tool_input=riddle())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, should_continue=boom)
+    check("**零调用**", len(fc.calls) == 0, len(fc.calls))
+    check("metrics 标 interrupted",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+
+
+def test_g1_budget_and_attempts_are_honored():
+    """后台预算真的生效: `max_attempts=2` 时最多出 2 稿。"""
+    print("\n[G1-L7] 后台预算: 最多 2 稿")
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_rewrite("烂")),
+        LLMResult(tool_input=riddle(puzzle="二稿谜面, 另一个事件。为什么?")),
+        LLMResult(tool_input=review_rewrite("还是烂")),
+        # 若还去出第 3 稿, 这里会被取走 -> 断言能抓到
+        LLMResult(tool_input=riddle(puzzle="三稿不该出现。为什么?")),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=2)
+    check("**只出了 2 稿**",
+          [c["tool"]["name"] for c in fc.calls].count("emit_riddle") == 2,
+          [c["tool"]["name"] for c in fc.calls])
+    check("失败时 error 非空且 puzzle 为空(不能被当成结果)",
+          bool(spec.error) and not spec.puzzle,
+          (spec.error, spec.puzzle[:20]))
+    check("**没有被标成 interrupted**",
+          not (spec.metrics or {}).get("interrupted"), spec.metrics)
+
+
 def main():
     for t in (test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
@@ -3298,6 +3485,14 @@ def main():
               test_v4_policy_version_is_v4,
               # ---- Batch A closeout ----
               test_closeout_check_tool_has_no_recent_window_rule,
+              # ---- G1: gen_spec 协作式取消 ----
+              test_g1_gen_spec_default_is_bit_identical,
+              test_g1_gen_spec_stops_before_first_draft,
+              test_g1_gen_spec_stops_before_reviewer,
+              test_g1_gen_spec_stops_before_second_draft,
+              test_g1_gen_spec_stops_before_truth_audit,
+              test_g1_probe_exception_is_fail_closed,
+              test_g1_budget_and_attempts_are_honored,
               test_closeout_observed_signature_schema_is_complete,
               test_closeout_incomplete_observed_signature_is_rejected,
               test_closeout_incomplete_obs_never_lands_in_signature,

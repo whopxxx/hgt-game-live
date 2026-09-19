@@ -39,9 +39,37 @@ tick 线程)和一整套状态机, 值得单独一个文件级 docstring; 而且
 
     任何生成/add 失败
       ↓
-    BACKOFF
+    BACKOFF(递增: 30/60/120/240/300, 成功后归零)
       ↓ 到期
     REFILL_ACTIVE
+
+    **让路(interrupted)** —— 直播变忙, gen_spec 协作式收手
+      ↓
+    REFILL_ACTIVE(**不退避、不计失败**) —— 它不是故障
+
+## G1: 后台生成必须能在**跑到一半**时让路
+
+上面那张状态机只描述"这一拍要不要启动"。实播事故发生在**两次 tick
+之间**:
+
+    18:44:49 prefetch 在 REVEALED 启动(当时确实空闲)
+    18:45:07 揭晓结束、下一题开始(SETTING), 池里没题 -> live 现场生成
+    18:45:58 旧 prefetch 才跑完第 4 稿失败
+
+两个生成同时占网关 51 秒。之后又反复出现"开 -> 50 秒后败"的循环。
+
+根因不是"判定写错了", 而是**判定只在 tick 里跑**(4Hz 的决策点),
+而一次 gen_spec 内部有 4~8 次昂贵调用, 每次之间都可能跨过相位切换。
+所以 G1 给 `gen_spec` 加了协作式取消: 每次尚未发出的昂贵调用之前
+都问一次 `_should_continue`, 说停就停。已经发出去的 HTTP 请求无法
+取消 —— 等它回来即可, 关键是**它回来之后不能再发下一次**。
+
+## G1: 后台用**自己的**预算
+
+`gen_spec` 的默认参数(4 稿 / 90s)是**直播现场出题**的预算: 那时观众
+在干等, 多试一稿值得。后台补池的收益上限只是"池子里多一道题", 代价
+却是与直播抢网关、以及跨过下一题的 deadline。所以后台是 2 稿 / 25s
+—— **少尝试, 不是降低题质**(硬门一道不少)。
 
 ## 四条设计要点
 
@@ -153,9 +181,38 @@ class PoolPrefetcher:
             self._playable_min,
             int(getattr(cfg, "pool_reveal_playable_target", 2) or 0))
         self._reveal_guard_s = max(
-            0.0, float(getattr(cfg, "pool_reveal_start_guard_seconds", 15.0)
+            0.0, float(getattr(cfg, "pool_reveal_start_guard_seconds", 30.0)
                        or 0.0))
+        # ---- G1: 后台补池的独立预算 ----
+        # 过去 prefetch 直接调 `gen_spec()` 的默认参数(max_attempts=4 /
+        # budget_s=90) —— 那是**直播现场出题**的预算。live 出一道题观众
+        # 就在干等, 值得多试几稿; 后台补池只是"有空补一道", 多试一稿的
+        # 全部收益是池子里多一道题, 代价却是与直播抢网关 + 跨过 deadline
+        # 继续跑。所以后台**少尝试**, 不是降低题质 —— 硬门一道不少。
+        self._prefetch_attempts = max(
+            1, int(getattr(cfg, "pool_prefetch_max_attempts", 2) or 2))
+        self._prefetch_budget = max(
+            1.0, float(getattr(cfg, "pool_prefetch_budget_seconds", 25.0)
+                       or 25.0))
+        self._guard_margin = max(
+            0.0, float(getattr(cfg, "pool_prefetch_guard_margin_seconds", 5.0)
+                       or 0.0))
+        # ---- G1: guard 必须至少覆盖一轮预算 ----
+        # 只挡"启动"是不够的: 实播里 guard=15s 而一轮 prefetch 可能跑
+        # 几十秒, 于是"只剩 18 秒"照样启动一个注定跨过 deadline 的后台
+        # 任务, 它跑着跑着下一题已经开始现场生成了 —— 两边同时占网关
+        # 51 秒。这里取 max() 兜底, 免得"调大了 budget 却忘了调 guard"
+        # 静默退回旧行为。配置侧会为此出一条告警(见 config.validate)。
+        self._effective_guard_s = max(
+            self._reveal_guard_s, self._prefetch_budget + self._guard_margin)
         self._backoff_s = float(getattr(cfg, "pool_prefetch_backoff_s", 30.0) or 30.0)
+        # ---- G1: 连续失败的退避序列 ----
+        # 固定 30 秒会让同一个上下文(同样的 recent window / 同样的配额
+        # 饱和)被反复重试, 每次都烧完整一轮预算。改成递增, 成功后归零。
+        _sched = tuple(getattr(cfg, "pool_prefetch_backoff_schedule_s",
+                               None) or ())
+        self._backoff_schedule = tuple(
+            float(x) for x in _sched if float(x) > 0) or (self._backoff_s,)
 
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
         # blueprint 序列随"补池开不开"而变 —— 那既难排查, 也让
@@ -174,6 +231,14 @@ class PoolPrefetcher:
         self._future: Optional[Future] = None
         self._refill_active = False        # latch(滞回)
         self._retry_at = 0.0               # 退避到期时刻(monotonic)
+        #: G1: 连续失败次数。`interrupted`(让路)**不计** —— 见
+        #: `_apply_result`。它在 `_fail_streak` 上的效果必须是
+        #: "什么都没发生", 否则"直播很忙"会被记成"补池一直在失败"。
+        self._fail_streak = 0
+        #: G1: 上一次提交时看到的"场景指纹"(puzzle_index)。新一题正式
+        #: 开始后, 生成约束环境(recent window)整体变了 —— 此时允许把
+        #: 长退避**重置一次**, 而不是机械地等满 300 秒再试同一个上下文。
+        self._scene_at_submit = 0
         self._pending_result = None        # worker 的终局结果, 由 tick 取走
         self._last_fail = ""
         #: 硬上限 warning 的节流时刻(monotonic)。tick 4Hz, 不节流会把
@@ -193,6 +258,11 @@ class PoolPrefetcher:
         self.playtest_unsolved_count = 0
         self.playtest_unavailable_count = 0
         self.playtest_interrupted_count = 0
+        #: G1: gen_spec 因"直播变忙"协作式收手的次数。**与
+        #: generation_fail_count 分开** —— 前者是优先级让路(正常),
+        #: 后者是题不合格(故障)。合成一个数字之后, "补池失败率"就
+        #: 只反映直播活跃度了。
+        self.interrupted_count = 0
         self.skip_count = 0
 
     # ------------------------------------------------------------------
@@ -253,7 +323,27 @@ class PoolPrefetcher:
 
             # ---- ③ 退避 ----
             if now < self._retry_at:
-                return
+                # ---- G1: 场景变了就允许重置一次长退避 ----
+                # 退避的初衷是"别在同一个坏上下文里反复烧钱"。但如果
+                # 期间**新一题正式开始**了, recent window / 配额饱和状态
+                # 已经整体换了一批 —— 机械地等满 300 秒只是白等。
+                #
+                # 只重置到**第一档**(不是直接清零): 立刻重试一个刚失败
+                # 过的环境仍然是错的, 但等 30 秒是合理的。
+                #
+                # 判据用 puzzle_index(单调递增的场景指纹), 不是"时间到了"
+                # —— 后者会让退避序列形同虚设。
+                if self._fail_streak > 1:
+                    cur = self._scene_of(self._probe_safe())
+                    if cur is not None and cur != self._scene_at_submit:
+                        self._scene_at_submit = cur
+                        self._fail_streak = 1
+                        self._retry_at = now + self._backoff_for_streak(1)
+                        log.info("补池: 直播已进入新一题(场景指纹 %s), "
+                                 "长退避重置为第一档 %.0fs",
+                                 cur, self._backoff_for_streak(1))
+                if now < self._retry_at:
+                    return
 
             # ---- ④ 账本不可信 -> 完全不补池 ----
             # 此时 pop_next 一道都不交付, 灌题只是白烧网关配额。
@@ -363,6 +453,11 @@ class PoolPrefetcher:
             # 进来, 会重复起任务。
             to_submit = inputs
             self._future = _PENDING
+            # G1: 记下"这次生成是在哪个场景里启动的"。场景指纹变了
+            # 才允许重置长退避(见 ③)。
+            _sc = self._scene_of(self._probe_safe())
+            if _sc is not None:
+                self._scene_at_submit = _sc
 
         # ---- 锁外真正提交 ----
         try:
@@ -411,23 +506,81 @@ class PoolPrefetcher:
             self.add_fail_count += 1
         elif kind == "exc":
             self.exception_count += 1
+        elif kind == "interrupted":
+            # G1: **不是失败**。gen_spec 因为"直播变忙"收手, 与
+            # gen_fail(题不好) / add_fail(存不下) / exc(代码 bug) 是
+            # 完全不同的第四类。它有自己的计数, 且**绝不**进失败链。
+            self.interrupted_count += 1
 
         # ---- ③ 退避 ----
-        # 成功入池清退避; 其余一律按 `OUTCOME_POLICY` 决定。
-        # `interrupted` 只让路, 不退避 —— 否则运维数据会把"直播活跃"
-        # 误读成"试玩大量失败"。
+        # 成功入池清退避并且**重置连续失败序列**; 让路既不清也不加;
+        # 其余一律按连续失败次数取递增档位。
+        #
+        # 为什么"让路"不能退避: 直播忙是**正常状态**, 不是故障。给它
+        # 退避会让运维数据把"直播很活跃"读成"补池大量失败", 而且退避
+        # 结束后直播可能还是忙的, 于是又一轮无效启动。
+        #
+        # 为什么"让路"也不能清退避: 让路发生在**结果**里, 而不是"新
+        # 一轮成功了"。它什么都没证明, 清退避等于让一次真失败白等。
         if kind == "ok":
             self._retry_at = 0.0
             self._last_fail = ""
+            self._fail_streak = 0
             log.info("补池成功: 库存 -> %d", self._stock())
             return
-        if (extra or {}).get("interrupted"):
+        if (extra or {}).get("interrupted") or kind == "interrupted":
             log.info("补池让路(直播变忙), 不计失败不退避: %s", detail)
             return
-        self._retry_at = now + self._backoff_s
+        self._fail_streak += 1
+        wait = self._backoff_for_streak(self._fail_streak)
+        self._retry_at = now + wait
         self._last_fail = detail or kind
-        log.warning("补池失败(%s), 退避 %.0fs: %s",
-                    kind, self._backoff_s, detail)
+        if wait > self._backoff_s:
+            log.warning("补池连续失败 %d 次(%s), 退避 %.0fs: %s",
+                        self._fail_streak, kind, wait, detail)
+        else:
+            log.warning("补池失败(%s), 退避 %.0fs: %s", kind, wait, detail)
+
+    def _probe_safe(self) -> dict:
+        """读压力探针, **绝不抛**。读不到返回空 dict。
+
+        G1 新增的用途是取场景指纹; 判定逻辑仍然各自 fail closed
+        (读不到 -> 让路 / 不启动), 不在这里替调用方决定。
+        """
+        try:
+            p = self._probe()
+            return p if isinstance(p, dict) else {}
+        except Exception:                       # noqa: BLE001
+            log.exception("读压力探针异常")
+            return {}
+
+    @staticmethod
+    def _scene_of(p: dict) -> Optional[int]:
+        """从探针结果里取"场景指纹"(当前题号)。取不到返回 None。
+
+        旧探针(没有这个字段的替身)返回 None —— 调用方据此**不做**
+        退避重置, 退回 G1 之前的固定递增行为, 而不是把 None 当成
+        "场景变了"而疯狂重置。
+        """
+        v = (p or {}).get("puzzle_index")
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _backoff_for_streak(self, streak: int) -> float:
+        """连续第 `streak` 次失败该退避多久。
+
+        序列递增(默认 30/60/120/240/300...), 最后一档封顶 —— 不要
+        无限翻倍: 补池的价值上限就是"池子里多一道题", 等到 10 分钟
+        已经和停掉它没区别了, 但保留 300 秒能保证它**最终**会再试。
+
+        `streak` 从 1 开始(第一次失败取第一档)。
+        """
+        idx = max(0, int(streak) - 1)
+        if idx >= len(self._backoff_schedule):
+            return float(self._backoff_schedule[-1])
+        return float(self._backoff_schedule[idx])
 
     # ------------------------------------------------------------------
     def _ledger_ok(self) -> bool:
@@ -569,16 +722,23 @@ class PoolPrefetcher:
         return self._target_size, self._playable_min
 
     def _deadline_too_close(self) -> bool:
-        """U1: 距下一题不足 guard 秒 -> 不再**启动**新请求。
+        """U1 + G1: 距下一题不足 guard 秒 -> 不再**启动**新请求。
 
         只挡"启动", 不碰在途任务 —— urllib 请求无法取消, 强杀只会让
         那一次生成白烧。已经飞着的跑完就进池子, 下一题用不上也无妨。
+        (它**回来了**之后还能不能再发下一次, 由 `_should_continue` 卡。)
+
+        ⚠️ G1: 这里的阈值是 `_effective_guard_s`, **不是**配置里那个
+        原始 guard。实播事故就是原始 guard=15s 而一轮 prefetch 能跑
+        几十秒 —— "只剩 18 秒"照样启动一个注定跨过 deadline 的后台
+        任务, 下一题开始时它还在跑。effective guard = max(配置值,
+        一轮预算 + 余量), 保证启动的那次有希望在 deadline 前结束。
 
         只在 REVEALED 且**确实拿到**剩余秒数时判定。探针给 None
         (不在 REVEALED / 没有 deadline)一律按"不限"处理 —— 少一次
         生成远比误判成"快截稿了"而长期不补池安全。
         """
-        if self._reveal_guard_s <= 0:
+        if self._effective_guard_s <= 0:
             return False
         try:
             p = self._probe() or {}
@@ -589,9 +749,74 @@ class PoolPrefetcher:
         if left is None:
             return False
         try:
-            return float(left) <= self._reveal_guard_s
+            return float(left) <= self._effective_guard_s
         except (TypeError, ValueError):
             return True                         # 读到脏值 -> 不启动
+
+    def _should_continue(self) -> bool:
+        """G1: 后台生成"还该不该继续" —— 传给 `gen_spec` 的协作式取消谓词。
+
+        与 `_low_pressure()` 是**同一个判定边界**(复用同一个压力探针),
+        但调用时机完全不同, 所以不能互相替代:
+
+            `_low_pressure()`  决定"这一拍**要不要启动**"      (低频, tick 4Hz)
+            `_should_continue` 决定"已经跑起来的**要不要往下走**"(高频, 每次调用前)
+
+        实播事故正是"启动时低压力、跑着跑着房间忙了"这个窗口造成的:
+        补池在 REVEALED 启动, 下一题开始后它仍在审稿 / 再出一稿, 与
+        直播的现场生成抢了几十秒网关。`_low_pressure` 只在 tick 里跑,
+        根本看不见这个窗口; 这个谓词在**每次昂贵调用之前**跑, 看得见。
+
+        ## 允许继续
+
+            QA 且 pending/inflight/hint/reveal 全 0
+            REVEALED 且没有 reveal 在途、且距下一题还有足够时间
+
+        ## 必须让路
+
+            SETTING / REVEALING  —— 直播自己在用网关
+            pending / inflight > 0 —— 有观众在等回答
+            hint / reveal 在途
+            stopped
+            REVEALED 已进入启动 guard(剩余不足一轮预算)
+
+        ⚠️ 最后那条**必须**用 `_effective_guard_s`(最大 预算+余量), 不能
+        用配置里那个原始值: guard 存在的意义就是"留够一轮生成的时间",
+        用小的那个等于没留。
+
+        探针读不到时 fail closed(返回 False): 后台少生成一道题的成本
+        远小于"在直播最忙的时候抢网关"。谓词自己绝不抛异常。
+        """
+        try:
+            p = self._probe() or {}
+        except Exception:                       # noqa: BLE001
+            log.exception("读压力探针异常, 后台生成让路")
+            return False
+        if p.get("stopped"):
+            return False
+        from .state import Phase
+        if p.get("pending") or p.get("inflight"):
+            return False
+        phase = p.get("phase")
+        if phase == Phase.QA:
+            # QA 期间 hint/reveal 都可能正在生成 —— 让路。
+            if p.get("hint_inflight") or p.get("reveal_inflight"):
+                return False
+            return True
+        if phase == Phase.REVEALED:
+            if p.get("reveal_inflight"):
+                return False
+            left = p.get("reveal_remaining_seconds")
+            if left is None:
+                # 拿不到剩余秒数就不限制 —— 与 `_deadline_too_close` 同一
+                # 取舍: 少一次生成远比"误判成快截稿而长期不补池"安全。
+                return True
+            try:
+                return float(left) > self._effective_guard_s
+            except (TypeError, ValueError):
+                return False                    # 读到脏值 -> 让路
+        # SETTING / REVEALING / IDLE 之外的一切 —— 让路。
+        return False
 
     def _generation_inputs(self) -> dict:
         try:
@@ -628,12 +853,36 @@ class PoolPrefetcher:
         avoid = inputs.get("avoid")
         extra: dict = {}
         bp = self._pick_blueprint(recent, rng=self._rng)
+        # ---- G1: 低优先级生成 ----
+        # `should_continue` 在**每一次尚未发出的昂贵调用之前**被检查
+        # (出稿 / 审稿 / truth audit / 下一稿, 见 `gen_spec`)。已经发出去
+        # 的那次 HTTP 请求无法取消, 等它回来即可 —— 关键是**它一回来就
+        # 不能再发下一次**。这正是要消灭的实播事故: 下一题已经开始现场
+        # 生成, 而旧 prefetch 还在审稿 / 再出一稿, 两边同时占网关 51 秒。
+        #
+        # 预算也换成后台自己的(少尝试, 不是降低题质): live 是 4 稿/90s,
+        # 后台是 2 稿/25s。后台多试一稿的收益只是池子里多一道题, 代价
+        # 却是跨过 deadline 与直播抢网关。
         spec = self.writer.gen_spec(
             avoid=avoid, blueprint=bp, recent=recent,
+            max_attempts=self._prefetch_attempts,
+            budget_s=self._prefetch_budget,
+            should_continue=self._should_continue,
             # bp is None 时**真的**跳过 blueprint 硬校验, 而不是退回
             # 默认 blueprint(那是已经修过的 bug)。与 live 路径同一写法。
             enforce_blueprint=bp is not None)
-        if spec is None or not getattr(spec, "puzzle", "") or spec.error:
+        # ---- G1: 让路 —— 单独一类结果, **不能**记成 gen_fail ----
+        # 判据看 metrics 里的显式标记(gen_spec 设的), 而不是猜 error
+        # 文本; 也顺手兜住"writer 是替身、没有 metrics"的情况。
+        if bool((getattr(spec, "metrics", None) or {}).get("interrupted")):
+            return ("interrupted", "直播变忙, 本轮补池让路", {"interrupted": True})
+        # 让路时 gen_spec **故意**把 error 留空(它不是失败), 所以这里
+        # 必须在判断 error 之前先判 puzzle 空 —— 否则会走进下面
+        # "空谜面"那条, 把一次让路记成 gen_fail。
+        if spec is None or not getattr(spec, "puzzle", ""):
+            if bool(getattr(spec, "interrupted", False)):
+                return ("interrupted", "直播变忙, 本轮补池让路",
+                        {"interrupted": True})
             return ("gen_fail",
                     (spec.error if spec is not None else "spec=None")
                     or "空谜面", {})
@@ -744,11 +993,21 @@ class PoolPrefetcher:
                 "reveal_target": self._reveal_target,
                 "reveal_playable_target": self._reveal_playable_target,
                 "reveal_guard_s": self._reveal_guard_s,
+                # G1: **实际生效**的 guard(>= 一轮预算 + 余量)。报这个
+                # 而不是配置里那个原始值 —— 否则复盘时会看到"guard=15
+                # 却仍然在剩余 20 秒时启动"这种自相矛盾的指纹, 而那
+                # 恰恰是 G1 之前那个 bug 的样子。
+                "effective_guard_s": self._effective_guard_s,
+                "prefetch_budget_s": self._prefetch_budget,
+                "prefetch_max_attempts": self._prefetch_attempts,
+                "fail_streak": self._fail_streak,
 
                 "added": self.added_count,
                 "generation_fail": self.generation_fail_count,
                 "add_fail": self.add_fail_count,
                 "exception": self.exception_count,
+                # G1: 与 generation_fail **分开** —— 让路是优先级, 不是故障。
+                "interrupted": self.interrupted_count,
                 "skip": self.skip_count,
 
                 "playtest": {
