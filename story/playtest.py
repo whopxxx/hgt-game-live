@@ -299,12 +299,20 @@ class Playtester:
 
         `judge_solve=True` 且带 `spec` —— 与直播逐字相同, 连
         `solution_candidate` 闸门一起测。
+
+        ⚠️ **必须把通关合同一起传下去**。不传的话, 一道 v6 题在这里会
+        走 legacy 分支(有合同却没有 `completion_fact_ids` -> `has_contract`
+        为假), 于是它可能吐出 `P.SOLVE` —— 试玩就会按**直播里根本不
+        存在**的路径判 PASS, 分数与真实语义对不上。
         """
         try:
             results, err = self.host.answer(
                 puzzle=puzzle, answer=answer, transcript=[], qid=turn,
                 user_name="AI玩家", text=text,
-                judge_solve=True, spec=spec)
+                judge_solve=True, spec=spec,
+                completion_fact_ids=list(
+                    getattr(spec, "completion_fact_ids", None) or []),
+                core_answer=str(getattr(spec, "core_answer", "") or ""))
         except Exception as e:                  # noqa: BLE001
             log.exception("Host answer 异常: %s", e)
             return "", "", str(e)

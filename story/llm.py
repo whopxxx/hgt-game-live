@@ -2845,6 +2845,18 @@ class PuzzleWriter:
         ⚠️ 胜负入口仍然只有 Engine 的合同覆盖判定 —— 见
         `RoundEngine.submit_qa`。这里没有第二条路。
 
+        ## v6: 第一层 Answer **不拥有通关权**
+
+        ```
+        第一层(本函数)永远只产出: 是 / 不是 / 无关 / 未判定
+        P.SOLVE 只能来自 legacy Final Judge。
+        ```
+
+        两条解析路径(tool / text)**汇合之后**统一把 P.SOLVE 降级为
+        「是」。只在 tool 分支降级是不够的 —— 文本回退走
+        `P.parse_answers`, 而它的关键词表把 `揭晓`/`完全正确`/`答对了`
+        都映射成 P.SOLVE, 于是纯文本回复能直接绕过合同。
+
         为什么这样能省调用: 绝大多数提问是"他是医生吗"这种**单点事实提问**,
         它们不可能说中完整谜底。让模型先答一个 `solution_candidate=false`,
         代码就不调复核了 —— judge_calls/answer_calls 从接近 100% 降下来。
@@ -2876,12 +2888,12 @@ class PuzzleWriter:
         if res.tool_input:
             for a in (_unwrap_tool_input(res.tool_input).get("answers") or []):
                 v = str(a.get("verdict", "")).strip()
-                # 「揭晓」已被移除; 老网关/模型仍可能吐出来 -> 一律降级。
-                # 通关**只能**由下面的 Final Judge 决定。
-                if v == P.SOLVE:
-                    log.info("裁决返回了已废弃的'揭晓', 降级为'是': %r", text[:30])
-                    v = "是"
-                if v not in P.VERDICTS or v == P.SOLVE:
+                # 「揭晓」已被移除; 老网关/模型仍可能吐出来。
+                # ⚠️ 归一**不在这里**做 —— 见下面两条路径汇合处的统一循环。
+                # 只在 tool 分支里降级, 文本分支(parser 的 SOLVE 关键词表)
+                # 就会漏过去, 于是 `1. 揭晓` 这类纯文本回复能直接绕过
+                # v6 的通关合同。统一做一次, 以后新增 parser path 也不会漏。
+                if v not in P.VERDICTS:
                     continue
                 cm = str(a.get("comment", "") or "")[:60]
                 # 点评里若出现谜底片段, 直接丢掉点评(防止"给点提示"被回成答案)
@@ -2908,17 +2920,41 @@ class PuzzleWriter:
         elif res.text:
             # 回退: 文本解析(工具调用不可用时)。
             # 这条路拿不到 candidate -> **保守地认为可能是候选**?
-            # 不: 那会让 judge 调用率回到 100%。文本回退本来就罕见,
-            # 这里保持 candidate=False, 但对带因果连词的长句放行。
+            # 不: 那会让复核调用率回到 100%。文本回退本来就罕见,
+            # 这里仍以句式启发式为准(`_looks_like_solution`)。
             results, _ = P.parse_answers(
                 res.text, [type("Q", (), {"qid": qid})()])
-            if answer:
-                for r in results:
-                    if _leaks_answer(r.comment, answer):
-                        r.comment = ""
-                    r.solution_candidate = _looks_like_solution(text)
+            for r in results:
+                # ⚠️ candidate 的赋值必须在 `if answer` **外面**。
+                # 原先它嵌在 `if answer:` 里, 于是谜底缺失时这条路
+                # 谁都不会被标成候选 —— 一个说得完全正确的观众
+                # 因此永远走不到复核。谜底只用来做泄漏检查, 不该
+                # 决定 candidate。
+                if answer and _leaks_answer(r.comment, answer):
+                    r.comment = ""
+                r.solution_candidate = _looks_like_solution(text)
         if not results:
             return [], res.error or "解析不出裁决"
+
+        # ---- 第一层裁决归一: P.SOLVE 一律降级为「是」 ----
+        #
+        # **两条路径汇合之后**统一做, 不在 tool 分支里各做一遍。
+        #
+        # 为什么必须在这里: 文本回退走 `P.parse_answers`, 而 parser 的
+        # 关键词表里 `揭晓` 是**一等裁决**(`VERDICTS` 含它, 且
+        # "完全正确"/"答对了" 也映射到它)。只在 tool 分支降级的话,
+        # 一句纯文本 `1. 揭晓` 就能产出 `QAResult(verdict=P.SOLVE)`,
+        # 一路绕过 v6 的 `completion <= established` 直接进揭晓。
+        #
+        # 冻结语义: **第一层 Answer 永远只有 是 / 不是 / 无关 / 未判定。**
+        # P.SOLVE 只能由 legacy Final Judge 产生(`_fill_coverage` 之后那段)。
+        # 对 legacy 也一样: 第一层说"揭晓"不能直接赢, 必须降成"是",
+        # 再按 candidate 走旧 Final Judge。
+        for r in results:
+            if r.verdict == P.SOLVE:
+                log.info("第一层裁决返回已废弃的'揭晓', 降级为'是': %r",
+                         text[:30])
+                r.verdict = P.YES
 
         r0 = results[0]
         _detail("裁决 %r -> %s%s (碰事实=%s 候选=%s)", text[:40], r0.verdict,

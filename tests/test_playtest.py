@@ -156,9 +156,16 @@ class _FakeHost:
         self.calls = []
 
     def answer(self, puzzle, answer, transcript, qid, user_name, text,
-               judge_solve=True, solve_atoms=None, facts=None, spec=None):
+               judge_solve=True, solve_atoms=None, facts=None, spec=None,
+               completion_fact_ids=None, core_answer="",
+               room_established_fact_ids=None, **kw):
+        # `**kw` 是刻意的: 生产 `answer()` 的签名会继续长, 这个假 Host
+        # 不该因为多了一个关键字参数就整条测试炸掉。真正要断言的是
+        # **合同有没有被传下去**(见下面 completion_fact_ids 的断言)。
         self.calls.append({"text": text, "qid": qid, "judge_solve": judge_solve,
-                           "spec": spec, "puzzle": puzzle})
+                           "spec": spec, "puzzle": puzzle,
+                           "completion_fact_ids": completion_fact_ids,
+                           "core_answer": core_answer})
         if self.error:
             return [], self.error
         if self.solved_at is not None and qid == self.solved_at:
@@ -261,6 +268,12 @@ def test_host_answer_uses_production_path():
     c = host.calls[0]
     check("**judge_solve=True**", c["judge_solve"] is True)
     check("**带上 spec(连闸门一起测)**", c["spec"] is spec)
+    # ⚠️ 合同也必须传下去 —— 不传的话 v6 题在试玩里会走 legacy 分支,
+    # 于是可能吐出 P.SOLVE, 试玩就按直播里**不存在**的路径判 PASS。
+    check("**带上 completion_fact_ids(与直播同一条路)**",
+          c["completion_fact_ids"] == ["f1", "f2"], c["completion_fact_ids"])
+    check("**带上 core_answer**", c["core_answer"] == spec.core_answer,
+          c["core_answer"])
     check("qid 是轮号", c["qid"] == 1, c["qid"])
 
 

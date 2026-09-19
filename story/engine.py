@@ -922,8 +922,21 @@ class RoundEngine:
                              self._puzzle_index, q.user_name, q.text[:30])
                     acts.extend(self._solve_by_contract_locked(now, q.user_name))
                     return acts
-                if r.verdict == P.SOLVE and \
-                        self._reveals < self.cfg.max_reveals_per_puzzle:
+                # ---- legacy: P.SOLVE 直接通关(仅限**无合同**的题) ----
+                #
+                # Defense-in-depth: 有通关合同的题**只有**一条胜利路径
+                # (`completion <= established`, 见上面), 这里必须显式
+                # 排除掉。不能只相信 Writer 会永远把第一层的 P.SOLVE
+                # 归一成「是」—— 将来任何一个新 producer / no-llm 路径 /
+                # 异常 parser 只要塞进一个 P.SOLVE, 就会绕开合同。
+                #
+                # 语义冻结:
+                #   有 completion contract -> 只能集合覆盖获胜
+                #   无 completion contract -> legacy 路径原样保留
+                #     (老 archive / 老 fixture 不该因这次改动失去通关能力)
+                if (not self._completion_fact_ids
+                        and r.verdict == P.SOLVE
+                        and self._reveals < self.cfg.max_reveals_per_puzzle):
                     log.info("第 %d 题被 %s 猜中: %s", self._puzzle_index,
                              q.user_name, q.text[:30])
                     acts.extend(self._enter_revealing_locked(now, "solved",

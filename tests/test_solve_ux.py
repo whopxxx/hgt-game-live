@@ -38,9 +38,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
+import story.parser as P  # noqa: E402
 from story.llm import (  # noqa: E402
-    LLMResult, PuzzleWriter,
-    _QUALITY_CHECK_FIELDS, _TOOL_ANSWER, _TOOL_CHECK, _TOOL_RIDDLE,
+    COMPLETION_VERIFY_SYSTEM, LLMResult, PuzzleWriter,
+    _QUALITY_CHECK_FIELDS, _TOOL_ANSWER, _TOOL_CHECK,
+    _TOOL_COMPLETION_VERIFY, _TOOL_RIDDLE,
     ANSWER_SYSTEM, CHECK_SYSTEM, RIDDLE_SYSTEM,
 )
 from story.puzzle import (  # noqa: E402
@@ -1110,6 +1112,10 @@ def test_v6_reviewer_has_minimality_rule():
 # ======================================================================
 _AUCTION_TEXT = ("古董商自己把箱子送去拍, 又自己把价格拍高, 刷出高价"
                  "成交记录, 这样手里那些同类旧箱就能卖得更贵。")
+#: 带因果连词的完整解 —— `_looks_like_solution` 要求这个(文本回退路径
+#: 靠句式启发式认候选)。真实观众说完整解时几乎一定带"所以/是因为"。
+_AUCTION_TEXT_CAUSAL = ("古董商自己把箱子送去拍又自己拍高, 所以成交记录"
+                        "被刷虚了, 是为了把手里同类旧箱卖得更贵。")
 
 
 def test_v6_case1_complete_answer_ends_puzzle():
@@ -1554,6 +1560,267 @@ class _CaptureLogs:
         self._root.setLevel(self._old)
 
 
+# ======================================================================
+# v6 blocker: 第一层绝不拥有通关权
+# ======================================================================
+# 两条绕过路径:
+#   1. 文本回退 —— `P.parse_answers` 的关键词表把 揭晓/完全正确/答对了
+#      都映射成 P.SOLVE, 而只有 tool 分支做了降级。
+#   2. Engine —— 即使 Writer 归一了, 其它 producer 塞进来的 P.SOLVE
+#      仍会走 legacy 直通揭晓。
+# 这两个都要修, 且都要有 mutation 测试钉住。
+_SOLVE_TEXTS = ["1. 揭晓", "1. 答对了", "1. 完全正确", "1. 真相是",
+                "1. 答案是", "1. 谜底是", "1. 正确答案"]
+_TOOL_SOLVE = [{"id": 1, "verdict": "揭晓", "comment": "",
+                "solution_candidate": False, "touched_fact_ids": [],
+                "established_fact_ids": []}]
+
+
+def test_v6_a_text_fallback_solve_cannot_win():
+    """A: 纯文本 `1. 揭晓` 不能直接获胜。
+
+    第一层文本回退解析出 P.SOLVE, 必须被统一降级为「是」; 观众说的是
+    candidate=false 的短句, 所以连复核都不该触发, 更不该揭晓。
+    """
+    print("\n[v6 A] text fallback '揭晓' 不能直通")
+    spec = auction_spec()
+    for txt in _SOLVE_TEXTS:
+        fc = FakeClient([LLMResult(text=txt, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, err = w.answer(
+            spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗", spec=spec,
+            completion_fact_ids=spec.completion_fact_ids,
+            core_answer=spec.core_answer, room_established_fact_ids=[])
+        check(f"{txt!r} -> verdict 是「是」", out and out[0].verdict == "是",
+              out[0].verdict if out else None)
+        check(f"{txt!r} -> 不是 P.SOLVE", out and out[0].verdict != "揭晓",
+              out[0].verdict if out else None)
+        check(f"{txt!r} -> 没触发复核(candidate=false)",
+              all(c["tool"]["name"] != "emit_completion_match"
+                  for c in fc.calls), [c["tool"]["name"] for c in fc.calls])
+
+    # Engine 侧: 提交这条降级后的结果, 必须仍在 QA。
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", "他是医生吗", verdict="是",
+        solution_candidate=False)
+    check("Engine 仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("没有胜者", not eng._solved_by, eng._solved_by)
+
+
+def test_v6_b_text_fallback_variants_all_normalized():
+    """B: parser 的关键词不止字面 `揭晓` —— 全部都要降级。
+
+    这条与 A 分开, 是因为它防的是"以后有人只给 `揭晓` 加特判"。
+    判据必须是 `verdict == P.SOLVE`, 不是某个字面量。
+    """
+    print("\n[v6 B] text fallback 的 SOLVE 变体全部降级")
+    import story.parser as P
+    spec = auction_spec()
+    seen_solve = 0
+    for txt in _SOLVE_TEXTS:
+        # 先确认 parser 真的把这些映射成 P.SOLVE —— 否则这条测试是空的。
+        parsed, _ = P.parse_answers(txt, [type("Q", (), {"qid": 1})()])
+        if parsed and parsed[0].verdict == P.SOLVE:
+            seen_solve += 1
+        fc = FakeClient([LLMResult(text=txt, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, _ = w.answer(
+            spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗", spec=spec,
+            completion_fact_ids=spec.completion_fact_ids,
+            core_answer=spec.core_answer, room_established_fact_ids=[])
+        check(f"{txt!r} 降级后不是 P.SOLVE",
+              out and out[0].verdict != P.SOLVE,
+              out[0].verdict if out else None)
+    check("parser 确实会把其中多条映射成 P.SOLVE(否则本测试没意义)",
+          seen_solve >= 2, seen_solve)
+    # tool 分支同样归一。
+    fc = FakeClient([LLMResult(tool_input={"answers": _TOOL_SOLVE}, model="m")])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗",
+                      spec=spec,
+                      completion_fact_ids=spec.completion_fact_ids,
+                      core_answer=spec.core_answer,
+                      room_established_fact_ids=[])
+    check("tool 分支的'揭晓'也降级为「是」",
+          out and out[0].verdict == "是", out[0].verdict if out else None)
+
+
+def test_v6_c_text_fallback_candidate_still_reaches_verifier():
+    """C: candidate=true 的文本回退**仍能赢** —— 但必须经过 completion IDs。
+
+    这是本 blocker 的关键平衡: 修完之后不能把正常通关也堵死。
+    路径: 文本\"完全正确\" -> 降级\"是\" -> `_looks_like_solution` 命中
+    -> completion 复核 -> f1/f2 -> Engine 覆盖 -> 揭晓。
+    """
+    print("\n[v6 C] text fallback + 完整解 -> 经复核获胜")
+    spec = auction_spec()
+    from story.llm import _looks_like_solution
+    check("这条发言确实触发句式启发式",
+          _looks_like_solution(_AUCTION_TEXT_CAUSAL), _AUCTION_TEXT_CAUSAL)
+    fc = FakeClient([LLMResult(text="1. 完全正确", model="m"),
+                     _completion_match(["f1", "f2"])])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT_CAUSAL, spec=spec,
+        completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("第一层先降级为「是」", out and out[0].verdict == "是",
+          out[0].verdict if out else None)
+    check("句式像完整解 -> 触发了复核", len(fc.calls) == 2, len(fc.calls))
+    check("第二层是 completion 复核",
+          fc.calls[1]["tool"]["name"] == "emit_completion_match",
+          [c["tool"]["name"] for c in fc.calls])
+    check("established 来自复核的 completion IDs",
+          out and out[0].established_fact_ids == ["f1", "f2"],
+          out[0].established_fact_ids if out else None)
+    check("**不是**凭 P.SOLVE 赢的", out and out[0].verdict != P.SOLVE,
+          out[0].verdict if out else None)
+
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", _AUCTION_TEXT_CAUSAL,
+        verdict=out[0].verdict, solution_candidate=True,
+        established_fact_ids=list(out[0].established_fact_ids or []),
+        completion_verified_fact_ids=list(
+            out[0].completion_verified_fact_ids or []))
+    check("Engine coverage 揭晓", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是当前真人", eng._solved_by == "甲", eng._solved_by)
+
+
+def test_v6_d_engine_rejects_solve_bypass_with_contract():
+    """D: Engine defense-in-depth —— 直接塞 P.SOLVE 也绕不开合同。
+
+    **本批最关键的一条 mutation**: 完全绕过 Writer, 向一个有通关合同的
+    Engine 提交 P.SOLVE + established=[]。必须仍在 QA。
+
+    这条防的是"将来另一个 producer / no-llm / 异常 parser 又塞进
+    P.SOLVE" —— 只相信 Writer 会永远归一正确是不够的。
+    """
+    print("\n[v6 D] Engine 直接 P.SOLVE -> 有合同必须拒绝")
+    spec = auction_spec()
+    eng, clk = boot(spec)
+    check("这道题确实有合同", set(spec.completion_fact_ids) == {"f1", "f2"},
+          spec.completion_fact_ids)
+    ask(eng, clk, "u1", "甲", "我自己宣布答对了",
+        verdict="揭晓", solution_candidate=True, established_fact_ids=[])
+    check("phase 仍 QA(没有被 P.SOLVE 直通)", eng.phase == Phase.QA,
+          eng.phase)
+    check("不 solved", not eng._solved_by, eng._solved_by)
+    # 对照: 补齐合同才揭晓。
+    ask(eng, clk, "u2", "乙", "他是自己拍高刷成交记录的",
+        verdict="是", solution_candidate=True, established_fact_ids=["f1"])
+    check("补 f1 后仍未揭晓", eng.phase == Phase.QA, eng.phase)
+    ask(eng, clk, "u3", "丙", "为了把手里同类旧箱卖贵",
+        verdict="是", solution_candidate=True, established_fact_ids=["f2"])
+    check("补齐合同后才揭晓", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是补缺口那位", eng._solved_by == "丙", eng._solved_by)
+
+
+def test_v6_e_legacy_solve_still_wins():
+    """E: legacy(无合同)的 P.SOLVE 路径**必须原样保留**。
+
+    只锁 v6, 不能杀掉旧数据兼容 —— 老 archive / 老 fixture 的题就是
+    靠这条路通关的。
+    """
+    print("\n[v6 E] legacy P.SOLVE 仍可通关")
+    from story.puzzle import PuzzleFact, SolveAtom
+    legacy = PuzzleSpec(
+        id="ux-legacy", title="老题",
+        puzzle="门外站着一个女人, 开门的人一见她就愣住了。为什么?",
+        answer="门外女人是父亲的亲生女儿。",
+        # **无合同** + 旧政策 -> legacy 语义
+        core_answer="", completion_fact_ids=[],
+        facts=[PuzzleFact(id="f1", text="门外女人是父亲的亲生女儿",
+                          kind="core")],
+        solve_atoms=[
+            SolveAtom(id="a1", role="cause", text="x", fact_ids=["f1"]),
+            SolveAtom(id="a2", role="mechanism", text="y", fact_ids=["f1"]),
+        ],
+        hints=["a", "b", "c"],
+        prompt_version="riddle-v4", quality_policy_version="quality-v4")
+    eng, clk = boot(legacy)
+    check("legacy 题确实没有合同", not eng._completion_fact_ids,
+          eng._completion_fact_ids)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吧",
+        verdict="揭晓", solution_candidate=True, established_fact_ids=["f1"])
+    check("legacy 的 P.SOLVE 仍进入揭晓",
+          eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者记下了", eng._solved_by == "甲", eng._solved_by)
+
+    # 反向: 同一道题一旦**有**合同, P.SOLVE 就不再直通。
+    with_c = auction_spec()
+    eng2, clk2 = boot(with_c)
+    ask(eng2, clk2, "u1", "甲", "她是父亲的女儿吧",
+        verdict="揭晓", solution_candidate=True, established_fact_ids=["f1"])
+    check("有合同时同样输入**不**揭晓", eng2.phase == Phase.QA, eng2.phase)
+
+
+def test_v6_first_layer_never_owns_victory():
+    """把"第一层不拥有通关权"这条语义钉成不变量。
+
+    判据不是某个字面量, 而是: 第一层产出的任何 verdict 都不可能是
+    P.SOLVE —— 无论走 tool 还是 text, 无论模型说什么。
+    """
+    print("\n[v6] 第一层永不产出 P.SOLVE")
+    spec = auction_spec()
+    # tool 路径: 所有可能的 verdict 值 + 越界值
+    for v in ["是", "不是", "无关", "揭晓", "SOLVE", "solved", ""]:
+        fc = FakeClient([LLMResult(tool_input={"answers": [{
+            "id": 1, "verdict": v, "comment": "c",
+            "solution_candidate": False, "touched_fact_ids": [],
+            "established_fact_ids": []}]}, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗",
+                          spec=spec,
+                          completion_fact_ids=spec.completion_fact_ids,
+                          core_answer=spec.core_answer,
+                          room_established_fact_ids=[])
+        if out:
+            check(f"tool verdict={v!r} 产出不是 P.SOLVE",
+                  out[0].verdict != P.SOLVE, out[0].verdict)
+    # text 路径: 全部 SOLVE 关键词
+    for txt in _SOLVE_TEXTS:
+        fc = FakeClient([LLMResult(text=txt, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗",
+                          spec=spec,
+                          completion_fact_ids=spec.completion_fact_ids,
+                          core_answer=spec.core_answer,
+                          room_established_fact_ids=[])
+        if out:
+            check(f"text {txt!r} 产出不是 P.SOLVE",
+                  out[0].verdict != P.SOLVE, out[0].verdict)
+
+
+def test_v6_candidate_not_gated_by_answer_presence():
+    """candidate 的判定不该被"谜底有没有记录"左右。
+
+    修 blocker 时顺带发现的**潜伏 bug**: 文本回退里
+    `r.solution_candidate = _looks_like_solution(text)` 原先嵌在
+    `if answer:` 里面。于是**谜底缺失**时这条路谁都不会被标成候选,
+    一个说得完全正确的观众永远走不到复核 —— 而谜底本来就只是用来做
+    泄漏检查的, 不该决定 candidate。
+    """
+    print("\n[v6] candidate 不受 answer 有无影响")
+    spec = auction_spec()
+    for ans in ["", spec.answer]:
+        fc = FakeClient([LLMResult(text="1. 完全正确", model="m"),
+                         _completion_match(["f1", "f2"])])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, _ = w.answer(
+            spec.puzzle, ans, [], 1, "甲", _AUCTION_TEXT_CAUSAL, spec=spec,
+            completion_fact_ids=spec.completion_fact_ids,
+            core_answer=spec.core_answer, room_established_fact_ids=[])
+        tag = "有谜底" if ans else "无谜底"
+        check(f"{tag}: candidate 被正确标出",
+              out and out[0].solution_candidate is True,
+              out[0].solution_candidate if out else None)
+        check(f"{tag}: 复核被触发(2 次调用)", len(fc.calls) == 2,
+              len(fc.calls))
+        check(f"{tag}: 通关成立",
+              out and out[0].established_fact_ids == ["f1", "f2"],
+              out[0].established_fact_ids if out else None)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -1603,6 +1870,14 @@ def main():
         test_v6_case10_status_must_be_ok_for_verifier,
         test_v6_verified_ids_archive_boundary,
         test_v6_progress_log_leaks_no_truth,
+        # ---- v6 blocker: 第一层绝不拥有通关权 ----
+        test_v6_a_text_fallback_solve_cannot_win,
+        test_v6_b_text_fallback_variants_all_normalized,
+        test_v6_c_text_fallback_candidate_still_reaches_verifier,
+        test_v6_d_engine_rejects_solve_bypass_with_contract,
+        test_v6_e_legacy_solve_still_wins,
+        test_v6_first_layer_never_owns_victory,
+        test_v6_candidate_not_gated_by_answer_presence,
     ]
     for t in tests:
         t()
