@@ -725,6 +725,37 @@ class PuzzlePool:
                            f"(spec={spec_policy!r}, "
                            f"current={QUALITY_POLICY_VERSION!r})")
 
+        # ---- curated 准入政策门(H3-A) ----
+        #
+        # curated 题**额外**受一条独立政策约束。它与上面的 quality policy
+        # 是两件事:
+        #
+        #   quality_policy_version  "这道题的内容质量达不达标"
+        #   curated_policy_version  "按哪一版**题型定义**收进来的"
+        #
+        # 为什么非要有第二条: 我们收紧的恰恰是后者。H2 的九条判据把
+        # "卡车烧油变轻"这种单点物理脑筋急转弯放了进来 —— 它不是质量
+        # 问题(叙事真实 / 通关合同 / 层次全都合格), 是**题型定义太宽**。
+        # 质量政策版本没变, 所以光靠上面那条门, 旧题会一直合法。
+        #
+        # 只有 source_type == "curated" 的题才查这条(**不**去要求自由
+        # 生成的题声明 curated 政策 —— 那字段对它们没有意义)。
+        #
+        # 空串 / 缺失 / 不等于当前版本 -> 隔离。H2 那批(v1, 含 q10000)
+        # 落盘时没写这把键, 于是**自动**失去 live eligibility:
+        #   不计 stock_count / 不能 add / 不被 pop_next 返回。
+        # 不需要删行, 也不需要任何人工清理 —— 与 quality policy 那扇门
+        # 完全同构。
+        if str(getattr(spec, "source_type", "") or "") == "curated":
+            from tools.curated_compiler import CURATED_POLICY_VERSION
+            cpv = str(getattr(spec, "curated_policy_version", "") or "")
+            if not cpv:
+                return False, ("curated 政策版本缺失(spec 没声明按哪一版"
+                               "题型定义收的)")
+            if cpv != CURATED_POLICY_VERSION:
+                return False, (f"curated 政策不兼容(spec={cpv!r}, "
+                               f"current={CURATED_POLICY_VERSION!r})")
+
         try:
             vr = validate_spec(spec)
         except Exception:                       # noqa: BLE001

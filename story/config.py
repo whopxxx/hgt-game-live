@@ -384,6 +384,32 @@ class Config:
     #: 的补池是**离线编译**(compile_curated.py), 不是直播时后台生成 ——
     #: 直播期间不该调它。这个开关只控制"是否把 curated 池纳入取题候选"。
     curated_pool_enabled: bool = True
+
+    # ---- Batch H3-B: Lazy Curator(后台按需审题) ----
+    #
+    # 库存迟滞: **低于 min** 或"下一题没得播"才开始补, 一路补到 target。
+    # 为什么不用"低于 target 就补": 那会让库存一跌破 10 就立刻开审 ——
+    # 而那时正是观众在提问的时候。迟滞让它等到真快空了再动, 一次补一批。
+    curated_target_size: int = 10
+    curated_min_size: int = 4
+    curated_playable_min: int = 2
+    #: 硬上限, 防无限增长。到这儿就停, 即使 playable 还是 0。
+    curated_max_size: int = 20
+    #: 后台审题总开关。
+    curated_background_enabled: bool = True
+    #: 单条预算(秒)。超了记 technical_defer(**不是** rejected)——
+    #: 一道题卡住不该吃掉整个后台窗口, 也不该被永久判死。
+    curated_budget_seconds: float = 45.0
+    #: 临近下一题多少秒内不再启动新的审题。与 `pool_reveal_start_guard_seconds`
+    #: 同一个思路: 启动一个注定跨过 deadline 的调用是纯浪费。
+    curated_start_guard_seconds: float = 15.0
+    #: 候选语料(**只读**)。默认就是 H1-D 的产出。
+    curated_corpus_path: str = os.path.join(
+        "data_external", "normalized", "curated_raw.jsonl")
+    #: 决策账本(H3-A)。"这条路处理过没有"的**唯一**权威。
+    curated_decisions_path: str = os.path.join(
+        "data", "curated_decisions.jsonl")
+
     # 注: 这里**曾**有一个 `pool_op_budget_ms`, 号称给 pop_next 的 I/O 一个
     # 上界。它没有任何代码读它 —— 是个 dead config, 注释却会让人以为
     # "500ms 后一定回落", 那是不存在的保证(单次 open/fsync 真卡住时,

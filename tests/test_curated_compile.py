@@ -69,12 +69,27 @@ def mk_rec(**kw) -> RawCuratedPuzzle:
     return RawCuratedPuzzle(**d)
 
 
+def _qc_v2(**kw):
+    """一份**能过 curated-v2 全部判据**的 quality_checks。
+
+    H3-A 起判据从九条变成十二条, 其中 `single_trick` 是**反向**的
+    (true = 坏)。所以不能再用 `{k: True for k in CURATED_CHECKS}`
+    —— 那会把 single_trick 填成 True, 于是每一道题都被故事门拒掉,
+    看起来像"编译器全坏了"。
+    """
+    qc = {k: True for k in CC.CURATED_CHECKS_V2}
+    qc["single_trick"] = False
+    qc.update(kw)
+    return qc
+
+
 def _compile_tool(**kw):
     """一份**能过全部确定性门**的编译结果。"""
     body = _PUZ.rstrip("?？")
     d = {
         "accepted": True,
-        "quality_checks": {k: True for k in CC.CURATED_CHECKS},
+        "quality_checks": _qc_v2(),
+        "content_style": ["悬疑", "细思极恐"],
         "style_tags": ["object_meaning", "causal_flip"],
         "title": "灯塔",
         "puzzle": _PUZ,
@@ -263,23 +278,28 @@ def test_chinese_source_not_told_to_translate():
 # 2. AI 审题门(H2-B)
 # ======================================================================
 def test_ai_gate_rejects_on_false_check():
-    """九条里任意一条 false -> 拒。"""
-    print("\n[H2-B] 九条判据逐条 fail closed")
-    for k in CC.CURATED_CHECKS:
-        d = {"accepted": True,
-             "quality_checks": {x: True for x in CC.CURATED_CHECKS}}
-        d["quality_checks"][k] = False
-        ok, why = CC.check_tool_result(d)
-        check(f"{k}=false -> 拒", not ok and k in " ".join(why), why)
+    """十二条里任意一条不合格 -> 拒(fail closed)。
+
+    ⚠️ `single_trick` 方向相反: 它的**不合格**取值是 `True`。
+    用同一句 `qc[k] = False` 去试它, 恰好是**合格**取值 —— 那种测试
+    会永远绿, 而它本该是最关键的一条。
+    """
+    print("\n[H2-B] 十二条判据逐条 fail closed")
+    for k in CC.CURATED_CHECKS_V2:
+        qc = _qc_v2()
+        qc[k] = True if k in CC._INVERTED_CHECKS else False
+        ok, why = CC.check_tool_result({"accepted": True,
+                                        "quality_checks": qc})
+        check(f"{k} 不合格 -> 拒", not ok, why)
 
 
-def test_ai_gate_requires_all_nine():
-    print("\n[H2-B] 九条缺一不可")
-    check("九条齐全且全 true -> 过",
-          CC.check_tool_result({"accepted": True, "quality_checks":
-                                {k: True for k in CC.CURATED_CHECKS}})[0])
+def test_ai_gate_requires_all_checks():
+    print("\n[H2-B] 十二条缺一不可")
+    check("十二条齐全且全合格 -> 过",
+          CC.check_tool_result({"accepted": True,
+                                "quality_checks": _qc_v2()})[0])
     # 缺一条
-    qc = {k: True for k in CC.CURATED_CHECKS}
+    qc = _qc_v2()
     del qc["livestream_safe"]
     ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
     check("**缺一条 -> 拒**", not ok, why)
@@ -309,7 +329,7 @@ def test_ai_gate_is_fail_closed_on_self_contradiction():
     信那个总结布尔就会把一道没有反转的题放进池子 —— 正是本批要消灭的。
     """
     print("\n[H2-B] **自相矛盾时以逐条判据为准**")
-    qc = {k: True for k in CC.CURATED_CHECKS}
+    qc = _qc_v2()
     qc["has_reversal"] = False
     ok, why = CC.check_tool_result({"accepted": True, "quality_checks": qc})
     check("**拒(不信 accepted)**", not ok, why)
@@ -328,15 +348,17 @@ def test_explicit_ai_reject_does_not_retry():
     check("**只调了一次**(没重试)", len(fc.calls) == 1, len(fc.calls))
     check("理由带回", "not_a_story" in " ".join(info["reject_reasons"]),
           info)
+    # H3-A 后 stage 仍是 ai_gate: 模型**自己**说不行时, 采信它给的原因
+    # (它比故事门精准 —— 故事门对一份没有 quality_checks 的回复只能说
+    # "三条都不合格")。故事门负责的是"模型说行、其实不行"那种。
     check("stage 标 ai_gate", info["stage"] == "ai_gate", info)
 
 
 def test_self_contradiction_retries_then_gives_up():
     """自相矛盾 -> 重试(多半是漏填), 但重试耗尽仍要拒。"""
     print("\n[H2-B] 自相矛盾重试到上限仍拒")
-    bad_qc = {k: True for k in CC.CURATED_CHECKS}
-    bad_qc["dramatic_payoff"] = False
-    bad_qc.pop("dramatic_payoff", None)     # 用"缺一项"更贴近真实漏填
+    bad_qc = _qc_v2()
+    bad_qc.pop("livestream_safe", None)     # 用"缺一项"更贴近真实漏填
     w, fc = _writer([
         LLMResult(tool_input={"accepted": True, "quality_checks": bad_qc},
                   model="m"),
@@ -646,7 +668,7 @@ def main():
         test_chinese_source_not_told_to_translate,
         # AI 门
         test_ai_gate_rejects_on_false_check,
-        test_ai_gate_requires_all_nine,
+        test_ai_gate_requires_all_checks,
         test_ai_gate_rejects_explicit_reject,
         test_ai_gate_is_fail_closed_on_self_contradiction,
         test_explicit_ai_reject_does_not_retry,

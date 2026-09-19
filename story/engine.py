@@ -1404,6 +1404,19 @@ class RoundEngine:
                 "hint_inflight": bool(self._hint_pending),
                 "reveal_inflight": self._reveal_deadline is not None,
                 "reveal_remaining_seconds": reveal_remaining,
+                # ---- H3-B: AI 玩家是否占用网关 ----
+                #
+                # Lazy Curator 也必须避开**这一项**, 不能只看真人 pending。
+                # 只公开"在途与否"这一个布尔: reservation token / round /
+                # spec_key 都是内部调度状态, 下发等于泄漏别人的解题进度
+                # (与 Snapshot.ai_player 的同一条原则, 见 state.py)。
+                #
+                # 为什么用 reservation 判而不是别的: AI 玩家的一次动作
+                # 是"引擎发 token -> 外部(LLM)去生成 -> 回填结果"的两段式,
+                # 中间那段就是它在网关上的时间。reservation 非空恰好等价
+                # 于"有人在飞"。
+                "ai_player_in_flight": bool(
+                    self._ai_player_ledger.detective_reservation is not None),
                 # ---- G1: 场景指纹 ----
                 # 新一题开始 = 生成约束环境(recent window / 配额饱和状态)
                 # 整体换了一批。补池靠它判断"我那次失败是不是发生在**别的

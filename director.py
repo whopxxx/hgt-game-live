@@ -263,6 +263,27 @@ class Director:
                 pick_blueprint=self._pick_blueprint,
                 rng=pf_rng, playtester=playtester)
 
+        # ---- Batch H3-B: Lazy Curator(按需审外部题) ----
+        #
+        # 与上面的 `_prefetcher` 是**两条独立的链**:
+        #   prefetcher   走"发明"链(choose_blueprint -> gen_spec), 产 AI 题
+        #   lazy_curator 走"搬运"链(curated 编译), 产 curated 题
+        # 两者的第一步完全不同, 所以各自一个实例、各自一个 writer。
+        #
+        # 它**不拥有线程** —— 由主循环在自己的节奏里调 `step()`。这样
+        # "什么时候可以干活"的判断权留在这一层(它能同时看到 engine 和
+        # 两个池), 而 LazyCurator 只管"取一条、审一条、记账"。
+        #
+        # ⚠️ 只在 curated 池可用时才建: 没有池子就没有落点, 审出来也
+        # 无处可放(而且会白烧 LLM)。
+        self._lazy_curator = None
+        if (self.curated_pool is not None and self.client is not None
+                and bool(getattr(cfg, "curated_background_enabled", True))):
+            from story.lazy_curator import build_lazy_curator
+            lc_writer = PuzzleWriter(client=self.client, runtime_cfg=cfg)
+            self._lazy_curator = build_lazy_curator(
+                cfg, self.curated_pool, lc_writer, self.engine.pressure)
+
     # ------------------------------------------------------------------
     def _playtest_should_continue(self) -> bool:
         """试玩让路谓词: 房间还空着才继续。
@@ -1172,6 +1193,25 @@ class Director:
                 # `on_tick` 契约上绝不抛 —— 补池不能影响直播主循环。
                 if self._prefetcher is not None:
                     self._prefetcher.on_tick()
+                # ---- H3-B: Lazy Curator ----
+                #
+                # 与补池并列, 但在**同一拍里只跑一个 candidate**。
+                #
+                # 为什么不给它单独线程: 它会调 LLM(十几到几十秒), 而
+                # 本循环是 4Hz 的心跳。放这里意味着"这一拍会慢" —— 所以
+                # `step()` 内部**第一件事**就是查压力, 忙就立刻返回。
+                # 真正跑起来时 live 出题会被推迟到下一拍, 而下一拍会先
+                # 看到"忙"并让路。这与 `_deferred_riddle` 的机制一致。
+                #
+                # ⚠️ `step(max_candidates=1)`: 一次一拍最多审一条。审完
+                # 立刻回到循环顶部重新评估压力 —— 而不是连着审三条。
+                if self._lazy_curator is not None:
+                    try:
+                        self._lazy_curator.step(max_candidates=1)
+                    except Exception:           # noqa: BLE001
+                        # `step` 契约上绝不抛, 但这里再兜一层: 直播主
+                        # 循环**永远**不能因为后台审题而中断。
+                        log.exception("lazy curator 异常(已忽略)")
                 self.push()
                 pushes_since += 1
                 if self.engine.should_stop():
@@ -1247,6 +1287,21 @@ class Director:
                      else "  ⚠️ used 账本不可信 -> 本次禁用!"))
             if not getattr(cfg, "allow_live_generation", True):
                 print("                现场 AI 生成已关闭(H2-G): 池空则走兜底")
+            # ---- Batch H3-B: Lazy Curator 状态 ----
+            # 任务书十七: 启动就要能看到"还有多少候选、审了多少、拒了
+            # 多少、库存几位数"。**不打印题底。**
+            if self._lazy_curator is None:
+                print("  lazy curator: 关闭(无 writer / 无 curated 池 / 已关)")
+            else:
+                ls = self._lazy_curator.status()
+                print(f"  lazy curator: 开"
+                      f"(低水位 {ls['min']} -> 高水位 {ls['target']})")
+                print(f"    curated candidate : {ls['candidates']}")
+                print(f"    curated decided   : {ls['decided']}")
+                print(f"    curated rejected  : {ls['rejected']}")
+                print(f"    curated accepted  : {ls['accepted']}")
+                print(f"    curated 库存      : {ls['stock']} 道"
+                      f"(可播 {ls['playable']})")
         if self.pool is not None:
             if self._prefetcher is None:
                 print("  补池        : 关闭(不在 --no-llm 下生成)")

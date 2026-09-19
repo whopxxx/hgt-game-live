@@ -715,6 +715,12 @@ def _curated_spec(**kw):
     s.attribution = {"question_author": "Q", "answer_author": "A",
                      "modified": True}
     s.style_tags = ["identity_flip"]
+    # ---- H3-A: curated 题必须声明**按哪一版题型定义**收的 ----
+    # 不声明 -> 题池准入门隔离它(见 `_validate_pool_spec`)。这不是
+    # 为了让测试变绿而补的字段, 而是这道题在生产里**真的**必须带 ——
+    # 缺了它, 一道编译成功的 curated 题会表现为"播不出来"。
+    from tools.curated_compiler import CURATED_POLICY_VERSION
+    s.curated_policy_version = CURATED_POLICY_VERSION
     return s
 
 
