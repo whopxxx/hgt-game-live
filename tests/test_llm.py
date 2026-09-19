@@ -3829,16 +3829,25 @@ def test_g4_repair_vs_hard_reject_counts():
         以前 10 次 hard reject
         现在其中 6 次被 repair 救回
 
-    没有这三个量就只能从日志肉眼看。它们**不新增任何 LLM 调用**,
+    没有这几个量就只能从日志肉眼看。它们**不新增任何 LLM 调用**,
     纯粹是对已经算出来的结果做分类。
 
-    三个量互斥且穷尽本轮出题的每一稿:
-        candidate_repair_count          —— 带 fixable 交审稿人修补
-        hard_reject_before_review_count —— 硬校验就毙(没花审稿)
-        rewrite_count                   —— 审稿语义拒绝(已有)
+    ⚠️ G4-E 修正了一个**语义错误**: G4-D 只记了一个
+    `candidate_repair_count`, 而它在**送审稿人之前**就 +1。于是
+
+        带 core_length fixable -> attempt += 1
+        -> 审稿人反而要求重出 -> rewrite_count += 1
+
+    会让同一稿同时记成"repair 救回 1"和"重出 1", 那个数根本回答不了
+    "有多少**真的**被同稿修好并继续通过"。现在拆成:
+
+        candidate_repair_attempt_count —— 带 fixable 送进审稿人(尝试)
+        candidate_repair_success_count —— 改完重新验干净且没重出(救回)
+
+    外加 `hard_reject_before_review_count`(硬校验/blueprint 就毙, 没花审稿)。
     """
     print("\n[G4-OBS] repair vs hard-reject 计数")
-    # ---- ① 一稿带 core 超长(可修) -> repair 计数 + 分类 ----
+    # ---- ① 一稿带 core 超长(可修) -> attempt + success + 分类 ----
     P = _GOOD_PUZ
     fc = FakeClient([
         LLMResult(tool_input=riddle(core_answer="他" * 100), model="m"),
@@ -3848,11 +3857,18 @@ def test_g4_repair_vs_hard_reject_counts():
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     spec = w.gen_spec(blueprint=fc.default_blueprint)
     m = spec.metrics
-    check("**candidate_repair_count = 1**",
-          m.get("candidate_repair_count") == 1, m.get("candidate_repair_count"))
-    check("**repair_reasons 归到了 core_length**",
-          m.get("repair_reasons", {}).get("core_length") == 1,
-          m.get("repair_reasons"))
+    check("**candidate_repair_attempt_count = 1**",
+          m.get("candidate_repair_attempt_count") == 1,
+          m.get("candidate_repair_attempt_count"))
+    check("**candidate_repair_success_count = 1(修好了, 没重出)**",
+          m.get("candidate_repair_success_count") == 1,
+          m.get("candidate_repair_success_count"))
+    check("**repair_attempt_reasons 归到了 core_length**",
+          m.get("repair_attempt_reasons", {}).get("core_length") == 1,
+          m.get("repair_attempt_reasons"))
+    check("**repair_success_reasons 也归到了 core_length**",
+          m.get("repair_success_reasons", {}).get("core_length") == 1,
+          m.get("repair_success_reasons"))
     check("硬拒计数为 0(它没被硬拒)",
           m.get("hard_reject_before_review_count") == 0,
           m.get("hard_reject_before_review_count"))
@@ -3875,8 +3891,8 @@ def test_g4_repair_vs_hard_reject_counts():
           m2.get("hard_reject_before_review_count") == 1,
           m2.get("hard_reject_before_review_count"))
     check("那一稿没走进审稿(第一稿没花审稿调用)",
-          m2.get("candidate_repair_count") == 0,
-          m2.get("candidate_repair_count"))
+          m2.get("candidate_repair_attempt_count") == 0,
+          m2.get("candidate_repair_attempt_count"))
 
     # ---- ③ fact enum 错位(G4-A) 现在算 repair 而不是 hard reject ----
     bad3 = riddle()
@@ -3896,13 +3912,137 @@ def test_g4_repair_vs_hard_reject_counts():
     spec3 = w3.gen_spec(blueprint=fc3.default_blueprint)
     m3 = spec3.metrics
     check("**fact enum 归到 repair(不是 hard reject)**",
-          m3.get("candidate_repair_count") == 1
+          m3.get("candidate_repair_attempt_count") == 1
           and m3.get("hard_reject_before_review_count") == 0,
-          (m3.get("candidate_repair_count"),
+          (m3.get("candidate_repair_attempt_count"),
            m3.get("hard_reject_before_review_count")))
+    check("**fact_enum 这一稿也真救回了**",
+          m3.get("candidate_repair_success_count") == 1,
+          m3.get("candidate_repair_success_count"))
     check("**分类为 fact_enum**",
-          m3.get("repair_reasons", {}).get("fact_enum") == 1,
-          m3.get("repair_reasons"))
+          m3.get("repair_attempt_reasons", {}).get("fact_enum") == 1,
+          m3.get("repair_attempt_reasons"))
+
+
+def test_g4e_repair_attempt_is_not_repair_success():
+    """**G4-E 的核心回归**: 送修 != 修好。
+
+    这是任务书点名"最重要"的那条 —— 它必须证明 G4-D 的"互斥"假设
+    是错的, 而且现在被纠正了:
+
+        带 core_length fixable -> Reviewer 看完要求 **rewrite**
+        => attempt = 1, success = 0, rewrite_count = 1
+
+    旧实现(只记 attempt 并把它叫"救回")在这条路径上会给出
+    repair=1 / rewrite=1 的形状 —— 一个自相矛盾的数字。如果谁把
+    success 记回"送修就算", 这条会立刻红。
+    """
+    print("\n[G4-E1] 送修但最终重出 -> success=0")
+    P = _GOOD_PUZ
+    # 审稿人看完要求重出(不是 ok, 也不是技术失败)
+    _review_rewrite = dict(review_ok(P))
+    _review_rewrite["decision"] = "rewrite"
+    _review_rewrite.pop("puzzle", None)
+    fc = FakeClient([
+        # 第 1 稿: core 超长(可修) -> 送修
+        LLMResult(tool_input=riddle(core_answer="他" * 100), model="m"),
+        # 审稿人: 故事本身有语义问题 -> rewrite(整稿扔掉)
+        LLMResult(tool_input=_review_rewrite, model="m"),
+        # 第 2 稿: 干净的一个正常稿
+        LLMResult(tool_input=riddle(), model="m"),
+        LLMResult(tool_input=review_ok(P), model="m"),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    m = spec.metrics
+    check("**attempt = 1(送修过)**",
+          m.get("candidate_repair_attempt_count") == 1,
+          m.get("candidate_repair_attempt_count"))
+    check("**success = 0(没救回 —— 审稿人把它整稿退回了)**",
+          m.get("candidate_repair_success_count") == 0,
+          m.get("candidate_repair_success_count"))
+    check("**rewrite_count = 1**",
+          m.get("rewrite_count") == 1, m.get("rewrite_count"))
+    check("**attempt_reasons 仍记着那次 fact/core 修复尝试**",
+          bool(m.get("repair_attempt_reasons")),
+          m.get("repair_attempt_reasons"))
+    check("**success_reasons 必须是空的(没救回就不能记原因)**",
+          not m.get("repair_success_reasons"),
+          m.get("repair_success_reasons"))
+    check("最终仍然出了题(第 2 稿过的)", bool(spec.puzzle), spec.puzzle[:30])
+
+
+def test_g4e_archive_round_trip_keeps_g4_metrics():
+    """**G4-E 落盘回归**: 五个 G4 字段必须真的进 puzzle.jsonl。
+
+    `spec.metrics` 里躺着不等于赛后看得见 —— `_archive_reveal()` 用
+    `director._round_metrics()` 显式挑字段写 record, **不搬**整个
+    `spec.metrics`。所以漏接 `_round_metrics()` 的话, 指标在直播结束时
+    就蒸发了, 而所有别的测试都还是绿的。
+    """
+    print("\n[G4-E2] archive round-trip 保留 5 个 G4 字段")
+    import json
+    import os
+    import tempfile
+    import director as D
+    from story.puzzle import PuzzleSpec
+
+    d = tempfile.mkdtemp()
+    cfg = D.Config(sim_path="x", no_llm=True,
+                   puzzle_out_path=os.path.join(d, "puzzle.jsonl"))
+    dr = D.Director(cfg)
+    # 造一个"带 G4 指标"的 spec, 走真实的 _archive_reveal 路径
+    spec = PuzzleSpec(puzzle=_GOOD_PUZ, answer="退潮时礁石露出。")
+    spec.metrics = {
+        "generation_attempts": 2,
+        "candidate_repair_attempt_count": 3,
+        "candidate_repair_success_count": 2,
+        "hard_reject_before_review_count": 1,
+        "repair_attempt_reasons": {"fact_enum": 2, "core_length": 1},
+        "repair_success_reasons": {"fact_enum": 2},
+    }
+    dr._archive_reveal({"puzzle": spec.puzzle, "answer": spec.answer,
+                        "spec": spec}, "揭晓文案")
+    with open(cfg.puzzle_out_path, encoding="utf-8") as f:
+        rec = json.loads(f.readline())
+    rm = rec.get("metrics") or {}
+    check("**record.metrics 里有 candidate_repair_attempt_count**",
+          rm.get("candidate_repair_attempt_count") == 3,
+          rm.get("candidate_repair_attempt_count"))
+    check("**record.metrics 里有 candidate_repair_success_count**",
+          rm.get("candidate_repair_success_count") == 2,
+          rm.get("candidate_repair_success_count"))
+    check("**record.metrics 里有 hard_reject_before_review_count**",
+          rm.get("hard_reject_before_review_count") == 1,
+          rm.get("hard_reject_before_review_count"))
+    check("**record.metrics 里有 repair_attempt_reasons(原样)**",
+          rm.get("repair_attempt_reasons") == {"fact_enum": 2,
+                                               "core_length": 1},
+          rm.get("repair_attempt_reasons"))
+    check("**record.metrics 里有 repair_success_reasons(原样)**",
+          rm.get("repair_success_reasons") == {"fact_enum": 2},
+          rm.get("repair_success_reasons"))
+
+    # 老题 / 结构化兜底: metrics 里没有这些键 -> 落盘必须是 0 / {}
+    spec_old = PuzzleSpec(puzzle=_GOOD_PUZ, answer="退潮时礁石露出。")
+    spec_old.metrics = {"generation_attempts": 1}
+    dr._archive_reveal({"puzzle": spec_old.puzzle, "answer": spec_old.answer,
+                        "spec": spec_old}, "揭晓文案")
+    with open(cfg.puzzle_out_path, encoding="utf-8") as f:
+        rec_old = json.loads(f.readlines()[-1])
+    ro = rec_old.get("metrics") or {}
+    check("**老题兜底为 0 / {}(不是 null, 也不用下游 .get)**",
+          (ro.get("candidate_repair_attempt_count") == 0
+           and ro.get("candidate_repair_success_count") == 0
+           and ro.get("hard_reject_before_review_count") == 0
+           and ro.get("repair_attempt_reasons") == {}
+           and ro.get("repair_success_reasons") == {}),
+          {k: ro.get(k) for k in ("candidate_repair_attempt_count",
+                                  "candidate_repair_success_count",
+                                  "hard_reject_before_review_count",
+                                  "repair_attempt_reasons",
+                                  "repair_success_reasons")})
 
 
 def test_g4_fix_reasons_never_guesses():
@@ -4067,6 +4207,8 @@ def main():
               test_g4a_enums_are_imported_for_the_swap,
               # ---- G4: 可观测性 ----
               test_g4_repair_vs_hard_reject_counts,
+              test_g4e_repair_attempt_is_not_repair_success,
+              test_g4e_archive_round_trip_keeps_g4_metrics,
               test_g4_fix_reasons_never_guesses,
               test_q2_discovery_beats_schema_and_prompts,
               test_q2_v7_pool_quarantined_but_v8_eligible,

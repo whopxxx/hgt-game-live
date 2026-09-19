@@ -49,16 +49,25 @@ def _report(title, fc):
 
 
 def _obs(spec):
-    """G4 可观测性: repair 救回 / 硬拒 的对照。"""
+    """G4 可观测性: repair 救回 / 硬拒 的对照。
+
+    G4-E 起 attempt 与 success 是**两个数**: 送修不等于修好 —— 审稿人
+    完全可能看完反而要求重出。`repair=成功/尝试` 才是能回答"以前整稿
+    扔掉的轻微问题现在救回了多少"的那个比例。
+    """
     m = spec.metrics or {}
-    rep = m.get("candidate_repair_count", 0)
+    att = m.get("candidate_repair_attempt_count", 0)
+    suc = m.get("candidate_repair_success_count", 0)
     hard = m.get("hard_reject_before_review_count", 0)
-    print("    **repair 救回: %d / 硬拒(审稿前): %d**" % (rep, hard))
-    rr = m.get("repair_reasons") or {}
-    if rr:
-        print("    按原因: " + ", ".join("%s=%d" % kv
-                                        for kv in sorted(rr.items())))
-    return rep, hard
+    print("    **repair 救回: %d/%d(成功/尝试) / 硬拒(审稿前): %d**"
+          % (suc, att, hard))
+    for label, key in (("尝试原因", "repair_attempt_reasons"),
+                       ("救回原因", "repair_success_reasons")):
+        rr = m.get(key) or {}
+        if rr:
+            print("    %s: %s" % (label, ", ".join("%s=%d" % kv
+                                                   for kv in sorted(rr.items()))))
+    return att, suc, hard
 
 
 def scenario_a():

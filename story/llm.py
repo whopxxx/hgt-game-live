@@ -2847,17 +2847,36 @@ class PuzzleWriter:
         #     以前 10 次 hard reject
         #     现在其中 6 次被 repair 救回
         #
-        # 不用再从日志肉眼扒。三个量互斥且穷尽本轮出题的每一稿:
-        #     candidate_repair_count        —— 带 fixable 交审稿人修补
-        #     hard_reject_before_review_count —— 硬校验就毙(没花审稿)
-        #     repair_reasons                —— 按原因分类的计数
+        # ---- G4-E: **尝试**与**救回**必须分开 ----
+        #
+        # G4-D 把这件事记成了一个数(`candidate_repair_count`), 那是个
+        # 错的语义: 它在**送审稿人之前**就 +1, 于是下面这条真实路径会
+        #
+        #     candidate 带 core_length fixable
+        #     -> candidate_repair_attempt_count += 1
+        #     -> 审稿人看完发现故事本身有语义问题 -> decision=rewrite
+        #     -> rewrite_count += 1
+        #
+        # 让同一稿**同时**记成 "repair 救回 1" 和 "重出 1"。那个数因此
+        # 回答不了我们真正要问的问题:
+        #
+        #     "以前会整稿扔掉的轻微问题, 现在有多少**真的**被同稿修好
+        #      并继续通过了?"
+        #
+        # 所以拆成两个, 语义互不重叠:
+        #     candidate_repair_attempt_count —— 带 fixable 送进审稿人(尝试)
+        #     candidate_repair_success_count —— 改完**重新验干净**且没重出
         #
         # `hard_reject_before_review` 这个名字是**故意的**: 它数的是
         # "reviewer 之前就被毙掉"的那些(结构错误 / blueprint 违反),
         # 而不是所有被拒的稿 —— 审稿语义拒绝是另一条路(rewrite_count)。
-        m["candidate_repair_count"] = 0
+        m["candidate_repair_attempt_count"] = 0
+        m["candidate_repair_success_count"] = 0
         m["hard_reject_before_review_count"] = 0
-        m["repair_reasons"] = {}
+        # 本轮还没走完, 所以"这一稿的 fixable 是否被救回"是悬着的 ——
+        # 见下面几处 `*= 0` 的注释。
+        m["repair_attempt_reasons"] = {}
+        m["repair_success_reasons"] = {}
         # 审稿**累计**耗时(第三轮 review): 一题可能审多次, 所以是 total。
         # 复盘时用 total / review_calls 自己算均值 —— 只存"最后一次"
         # 会把"审了 5 次"的题算得和"审了 1 次"一样快。
@@ -2982,14 +3001,23 @@ class PuzzleWriter:
             # SETTING, 再往下就是又一轮几十秒的审稿。
             if _stop():
                 break
-            # ---- G4: 记下"这一稿是带病送来修的" ----
-            # 有 fixable 却走到这里, 说明它**没有**被硬拒 —— 正是
-            # "repair 救回"的那一类。按原因分类累积, 下一场直播直接看数。
+            # ---- G4-E: 记下"这一稿是带病送来修的" ----
+            # 有 fixable 却走到这里, 说明它**没有**被硬拒 —— 送进审稿人了。
+            # 但此刻只知道**尝试**, 还不知道救不救得回来(审稿人可能反而
+            # 要求重出), 所以先只记 attempt 与它的原因分类。
+            #
+            # ⚠️ 这里的 `spec` 与审稿人返回的 `spec` 是**两个对象**(下面
+            # `spec = reviewed`), 所以不能等到题成功时再来取 `vr.fixable`
+            # —— 那样拿到的是最后一稿的校验结果, 会把"第 1 稿送修、第 3
+            # 稿才过"记成"第 3 稿送修"。必须**当场**把当时的原因快照下来,
+            # 题成功时按快照补记 success。
+            _repair_slugs = []
             if vr.fixable:
-                m["candidate_repair_count"] += 1
-                for _slug in vr.fix_reasons():
-                    m["repair_reasons"][_slug] = (
-                        m["repair_reasons"].get(_slug, 0) + 1)
+                m["candidate_repair_attempt_count"] += 1
+                _repair_slugs = vr.fix_reasons()
+                for _slug in _repair_slugs:
+                    m["repair_attempt_reasons"][_slug] = (
+                        m["repair_attempt_reasons"].get(_slug, 0) + 1)
             _tr = _t.monotonic()
             reviewed, why, need_rewrite, technical = self._review_spec_with_retry(
                 spec, bp, must_fix=vr.must_fix(),
@@ -3150,11 +3178,40 @@ class PuzzleWriter:
                     last = spec
                     last.error = f"和已出过的题太像: {dup[:30]}"
                     continue
+            # ---- G4-E: 到这里这一稿才算**真的**活下来了 ----
+            # 位置是刻意的: 必须是**最后一道门之后**。上面任意一处
+            # `continue`(改稿后仍不合格 / reveal 未执行 / truth audit /
+            # 跨题重复 / 与旧题太像)都意味着这一稿没被救回 —— 而
+            # `rewrite_count` 也是在这些地方涨的。所以把 success 记在
+            # 这里, 就天然保证了"
+            #     attempt=1 且 success=1  <=>  同一稿改完直接过
+            #     attempt=1 且 rewrite=1 =>  success=0
+            # "这两种形状不会同时成立, 也就是 G4-D 那个自相矛盾的计数
+            # 不会再出现。
+            if _repair_slugs:
+                m["candidate_repair_success_count"] += 1
+                for _slug in _repair_slugs:
+                    m["repair_success_reasons"][_slug] = (
+                        m["repair_success_reasons"].get(_slug, 0) + 1)
+                _repair_slugs = []
             log.info("出题成功(第 %d 稿, 用时 %.1fs): %s",
                      attempts, _t.monotonic() - t0, spec.puzzle[:40])
             m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
             m["ok"] = True
             spec.metrics = dict(m)
+            # ---- G4-E: 现场一行, 只此一行 ----
+            # 直播时人就在看滚屏, 想知道"这题花了几稿 / 省下几次重造"。
+            # `repair=成功/尝试`(不是尝试/成功) —— 读作"6 次里有 5 次
+            # 救回来了"。正式数据仍以 archive 为准, 所以**不**给内部节点
+            # 各刷一行(那会让日志变成刷屏, 反而没人看)。
+            log.info("generation metrics: attempts=%d repair=%d/%d "
+                     "hard_reject=%d rewrite=%d reasons=%s",
+                     m.get("generation_attempts", 0),
+                     m.get("candidate_repair_success_count", 0),
+                     m.get("candidate_repair_attempt_count", 0),
+                     m.get("hard_reject_before_review_count", 0),
+                     m.get("rewrite_count", 0),
+                     m.get("repair_attempt_reasons") or {})
             # 显式 provenance(第三轮 review): 不从 blueprint 的**值**推断
             # "这题有没有真的被分配 blueprint" —— 调度器完全可能合法地
             # 选中 information_gap + information_advantage, 那种题是**有**

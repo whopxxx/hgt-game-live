@@ -878,6 +878,30 @@ class Director:
             "review_latency_ms_total": gen.get("review_latency_ms_total", 0),
             "generated": bool(gen),
         })
+        # ---- G4-E: 效率指标落盘 ----
+        # 光在 `spec.metrics` 里躺着没用 —— `_archive_reveal()` 只挑上面
+        # 那几个字段写进 puzzle.jsonl, 不搬整个 `spec.metrics`。下一场
+        # 直播结束后分析正式 archive 时, G4 这几个数**看不见**。
+        #
+        # 缺省一律 `0 / {}`: 老题、结构化兜底题、`--no-llm` 的假题都没有
+        # 这些键, 而"没有"和"0 次"在复盘里是同一个结论, 不该逼下游做
+        # `.get(k, 0)` 之外的事(也避免 archive 里出现 null 与 0 混杂)。
+        #
+        # **不** bump spec_version / quality policy / prompt version: 这几
+        # 个纯粹是运行指标, 不改变题的语义, 也不改变任何准入政策。bump
+        # 只会把整池旧题无谓地 quarantine 掉。
+        out.update({
+            "candidate_repair_attempt_count":
+                gen.get("candidate_repair_attempt_count", 0),
+            "candidate_repair_success_count":
+                gen.get("candidate_repair_success_count", 0),
+            "hard_reject_before_review_count":
+                gen.get("hard_reject_before_review_count", 0),
+            "repair_attempt_reasons":
+                dict(gen.get("repair_attempt_reasons") or {}),
+            "repair_success_reasons":
+                dict(gen.get("repair_success_reasons") or {}),
+        })
         return out
 
     # ---- 离线(--no-llm)用的固定内容 ----
