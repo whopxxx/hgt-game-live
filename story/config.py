@@ -187,6 +187,11 @@ class Config:
     pending_cap: int = 40                 # 待答队列硬上限, 溢出丢最旧
     max_question_len: int = 60            # 单条提问长度上限
 
+    # ---- AI 玩家 ----
+    ai_player_enabled: bool = True
+    ai_player_min_gap_seconds: float = 45.0
+    ai_player_retry_seconds: float = 15.0
+
     # ---- 收尾与提示(单一时间轴) ----
     #   0min 出题 -> 每 hint_seconds 给一条提示 -> 给满 max_hints 条后
     #   **再等 hint_seconds** 才揭晓。默认就是:
@@ -626,6 +631,10 @@ class Config:
                 f"qa_answer_retries({self.qa_answer_retries}) < 0: "
                 f"已按 0 处理(不重试)。"
             )
+        if self.ai_player_min_gap_seconds < 0:
+            warns.append("ai_player_min_gap_seconds 为负, 已按 0 处理。")
+        if self.ai_player_retry_seconds <= 0:
+            warns.append("ai_player_retry_seconds <= 0: 技术失败会高频重试。")
         return warns
 
 

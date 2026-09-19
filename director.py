@@ -47,6 +47,7 @@ from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
                        _spec_to_riddle)
 from story.pool import PuzzlePool                   # noqa: E402
+from story.public_player import PublicPlayerCore    # noqa: E402
 from story.server import RenderServer, StateHub     # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
 
@@ -151,6 +152,7 @@ class Director:
         self.server: RenderServer | None = None
         self.writer: PuzzleWriter | None = None
         self.client: AnthropicMessagesClient | None = None
+        self.ai_player: PublicPlayerCore | None = None
         self._stop = threading.Event()
         # ⚠️ 实际上**只有 `_riddle` 用它**(非阻塞 acquire, 失败则
         # `_deferred_rddle=True` 交给下一拍补发)。`_hint` / `_reveal`
@@ -195,6 +197,7 @@ class Director:
             # 而 client.cfg 是 LLMConfig。漏掉它 -> 这些参数全部静默失效
             # (取到 None, 网关用默认值), 而测试因为 Fake 上有这些字段仍全绿。
             self.writer = PuzzleWriter(client=self.client, runtime_cfg=cfg)
+            self.ai_player = PublicPlayerCore(self.client)
 
         # ---- Q9: 后台补池 ----
         # 只在 QA 阶段、零压力、且库存低于低水位时才在后台预生成。
@@ -385,8 +388,95 @@ class Director:
             self._hint(action.payload)
         elif k == ActionKind.REVEAL:
             self._reveal(action.payload)
+        elif k == ActionKind.AI_PLAYER:
+            self._ai_player(action.payload)
         elif k == ActionKind.BROADCAST:
             self.push()
+
+    def _ai_player(self, payload: dict) -> None:
+        """执行 AI 玩家的一步；Engine 在每个阶段之间重新核对现场。"""
+        def work():
+            token = payload.get("token", "")
+            round_index = payload.get("expect_round")
+            spec_key = payload.get("expect_spec_key", "")
+            stage = payload.get("stage")
+            try:
+                if stage == "move":
+                    move = (self.ai_player.ask(
+                        payload.get("puzzle", ""),
+                        payload.get("transcript", []))
+                        if self.ai_player is not None else None)
+                    if move is None:
+                        acts = self.engine.submit_ai_player_move(
+                            token, round_index, spec_key,
+                            error="PublicPlayerCore 调用失败")
+                    else:
+                        acts = self.engine.submit_ai_player_move(
+                            token, round_index, spec_key,
+                            kind=move[0], text=move[1])
+                elif stage == "ask":
+                    if self.writer is None:
+                        results = [QAResult(
+                            qid=0,
+                            verdict=self._fake_verdict(payload.get("text", "")))]
+                        err = None
+                    else:
+                        results, err = self.writer.answer(
+                            payload.get("puzzle", ""),
+                            payload.get("answer", ""),
+                            payload.get("transcript", []), 0, "AI玩家",
+                            payload.get("text", ""), judge_solve=False,
+                            solve_atoms=payload.get("solve_atoms"),
+                            facts=payload.get("facts"),
+                            completion_fact_ids=[],
+                            timeout=payload.get("timeout"),
+                            max_retries=payload.get("max_retries"))
+                    r = results[0] if results else None
+                    acts = self.engine.submit_ai_player_result(
+                        token, round_index, spec_key, "ask",
+                        payload.get("text", ""),
+                        verdict=(r.verdict if r else ""),
+                        comment=(r.comment if r else ""),
+                        failed=(r is None or r.status != "ok"),
+                        error=(err if r is None else None))
+                elif stage == "solve":
+                    if self.writer is None:
+                        jr = None
+                    else:
+                        jr = self.writer.judge(
+                            payload.get("puzzle", ""),
+                            payload.get("answer", ""),
+                            payload.get("text", ""),
+                            payload.get("solve_atoms"),
+                            facts=payload.get("facts"),
+                            timeout=payload.get("timeout"),
+                            max_retries=payload.get("max_retries"))
+                    acts = self.engine.submit_ai_player_result(
+                        token, round_index, spec_key, "solve",
+                        payload.get("text", ""),
+                        solved=bool(jr and jr.solved),
+                        failed=bool(jr is None or jr.failed),
+                        error=(getattr(jr, "error", None) if jr else
+                               "Final Judge 调用失败"))
+                else:
+                    acts = self.engine.submit_ai_player_move(
+                        token, round_index, spec_key, error="未知 AI 玩家阶段")
+                self._dispatch(acts)
+            except Exception as e:                 # noqa: BLE001
+                log.exception("AI玩家调用异常: %s", e)
+                if stage == "move":
+                    acts = self.engine.submit_ai_player_move(
+                        token, round_index, spec_key, error=str(e))
+                else:
+                    acts = self.engine.submit_ai_player_result(
+                        token, round_index, spec_key,
+                        "ask" if stage == "ask" else "solve",
+                        payload.get("text", ""), failed=True, error=str(e))
+                self._dispatch(acts)
+            self.push()
+
+        threading.Thread(target=work, daemon=True,
+                         name="ai-player").start()
 
     # ---- ANSWER: 逐条秒回, 走并发池 ----
     def _answer(self, payload: dict) -> None:

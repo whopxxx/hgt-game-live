@@ -47,6 +47,7 @@ class ActionKind(str, Enum):
     ANSWER = "answer"         # 调 LLM 回答一条提问
     HINT = "hint"             # 调 LLM 生成一条提示
     REVEAL = "reveal"         # 调 LLM 生成揭晓(谜底措辞)
+    AI_PLAYER = "ai_player"   # AI 玩家生成公开动作 / Host 或 Judge 裁决
     BROADCAST = "broadcast"   # 只更新状态/提示文案, 不调 LLM
     LOG = "log"
 

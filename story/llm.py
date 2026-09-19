@@ -4288,7 +4288,8 @@ class PuzzleWriter:
         #
         # 只有真的自相矛盾才触发: status=ok + candidate=True + verdict=无关。
         # 普通问答一次都不多调。
-        if (str(getattr(r0, "status", "") or "") == "ok"
+        if (judge_solve
+                and str(getattr(r0, "status", "") or "") == "ok"
                 and r0.solution_candidate is True
                 and r0.verdict == P.IRRELEVANT):
             # ---- C1 closeout: **进入重判即终局, 成功失败都 return** ----

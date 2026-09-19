@@ -109,6 +109,18 @@ def sanitize_transcript(transcript: list) -> list:
             out.append({"role": "puzzle", "text": e.get("text", "")})
         elif role == "player":
             out.append({"role": "player", "text": e.get("text", "")})
+        elif role == "audience":
+            out.append({
+                "role": "audience",
+                "name": str(e.get("name", "") or "观众")[:40],
+                "text": str(e.get("text", "") or "")[:200],
+            })
+        elif role == "ai_player":
+            out.append({"role": "ai_player",
+                        "text": str(e.get("text", "") or "")[:200]})
+        elif role == "hint":
+            out.append({"role": "hint",
+                        "text": str(e.get("text", "") or "")[:200]})
         elif role == "host":
             line = f"主持人: {e.get('verdict', '')}"
             cm = e.get("text", "")
@@ -133,6 +145,12 @@ def build_prompt(puzzle: str, public: list) -> str:
         for e in public[1:]:
             if e["role"] == "player":
                 lines.append(f"你问: {e['text']}")
+            elif e["role"] == "audience":
+                lines.append(f"观众 {e['name']}：{e['text']}")
+            elif e["role"] == "ai_player":
+                lines.append(f"AI玩家：{e['text']}")
+            elif e["role"] == "hint":
+                lines.append(f"提示：{e['text']}")
             elif e["role"] == "host":
                 lines.append(f"  {e['text']}")
         lines.append("")
