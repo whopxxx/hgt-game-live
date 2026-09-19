@@ -2475,9 +2475,22 @@ class PuzzleWriter:
             sig = PuzzleSignature.from_dict(obs)
 
         if bad:
-            return None, ("审稿改了谜面/谜底, 但没有同步 " + " / ".join(bad)
-                          + " —— facts/atoms/clues/signature 是一套, "
-                            "不能只改谜底")
+            # 文案要能区分两类拒稿原因, 否则看日志会误以为是改了没同步:
+            #   - 同步类: facts / atoms / clues / core_answer / completion
+            #   - 质量类: quality_checks 四项未全过 / observed_signature 缺字段
+            # 两类混在同一句里会让人按错误的方向去修生成器。
+            _sync = [b for b in bad if not b.startswith(("quality_checks",
+                                                         "observed_signature"))]
+            _qual = [b for b in bad if b not in _sync]
+            _parts = []
+            if _sync:
+                _parts.append(
+                    "审稿改了谜面/谜底, 但没有同步 " + " / ".join(_sync)
+                    + " —— facts/atoms/clues/core_answer/completion_fact_ids"
+                      " 是一套, 不能只改谜底")
+            if _qual:
+                _parts.append("审稿结论不合格: " + " / ".join(_qual))
+            return None, "; ".join(_parts)
 
         # ---- clues 必须逐字出自**改后**的谜面 ----
         # 代码侧的确定性检查, 不花 LLM 调用。早先这一步只在别处对**生成器**

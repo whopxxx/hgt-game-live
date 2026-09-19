@@ -660,9 +660,24 @@ class Director:
     def _reveal(self, payload: dict) -> None:
         def work():
             try:
-                if self.cfg.no_llm or not self.writer:
+                core = str(payload.get("core_answer", "") or "").strip()
+                if core:
+                    # ---- v5: **确定性**揭晓, 0 次额外 LLM 调用 ----
+                    #
+                    # 旧路径让第二个 LLM 把已经审好的答案**再文学加工
+                    # 一遍**。三个坏处, 都在真实直播里出现过:
+                    #   1. 观众多等一次往返才看到答案;
+                    #   2. 加工过程会把清楚的 core_answer 改复杂;
+                    #   3. 二次生成 = 二次引入幻觉的机会。
+                    #
+                    # 现在先**逐字**念 core_answer, 再附完整解释。
+                    # `core_answer` 是生成 + 审稿双重把关过的字段,
+                    # 没有任何理由再让第三个模型改写它。
+                    text = self._compose_reveal(core, payload.get("answer", ""))
+                elif self.cfg.no_llm or not self.writer:
                     text = self._fake_reveal(payload.get("answer", ""))
                 else:
+                    # legacy: 没有 core_answer 的老题, 保持原路径。
                     text, err = self.writer.reveal(
                         payload.get("puzzle", ""), payload.get("answer", ""),
                         payload.get("reason", ""), payload.get("winner", ""))
@@ -734,6 +749,12 @@ class Director:
             quality_policy_version=spec_d.get("quality_policy_version", ""),
             puzzle=payload.get("puzzle", ""),
             answer=payload.get("answer", ""),
+            # ---- v5 通关合同(赛后复盘"房间是怎么解出这题的") ----
+            # `core_answer` 优先从 spec 取(spec.to_archive 一定有) ——
+            # payload 那份只在没有 spec 的老路径上存在。
+            core_answer=(spec_d.get("core_answer")
+                         or payload.get("core_answer", "")),
+            completion_fact_ids=spec_d.get("completion_fact_ids", []),
             reason=payload.get("reason", ""),
             winner=payload.get("winner", ""),
             reveal=text, qa=list(snap.qa_archive),
@@ -890,6 +911,32 @@ class Director:
 
     def _fake_reveal(self, answer: str) -> str:
         return answer or self.cfg.fallback_answer
+
+    @staticmethod
+    def _compose_reveal(core_answer: str, answer: str) -> str:
+        """v5 确定性揭晓文案 —— **不调 LLM**。
+
+        结构固定:
+
+            【核心答案】
+            {core_answer}
+
+            【完整解释】
+            {answer}
+
+        为什么第一句必须**逐字**是 core_answer: 它是"普通人一听就懂"
+        的那句话, 且已经过生成 + 审稿双重把关。让模型改写它, 就是把
+        唯一保证"人话先出现"的东西交给了第三次生成。
+
+        `answer == core_answer` 时**不重复**贴完整解释(题目很短时
+        两者会重合, 重复显示像 bug)。
+        """
+        core = (core_answer or "").strip()
+        full = (answer or "").strip()
+        lines = ["【核心答案】", core]
+        if full and full != core:
+            lines += ["", "【完整解释】", full]
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     def _consume(self) -> None:
