@@ -74,6 +74,9 @@ def mk_spec(**kw) -> PuzzleSpec:
                       text="SENTINEL_ATOM2 灯是在标礁石, 不是引路",
                       fact_ids=["f2", "f3"]),
         ],
+        # ---- v5 通关合同(标的是当前政策 -> 必须是完整 v5 spec) ----
+        core_answer="他亮灯是为了标出退潮时露出的礁石, 不是给船引路。",
+        completion_fact_ids=["f1", "f2"],
         fair_clues=[
             FairClue(quote="只在退潮时亮灯", supports_atoms=["a1"]),
             FairClue(quote="涨潮后反而熄灯", supports_atoms=["a2"]),

@@ -68,6 +68,9 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
                       text="灯是在标记礁石, 而不是给船引路",
                       fact_ids=["f2", "f3"]),
         ],
+        # ---- v5 通关合同(标的是当前政策 -> 必须是完整 v5 spec) ----
+        core_answer="他亮灯是为了标出退潮时露出的礁石, 不是给船引路。",
+        completion_fact_ids=["f1", "f2"],
         fair_clues=[
             FairClue(quote="只在退潮的那几个小时亮", supports_atoms=["a1"]),
             FairClue(quote="涨潮后他反而把灯熄掉", supports_atoms=["a2"]),

@@ -463,6 +463,292 @@ def test_case_l_runtime_identity():
           runtime_spec_key("谜面", "谜底", f, a, []) != base)
 
 
+# ======================================================================
+# Closeout: blocker regressions
+# ======================================================================
+def test_closeout_b1_atom_floor_reaches_schema():
+    """Blocker 1: v5 的 atom 下限必须贯穿 schema 与 prompt。
+
+    代码允许 1 条, 但 schema 写 minItems=2 -> 模型永远不敢只交 1 条,
+    于是"身份题只需要一条原子事实"这条改进在**生产里根本不会发生**。
+    prompt / schema / code 三套说法必须一致。
+    """
+    print("\n[B1] atom 下限贯穿 schema / prompt")
+    check("RIDDLE solve_atoms.minItems == 1",
+          _TOOL_RIDDLE["input_schema"]["properties"]["solve_atoms"]["minItems"]
+          == 1, _TOOL_RIDDLE["input_schema"]["properties"]["solve_atoms"])
+    check("CHECK solve_atoms.minItems == 1",
+          _TOOL_CHECK["input_schema"]["properties"]["solve_atoms"]["minItems"]
+          == 1, _TOOL_CHECK["input_schema"]["properties"]["solve_atoms"])
+    for name, txt in (("RIDDLE_SYSTEM", RIDDLE_SYSTEM),
+                      ("CHECK_SYSTEM", CHECK_SYSTEM)):
+        check(f"{name} 不再要求'必须恰好一条 cause 和一条 mechanism'",
+              "必须恰好一条" not in txt)
+    # 两处 description 都要讲清"不是胜利合同 / 可以只有 1 条 key"
+    for label, tool in (("RIDDLE", _TOOL_RIDDLE), ("CHECK", _TOOL_CHECK)):
+        d = tool["input_schema"]["properties"]["solve_atoms"]["description"]
+        check(f"{label} desc 讲 1~4 条", "1~4" in d, d[:60])
+        check(f"{label} desc 讲不是胜利合同", "不是胜利合同" in d
+              or "不是玩家逐字通关的模板" in d, d[:60])
+        check(f"{label} desc 讲可以只有 1 条 key", "key" in d, d[:60])
+    # required 字段不再自称"是否通关必需"
+    rd = _TOOL_RIDDLE["input_schema"]["properties"]["solve_atoms"][
+        "items"]["properties"]["required"]["description"]
+    check("RIDDLE required desc 不再说'通关必需'", "通关必需" not in rd, rd)
+    check("RIDDLE required desc 指明不决定通关",
+          "不决定" in rd and "completion_fact_ids" in rd, rd)
+
+
+def test_closeout_b1_minimal_identity_puzzle_valid():
+    """Blocker 1: 1 条 completion + 1 条 key atom 全链合法。"""
+    print("\n[B1] 最小身份题(1 合同 + 1 key atom)全链合法")
+    sp = PuzzleSpec(
+        id="mini", title="门外",
+        puzzle="门外站着一个女人, 开门的人一见她就愣住了。为什么?",
+        answer="门外女人是父亲的亲生女儿。",
+        core_answer="门外女人是父亲的亲生女儿。",
+        completion_fact_ids=["f1"],
+        facts=[PuzzleFact(id="f1", text="门外女人是父亲的亲生女儿",
+                          kind="core", visibility="hidden"),
+               PuzzleFact(id="f2", text="开门的人不认识她", kind="support")],
+        solve_atoms=[SolveAtom(id="a1", role="key",
+                               text="门外女人是父亲的亲生女儿",
+                               fact_ids=["f1"])],
+        fair_clues=[FairClue(quote="开门的人一见她就愣住了",
+                             supports_atoms=["a1"])],
+        hints=["a", "b", "c"],
+        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+    vr = validate_spec(sp)
+    check("validate_spec 通过", vr.ok, vr.why())
+    check("只有 1 条 atom", len(sp.solve_atoms) == 1)
+    check("只有 1 条合同", len(sp.completion_fact_ids) == 1)
+    # 走一遍引擎: 这一条被确认就该通关
+    eng, clk = boot(sp)
+    ask(eng, clk, "u1", "甲", "她是父亲的女儿吗", verdict="是",
+        established_fact_ids=["f1"])
+    check("1 条合同被补齐 -> 揭晓", eng.phase == Phase.REVEALING, eng.phase)
+
+
+def test_closeout_b2_v5_must_have_contract():
+    """Blocker 2: quality-v5 标签**不能**配 legacy 通关语义。"""
+    print("\n[B2] quality-v5 必须有完整合同")
+    from story.quality import QUALITY_POLICY_VERSION as _Q
+    # v5 标签 + 空合同 -> 拒
+    sp = ident_spec()
+    sp.completion_fact_ids = []
+    vr = validate_spec(sp)
+    check("v5 + 空 completion -> 拒", not vr.ok, vr.why())
+    check("理由点名了版本门",
+          "quality-v5" in vr.why() and "completion" in vr.why(), vr.why())
+    # v5 标签 + 空 core_answer -> 拒
+    sp2 = ident_spec()
+    sp2.core_answer = ""
+    vr2 = validate_spec(sp2)
+    check("v5 + 空 core_answer -> 拒", not vr2.ok, vr2.why())
+    # legacy(v4) + 空合同 -> 仍可通过旧 gate
+    sp3 = ident_spec()
+    sp3.quality_policy_version = "quality-v4"
+    sp3.completion_fact_ids = []
+    sp3.core_answer = ""
+    sp3.solve_atoms = [
+        SolveAtom(id="a1", role="cause", text="x", fact_ids=["f1"]),
+        SolveAtom(id="a2", role="mechanism", text="y", fact_ids=["f2"]),
+    ]
+    vr3 = validate_spec(sp3)
+    check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
+    check("版本常量确实是 v5", _Q == "quality-v5", _Q)
+    # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
+    check("has_completion_contract 仍是运行时判据",
+          ident_spec().has_completion_contract())
+
+
+def test_closeout_b2_pool_rejects_v5_without_contract():
+    """Blocker 2: 题池必须同步 —— v5 无合同不能入池 / 不能出池。"""
+    print("\n[B2] 题池: v5 无合同 -> 入池与出池都拒")
+    from story.pool import PuzzlePool
+    # add() 入口
+    sp = ident_spec()
+    sp.completion_fact_ids = []
+    pool = PuzzlePool.__new__(PuzzlePool)
+    ok, why = PuzzlePool._validate_pool_spec(sp)
+    check("add/pop 统一门拒绝 v5 无合同", not ok, why)
+    # legacy 完整旧题 -> quarantine(政策不匹配)
+    sp2 = ident_spec()
+    sp2.quality_policy_version = "quality-v4"
+    ok2, why2 = PuzzlePool._validate_pool_spec(sp2)
+    check("quality-v4 -> quarantine", not ok2, why2)
+    check("理由点名政策不兼容", "不兼容" in why2, why2)
+    # 空版本 -> 同样隔离, 不伪装成 v5 库存
+    sp3 = ident_spec()
+    sp3.quality_policy_version = ""
+    ok3, why3 = PuzzlePool._validate_pool_spec(sp3)
+    check("空版本 -> quarantine", not ok3, why3)
+    # 真 v5 完整题 -> 通过。注意池门还会查 signature 完整性, 所以这里
+    # 必须带上一份**完整** signature —— ident_spec 是给引擎用的最小构造,
+    # 没有 signature, 会被另一条规则拦下(那不是本用例要测的东西)。
+    from story.puzzle import PuzzleSignature
+    full = ident_spec()
+    full.signature = PuzzleSignature(
+        mechanism_family="identity_misread",
+        solution_shape="identity_reversal", domain="family",
+        emotion_mode="warm", relation="family", time_shape="instant",
+        reveal_mode="identity_flip")
+    ok4, why4 = PuzzlePool._validate_pool_spec(full)
+    check("完整 v5 题 -> 入池", ok4, why4)
+    del pool
+
+
+def test_closeout_b3_irrelevant_never_establishes():
+    """Blocker 3: 「无关」绝不能建立事实 —— 否则刷无关即可白送通关。"""
+    print("\n[B3] 「无关」不能建立事实")
+    sp = ident_spec()   # 合同 = f1 + f2
+    eng, clk = boot(sp)
+    # 先用正常路径建立 f1
+    ask(eng, clk, "u1", "甲", "第一条", verdict="是",
+        established_fact_ids=["f1"])
+    check("f1 已建立", eng._established_fact_ids == {"f1"},
+          eng._established_fact_ids)
+    # 关键攻击: 用「无关」去建立最后一条 completion fact
+    ask(eng, clk, "u2", "乙", "随便问问", verdict="无关",
+        established_fact_ids=["f2"])
+    check("「无关」不建立事实", eng._established_fact_ids == {"f1"},
+          eng._established_fact_ids)
+    check("不通关", eng.phase == Phase.QA, eng.phase)
+    check("胜者仍为空", not eng._solved_by, eng._solved_by)
+
+
+def test_closeout_b3_verdict_matrix():
+    """Blocker 3: verdict/status 矩阵 —— 只有 是/不是 能建立。"""
+    print("\n[B3] established 的 verdict 矩阵")
+    from story.parser import NO, UNAVAILABLE, YES
+    cases = [
+        (YES, "ok", True, "「是」可以建立"),
+        (NO, "ok", True, "「不是」也可以建立"),
+        ("无关", "ok", False, "「无关」不能建立"),
+        (UNAVAILABLE, "unavailable", False, "「未判定」不能建立"),
+        ("揭晓", "ok", False, "「揭晓」不能建立"),
+    ]
+    for verdict, status, should, label in cases:
+        sp = ident_spec()
+        eng, clk = boot(sp)
+        ask(eng, clk, "u1", "甲", "问题", verdict=verdict, status=status,
+            established_fact_ids=["f1", "f2"])
+        got = eng._established_fact_ids == {"f1", "f2"}
+        check(label, got is should, (verdict, status, eng._established_fact_ids))
+        if should:
+            check(f"  {label} -> 直接通关", eng.phase == Phase.REVEALING,
+                  eng.phase)
+        elif verdict == "揭晓":
+            # 「揭晓」走的是 **legacy** P.SOLVE 路径(那是另一条规则, 不在
+            # 本次范围内)。这里只断言它**没有建立 fact** —— 上面那条
+            # `got is should` 已经覆盖了。
+            pass
+        else:
+            check(f"  {label} -> 仍在 QA", eng.phase == Phase.QA, eng.phase)
+
+
+def test_closeout_b4_clue_must_reach_completion():
+    """Blocker 4: 至少一条 clue 指向通向 completion 的 atom。"""
+    print("\n[B4] clue 必须真的指向通关路径")
+    # 反例: 通关走 a1, 但唯一的 clue 指向无关的 a2
+    bad = ident_spec()
+    bad.solve_atoms = [
+        SolveAtom(id="a1", role="key", text="门外女人是父亲的亲生女儿",
+                  fact_ids=["f1"]),
+        SolveAtom(id="a2", role="support", text="开门的人不认识她",
+                  fact_ids=["f3"]),
+    ]
+    bad.fair_clues = [FairClue(quote="开门的人一见她就愣住了",
+                               supports_atoms=["a2"])]   # 指不到 f1
+    vr = validate_spec(bad)
+    check("clue 指不到 completion -> 拒", not vr.ok, vr.why())
+    check("理由点名了推理路径",
+          "推理路径" in vr.why() or "不公平" in vr.why(), vr.why())
+    # 正例: clue 指向 a1(它引用 f1)。
+    # ⚠️ a2 必须仍然引用合同成员 f2 —— 否则"每条 completion fact 都要被
+    # atom 引用"那条规则会先开火, 测的就不是 clue 路径了。
+    good = ident_spec()
+    good.solve_atoms = [
+        SolveAtom(id="a1", role="key", text="门外女人是父亲的亲生女儿",
+                  fact_ids=["f1"]),
+        SolveAtom(id="a2", role="key", text="她昨晚与父亲同桌吃饭",
+                  fact_ids=["f2"]),
+    ]
+    good.fair_clues = [FairClue(quote="开门的人一见她就愣住了",
+                                supports_atoms=["a1"])]
+    vr2 = validate_spec(good)
+    check("clue 指向 completion atom -> 通过", vr2.ok, vr2.why())
+    # 只要求"至少一条", 不要求每条 completion fact 都有 clue
+    partial = ident_spec()   # 合同 f1+f2, 但只有一条 clue
+    check("两条合同一条 clue -> 仍通过", validate_spec(partial).ok,
+          validate_spec(partial).why())
+
+
+def test_closeout_p1_reviewer_sync_fail_closed():
+    """P1: reviewer 六样同步必须真的 fail-closed。"""
+    print("\n[P1] reviewer 同步合同 fail-closed")
+    import copy as _copy
+
+    base = _pass_review()
+
+    def run(ti):
+        fc = FakeClient([LLMResult(tool_input=ti, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        # 用一份**v5** spec 作为被审对象, 这样走的是 v5 全量分支
+        sub_spec = ident_spec()
+        return w._review_spec(sub_spec)[:1]
+
+    # 1) pass + 只改 facts, 省略 solve_atoms -> 拒
+    t1 = _copy.deepcopy(base)
+    t1["facts"] = [dict(f, text=f["text"] + "改") for f in t1["facts"]]
+    t1.pop("solve_atoms")
+    merged, = run(t1)
+    check("只改 facts 省略 atoms -> 拒", merged is None, merged)
+
+    # 2) pass + 只改 completion_fact_ids, 省略 facts/atoms/clues -> 拒
+    t2 = _copy.deepcopy(base)
+    t2["completion_fact_ids"] = ["f1"]
+    for k in ("facts", "solve_atoms", "fair_clues"):
+        t2.pop(k)
+    merged, = run(t2)
+    check("只改合同省略 facts/atoms/clues -> 拒", merged is None, merged)
+
+    # 3) fix + 改 core_answer, 缺 completion/facts/atoms/clues -> 拒
+    t3 = _copy.deepcopy(base)
+    t3["decision"] = "fix"
+    t3["core_answer"] = "换了核心答案。"
+    for k in ("completion_fact_ids", "facts", "solve_atoms", "fair_clues"):
+        t3.pop(k)
+    merged, = run(t3)
+    check("fix 改 core_answer 缺其余 -> 拒", merged is None, merged)
+
+    # 4) 完整 bundle -> 通过
+    merged, = run(_copy.deepcopy(base))
+    check("完整 bundle -> 通过", merged is not None, merged)
+    if merged is not None:
+        check("  新 spec 带上合同", merged.completion_fact_ids == ["f1", "f2"],
+              merged.completion_fact_ids)
+        check("  新 spec 带上 core_answer",
+              merged.core_answer == base["core_answer"], merged.core_answer)
+
+
+def test_closeout_p1_legacy_reviewer_unchanged():
+    """P1: legacy(v4)审稿路径保持"改了才要求齐全", 不被 v5 规则误伤。"""
+    print("\n[P1] legacy reviewer 不受 v5 全量要求影响")
+    fc = FakeClient([LLMResult(tool_input={
+        "decision": "pass",
+        "observed_signature": _pass_review()["observed_signature"],
+        "quality_checks": _pass_review()["quality_checks"],
+    }, model="m")])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    legacy = ident_spec()
+    legacy.quality_policy_version = "quality-v4"
+    legacy.completion_fact_ids = []
+    merged, why, rewrite = w._review_spec(legacy)
+    check("legacy: 没改就沿用 -> 不因缺 bundle 被拒",
+          not (merged is None and "同步合同" in (why or "")), (merged, why))
+
+
 # ----------------------------------------------------------------------
 # 四句话产品语义 —— 与 prompt / schema 的一致性
 # ----------------------------------------------------------------------
@@ -546,6 +832,16 @@ def main():
         test_case_j_mechanism_consistency_fail_closed,
         test_case_k_deterministic_reveal,
         test_case_l_runtime_identity,
+        # ---- Closeout: 4 blockers + P1 ----
+        test_closeout_b1_atom_floor_reaches_schema,
+        test_closeout_b1_minimal_identity_puzzle_valid,
+        test_closeout_b2_v5_must_have_contract,
+        test_closeout_b2_pool_rejects_v5_without_contract,
+        test_closeout_b3_irrelevant_never_establishes,
+        test_closeout_b3_verdict_matrix,
+        test_closeout_b4_clue_must_reach_completion,
+        test_closeout_p1_reviewer_sync_fail_closed,
+        test_closeout_p1_legacy_reviewer_unchanged,
         test_product_semantics_pinned,
         test_established_archive_boundary,
     ]

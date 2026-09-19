@@ -194,6 +194,27 @@ def validate_spec(spec: PuzzleSpec,
             if fid not in seen_f:
                 r.fail(f"atom {a.id} 引用了不存在的 fact: {fid}")
 
+    # ---- quality-v5 版本硬门 ----
+    #
+    # ⚠️ **不能**用 `bool(spec.completion_fact_ids)` 当"这是 v5 还是
+    # legacy"的唯一判据。后果是:
+    #
+    #     quality-v5 + completion=[]  ->  悄悄降级成 legacy 通关语义
+    #
+    # 也就是说, 一道**自称 v5** 的题可以带着旧的 cause+mechanism
+    # victory semantics 进 live 库存。v5 标签绝不能与 legacy 通关语义
+    # 共存 —— 所以这里按**政策版本**判, 而不是按"有没有填合同"判。
+    #
+    #   quality-v5            -> 必须有完整 v5 合同(core_answer + 1~2 条)
+    #   quality-v4 / 空 / 其它 -> legacy, 合同可以为空(老 archive 不能判死)
+    is_v5 = str(spec.quality_policy_version or "") == QUALITY_POLICY_VERSION
+    if is_v5:
+        if not spec.completion_fact_ids:
+            r.fail("quality-v5 spec 缺 completion_fact_ids"
+                   "(v5 标签不能配 legacy 通关语义)")
+        if not (spec.core_answer or "").strip():
+            r.fail("quality-v5 spec 缺 core_answer")
+
     # ---- 通关合同(v5) 与 atom 要求 ----
     #
     # 这里把"通关需要什么"与"atoms 长什么样"彻底解耦。历史包袱:
@@ -304,6 +325,37 @@ def validate_spec(spec: PuzzleSpec,
         elif not (supported & req_ids):
             (r.fail if v2 else r.warn)(
                 "没有 fair_clue 支持任何 required atom(题目缺公平推理路径)")
+
+    # ---- v5: 线索必须真的通向通关路径(Blocker 4) ----
+    #
+    # 上一步只查了两件**分开**的事:
+    #     completion fact 被某个 atom 引用
+    #     fair_clue 支持某个 required atom
+    # 这不够 —— 两者可以落在**不同的分支**上: 通关事实走 a1, 而唯一的
+    # clue 指向一条与通关无关的 a2。结果是一道"有线索、也有抓手, 但
+    # 线索指不到通关条件"的题, 观众永远推不出来。
+    #
+    # 要求: **至少一条 clue 指向某个引用 completion fact 的 atom**。
+    # 刻意**不**要求每个 completion fact 都有自己的 clue —— 那会重新
+    # 变得过度保守(合同本来就是"最少要确认什么", 不必每条都从题面
+    # 直接可推)。
+    #
+    # ⚠️ 位置: 必须在 `clues` 绑定**之后**。早先它被放在合同校验块里
+    # (那一段在 fair_clues 之前), 于是任何有合同的 spec 走到这里都会
+    # UnboundLocalError —— 一个只在"校验真的跑到底"时才暴露的错。
+    if has_contract and atoms and clues:
+        completion_ids = set(spec.completion_fact_ids)
+        completion_atom_ids = {
+            a.id for a in atoms
+            if completion_ids.intersection(a.fact_ids or [])}
+        clued_atom_ids = {
+            aid for c in clues for aid in (c.supports_atoms or [])}
+        if completion_atom_ids and clued_atom_ids:
+            if not (completion_atom_ids & clued_atom_ids):
+                r.fail("没有任何 fair_clue 指向通关事实的推理路径"
+                       "(线索指不到 completion, 题目不公平)"
+                       f" [completion atoms={sorted(completion_atom_ids)}"
+                       f", clued={sorted(clued_atom_ids)}]")
 
     # ---- hints ----
     hints = spec.hints or []

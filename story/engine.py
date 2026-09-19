@@ -1425,10 +1425,25 @@ class RoundEngine:
           - 这道题可能已经换了(`_identity_ok` 之前的部分路径), 于是
             worker 按**旧** spec 过滤过的 id 对新 spec 可能非法。
 
-        技术失败 / 未判定**不建立任何事实**: 那两种情况下主持人根本没
-        做出判断, 不能把模型随手回的 id 当成"确认"。
+        ## 只有「是」和「不是」能建立事实
+
+        ⚠️ **这是代码层的硬门, 不是只靠 ANSWER prompt 的约定。**
+
+        「无关」的语义是"这个说法与谜底无关" —— 它**没有**确认事实表里的
+        任何东西。若让它也建立事实, 观众只要刷"XX是无关的吗"把每条 fact
+        都碰一遍, 合同就被白送覆盖了, 整道题立刻自解。
+
+        「未判定」是系统故障(超时/解析失败), 主持人根本没做出判断 ——
+        同样不能建立任何事实。
+
+        所以判据是 `status == ok` **且** `verdict in (是, 不是)`。
+        注意「不是」**可以**建立事实(它完整公开地否定了该 fact),
+        这与「无关」完全不同。
         """
-        if verdict == P.UNAVAILABLE or status == "unavailable":
+        if status == "unavailable" or verdict == P.UNAVAILABLE:
+            return []
+        if verdict not in (P.YES, P.NO):
+            # 「无关」/「揭晓」/空裁决一律不建立。
             return []
         known = {f.id for f in (getattr(self._spec, "facts", None) or [])}
         out: list = []

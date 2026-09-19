@@ -63,6 +63,11 @@ def good_spec(**kw) -> PuzzleSpec:
     s = PuzzleSpec(id="p1", title="灯塔", puzzle=PUZZLE,
                    answer="退潮时礁石露出水面, 亮灯是为标出礁石位置; "
                           "涨潮后继续亮反而误导船只。",
+                   # good_spec 标的是**当前政策**(quality-v5), 所以它必须
+                   # 是一份**完整 v5 spec** —— 否则它自己就违反了 Blocker 2
+                   # 的版本硬门(那正是要修的: "v5 标签不能配 legacy 通关语义")。
+                   core_answer="他亮灯是为了标出退潮时露出的礁石, 不是给船引路。",
+                   completion_fact_ids=["f1", "f2"],
                    facts=facts, solve_atoms=atoms, fair_clues=clues,
                    hints=["注意灯的开关时机", "想想潮水的变化",
                           "灯是在给谁传递信息?"],
@@ -83,6 +88,23 @@ def good_spec(**kw) -> PuzzleSpec:
     return s
 
 
+def legacy_spec(**kw) -> PuzzleSpec:
+    """一份**真正的 legacy**(quality-v4)题 —— 没有 v5 合同。
+
+    与 `good_spec()` 的区别只有政策版本与合同字段: 它刻意保留旧语义,
+    用来验证"老 archive / 老 fixture 仍可读、仍走旧 gate, 但**不能**
+    伪装成 v5 库存"。
+    """
+    s = good_spec(**kw)
+    s.quality_policy_version = "quality-v4"
+    if "core_answer" not in kw:
+        s.core_answer = ""
+    if "completion_fact_ids" not in kw:
+        s.completion_fact_ids = []
+    return s
+
+
+# ======================================================================
 def v5_spec(**kw) -> PuzzleSpec:
     """在 `good_spec()` 之上加一份**合法**的 v5 通关合同。
 
@@ -125,9 +147,12 @@ def test_v5_old_archive_reads_as_no_contract():
     check("core_answer 空", s.core_answer == "", s.core_answer)
     check("completion 空", s.completion_fact_ids == [], s.completion_fact_ids)
     check("判为无合同(走 legacy)", not s.has_completion_contract())
-    # 老数据继续走旧 gate: 缺 cause/mechanism 仍应被拒
-    vr = validate_spec(good_spec(completion_fact_ids=[]))
-    check("无合同 -> 仍要求 cause+mechanism 齐全", vr.ok, vr.why())
+    # legacy(v4)题继续走旧 gate: 有 cause+mechanism 就通过
+    vr = validate_spec(legacy_spec())
+    check("legacy 无合同 -> 旧 gate 仍通过", vr.ok, vr.why())
+    # 但 **v5 标签 + 空合同** 必须被拒(见 v5-8)
+    vr2 = validate_spec(good_spec(completion_fact_ids=[], core_answer=""))
+    check("v5 标签 + 空合同 -> 拒", not vr2.ok, vr2.why())
 
 
 def test_v5_support_cannot_be_completion():
@@ -191,9 +216,8 @@ def test_v5_key_role_atom_is_enough():
     vr = validate_spec(s)
     check("key-only 题通过 v5 校验", vr.ok, vr.why())
     # 但同一条题若**没有**合同, 仍走旧 gate -> 必须被拒
-    vr2 = validate_spec(good_spec(
-        solve_atoms=[SolveAtom(id="a1", role="key", text="x", fact_ids=["f1"])],
-        completion_fact_ids=[]))
+    vr2 = validate_spec(legacy_spec(
+        solve_atoms=[SolveAtom(id="a1", role="key", text="x", fact_ids=["f1"])]))
     check("无合同时 key 不顶用(legacy gate 不变)", not vr2.ok, vr2.why())
 
 
@@ -249,7 +273,9 @@ def test_atom_missing_fact_rejected():
 
 def test_missing_required_cause_rejected():
     print("[validate_spec: 缺 required cause -> 拒]")
-    s = good_spec()
+    # **legacy 专属**: v5 有合同时不再要求 cause/mechanism, 所以这条
+    # 规则只在无合同的 legacy 题上成立 —— 用 legacy_spec 才测得到它。
+    s = legacy_spec()
     s.solve_atoms = [SolveAtom(id="a1", role="support", text="x", fact_ids=["f1"]),
                      SolveAtom(id="a2", role="mechanism", text="y", fact_ids=["f2"])]
     r = validate_spec(s)
@@ -259,7 +285,7 @@ def test_missing_required_cause_rejected():
 
 def test_missing_required_mechanism_rejected():
     print("[validate_spec: 缺 required mechanism -> 拒]")
-    s = good_spec()
+    s = legacy_spec()   # 同上: 这是 legacy-only 规则
     s.solve_atoms = [SolveAtom(id="a1", role="cause", text="x", fact_ids=["f1"]),
                      SolveAtom(id="a2", role="support", text="y", fact_ids=["f2"])]
     r = validate_spec(s)

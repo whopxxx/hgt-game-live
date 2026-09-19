@@ -820,7 +820,7 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 5. 写 `core_answer`(一句话, ≤60 字, 不换行): 普通观众一听就懂的核心答案,
    必须**直接回答谜面最后那个问题**。
 6. 写 answer(2-4 句, 第一句正面解释核心反常)。
-7. 定 solve_atoms(2~4 条): 这是**对谜底的分析拆分**, 给提示与复盘用,
+7. 定 solve_atoms(1~4 条): 这是**对谜底的分析拆分**, 给提示与复盘用,
    **不是**玩家逐字通关的模板。用 fact_ids 指向上面的事实。
    只有确实存在因果链的题才用 cause/mechanism; 身份、物品、时间、目标等
    核心翻转用 `key`。**不要为了凑角色硬造因果关系。**
@@ -1160,7 +1160,7 @@ _TOOL_RIDDLE = {
                     "四者职责必须分开。至少 1 条 kind=exclusion。"),
             },
             "solve_atoms": {
-                "type": "array", "minItems": 2, "maxItems": 4,
+                "type": "array", "minItems": 1, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1185,20 +1185,20 @@ _TOOL_RIDDLE = {
                         },
                         "required": {
                             "type": "boolean",
-                            "description": "是否通关必需(默认 true)",
+                            "description": (
+                                "是否属于谜底的主要解释结构 / 提示优先结构。"
+                                "**不决定玩家是否通关** —— 通关只看 "
+                                "completion_fact_ids。"),
                         },
                     },
                     "required": ["id", "role", "text", "fact_ids"],
                 },
                 "description": (
-                    "对谜底的**分析拆分**(2-4 条), 用 fact_ids 指向上面的"
-                    "fact。\n"
-                    "⚠️ 它**不是**玩家逐字通关的模板 —— 通关由 "
-                    "`completion_fact_ids` 决定。这里写的是\"这题怎么拆\", "
-                    "用来给提示选方向、给揭晓做复盘结构。\n"
-                    "角色选择: **只有确实存在因果链的题**才用 cause + "
-                    "mechanism; 身份、物品、时间、目标等核心翻转用 `key`。"
-                    "不要为了凑角色硬造因果关系。"),
+                    "1~4 条对谜底的分析原子。\n"
+                    "它们用于**提示 / 解释 / 复盘**, **不是胜利合同**。\n"
+                    "身份 / 时间 / 目标 / 物品翻转可以只有 1 条 key atom。\n"
+                    "只有真实存在因果链时才使用 cause / mechanism。\n"
+                    "**不得为了满足 schema 凑第二条 atom。**"),
             },
             "fair_clues": {
                 "type": "array", "minItems": 1, "maxItems": 4,
@@ -1372,8 +1372,11 @@ _TOOL_CHECK = {
     "name": "emit_review",
     "description": (
         "审阅这个谜题, 并给出 **pass / fix / rewrite** 三选一的决定。"
-        "改动核心机制时, 必须把 facts / solve_atoms / fair_clues / "
-        "observed_signature **一起重出** —— 它们是一套, 不能只改谜底。"),
+        "改动核心机制时, 必须把 puzzle / answer / core_answer / "
+        "completion_fact_ids / facts / solve_atoms / fair_clues / "
+        "observed_signature / quality_checks **一起重出** —— 它们是一套, "
+        "不能只改谜底。**pass/fix 时以上字段一律必须显式回传**, "
+        "代码不会「没回就沿用旧值」。"),
     "input_schema": {
         "type": "object",
         "properties": {
@@ -1448,7 +1451,7 @@ _TOOL_CHECK = {
                     "没动核心就原样回传。"),
             },
             "solve_atoms": {
-                "type": "array", "minItems": 2, "maxItems": 4,
+                "type": "array", "minItems": 1, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1467,14 +1470,20 @@ _TOOL_CHECK = {
                             "type": "array", "items": {"type": "string"},
                             "description": "依据的 fact id(必须存在于 facts)",
                         },
-                        "required": {"type": "boolean"},
+                        "required": {"type": "boolean",
+                                     "description": (
+                                         "是否属于主要解释结构 / 提示优先"
+                                         "结构。**不决定玩家是否通关** —— "
+                                         "通关只看 completion_fact_ids。")},
                     },
                     "required": ["role", "text"],
                 },
                 "description": (
-                    "玩家必须说中的 2-4 条原子事实。**必须恰好一条 cause 和"
-                    "一条 mechanism**。改了核心就重出这一组; 没动就原样回传"
-                    "(含 id 与 fact_ids)。"),
+                    "对谜底的**分析拆分**(1~4 条), 不是玩家逐字通关的模板。"
+                    "身份 / 时间 / 目标 / 物品翻转可以只有 1 条 key atom; "
+                    "**只有确实存在因果链的题**才用 cause + mechanism; "
+                    "不得为了满足 schema 凑第二条。\n"
+                    "改了核心就重出这一组; 没动就原样回传(含 id 与 fact_ids)。"),
             },
             "fair_clues": {
                 "type": "array", "minItems": 1, "maxItems": 4,
@@ -2341,6 +2350,22 @@ class PuzzleWriter:
         所以现在:
           - **没改** -> 原样回传即可, 缺什么补什么(零风险)。
           - **改了** -> 四样必须齐全, 缺一即拒(交回生成器重出)。
+
+        ## v5: 改成**全量 fail-closed**(不再看"改没改")
+
+        `changed = puzzle_changed or answer_changed` 有两个洞:
+
+            puzzle 没变 / answer 没变 / facts 改了  -> 旧 atoms/clues 被沿用
+            core_answer 或 completion_fact_ids 改了 -> 完全没被 changed 捕获
+
+        两者都会产出**混合版本**的稿子(新 facts + 旧 atoms; 新合同 + 旧
+        facts), 而这一整段的存在意义就是消灭这种稿子。所以 v5 直接要求
+        `puzzle / answer / core_answer / completion_fact_ids / facts /
+        solve_atoms / fair_clues / observed_signature / quality_checks`
+        **全部显式回传**, 与改没改无关。
+
+        legacy(v4 / 空版本)保持原来的"改了才要求齐全", 否则老 fixture 与
+        老调用方会集体失效 —— 那不是这次要修的东西。
         """
         new_answer = str(ti.get("answer", "") or "").strip()
         new_puzzle = (new_puzzle or "").strip()
@@ -2350,6 +2375,25 @@ class PuzzleWriter:
                    or new_answer != (spec.answer or "").strip())
         if not new_answer:
             new_answer = spec.answer
+
+        # ---- v5: 同步合同是**全量**的, 与"改没改"无关 ----
+        #
+        # 为什么不能只看 `changed`: 它只看谜面与谜底两个字面量。审稿人
+        # 改 `facts` 而谜面谜底不动, 或者只改 `core_answer` /
+        # `completion_fact_ids`, 都不会被它捕获 —— 于是代码沿用旧 atoms /
+        # 旧 clues, 产出一个混合版本的稿子。
+        #
+        # 判据用**政策版本**, 与 `validate_spec` 的版本硬门一致:
+        # 自称 v5 就必须守 v5 的规则, 不能靠"没填就沿用"蒙混。
+        is_v5_review = (str(spec.quality_policy_version or "")
+                        == QUALITY_POLICY_VERSION)
+        missing_bundle: list = []
+        if is_v5_review:
+            for _name in ("puzzle", "answer", "core_answer",
+                          "completion_fact_ids", "facts", "solve_atoms",
+                          "fair_clues"):
+                if ti.get(_name) is None:
+                    missing_bundle.append(_name)
 
         # ---- v5 通关合同: 与 facts/atoms/clues **同一套** ----
         #
@@ -2392,6 +2436,14 @@ class PuzzleWriter:
                 bad.append("fair_clues")
             else:
                 clues = list(spec.fair_clues)
+
+        # v5 缺项 -> 立刻拒(在下面任何"沿用旧值"的兜底之前)。
+        if missing_bundle:
+            return None, ("审稿未回传完整的同步合同(缺: "
+                          + ", ".join(missing_bundle)
+                          + ") —— v5 要求 puzzle/answer/core_answer/"
+                            "completion_fact_ids/facts/solve_atoms/"
+                            "fair_clues 全部显式回传, 代码不会替你沿用旧值")
 
         # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
         comp_raw = ti.get("completion_fact_ids")
