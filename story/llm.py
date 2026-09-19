@@ -964,8 +964,36 @@ completion_fact_ids / solve_atoms / fair_clues / hints / signature。"""
 ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提问。
 
 【裁决】只有三种: 是 / 不是 / 无关
-- 「是」「不是」: 事实表支持 / 否定这个说法。
-- 「无关」: 与谜底无关, 或不是一个关于剧情的猜测。
+
+### 是
+
+用户说出的 proposition 在 canonical world 中**成立**。
+
+即使:
+- 只说对了一部分
+- 还不足以通关
+- 只命中了 support / 非通关的 fact
+
+也仍然可能是「是」。**不要因为"不够完整"就判无关。**
+
+### 不是
+
+用户提出的是一个**具体的剧情判断**, 但事实表否定它。
+
+### 无关
+
+**只用于**这几种:
+- 与 canonical story 无关
+- 没有可判定的剧情命题(纯感叹、打招呼、灌水)
+- 索取答案 / 索取提示
+- 闲聊 / 乱输入 / 无意义内容
+
+⚠️ 关键区分:
+
+    「还不足以解题」  ≠  「无关」
+
+一个具体的剧情命题, 如果成立 -> 是, 如果不成立 -> 不是。**它永远不该
+被叫"无关"。** 把它判成无关是**错误的信息**, 会把观众的思路带偏。
 
 **事实表是唯一依据。** 不得自行新增事实表没写的关键设定。
 谜底只是帮你理解自然语言的辅助上下文, 判定依据是事实表。
@@ -979,6 +1007,7 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
 - "他对老板有意见" -> 不是
 - "今天天气怎么样" -> 无关
 - "他叫什么名字"   -> 无关
+- "歌正好四十分钟, 汤到这个时间正好做好" -> 是(**只对了一部分也是是**)
 
 索取答案或提示的, 给「无关」:
 "告诉我答案" / "答案是啥" / "给点提示" / "不会了"
@@ -2021,6 +2050,82 @@ _TOOL_COMPLETION_VERIFY = {
 
 
 # ======================================================================
+# A2: candidate=True 却判「无关」的定向重判
+# ======================================================================
+# 实播出现过:
+#
+#     solution_candidate=True
+#     verdict=无关
+#     established=[]
+#
+# 这是**语义内部矛盾**: 模型一边说"他在尝试完整解释谜底", 一边说"这跟
+# 谜底无关"。一个 concrete explanation 的判据本来是
+#
+#     如果成立 -> 是
+#     如果不成立 -> 不是
+#
+# 它不该叫「无关」。
+#
+# 为什么不能简单映射成 是/不是: 那等于**猜**。猜错方向会把观众的思路
+# 直接带反(实测踩过: 超时被回成"无关", 把观众带偏)。
+#
+# 为什么不能整条重跑 Answer: 那就是 3 次 LLM(Answer + recheck +
+# completion 复核), 而 qa_answer_timeout=8s / qa_inflight_timeout=25s
+# 的预算撑不住。所以这里用**一个窄工具**, 一次调用同时做两件事:
+#
+#     ① 把这条 concrete explanation 重新判成 是 / 不是
+#     ② 若它真的建立了 missing completion, 顺便回传那些 id
+#
+# 时延上限因此仍是: **第一层 Answer + 最多一次附加调用**。
+CANDIDATE_RECHECK_SYSTEM = """你是海龟汤直播的裁决机。上一步出现了**自相矛盾**的结果。
+
+系统收到的第一层裁决是「无关」, 但同一个回答又把这句话标成了
+**"在尝试完整解释谜底"**。这两件事不可能同时成立:
+
+- 一个**具体的剧情命题**: 如果成立 -> 是, 如果不成立 -> 不是。
+- 「无关」只留给**没有可判定剧情命题**的输入(闲聊、灌水、索取答案、
+  与故事无关)。
+
+所以你要**重新判一次**这句话, 只在 是 / 不是 里选。
+
+【判据】仍然以【事实表】为唯一依据。
+
+- 「是」: 这句话说出的 proposition 在 canonical world 中成立。
+  **即使只说对了一部分、还不足以通关、只命中 support, 也仍是「是」。**
+- 「不是」: 这句话提出了一个具体剧情判断, 但事实表否定它。
+
+【顺便做第二件事】
+如果这句话**确实**公开建立了【仍缺的通关事实】里的某几条, 一并回传
+它们的 id。判据与平时一致: 观众**自己说出**了那条 fact 的核心机制 ——
+不能因为你看得见 hidden fact 就替观众补全。
+
+【输出】只输出 verdict 与(可选的)matched_completion_fact_ids。
+**没有 solved 字段** —— 通关由系统按合同覆盖判定, 不归你负责。"""
+
+_TOOL_CANDIDATE_RECHECK = {
+    "name": "emit_candidate_recheck",
+    "description": "把一条自相矛盾(候选却判无关)的发言重新判成 是/不是",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string", "enum": ["是", "不是"],
+                "description": ("重新裁决。**只能是 是 或 不是** —— "
+                                "「无关」在这种输入上不成立。"),
+            },
+            "matched_completion_fact_ids": {
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "这条发言**自己**公开建立了哪些通关事实(只填"
+                    "【仍缺的通关事实】里列出的 id)。没有就留空数组。"),
+            },
+        },
+        "required": ["verdict"],
+    },
+}
+
+
+# ======================================================================
 @dataclass
 class RiddleResult:
     puzzle: Optional[str] = None
@@ -3030,17 +3135,33 @@ class PuzzleWriter:
                 f" ({r0.comment})" if r0.comment else "",
                 r0.touched_fact_ids, r0.solution_candidate)
 
-        # ---- v5/v6: 有通关合同 -> **绝不**调 Final Judge ----
+        # ---- A2: candidate=True 却判「无关」-> 定向重判 ----
         #
-        # 这不是"省一次调用"的优化, 是**语义**要求: v5 起的胜负由 Engine
-        # 对 established facts 做集合覆盖判定。若这里仍调 Judge 并把
-        # P.SOLVE 写回去, 就又有了一条绕开合同的通关路径 ——
-        # 观众说中一条 support 剧情也可能被判"猜中"。
+        # 这是**语义内部矛盾**, 不能原样交给观众。一个 concrete explanation
+        # 的判据是"如果成立 -> 是, 如果不成立 -> 不是", 它永远不该叫无关。
         #
-        # `solution_candidate` 保留下来, 但只作为分析指标(复盘时看
-        # 有多少人在尝试完整解谜), 不再是通关闸门。
+        # 为什么不做成"无关 -> 是"或"无关 -> 不是"的映射: 那是**猜**,
+        # 猜错方向会把观众思路直接带反。
         #
-        # ---- v6/A1: 有通关合同 -> **绝不**调 Final Judge ----
+        # 为什么不是整条重跑 Answer: 那就是 3 次 LLM, 而
+        # qa_answer_timeout=8s / qa_inflight_timeout=25s 撑不住。
+        # `_candidate_recheck` 用一个窄工具在一次调用里同时做两件事
+        # (重判 + 可选 completion match), 所以时延上限仍然是
+        # **第一层 Answer + 最多一次附加调用**。
+        #
+        # 只有真的自相矛盾才触发: status=ok + candidate=True + verdict=无关。
+        # 普通问答一次都不多调。
+        if (str(getattr(r0, "status", "") or "") == "ok"
+                and r0.solution_candidate is True
+                and r0.verdict == P.IRRELEVANT):
+            self._candidate_recheck(
+                r0, spec=spec, completion_fact_ids=completion_fact_ids,
+                room_established_fact_ids=room_established_fact_ids,
+                core_answer=core_answer, transcript=transcript,
+                user_name=user_name, text=text,
+                timeout=timeout, max_retries=max_retries)
+
+        # ---- v5/v6/A1: 有通关合同 -> **绝不**调 Final Judge ----
         #
         # 这不是"省一次调用"的优化, 是**语义**要求: v5 起的胜负由 Engine
         # 对 established facts 做集合覆盖判定。若这里仍调 Judge 并把
@@ -3104,6 +3225,119 @@ class PuzzleWriter:
                 r0.verdict = P.UNAVAILABLE
                 r0.status = "unavailable"
         return results, res.error
+
+    def _candidate_recheck(self, r0: "QAResult", *, spec: "PuzzleSpec",
+                           completion_fact_ids, room_established_fact_ids,
+                           core_answer: str, transcript: list,
+                           user_name: str, text: str,
+                           timeout: Optional[float] = None,
+                           max_retries: Optional[int] = None) -> None:
+        """A2: `candidate=True` 却判「无关」时的**定向重判**。就地改 r0。
+
+        ## 为什么必须重判
+
+        `candidate=True` 说"这句在尝试完整解释谜底", `verdict=无关` 说
+        "这句跟谜底没有可判定的关系"。两者不可能同时成立。原样交给观众
+        就是给了一条**错误信息**。
+
+        ## 它做什么 / 不做什么
+
+        **做**: 把这条 concrete explanation 重新判成 是 / 不是; 若它真的
+        建立了 missing completion, 顺便回传那些 id(交给随后的
+        `_completion_verify` 走同一套确认 —— 这里**不**直接写 established)。
+
+        **不做**: 不产生 `P.SOLVE`(胜负永远只在 Engine 的合同覆盖判定);
+        不把「无关」简单映射成某一侧(那是猜, 猜错会把观众带反)。
+
+        ## 失败时的处置
+
+        timeout / 空 tool / verdict 不合法 -> 保留原「无关」**不能要**, 因为
+        系统已经知道它是自相矛盾的结果。改成:
+
+            verdict = 未判定(P.UNAVAILABLE)
+            status  = "unavailable"
+            comment = "这句我没判稳, 再换个说法"
+
+        不建立 fact、不 solved。这与 Engine 对"未判定"的既有处理一致 ——
+        它既不计入 verdict_counts, 也不推动任何提示/通关逻辑。
+        """
+        try:
+            room = {str(x) for x in (room_established_fact_ids or [])
+                    if str(x).strip()}
+            completion = {str(x) for x in (completion_fact_ids or [])
+                          if str(x).strip()}
+            missing = completion - room
+            by_id = {f.id: f for f in (spec.facts or [])}
+            miss_txt = "\n".join(
+                f"- {fid} {by_id[fid].text}" for fid in sorted(missing)
+                if fid in by_id) or "(本题没有通关合同)"
+            tr = "\n".join(transcript[-40:]) if transcript else "(暂无)"
+            user = (
+                f"【谜面】{spec.puzzle}\n\n"
+                f"【事实表(判定依据)】\n"
+                f"{_facts_block(spec, completion_fact_ids=completion_fact_ids)}"
+                f"\n\n"
+                f"【核心答案】\n{core_answer or '(未记录)'}\n\n"
+                f"【仍缺的通关事实】\n{miss_txt}\n\n"
+                f"【之前公开问答】\n{tr}\n\n"
+                f"【当前真人发言】\n{user_name}：{text}\n\n"
+                f"【上一层的矛盾结果】\nverdict=无关, 但被标为完整答案候选。"
+            )
+            res = self.client.messages(CANDIDATE_RECHECK_SYSTEM, user,
+                                       max_tokens=300,
+                                       tool=_TOOL_CANDIDATE_RECHECK,
+                                       temperature=0,
+                                       timeout=timeout,
+                                       max_retries=max_retries)
+            ti = (_unwrap_tool_input(res.tool_input) if res.tool_input
+                  else {})
+            v = str(ti.get("verdict", "") or "").strip()
+            if v not in (P.YES, P.NO):
+                # tool 不可用 / 空返回 / 回了 无关(不在 enum 里)。
+                self._recheck_failed(r0, text,
+                                     f"verdict={v!r}" if v else "无有效返回")
+                return
+            r0.verdict = v
+            # ---- 可选: 它自己建立了哪几条 missing completion ----
+            # 只当**记录**, 不直接写 established —— 那一步交给
+            # `_completion_verify` 走同一套确认。这样"谁能推进通关"仍然
+            # 只有一条路径。
+            raw_ids = ti.get("matched_completion_fact_ids")
+            if isinstance(raw_ids, list) and missing:
+                seeded = []
+                for x in raw_ids:
+                    fid = str(x).strip()
+                    if fid and fid in missing and fid not in seeded:
+                        seeded.append(fid)
+                if seeded:
+                    # 记为第一层"提议建立"的完成事实, 让随后的
+                    # `_completion_verify` 有东西可验(它只验
+                    # direct_completion ∪ missing)。
+                    r0.established_fact_ids = self._stable_ids(
+                        seeded, reference=r0.established_fact_ids or [])
+                    log.info("候选重判补入提议 %s: %.30r", seeded, text)
+            # comment 也要换掉 —— 原来的多半是"发个 是/不是 的猜测",
+            # 而现在已经判成 是/不是 了, 留着会前后矛盾。
+            if _leaks_answer(r0.comment, spec.answer or ""):
+                r0.comment = ""
+            elif not r0.comment or r0.comment.startswith("发个"):
+                r0.comment = ""
+            log.info("候选重判: 无关 -> %s: %.30r", r0.verdict, text)
+        except Exception:                       # noqa: BLE001
+            # 这个函数的任何异常都不能把一条已经成功的裁决拖垮, 也不能
+            # 让自相矛盾的「无关」漏出去。统一走失败处置。
+            log.exception("候选重判异常, 按未判定处理")
+            self._recheck_failed(r0, text, "异常")
+
+    @staticmethod
+    def _recheck_failed(r0: "QAResult", text: str, why: str) -> None:
+        """重判失败 -> 未判定(绝不留着自相矛盾的「无关」)。"""
+        log.warning("候选重判失败(%s), 该条改判未判定: %.30r", why, text)
+        r0.verdict = P.UNAVAILABLE
+        r0.status = "unavailable"
+        r0.comment = "这句我没判稳, 再换个说法"
+        r0.established_fact_ids = []
+        r0.completion_verified_fact_ids = []
 
     def _completion_verify(self, r0: "QAResult", *, spec: "PuzzleSpec",
                            completion_fact_ids, room_established_fact_ids,
