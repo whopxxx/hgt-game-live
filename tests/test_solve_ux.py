@@ -1071,35 +1071,62 @@ def test_c6b_current_policy_field_lists_all_include_beats():
     check("**CHECK_SYSTEM 不再写'六样'(已是七样)**",
           "六样" not in _llm.CHECK_SYSTEM)
     check("CHECK_SYSTEM 写的是七样", "七样" in _llm.CHECK_SYSTEM)
-    check("**quality_checks 标题写十二项(不是四项)**",
-          "十二项" in _llm.CHECK_SYSTEM
-          and "四项**" not in _llm.CHECK_SYSTEM)
+    # H4-D1 §二: 标题改成"按题分派" —— 不再是单一数字。
+    #
+    # ⚠️ 这里**曾经**断言 "十二项" 在 CHECK_SYSTEM 里。那正是 H4-D
+    # 第一版那个 bug 的同伙: 断言一个**数字**, 于是"字段映射完全错了
+    # 但项数对得上"照样绿。现在断言的是**两套清单都被写出来**, 且
+    # curated 那套与编译侧同名 —— 语义, 不是计数。
+    check("**CHECK_SYSTEM 声明清单按题分派**",
+          "按题分派" in _llm.CHECK_SYSTEM)
+    check("CHECK_SYSTEM 写出 curated 的六条内容门",
+          all(k in _llm.CHECK_SYSTEM for k in _llm.CURATED_CONTENT_GATES),
+          _llm.CURATED_CONTENT_GATES)
+    check("**CHECK_SYSTEM 不再把 dramatic_payoff 当 curated 的门**",
+          "clear_anomaly / unique_explanation / yes_no_progress" in
+          _llm.CHECK_SYSTEM)
     # _QUALITY_CHECK_FIELDS 必须真的是十二项 —— 标题与实现不能各说各话。
     #
     # H3-D3: 契约清单是**十二项**(v8 八项 + 题型四问), 但题型四问只对
     # curated 题生效 —— 见 `_quality_check_contract`。自由生成链仍是
     # 八项, 所以这里断言的是"清单有十二项", 而不是"每次都查十二项"。
     #
-    # ⚠️ H4-D §七: curated 的**门**从十二项缩到九项 —— 题型三问降为
-    # 信号。清单本身(模型要回答什么)没变, 变的是哪几项有否决权。
+    # ⚠️ H4-D §七 / H4-D1 §二: curated 的门是**它自己的一套九项**
+    # (与编译侧同名的六条内容门 + 冷知识门 + 两条真实性)。
     check("_QUALITY_CHECK_FIELDS 确实是 12 项",
           len(_llm._QUALITY_CHECK_FIELDS) == 12,
           _llm._QUALITY_CHECK_FIELDS)
     check("**自由生成链只查前 8 项**(题型四问不适用于它)",
-          len(_llm._quality_check_contract(
-              type("S", (), {"source_type": ""})())) == 8)
-    check("**curated 链只查 9 项**(题型三问已降为信号)",
-          len(_llm._quality_check_contract(
-              type("S", (), {"source_type": "curated"})())) == 9,
           _llm._quality_check_contract(
-              type("S", (), {"source_type": "curated"})()))
-    check("**那 9 项里没有被降级的三个信号字段**",
-          not (set(_llm._CURATED_SIGNAL_FIELDS)
-               & set(_llm._quality_check_contract(
-                   type("S", (), {"source_type": "curated"})()))),
-          sorted(set(_llm._CURATED_SIGNAL_FIELDS)
-                 & set(_llm._quality_check_contract(
-                     type("S", (), {"source_type": "curated"})()))))
+              type("S", (), {"source_type": ""})())
+          == _llm._QUALITY_CHECK_FIELDS[:8])
+    # ---- H4-D1 §四: 语义断言, **不是计数断言** ----
+    #
+    # ⚠️ 这里**曾经**是 `len(...) == 9`。那不够: 它让完全错误的字段映射
+    # 也能通过(把 `dramatic_payoff` 当成 `no_external_media` 的替身,
+    # 项数一样是 9)。现在断言的是**逐字相等**。
+    _cur = _llm._quality_check_contract(
+        type("S", (), {"source_type": "curated"})())
+    check("**curated 的六条内容门与编译侧逐字相同**",
+          _llm.CURATED_CONTENT_GATES == tuple(
+              __import__("tools.curated_compiler", fromlist=["x"]
+                         ).CURATED_HARD_CHECKS),
+          _llm.CURATED_CONTENT_GATES)
+    check("**curated 门里没有 dramatic_payoff**(它已降为信号)",
+          "dramatic_payoff" not in _cur)
+    check("**curated 门里没有 reasoning_beats_nonredundant**(已降为信号)",
+          "reasoning_beats_nonredundant" not in _cur)
+    check("**curated 门里没有 concrete_anomaly 等自由生成字段**",
+          not ({"concrete_anomaly", "clue_recontextualized",
+                "core_answer_direct", "completion_contract_minimal"}
+               & set(_cur)))
+    for _k in ("livestream_safe", "no_external_media",
+               "no_external_knowledge_dependency", "narrator_truthful",
+               "mechanism_consistent"):
+        check("**硬门仍在: %s**" % _k, _k in _cur)
+    check("**那 5 个信号字段一个都不在门里**",
+          not (set(_llm._CURATED_SIGNAL_FIELDS) & set(_cur)),
+          sorted(set(_llm._CURATED_SIGNAL_FIELDS) & set(_cur)))
     # 工具 schema 的 required 必须含 beats(模型最直接遵守的那一层)
     check("_TOOL_RIDDLE.required 含 discovery_beats",
           "discovery_beats" in _llm._TOOL_RIDDLE["input_schema"]["required"],
@@ -1245,6 +1272,7 @@ def test_final_closeout_status_must_be_ok():
 # ----------------------------------------------------------------------
 def test_product_semantics_pinned():
     print("\n[语义] 四句话必须与 prompt / schema 一致")
+    from story import llm as _llm
     # 1. 谜面可以误导, 但不能撒谎
     check("RIDDLE_SYSTEM 有'陈述必须为真'",
           "陈述" in RIDDLE_SYSTEM and "为真" in RIDDLE_SYSTEM)
@@ -1275,13 +1303,41 @@ def test_product_semantics_pinned():
           "completion_fact_ids" in _TOOL_RIDDLE["input_schema"]["required"])
     check("CHECK 工具带 completion_fact_ids",
           "completion_fact_ids" in _TOOL_CHECK["input_schema"]["properties"])
-    # Reviewer 四项检查进 schema 且必填
-    qc = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
-    check("quality_checks 四项齐全",
-          set(qc["properties"]) == set(_QUALITY_CHECK_FIELDS),
-          sorted(qc["properties"]))
-    check("quality_checks 四项都必填",
-          set(qc["required"]) == set(_QUALITY_CHECK_FIELDS), qc["required"])
+    # Reviewer 的 quality_checks 进 schema 且必填。
+    #
+    # ⚠️ H4-D1 §二: `_TOOL_CHECK` 现在是个**超集**(自由生成 12 项 +
+    # curated 独有的 6 项都写在那里), 真正发给模型的那份由
+    # `check_tool(spec)` 按题裁。所以这里断言的是**裁完之后**的两份,
+    # 而不是常量本身 —— 断言常量等于断言"两边字段一样", 而那正是
+    # H4-D 第一版那个假映射的温床。
+    _free = _llm.check_tool(type("S", (), {"source_type": "ai_original"})())
+    _cur = _llm.check_tool(type("S", (), {"source_type": "curated"})())
+    _fq = _free["input_schema"]["properties"]["quality_checks"]
+    _cq = _cur["input_schema"]["properties"]["quality_checks"]
+    check("自由生成 schema: quality_checks 恰好是那 12 项",
+          set(_fq["properties"]) == set(_QUALITY_CHECK_FIELDS),
+          sorted(_fq["properties"]))
+    check("自由生成 schema: quality_checks 全部必填",
+          set(_fq["required"]) == set(_QUALITY_CHECK_FIELDS), _fq["required"])
+    check("curated schema: quality_checks 是门 9 + 信号 5",
+          set(_cq["properties"]) == (set(_llm._CURATED_HARD_CHECK_FIELDS)
+                                     | set(_llm._CURATED_SIGNAL_FIELDS)),
+          sorted(_cq["properties"]))
+    check("**curated schema: required 恰好是那 9 个门**",
+          tuple(_cq["required"]) == _llm._CURATED_HARD_CHECK_FIELDS,
+          _cq["required"])
+    check("**curated schema 不再问 concrete_anomaly 等自由生成字段**",
+          not ({"concrete_anomaly", "clue_recontextualized",
+                "core_answer_direct", "completion_contract_minimal"}
+               & set(_cq["properties"])))
+    check("**curated schema 有自己的 clear_anomaly / livestream_safe**",
+          {"clear_anomaly", "livestream_safe", "no_external_media",
+           "unique_explanation", "yes_no_progress",
+           "no_obscure_system"} <= set(_cq["properties"]))
+    check("**裁 schema 不会就地改坏 _TOOL_CHECK**",
+          set(_TOOL_CHECK["input_schema"]["properties"]
+              ["quality_checks"]["properties"]) ==
+          set(_fq["properties"]) | set(_cq["properties"]))
     check("CHECK_SYSTEM 讲了方向检查", "方向" in CHECK_SYSTEM)
     check("CHECK_SYSTEM 讲了 narrator truthfulness",
           "narrator_truthful" in CHECK_SYSTEM)
@@ -1409,17 +1465,21 @@ def test_v6_reviewer_has_minimality_rule():
     check("schema 描述含删除测试", "删除测试" in d)
     check("CHECK_SYSTEM 含 v6 段", "不得严于 core_answer" in CHECK_SYSTEM)
     check("CHECK_SYSTEM 含删除测试", "删除测试" in CHECK_SYSTEM)
-    # fail-closed 必须还在: 四项仍全部 required。
+    # fail-closed 必须还在: 自由生成那 12 项仍全部 required。
+    #
+    # ⚠️ H4-D1 §二: `_TOOL_CHECK` 的 `required` 现在是**自由生成那一套**
+    # (它同时是模块常量的默认值)。curated 题实际收到的那份由
+    # `check_tool(spec)` 裁切, required 换成 curated 的九项 —— 见上面
+    # `test_product_semantics_pinned` 里的分派断言。
     req = (_TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
            ["required"])
     # v8: 从四项扩到八项(后四项查"好不好玩"), 仍是**全部** required ——
     # fail-closed 的语义没变: 任一项不是 True 就整稿拒收。
-    # fail-closed 必须还在: 十二项仍全部 required。
     #
     # H3-D3: 题型四问并进了这次审稿调用(不再有独立的复核调用), 所以
     # required 从八项扩到十二项。**全部 required** 的语义没变: 任一项
     # 取值不对就整稿拒收。
-    check("十二项仍全部 required",
+    check("自由生成那 12 项仍全部 required",
           set(req) == {"narrator_truthful", "mechanism_consistent",
                        "core_answer_direct", "completion_contract_minimal",
                        "concrete_anomaly", "clue_recontextualized",

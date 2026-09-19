@@ -793,6 +793,18 @@ def story_gate_from_review(rev: Optional[dict]) -> list:
         out.append("not_story_reconstruction")
     if rev.get("multi_step_deduction") is False:
         out.append("no_multi_step_deduction")
+    # ---- H4-D1 §三: 这两项也降成信号 ----
+    #
+    # ⚠️ 它们**曾经是 curated 的硬门** —— H4-D 第一版把它们当成
+    # `no_external_media` / `livestream_safe` 的替身(那张假映射见
+    # `story/llm.py` 的 `_CURATED_HARD_CHECK_FIELDS`)。语义不成立, 而且
+    # `reasoning_beats_nonredundant` 就是 `multi_step_deduction` 的另一种
+    # 说法 —— 把它当门等于把刚拆掉的门装回去。现在它们回到信号的
+    # 位置: 记录、供以后排序、**不拒题**。
+    if rev.get("dramatic_payoff") is False:
+        out.append("no_dramatic_payoff")
+    if rev.get("reasoning_beats_nonredundant") is False:
+        out.append("flat_reasoning_beats")
     # ⚠️ 这一条**不是** soft —— 它是硬门, 由 `hard_check_reasons` 处理。
     # 这里**故意不报**: 一道冷知识题会同时出现在两处, 而报告里
     # "story_signal" 那一栏混进一个准入理由会让人误以为它是信号。

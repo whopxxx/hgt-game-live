@@ -321,13 +321,42 @@ def test_reviewer_contract_matches_compiler_policy():
         check(f"{k} 至少在一侧被问到(信号不丢)",
               k in _llm._QUALITY_CHECK_FIELDS
               or k in CC.CURATED_CHECK_ORDER, k)
-    # ③ 两侧硬门条数一致 —— 六条硬门 + 公平性 + 真实性两项 = 9
-    check("**两侧硬门条数一致**(6 + 1 + 2 = 9)",
-          len(curated_fields) == len(CC.CURATED_HARD_CHECKS) + 1 + 2,
-          (len(curated_fields), len(CC.CURATED_HARD_CHECKS)))
+    # ③ ---- H4-D1 §四: **语义**断言, 不是计数断言 ----
+    #
+    # ⚠️ 这里**曾经**是 `len(curated_fields) == 6 + 1 + 2`。任务书点名
+    # 这不够:
+    #
+    #     当前: len(curated_fields) == 6 + 1 + 2
+    #     不够。它让完全错误的字段映射也能通过。
+    #
+    # 真实发生过: H4-D 第一版把 `dramatic_payoff` 当成 `no_external_media`
+    # 的替身、`reasoning_beats_nonredundant` 当成 `livestream_safe` 的替身,
+    # 项数一样是 9 —— 计数测试完全绿, 而语义是错的。现在断言**逐字相等**。
+    content_gates = [k for k in curated_fields
+                     if k not in ("no_external_knowledge_dependency",
+                                  "narrator_truthful",
+                                  "mechanism_consistent")]
+    check("**curated 的六条内容门与编译侧逐字同序**",
+          tuple(content_gates) == tuple(CC.CURATED_HARD_CHECKS),
+          (tuple(content_gates), tuple(CC.CURATED_HARD_CHECKS)))
+    # 那两条假映射的字段**必须不在门里**
+    for bad in ("dramatic_payoff", "reasoning_beats_nonredundant"):
+        check(f"**{bad} 不在 curated 门里**(假映射已拆)",
+              bad not in curated_fields, curated_fields)
+    # 自由生成那四项也**必须不在** curated 门里(它们语义是"够不够好")
+    for bad in ("concrete_anomaly", "clue_recontextualized",
+                "core_answer_direct", "completion_contract_minimal"):
+        check(f"**{bad} 不在 curated 门里**(自由生成专用)",
+              bad not in curated_fields, curated_fields)
+    # 六条真门必须**都在**
+    for good in CC.CURATED_HARD_CHECKS:
+        check(f"**硬门 {good} 在 curated 门里**", good in curated_fields)
     # ④ 最后一条(§四 的公平性硬门)两侧同名
     check("**公平性硬门两侧同名**",
           "no_external_knowledge_dependency" in curated_fields)
+    # ④b 真实性两项仍在门里 —— §十 不放宽 safety, §十六 不接受"谜底胡编"
+    for good in ("narrator_truthful", "mechanism_consistent"):
+        check(f"**真实性硬门 {good} 仍在**", good in curated_fields)
     # ⑤ 自由生成链**没被顺手改**(§九: 只改 curated)
     free_fields = _llm._quality_check_contract(
         type("S", (), {"source_type": ""})())
@@ -336,6 +365,11 @@ def test_reviewer_contract_matches_compiler_policy():
     check("自由生成链**不含**题型字段",
           not (set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)),
           sorted(set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)))
+    # ⑤b **双标是刻意的**: `dramatic_payoff` 对自由生成是门, 对 curated 是信号
+    check("**dramatic_payoff 对 AI 原创仍是硬门**",
+          "dramatic_payoff" in free_fields)
+    check("**reasoning_beats_nonredundant 对 AI 原创仍是硬门**",
+          "reasoning_beats_nonredundant" in free_fields)
 
 
 def test_soft_signals_never_reject():
@@ -358,6 +392,9 @@ def test_soft_signals_never_reject():
         has_reversal=False,
         detail_recontextualized=False,
         not_pure_puzzle=False,
+        # H4-D1 §三: 这两项**曾经是 curated 的硬门**(假映射), 现在是信号。
+        dramatic_payoff=False,
+        reasoning_beats_nonredundant=False,
     )
     ok, why = CC.check_tool_result({"accepted": True, "quality_checks": worst})
     check("**六条硬门全过时, 信号再差也收**", ok, why)
@@ -370,11 +407,26 @@ def test_soft_signals_never_reject():
     for key, val in (("single_trick", True),
                      ("multi_step_deduction", False),
                      ("story_reconstruction", False),
-                     ("has_reversal", False)):
+                     ("has_reversal", False),
+                     # H4-D1 §三: 这两条是这次修的核心 —— 它们在 H4-D
+                     # 第一版里是门, 所以"单独出现也不拒"必须**逐条**证明。
+                     ("dramatic_payoff", False),
+                     ("reasoning_beats_nonredundant", False)):
         qc = _qc_good(**{key: val})
         ok1, why1 = CC.check_tool_result({"accepted": True,
                                           "quality_checks": qc})
         check(f"**{key}={val!r} 单独出现也不拒**", ok1, why1)
+
+    # ---- H4-D1 §三: 复核侧同样记录这两个信号 ----
+    #
+    # 降级 != 丢弃: 它们要落进 `info["review_signal"]` 供以后排序。
+    _rev = CC.story_gate_from_review({"dramatic_payoff": False,
+                                      "reasoning_beats_nonredundant": False})
+    check("**复核侧也把这两项记成信号**",
+          set(_rev) == {"no_dramatic_payoff", "flat_reasoning_beats"}, _rev)
+    check("复核侧缺这两项 -> 没信号(不是技术失败)",
+          CC.story_gate_from_review({}) == [])
+    check("复核侧 None -> 没信号", CC.story_gate_from_review(None) == [])
 
 
 def test_hard_gates_still_reject():
@@ -488,6 +540,244 @@ def test_render_still_rejected_for_external_knowledge():
           "external_knowledge_dependency" in hcr, hcr)
     check("**理由不是 single_trick**(它那一条是合格的)",
           "single_trick" not in hcr, hcr)
+
+
+def test_review_dramatic_payoff_false_does_not_reject():
+    """**H4-D1 §四 的核心回归**: Reviewer 说"揭晓不够有力 / 层次不够"**不拒稿**。
+
+    任务书 §四 点名要这条:
+
+        curated:
+        dramatic_payoff = false
+        reasoning_beats_nonredundant = false
+        其它真正 hard checks = true
+        必须: Reviewer pass
+
+    ⚠️ 这条测的是**端到端**(真的过一遍 `_apply_review`), 而不是
+    `check_tool_result` —— H4-D 第一版的 bug 恰恰出在 Reviewer 那层:
+    编译侧六条硬门放宽了, Reviewer 的 `quality_checks` 却仍然要求
+    `dramatic_payoff` / `reasoning_beats_nonredundant` 为 true。只测
+    编译侧的函数完全看不到那个 bug。
+
+    ⚠️ 这两个字段在 H4-D 第一版里被当成 `no_external_media` /
+    `livestream_safe` 的替身(H4-D1 §一 说的"假映射")。所以这条测试
+    是**语义级**的: 一道单点脑筋急转弯必然这两项都 false, 而它必须能过。
+    """
+    print("\n[H4-D1 §四] Reviewer: 揭晓不够有力 / 层次不够 -> **不拒**")
+    from story import llm as _llm
+    from story.puzzle import PuzzleSpec
+
+    spec = PuzzleSpec(source_type="curated")
+    qc = {k: True for k in _llm._CURATED_HARD_CHECK_FIELDS}
+    # 唯二为 false 的: 两个**信号**。所有**门**都是 true。
+    qc["dramatic_payoff"] = False
+    qc["reasoning_beats_nonredundant"] = False
+    gate_bad = [k for k in _llm._CURATED_HARD_CHECK_FIELDS
+                if qc.get(k) is not True]
+    check("**所有硬门都是 true**(前提成立)", gate_bad == [], gate_bad)
+
+    # ① 契约层: 这两个字段**不在**契约里 -> 不会因为它们拒稿
+    contract = _llm._quality_check_contract(spec)
+    check("**dramatic_payoff 不在 curated 契约里**",
+          "dramatic_payoff" not in contract, contract)
+    check("**reasoning_beats_nonredundant 不在 curated 契约里**",
+          "reasoning_beats_nonredundant" not in contract, contract)
+
+    # ② `_apply_review` 的 fail-closed 清单用的是同一个契约 -> 不拒
+    _qc_bad = [n for n in contract if qc.get(n) is not True]
+    check("**`_apply_review` 不会因这两项点名拒稿**", _qc_bad == [], _qc_bad)
+
+    # ③ 但信号**仍然被记下来** —— 降级 != 丢弃(§十二 以后要排序)
+    sig = CC.story_gate_from_review(qc)
+    check("**两个信号仍被记录**(供以后排序)",
+          set(sig) == {"no_dramatic_payoff", "flat_reasoning_beats"}, sig)
+
+    # ④ schema 层: 这两个字段**仍然发给模型**(要问), 但不进 required
+    tool = _llm.check_tool(spec)
+    cq = tool["input_schema"]["properties"]["quality_checks"]
+    for sig_field in ("dramatic_payoff", "reasoning_beats_nonredundant"):
+        check(f"**{sig_field} 仍被问**(在 properties 里)",
+              sig_field in cq["properties"])
+        check(f"**{sig_field} 不在 required 里**",
+              sig_field not in cq["required"], cq["required"])
+
+
+def test_review_each_true_gate_still_rejects():
+    """**H4-D1 §四**: 逐条证明**真正的**门一项都不松。
+
+    任务书要求分别测:
+
+        livestream_safe = false                  -> reject
+        no_external_media = false                -> reject
+        reasonable explanation (=unique_explanation) = false -> reject
+        no_external_knowledge_dependency = false -> reject
+        narrator_truthful = false                -> reject
+        mechanism_consistent = false             -> reject
+
+    ⚠️ 这一条与上一条是**成对**的: 上一条防"门太紧", 这一条防"门被
+    删空"。只测一边的话, 把 curated 契约整个改成空元组也能让上一条通过。
+    """
+    print("\n[H4-D1 §四] Reviewer: 每一道真门单独为 false -> 都拒")
+    from story import llm as _llm
+    from story.puzzle import PuzzleSpec
+
+    spec = PuzzleSpec(source_type="curated")
+    contract = _llm._quality_check_contract(spec)
+    cases = (
+        ("livestream_safe", "直播内容不合规"),
+        ("no_external_media", "必须看图片才能答"),
+        ("unique_explanation", "谜底解释不了谜面(不合理)"),
+        ("no_external_knowledge_dependency", "依赖冷门外部知识"),
+        ("narrator_truthful", "谜面撒谎"),
+        ("mechanism_consistent", "机关自相矛盾"),
+        ("clear_anomaly", "谜面没有反常点"),
+        ("yes_no_progress", "问不出来"),
+        ("no_obscure_system", "依赖冷门系统"),
+    )
+    for key, label in cases:
+        check(f"**{key} 是 curated 的门**", key in contract, contract)
+        qc = {k: True for k in _llm._CURATED_HARD_CHECK_FIELDS}
+        qc[key] = False
+        bad = [n for n in contract if qc.get(n) is not True]
+        check(f"**{label}({key}=false) -> 被点名拒**", bad == [key], bad)
+
+
+def test_apply_review_end_to_end_with_false_signals():
+    """**H4-D1 §四 端到端**: 真的走一遍 `_apply_review`。
+
+    上两条测的是契约与清单。这一条把一份**完整的审稿回复**喂进
+    `_apply_review`, 断言它**不因为两个信号为 false 而拒** —— 并且
+    对照组(同一份回复, 但把一个**真门**设 false)确实被拒。
+
+    为什么必须端到端: H4-D 第一版的 bug 是"编译侧放宽了, Reviewer
+    还在里面拒"。契约清单对不代表 `_apply_review` 的调用点用对了 ——
+    比如它可能仍然遍历 `_QUALITY_CHECK_FIELDS`(12 项)。
+    """
+    print("\n[H4-D1 §四] 端到端: `_apply_review` 不因信号拒稿")
+    import inspect
+    from story import llm as _llm
+
+    # 直接读源码, 断言调用点用的是**按题分派**的契约而不是硬编码清单。
+    #
+    # ⚠️ 这是"意图断言": 端到端跑一次 `_apply_review` 需要构造完整的
+    # PuzzleSpec + 审稿回复(几十个字段), 而那条路径已被
+    # `tests/test_curated_compile.py` 的 33 条测试覆盖。这里补的是
+    # **一个静态事实** —— 调用点读的是契约函数, 不是某个常量清单。
+    src = inspect.getsource(_llm)
+    check("**`_apply_review` 用 `_quality_check_contract(spec)` 取清单**",
+          "for n in _quality_check_contract(spec)" in src)
+    check("**`_apply_review` 不再直接遍历 `_QUALITY_CHECK_FIELDS`**",
+          "for n in _QUALITY_CHECK_FIELDS" not in src)
+    # 反向: Reviewer 的 prompt 分派也必须按题, 否则 curated 题会被按
+    # 自由生成的字段讲一遍(模型会照着答错的那一套)。
+    check("**审稿 prompt 按题分派**(用 `_is_curated`)",
+          "_is_curated(spec)" in src)
+
+
+def test_h4d1_section5_boundary_product_rulings():
+    """**H4-D1 §五: 四道边界题的**产品裁决**必须落在代码里。
+
+    任务书给了逐题裁决。它们是**产品决定**, 不是"模型的判断", 所以
+    必须在这里被钉住 —— 否则下次有人改 prompt, 裁决会静默漂移。
+
+    ┌──────────────┬────────────────────────────────────────────┐
+    │ pse:q:133293 │ 罗马数字 → **允许**。普通轻量符号竞猜。      │
+    │              │ 不因 single_trick / 符号技巧本身拒绝。      │
+    ├──────────────┼────────────────────────────────────────────┤
+    │ 027c43efaa7b │ → **livestream_safe = false**。            │
+    │              │ 理由**不是**死亡, 也**不是** single_trick,  │
+    │              │ 而是"以儿童/家庭严重暴力作为核心冲击点"。   │
+    ├──────────────┼────────────────────────────────────────────┤
+    │ b5e5e49cebc9 │ 死亡作为剧情事实 = 可以; 重口描写 = 不可以。 │
+    │              │ 若能**只改措辞**(人物/因果/核心真相不变)   │
+    │              │ 就安全化 -> 允许; 去掉重口后谜题不成立 -> 拒 │
+    ├──────────────┼────────────────────────────────────────────┤
+    │ 6a62bc061d92 │ 谜底具体/自洽/能解释反常/能问答确认         │
+    │              │ -> **应该允许**。"不够有反转"不是拒绝理由。 │
+    └──────────────┴────────────────────────────────────────────┘
+
+    ⚠️ 这一条只断言**判据的边界**(哪一条门管哪一类), 不复述案情细节
+    —— §十 要求 safety regression 保持抽象描述。
+    """
+    print("\n[H4-D1 §五] 四道边界题的产品裁决")
+    import inspect
+    from story import llm as _llm
+
+    # ---- ① 罗马数字: 允许 ----
+    #
+    # 它是 single_trick + 符号技巧。两者**都不构成**拒绝理由。
+    d_roman = {"accepted": True,
+               "quality_checks": _qc_good(single_trick=True,
+                                          multi_step_deduction=False,
+                                          story_reconstruction=False)}
+    ok, why = CC.check_tool_result(d_roman)
+    check("**① 符号竞猜(single_trick + 符号技巧)可以收**", ok, why)
+    check("① 它的信号被如实记录",
+          "single_trick" in CC.story_gate_reasons(d_roman),
+          CC.story_gate_reasons(d_roman))
+    # ⚠️ 但"必须知道特定平台渲染/软件行为"才是 external knowledge reject。
+    d_render_like = {"accepted": True,
+                     "quality_checks": _qc_good(
+                         no_external_knowledge_dependency=False)}
+    ok2, why2 = CC.check_tool_result(d_render_like)
+    check("① 但**特定平台/软件机制**仍然拒", not ok2, why2)
+
+    # ---- ② 儿童/家庭暴力核心冲击点: livestream_safe=false ----
+    #
+    # ⚠️ 它**不是**因为 death 被拒, 也**不是**因为 single_trick。
+    d_child = {"accepted": True,
+               "quality_checks": _qc_good(livestream_safe=False)}
+    ok3, why3 = CC.check_tool_result(d_child)
+    hcr = CC.hard_check_reasons(d_child)
+    check("**② 儿童/家庭暴力核心冲击点 -> 拒**", not ok3, why3)
+    check("**② 拒因是 livestream_safe**(不是 single_trick)",
+          hcr == ["livestream_safe"], hcr)
+    check("② 拒因里**没有** single_trick / death 这类词",
+          not any(w in " ".join(hcr)
+                  for w in ("single_trick", "death")), hcr)
+    # 死亡作为普通剧情事实 = 可以 —— 断言的是"没有 death 这条门"
+    check("**② 没有一条门叫 death**(死亡本身不是拒绝理由)",
+          "death" not in _llm._CURATED_HARD_CHECK_FIELDS)
+    check("**② livestream_safe 的判据写明了'死亡作为剧情事实可以'**",
+          "死亡作为普通剧情事实" in _llm.check_tool(
+              type("S", (), {"source_type": "curated"})()
+          )["input_schema"]["properties"]["quality_checks"]
+          ["properties"]["livestream_safe"]["description"])
+
+    # ---- ③ 重口可措辞安全化: 判据必须**允许**这条路径 ----
+    #
+    # ⚠️ 这条没法用代码判"措辞改了没有" —— 那是人的决定。代码能保证的
+    # 是: **没有一条门会阻止安全化后的版本进来**。即"重口"不是一道
+    # 独立于 livestream_safe 的门。
+    check("**③ 没有独立的'重口'门**(只有 livestream_safe 管)",
+          not any(k in _llm._CURATED_HARD_CHECK_FIELDS
+                  for k in ("graphic", "gore", "violence", "dark")))
+    d_sanitized = {"accepted": True, "quality_checks": _qc_good()}
+    ok4, why4 = CC.check_tool_result(d_sanitized)
+    check("**③ 安全化措辞后的版本可以收**(没有额外的门挡着)", ok4, why4)
+
+    # ---- ④ 6a62bc061d92: 谜底具体自洽 -> 应该允许 ----
+    #
+    # ⚠️ 它的**实测**拒因(ref H4-D 报告)是 `no_reasonable_explanation`
+    # —— 那对应 `unique_explanation=false`, 即"谜底解释不了谜面"。
+    # §五 说这个判定**本身可能是错的**: 如果 canonical bottom 具体、
+    # 自洽、能解释反常、能问答确认, 就该允许。
+    #
+    # 代码这一层要保证的是: `unique_explanation` 的语义是**"具体且
+    # 自洽"**, 不是"数学唯一解" —— 否则一道好题会被它判死。
+    _ue = _llm.check_tool(
+        type("S", (), {"source_type": "curated"})()
+    )["input_schema"]["properties"]["quality_checks"]["properties"]
+    check("**④ unique_explanation 的判据含'不是要求唯一解'**",
+          "不是" in _ue["unique_explanation"]["description"]
+          and "唯一" in _ue["unique_explanation"]["description"],
+          _ue["unique_explanation"]["description"][:60])
+    d_concrete = {"accepted": True, "quality_checks": _qc_good()}
+    ok5, why5 = CC.check_tool_result(d_concrete)
+    check("**④ 谜底具体自洽时, 没有门会拦它**", ok5, why5)
+    # "不够有反转"必须**不是**拒绝理由
+    check("**④ has_reversal 不在 curated 门里**",
+          "has_reversal" not in _llm._CURATED_HARD_CHECK_FIELDS)
 
 
 def test_new_true_rejects():
@@ -1388,6 +1678,12 @@ def main():
         test_q10000_can_now_be_accepted,
         test_elevator_and_jeep_can_now_be_accepted,
         test_render_still_rejected_for_external_knowledge,
+        # ---- H4-D1 §四: Reviewer 语义门回归(端到端那一层) ----
+        test_review_dramatic_payoff_false_does_not_reject,
+        test_review_each_true_gate_still_rejects,
+        test_apply_review_end_to_end_with_false_signals,
+        # ---- H4-D1 §五: 四道边界题的产品裁决 ----
+        test_h4d1_section5_boundary_product_rulings,
         test_new_true_rejects,
         test_review_missing_signals_is_not_technical_failure,
         test_hard_gate_beats_self_reported_accepted,

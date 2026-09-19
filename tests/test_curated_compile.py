@@ -174,26 +174,31 @@ def _writer(results, **kw):
 
 
 def _qc_v8(**kw):
-    """`_apply_review` 要求的十二项(curated 走过的门)。
+    """审稿回复的 `quality_checks` —— **curated 题走过的那一套**。
 
-    注意有两层判据, 是**不同**的:
-        curated 十三条  -> H2-B/H3 的"这题适不适合搬进直播"(编译期 ACCEPT/REJECT)
-        十二项          -> `_apply_review` 对**任何** spec 的交付门
-                            (narrator_truthful / … / 题型四问)
-    curated 题同样要过后者 —— 它复用同一套审稿人, 不是旁路。
+    ⚠️ H4-D1 §二: curated 的门**不再是** `concrete_anomaly` /
+    `dramatic_payoff` 那六项(那是 H4-D 第一版的假映射, 见
+    `story.llm._CURATED_HARD_CHECK_FIELDS`), 而是与编译侧**同名**的
+    六条内容门 + 冷知识门 + 两条真实性, 共九项。
 
-    ⚠️ H3-D3 起, 后四项(题型四问)也在 `_apply_review` 的 fail-closed
-    清单里 —— 因为 `story_review` 那次**独立调用已被并进审稿**(§一-2)。
-    所以这里的默认必须带上它们, 否则每一稿都会卡在
-    "quality_checks 未全过(story_reconstruction, …)"。
+    ⚠️ 这份 fixture 必须与 `story.llm._CURATED_HARD_CHECK_FIELDS`
+    **逐字一致** —— 少一项, `_apply_review` 会因为"缺字段"拒稿, 而这
+    正是 H4-D1 之前 12 条测试同时红掉的原因。测试
+    `test_curated_reviewer_contract_is_semantically_honest` 守这条。
+
+    信号五项(`dramatic_payoff` / `reasoning_beats_nonredundant` /
+    `story_reconstruction` / `multi_step_deduction` / `single_trick`)
+    **也给**, 因为真实回复会给; 但它们是信号, 取任何值都不拒稿。
     """
-    d = {"narrator_truthful": True, "mechanism_consistent": True,
-         "core_answer_direct": True, "completion_contract_minimal": True,
-         "concrete_anomaly": True, "clue_recontextualized": True,
+    d = {"clear_anomaly": True, "unique_explanation": True,
+         "yes_no_progress": True, "no_obscure_system": True,
+         "no_external_media": True, "livestream_safe": True,
+         "no_external_knowledge_dependency": True,
+         "narrator_truthful": True, "mechanism_consistent": True,
+         # ---- 信号(给全, 但取什么都不影响准入) ----
          "dramatic_payoff": True, "reasoning_beats_nonredundant": True,
-         # H3-D3: 题型四问(同一次审稿回复里的附带字段)。
          "story_reconstruction": True, "multi_step_deduction": True,
-         "single_trick": False, "no_external_knowledge_dependency": True}
+         "single_trick": False}
     d.update(kw)
     return d
 
