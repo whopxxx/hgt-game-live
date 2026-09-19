@@ -1297,7 +1297,7 @@ def test_v6_versions_bumped():
     check("QUALITY_POLICY_VERSION == quality-v7",
           QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION == riddle-v7",
-          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
+          RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v7",
           CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION == answer-v6",

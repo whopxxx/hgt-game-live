@@ -2026,9 +2026,247 @@ def test_old_records_without_provenance_still_load():
     check("脏 usage 被忽略而不是抛", dirty.usage is None, dirty.usage)
 
 
+
+# ======================================================================
+# G3 —— 不要生成"已经知道必死"的稿子
+# ======================================================================
+def _g3_sig(fam="rule_constraint", shape="social_constraint",
+            reveal="straight_explanation", proc=True, emo="tense"):
+    from story.puzzle import PuzzleSignature
+    return PuzzleSignature(mechanism_family=fam, solution_shape=shape,
+                           domain="workplace", relation="colleague",
+                           emotion_mode=emo, time_shape="instant",
+                           reveal_mode=reveal,
+                           procedural_rule_dependency=proc)
+
+
+def test_g3_saturated_constraints_mirror_the_gate():
+    """**G3**: 饱和约束必须与 cross gate **同源**。
+
+    这是本步的核心不变量。若 prompt 说"可以"而 gate 说"不行", 就正好
+    复现实播里"同一个方向连烧 4 稿"的故障 —— 而且更糟: 模型是**照着
+    我们的指示**写了一个必被拒的稿。
+
+    所以这里逐条对照: 约束说禁的, gate 必须真的拒。
+    """
+    print("\n[G3-A] 饱和约束与 cross gate 同源")
+    from story.quality import (saturated_constraints, describe_constraints,
+                               check_signature, Quotas)
+    q = Quotas()
+    # 窗口里一道"主要靠制度成立"的题
+    recent = [_g3_sig()]
+    con = saturated_constraints(recent, q)
+    check("**procedural 已满 -> 本次 MUST false**",
+          con["procedural_rule_dependency"] is False, con)
+    check("straight_explanation 进禁用表",
+          "straight_explanation" in con["forbidden_reveal_modes"], con)
+    check("recent_pairs 记下了那个 pair",
+          ("rule_constraint", "social_constraint") in con["recent_pairs"], con)
+    # ---- 同源验证: 约束说的每一条, gate 都真的拒 ----
+    bad_proc = _g3_sig(fam="rule_constraint", shape="rule_constraint",
+                       reveal="meaning_flip", proc=True)
+    why = check_signature(bad_proc, recent, q)
+    check("**gate 确实拒 procedural(约束没撒谎)**", bool(why), why)
+    bad_straight = _g3_sig(fam="hidden_function",
+                           shape="hidden_function_explains_behavior",
+                           reveal="straight_explanation", proc=False)
+    why2 = check_signature(bad_straight, recent, q)
+    check("**gate 确实拒 straight_explanation**", bool(why2), why2)
+    # ---- 反方向: 约束**没**禁的, gate 不该拒 ----
+    ok_sig = _g3_sig(fam="hidden_function",
+                     shape="hidden_function_explains_behavior",
+                     reveal="meaning_flip", proc=False, emo="neutral")
+    why3 = check_signature(ok_sig, recent, q)
+    check("**约束没禁的方向 gate 放行(不过度封锁)**", not why3, why3)
+
+
+def test_g3_no_constraints_on_empty_recent():
+    """第一题没有跨题约束 —— 不该凭空生成一段禁令。"""
+    print("\n[G3-B] 空窗口 -> 无约束")
+    from story.quality import (saturated_constraints, describe_constraints,
+                               Quotas)
+    con = saturated_constraints([], Quotas())
+    check("procedural 不限(None)", con["procedural_rule_dependency"] is None,
+          con)
+    check("没有禁用 reveal", con["forbidden_reveal_modes"] == [], con)
+    check("**没有约束时不输出废话段**", describe_constraints(con) == "",
+          describe_constraints(con))
+
+
+def test_g3_describe_is_actionable():
+    """约束文本必须**可操作** —— 说清"为什么会被拒"而不只是"不许"。"""
+    print("\n[G3-C] 约束文案可操作")
+    from story.quality import saturated_constraints, describe_constraints, Quotas
+    con = saturated_constraints([_g3_sig()], Quotas())
+    txt = describe_constraints(con)
+    check("提到 procedural", "procedural_rule_dependency" in txt, txt[:200])
+    check("**说明了会被跨题门拒(而不只是'不许')**",
+          "跨题门" in txt, txt[:200])
+    check("列出了要避开的 reveal 结构", "straight_explanation" in txt,
+          txt[:200])
+    check("列出了要避开的 pair", "rule_constraint/social_constraint" in txt,
+          txt[:300])
+
+
+def test_g3_rule_heavy_families_deprioritized_when_quota_full():
+    """**G3**: procedural 满桶后, rule-heavy family 被降权。
+
+    不是"永久禁" —— 题目本身没问题, 只是分布上不理想。所以保留
+    fallback 能力, 同时让别的 family 在正常情形下稳定胜出。
+    """
+    print("\n[G3-D] procedural 满桶 -> rule-heavy 降权")
+    from story.quality import family_headroom, Quotas
+    q = Quotas()
+    empty = family_headroom(q, [])
+    full = family_headroom(q, [_g3_sig()])
+    for fam in ("rule_constraint", "social_rule"):
+        check(f"{fam}: 满桶后被降权",
+              full[fam] < empty[fam], (full[fam], empty[fam]))
+    # 非 rule-heavy 的 family 不受影响(除了它们自己的 LRU 计数)
+    check("hidden_function 不被这条规则影响",
+          abs(full["hidden_function"] - empty["hidden_function"]) < 1e-9,
+          (full["hidden_function"], empty["hidden_function"]))
+
+
+def test_g3_rule_heavy_still_selectable_as_fallback():
+    """**G3 边界**: 降权 ≠ 禁止 —— 整个空间真堵死时仍能选它。"""
+    print("\n[G3-E] 降权不等于禁止(保留 fallback)")
+    from story.quality import family_headroom, Quotas, PROCEDURAL_LEANING_FAMILIES
+    q = Quotas()
+    full = family_headroom(q, [_g3_sig()])
+    for fam in PROCEDURAL_LEANING_FAMILIES:
+        check(f"{fam} 权重仍 > 0(还能被选中)", full[fam] > 0, full[fam])
+
+
+def test_g3_puzzle_scheduler_never_picks_blocked_pair():
+    """**G3**: 调度器不再主动选一个"生成前就必死"的 pair。
+
+    实播: recent 里已有 rule_constraint/social_constraint, 而调度器
+    仍然选它 -> 第 1/2/4 稿全被 cross gate 以结构重复拒掉。
+    """
+    print("\n[G3-F] 调度器避开必死 pair")
+    import random
+    from story.quality import choose_blueprint, Quotas, FAMILY_SHAPES
+    from story.puzzle import MECHANISM_FAMILIES
+    q = Quotas()
+    recent = [_g3_sig()]
+    blocked = ("rule_constraint", "social_constraint")
+    hits = 0
+    for seed in range(200):
+        bp = choose_blueprint(recent, rng=random.Random(seed), quotas=q)
+        if (bp.mechanism_family, bp.solution_shape) == blocked:
+            hits += 1
+    check("**200 个种子一次都没选中被禁的 pair**", hits == 0, hits)
+
+
+def test_g3_constraints_reach_the_generator_prompt():
+    """**G3**: 约束真的进了 Generator 的 prompt(否则它就是死代码)。"""
+    print("\n[G3-G] 约束进 prompt")
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    import test_llm as T
+    from story.llm import PuzzleWriter, LLMResult
+    from story.quality import saturated_constraints, Quotas
+    recent = [_g3_sig()]
+    fc = T.FakeClient([
+        LLMResult(tool_input=T.riddle(), model="m"),
+        LLMResult(tool_input=T.review_ok(), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    con = saturated_constraints(recent, Quotas())
+    w._gen_spec_once(avoid=[], blueprint=fc.default_blueprint,
+                     enforce_blueprint=True, constraints=con)
+    user = fc.calls[0]["user"]
+    check("**prompt 里有硬约束段**", "本次生成的硬约束" in user, user[:300])
+    check("**prompt 里点名 procedural 必须 false**",
+          "procedural_rule_dependency" in user, user[:400])
+    check("prompt 里列出了要避开的 pair",
+          "rule_constraint/social_constraint" in user, user[:600])
+    # 空约束 -> prompt 里不该出现那一段(不输出废话)
+    fc2 = T.FakeClient([LLMResult(tool_input=T.riddle(), model="m")])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    w2._gen_spec_once(avoid=[], blueprint=fc2.default_blueprint,
+                      enforce_blueprint=True, constraints={})
+    check("**空约束不产生废段落**",
+          "本次生成的硬约束" not in fc2.calls[0]["user"],
+          fc2.calls[0]["user"][:300])
+
+
+def test_g3_gen_spec_actually_computes_and_injects_constraints():
+    """**G3 接线**: `gen_spec` 自己算约束并注入 —— 不是只测 `_gen_spec_once`。
+
+    ⚠️ 这条与 G3-G 是**两件事**, 缺一不可:
+
+        G3-G   `_gen_spec_once(constraints=...)` 会不会把它写进 prompt
+        本条   `gen_spec` 到底**有没有算**并把它传下去
+
+    只测前者的话, 把 `gen_spec` 里那一行删掉(约束永远为空)不会有任何
+    测试变红 —— 谓词/函数全都测得很全, 但生产路径上根本没接线。
+    这正是 G1 里"删掉传参那一行不红"的同一个教训。
+    """
+    print("[G3-G2] gen_spec 真的算并注入约束\")")
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    import test_llm as T
+    from story.llm import PuzzleWriter, LLMResult
+    recent = [_g3_sig()]
+    fc = T.FakeClient([
+        LLMResult(tool_input=T.riddle(), model="m"),
+        LLMResult(tool_input=T.review_ok(), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.gen_spec(blueprint=fc.default_blueprint, recent=recent)
+    user = fc.calls[0]["user"]
+    check("**走 gen_spec 也带上了硬约束段**",
+          "本次生成的硬约束" in user, user[:300])
+    check("**点名 procedural 必须 false**",
+          "procedural_rule_dependency" in user, user[:400])
+    # 空 recent -> 不该出现那一段
+    fc2 = T.FakeClient([
+        LLMResult(tool_input=T.riddle(), model="m"),
+        LLMResult(tool_input=T.review_ok(), model="m"),
+    ])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    w2.gen_spec(blueprint=fc2.default_blueprint, recent=[])
+    check("空 recent 不产生硬约束段",
+          "本次生成的硬约束" not in fc2.calls[0]["user"],
+          fc2.calls[0]["user"][:300])
+
+
+def test_g3_riddle_version_bumped_but_policy_unchanged():
+    """**G3**: riddle prompt 升 v9, 但 **quality policy 保持 v8**。
+
+    这一条特别重要: 若把 policy 一起 bump, 盘上所有 v8 库存会被池门
+    隔离 —— 等于凭空清空题池。而 G3 改变的是"如何更少产出必死 draft",
+    最终接受标准没变。
+    """
+    print("\n[G3-H] 版本: riddle-v9 / policy 仍 v8")
+    from story.llm import (RIDDLE_PROMPT_VERSION, CHECK_PROMPT_VERSION,
+                           ANSWER_PROMPT_VERSION)
+    from story.quality import QUALITY_POLICY_VERSION
+    check("RIDDLE_PROMPT_VERSION = riddle-v9",
+          RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
+    check("**QUALITY_POLICY_VERSION 仍是 quality-v8**",
+          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
+    check("CHECK_PROMPT_VERSION 不动",
+          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
+    check("ANSWER_PROMPT_VERSION 不动",
+          ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
+
+
 def main():
     tests = [
         test_spec_roundtrip,
+        # ---- G3: 动态生成约束 ----
+        test_g3_saturated_constraints_mirror_the_gate,
+        test_g3_no_constraints_on_empty_recent,
+        test_g3_describe_is_actionable,
+        test_g3_rule_heavy_families_deprioritized_when_quota_full,
+        test_g3_rule_heavy_still_selectable_as_fallback,
+        test_g3_puzzle_scheduler_never_picks_blocked_pair,
+        test_g3_constraints_reach_the_generator_prompt,
+        test_g3_gen_spec_actually_computes_and_injects_constraints,
+        test_g3_riddle_version_bumped_but_policy_unchanged,
         # ---- v5: 通关合同 ----
         test_v5_completion_contract_roundtrip,
         test_v5_old_archive_reads_as_no_contract,

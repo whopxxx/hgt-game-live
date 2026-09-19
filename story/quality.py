@@ -992,6 +992,24 @@ def is_structurally_duplicate(sig: PuzzleSignature, recent: Optional[list],
 #: 不是合法 family, 从它选出来的 blueprint 会被 validate_blueprint 直接毙掉
 #: —— 那条路是死的。"创伤 + 长年怪规矩"是一种 **shape+flag 组合**
 #: (`past_trauma_explains_current_ritual`), 由 QUOTA_SHAPE_FLAGS 表达。
+#: ---- G3: 哪些 mechanism_family **天然倾向**于靠"制度/规矩/流程"成立 ----
+#:
+#: 这不是"禁止"清单, 只是**调度降权**用的先验: 当 `procedural_rule`
+#: 配额已经满时, 从这些 family 里选出"主要靠制度成立"的题的概率最高,
+#: 而那样的题会被 cross gate 拒。
+#:
+#: 为什么是"优先从别处选"而不是"永久禁掉": 这些 family 本身完全合法,
+#: 而且 rule_constraint / social_rule 覆盖了大量真实题材。真正的问题
+#: 只是"配额满了还往那个方向撞"。所以:
+#:
+#:     还有别的合法 family -> 不选这些
+#:     整个候选空间都堵死 -> 允许 fallback, 并打 warning
+#:
+#: 最终 cross gate 仍然负责拒(defense-in-depth 保留)。
+PROCEDURAL_LEANING_FAMILIES = frozenset({
+    "rule_constraint", "social_rule",
+})
+
 FAMILY_SHAPES = {
     "information_gap": ("information_advantage", "identity_reversal"),
     "hidden_function": ("hidden_function_explains_behavior",
@@ -1080,13 +1098,36 @@ def family_headroom(quotas: Quotas, recent: Optional[list]) -> dict:
             last_seen[s.mechanism_family] = i
     counts = Counter(s.mechanism_family for s in rs if s.mechanism_family)
 
+    # ---- G3: procedural 配额已满 -> 天然倾向制度的 family 降权 ----
+    #
+    # 实播日志里最贵的一种浪费:
+    #
+    #     procedural quota 已经 1/1
+    #       ↓ 调度器仍然选 rule_constraint/social_rule
+    #       ↓ 模型写出"主要靠制度成立"的题
+    #       ↓ cross gate 以'主要靠制度性设定成立'拒掉
+    #       ↓ 下一稿又一样
+    #
+    # 最终 gate 照旧兜底, 但**不该由它当第一道防线**。
+    #
+    # ⚠️ 降权(×0.15)而不是清零: 清零会让"整个候选空间只剩这两个
+    # family 合法"时直接退化到兜底路径, 而那本来是可以正常出题的
+    # 情形(题目本身没问题, 只是分布上不理想)。降权保留 fallback
+    # 能力, 同时让别的 family 在正常情形下稳定胜出。
+    _procedural_full = bool(
+        rs and sum(1 for s in rs if s.procedural_rule_dependency)
+        >= quotas.procedural_rule)
+
     out = {}
     for fam in FAMILY_SHAPES:
         age = last_seen.get(fam, -1)
         # age = -1: 最近窗口里从没出现 -> 最优先
         base = 2.0 + 1.0 / n if age < 0 else 1.0 + (n - age) / n
         # 出现次数越少越好(与 age 正交: age 看"多久没见", count 看"见了几次")
-        out[fam] = base / (1.0 + counts.get(fam, 0))
+        w = base / (1.0 + counts.get(fam, 0))
+        if _procedural_full and fam in PROCEDURAL_LEANING_FAMILIES:
+            w *= 0.15
+        out[fam] = w
     return out
 
 
@@ -1569,6 +1610,116 @@ def signature_of(bp: PuzzleBlueprint) -> PuzzleSignature:
         death=bp.death, past_trauma=bp.past_trauma,
         long_term_profession=bp.long_term_profession,
         repeated_ritual=bp.repeated_ritual)
+
+
+# ======================================================================
+# 5.6 G3: 动态生成约束(告诉生成器"这个方向已经满了")
+# ======================================================================
+#: 已经被 quota 占满、本次生成**必须避开**的方向。这是给 Generator 的
+#: **输入**, 不是给 Reviewer 的跨题职责 —— Reviewer 仍然只审单题。
+#
+#: ## 为什么要有它
+#:
+#: 实播日志里的固定形状:
+#:
+#:     procedural quota 已经 1/1
+#:       ↓ 模型继续生成 procedural
+#:       ↓ cross gate reject
+#:       ↓ 下一稿又 procedural
+#:       ↓ 再 reject
+#:
+#: 最终 gate **必须保留**(它是 defense-in-depth), 但它不该当**第一道**
+#: 防线 —— 让模型去写一个"我们早就知道必被拒"的方向, 是纯浪费。
+#:
+#: ## 与 cross gate 的关系
+#:
+#: 两者不是二选一, 而是"事前告知 + 事后兜底":
+#:
+#:     gen_spec 开始 -> 算出饱和约束 -> 注入 prompt   (本函数, 事前)
+#:     cross_puzzle_gate                            (事后, 保留)
+#:
+#: 判据**同源**(都从 `signature_counts` 读), 所以两侧不会漂移。
+
+
+def saturated_constraints(recent: Optional[list],
+                          quotas: Optional[Quotas] = None) -> dict:
+    """算出"本次生成必须避开"的方向, 供 prompt 注入。
+
+    返回的 dict 里每一项都是**可读的硬约束**, 空 = 不限:
+
+        {"procedural_rule_dependency": False,   # 已满 -> 本次 MUST false
+         "forbidden_reveal_modes": [...],        # 已满的 reveal 结构
+         "straight_explanation_full": bool,      # 便捷标志(与上面重叠)
+         "recent_pairs": [(fam, shape), ...]}    # 窗口内已用过的结构对
+
+    ⚠️ 判据必须与 `check_signature` **完全一致**, 否则会出现"prompt 说
+    可以、gate 说不行"(那正是实播里跨题重复被拒 4 稿的成因)。所以这里
+    逐条对着 `check_signature` 的判据写, 并且**只收紧不放松**:
+    多告诉模型一条禁令最多让它换个方向, 少告诉一条就是白烧一稿。
+
+    `recent` 为空 -> 什么也不限(第一题本来就没有跨题约束)。
+    """
+    q = quotas or Quotas()
+    rs = _recent(recent, q.window)
+    c = signature_counts(recent, q.window)
+    out: dict = {
+        "procedural_rule_dependency": None,     # None = 不限
+        "forbidden_reveal_modes": [],
+        "straight_explanation_full": False,
+        "recent_pairs": sorted(recent_pairs(recent, q.window)),
+    }
+    if not rs:
+        return out
+    # ---- procedural: 已满 -> 本次必须 false ----
+    if c.get("procedural_rule", 0) >= q.procedural_rule:
+        out["procedural_rule_dependency"] = False
+    # ---- straight_explanation 已满 -> 该 reveal 结构禁用 ----
+    if c.get("reveal:straight_explanation", 0) >= q.straight_explanation:
+        out["straight_explanation_full"] = True
+        out["forbidden_reveal_modes"].append("straight_explanation")
+    # ---- 其它已经到"同 reveal 模式上限"的 ----
+    # `same_reveal_mode` 是**所有** reveal 模式共用的计数上限, 所以这里
+    # 逐模式查一遍 —— 到顶的那些都不能再选。
+    for mode in REVEAL_MODES:
+        if not mode:
+            continue
+        if c.get(f"reveal:{mode}", 0) >= q.same_reveal_mode:
+            if mode not in out["forbidden_reveal_modes"]:
+                out["forbidden_reveal_modes"].append(mode)
+    out["forbidden_reveal_modes"] = sorted(out["forbidden_reveal_modes"])
+    return out
+
+
+def describe_constraints(con: dict) -> str:
+    """把 `saturated_constraints()` 的结果写成给生成器的**硬约束**段落。
+
+    没有约束时返回空字符串 —— **不要**输出一段"没有任何限制"的废话:
+    那只会稀释 prompt 里真正的约束。
+    """
+    if not con:
+        return ""
+    lines: list = []
+    if con.get("procedural_rule_dependency") is False:
+        lines.append(
+            "- `procedural_rule_dependency` **必须为 false**。"
+            "最近窗口里'主要靠制度/规矩/流程才能成立'的题已经到上限了, "
+            "再出一道会被跨题门拒掉 —— 那不是题不好, 是分布满了。")
+    fbm = list(con.get("forbidden_reveal_modes") or [])
+    if fbm:
+        lines.append(
+            "- 本题的揭晓结构**不得**是: " + " / ".join(fbm)
+            + "。它们已经在最近窗口里用满了, 再选会被跨题门拒掉。"
+            "请换一种**揭晓时重新解释谜面**的方式。")
+    pairs = list(con.get("recent_pairs") or [])
+    if pairs:
+        shown = ", ".join(f"{a}/{b}" for a, b in pairs[:6])
+        lines.append(
+            f"- 最近窗口里已经用过这些 (机制/解法) 组合: {shown}。"
+            f"**不要**再选其中任何一个 —— 结构重复会被跨题门拒掉。")
+    if not lines:
+        return ""
+    return ("\n\n【本次生成的硬约束(违反会被跨题门拒掉, 白烧一稿)】\n"
+            + "\n".join(lines))
 
 
 def choose_blueprint(recent: Optional[list],

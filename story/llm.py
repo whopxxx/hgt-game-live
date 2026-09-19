@@ -41,6 +41,8 @@ from .quality import (
     ngrams, too_similar, validate_blueprint, validate_reveal_adherence,
     validate_spec,
     _PUZZLE_TOUCH_MARK,
+    describe_constraints,
+    saturated_constraints,
 )
 from .state import QAResult
 
@@ -871,7 +873,20 @@ class AnthropicMessagesClient:
 # 提示词版本号(方案 §55) —— 写进 archive, 下一轮直播才能比较版本效果。
 # 改 prompt 就**必须**动这里, 否则复盘时分不清是哪一版的成绩。
 # ======================================================================
-RIDDLE_PROMPT_VERSION = "riddle-v8"
+#: ---- G3: riddle-v8 -> riddle-v9 ----
+#:
+#: 这一步改变了 Generator **收到的动态约束**(饱和方向的硬约束段)。
+#: 所以 prompt 版本必须动, 否则复盘时分不清一稿成功率的变化是哪来的。
+#:
+#: ⚠️ `QUALITY_POLICY_VERSION` **保持 quality-v8**, `CHECK_PROMPT_VERSION`
+#: 也不动, `spec_version` 不动:
+#:
+#:     最终接受标准没有改变。改的只是"如何更少地产出**必死**的 draft"。
+#:
+#: 因此**现有 quality-v8 池不 quarantine** —— 那些题仍然是合格的,
+#: 只是它们是被旧 prompt 生成出来的。若把 policy 版本一起 bump, 盘上
+#: 的 v8 库存会全部被池门隔离, 等于凭空清空题池。
+RIDDLE_PROMPT_VERSION = "riddle-v9"
 CHECK_PROMPT_VERSION = "check-v8"
 #: ---- G2-F: 审稿技术失败重试时的 max_tokens ----
 #:
@@ -2857,6 +2872,13 @@ class PuzzleWriter:
             enforce_blueprint = blueprint is not None
         bp = blueprint or PuzzleBlueprint()
 
+        # ---- G3: quota 只读一次, 供动态约束与跨题门**同源**使用 ----
+        # 两处若各读一次 Config, 配置在出题过程中被改(热重载/测试替身)
+        # 就会出现"prompt 说可以、gate 说不行"。读一次传下去。
+        _rcfg0 = self._cfg()
+        rcfg_quotas = (Quotas.from_config(_rcfg0)
+                       if _rcfg0 is not None else None)
+
         while attempts < (max_attempts if check else 1) and guard < 8:
             guard += 1
             if _t.monotonic() - t0 > budget_s:
@@ -2881,9 +2903,15 @@ class PuzzleWriter:
                           f"连续 {no_draft_count} 次未形成有效稿件")
                 break
             reject_why = "\n".join(f"- {w}" for w in seen_why)
+            # ---- G3: 每稿都重算动态约束 ----
+            # 放在循环**内部**而不是开头算一次: 一稿被拒之后 `bad` 变了,
+            # 而且将来若 recent 在稿与稿之间变化(prefetch 与 live 交替
+            # 写池), 约束自动跟着走, 不会用一份过期快照。
+            con = saturated_constraints(recent, rcfg_quotas)
             spec = self._gen_spec_once(avoid, avoid_reason=reject_why,
                                        bad_puzzles=bad, blueprint=bp,
-                                       enforce_blueprint=enforce_blueprint)
+                                       enforce_blueprint=enforce_blueprint,
+                                       constraints=con)
             if not spec.puzzle:
                 log.info("出题第 %d 轮没出稿(不计数): %s", guard, spec.error)
                 no_draft_count += 1
@@ -3207,10 +3235,23 @@ class PuzzleWriter:
     def _gen_spec_once(self, avoid: Optional[list] = None,
                        avoid_reason: str = "", bad_puzzles: Optional[list] = None,
                        blueprint: Optional[PuzzleBlueprint] = None,
-                       enforce_blueprint: bool = True) -> PuzzleSpec:
-        """生成一稿 `PuzzleSpec`(不做校验)。"""
+                       enforce_blueprint: bool = True,
+                       constraints: Optional[dict] = None) -> PuzzleSpec:
+        """生成一稿 `PuzzleSpec`(不做校验)。
+
+        `constraints` 是 G3 的**动态生成约束**(见
+        `quality.saturated_constraints`) —— 告诉模型"这个方向已经满了"。
+        它在 cross gate 之前就把必被拒的方向排除掉, 省下的是**整稿**的
+        生成 + 审稿 + audit 成本。cross gate 仍然保留(defense-in-depth)。
+        """
         bp = blueprint or PuzzleBlueprint()
         user = "请出一道新的海龟汤谜题。\n\n"
+        # ---- G3: 动态硬约束 ----
+        # 位置在 blueprint **之前**: 这些是"无论你选什么形状都成立"的
+        # 禁令, 而 blueprint 是"具体选哪个形状"。先说不许碰什么, 再给形状。
+        _con_txt = describe_constraints(constraints or {})
+        if _con_txt:
+            user += _con_txt.lstrip("\n") + "\n\n"
         if enforce_blueprint:
             # blueprint 是**代码决定的硬约束**, 必须原样执行(方案 §12)
             user += ("【本题的 Blueprint —— 代码层已经决定, 你不能修改它, "

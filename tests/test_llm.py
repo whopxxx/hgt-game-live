@@ -1432,7 +1432,7 @@ def test_v4_prompt_versions_bumped():
     print("\n[V4-1] riddle/check prompt 版本")
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
     check("RIDDLE_PROMPT_VERSION == riddle-v7",
-          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
+          RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v7",
           CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
 
@@ -3187,7 +3187,7 @@ def test_q2_versions_bumped():
     check("QUALITY_POLICY_VERSION = quality-v8",
           QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION = riddle-v8",
-          RIDDLE_PROMPT_VERSION == "riddle-v8", RIDDLE_PROMPT_VERSION)
+          RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION = check-v8",
           CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
     # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
