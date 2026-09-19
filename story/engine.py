@@ -1439,11 +1439,27 @@ class RoundEngine:
         所以判据是 `status == ok` **且** `verdict in (是, 不是)`。
         注意「不是」**可以**建立事实(它完整公开地否定了该 fact),
         这与「无关」完全不同。
+
+        ## status 必须**明确是 ok**(fail closed)
+
+        ⚠️ 不要写成"排除已知的坏状态":
+
+            if status == "unavailable": return []      # ✗ 反例
+
+        那样任何**未知**状态都会被放行 —— `status="error"` /
+        `""` / 将来新增的某个值, 只要不是字面上的 "unavailable", 就能
+        建立通关事实。这是胜负状态的入口, 必须"只有明确知道是 ok 才
+        允许", 而不是"只排除目前知道的那几种坏情况"。
+
+            只有 status == "ok" 才继续; 其余一律不建立。
+
+        将来加状态时, 默认落在**安全**一侧(不建立), 忘了改这里也不会
+        让系统自己把题解掉。
         """
-        if status == "unavailable" or verdict == P.UNAVAILABLE:
+        if status != "ok":
             return []
         if verdict not in (P.YES, P.NO):
-            # 「无关」/「揭晓」/空裁决一律不建立。
+            # 「无关」/「揭晓」/「未判定」/空裁决一律不建立。
             return []
         known = {f.id for f in (getattr(self._spec, "facts", None) or [])}
         out: list = []

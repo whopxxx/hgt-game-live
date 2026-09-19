@@ -2387,13 +2387,37 @@ class PuzzleWriter:
         # 自称 v5 就必须守 v5 的规则, 不能靠"没填就沿用"蒙混。
         is_v5_review = (str(spec.quality_policy_version or "")
                         == QUALITY_POLICY_VERSION)
-        missing_bundle: list = []
+        # ---- v5: 合同必须"存在**且非空**且类型正确" ----
+        #
+        # ⚠️ 只查 `ti.get(name) is None` 是不够的 —— 它只拦得住"key 缺失",
+        # 拦不住**显式空值**:
+        #
+        #     puzzle="", answer="", core_answer="",
+        #     completion_fact_ids=[], facts=[], solve_atoms=[], fair_clues=[]
+        #
+        # 这些值会被下面的 legacy 兼容逻辑当成"审稿人没给", 于是**偷偷
+        # 沿用旧 spec 的内容** —— 混合版本稿照样通过。这正是本批冻结的
+        # "v5 pass/fix 必须全量显式回传, 代码不替审稿人补旧字段"要堵的洞。
+        #
+        # 所以这里在**任何 fallback 之前**直接校验原始 bundle:
+        #   - 文本字段: 必须是 str 且 strip 后非空;
+        #   - 列表字段: 必须是 list 且非空。
+        # 空字符串 / 空数组 / 错误类型 一律算**无效**, 与"缺 key"同等处置。
+        #
+        # v5 的数据随后直接从 `ti` 构造(见下面的 `is_v5_review` 分支),
+        # 不再经过"空了就 fallback"那条老路。
+        invalid_bundle: list = []
         if is_v5_review:
-            for _name in ("puzzle", "answer", "core_answer",
-                          "completion_fact_ids", "facts", "solve_atoms",
+            for _name in ("puzzle", "answer", "core_answer"):
+                _v = ti.get(_name)
+                if not isinstance(_v, str) or not _v.strip():
+                    invalid_bundle.append(_name)
+            for _name in ("completion_fact_ids", "facts", "solve_atoms",
                           "fair_clues"):
-                if ti.get(_name) is None:
-                    missing_bundle.append(_name)
+                _v = ti.get(_name)
+                if not isinstance(_v, list) or not _v:
+                    invalid_bundle.append(_name)
+        missing_bundle = invalid_bundle
 
         # ---- v5 通关合同: 与 facts/atoms/clues **同一套** ----
         #
@@ -2404,6 +2428,7 @@ class PuzzleWriter:
         # `core_answer` 同理: 它会在揭晓时被**逐字**念给观众。
         new_core = " ".join(str(ti.get("core_answer", "") or "").split()).strip()
         if not new_core:
+            # v5 上面已经拒过空 core_answer, 所以这里只可能是 legacy。
             new_core = spec.core_answer
         # 判据用"审稿人到底给没给", 而不是"变没变" —— 见下面的 bad 列表。
         gave_core = bool(str(ti.get("core_answer", "") or "").strip())
@@ -2413,9 +2438,13 @@ class PuzzleWriter:
         bad: list = []
 
         # ---- facts: 它是**正式 Q&A 的判定依据**, 最不能过期 ----
+        #
+        # ⚠️ v5 走到这里时 bundle 已经保证非空(上面 invalid_bundle 已拒),
+        # 所以下面的 `if not facts:` 兜底**只可能**为 legacy 触发 ——
+        # v5 永远不会"空了就沿用旧 facts"。
         facts = [PuzzleFact.from_dict(f) for f in (ti.get("facts") or [])]
         if not facts:
-            if changed:
+            if changed or is_v5_review:
                 bad.append("facts")
             else:
                 facts = list(spec.facts)
@@ -2424,7 +2453,7 @@ class PuzzleWriter:
         atoms = [SolveAtom.from_dict(a, i)
                  for i, a in enumerate(ti.get("solve_atoms") or [])]
         if not atoms:
-            if changed:
+            if changed or is_v5_review:
                 bad.append("solve_atoms")
             else:
                 atoms = list(spec.solve_atoms)
@@ -2432,18 +2461,19 @@ class PuzzleWriter:
         # ---- clues: quote 必须逐字出自**改后**的谜面(下面还有一道硬检查) ----
         clues = [FairClue.from_dict(c) for c in _norm_clues(ti.get("fair_clues"))]
         if not clues:
-            if changed:
+            if changed or is_v5_review:
                 bad.append("fair_clues")
             else:
                 clues = list(spec.fair_clues)
 
-        # v5 缺项 -> 立刻拒(在下面任何"沿用旧值"的兜底之前)。
-        if missing_bundle:
-            return None, ("审稿未回传完整的同步合同(缺: "
-                          + ", ".join(missing_bundle)
+        # v5 合同为空/无效 -> 立刻拒(在下面任何"沿用旧值"的兜底之前)。
+        if invalid_bundle:
+            return None, ("v5 同步合同为空/无效(缺或空: "
+                          + ", ".join(invalid_bundle)
                           + ") —— v5 要求 puzzle/answer/core_answer/"
                             "completion_fact_ids/facts/solve_atoms/"
-                            "fair_clues 全部显式回传, 代码不会替你沿用旧值")
+                            "fair_clues 全部**非空**显式回传, "
+                            "代码不会替你沿用旧值")
 
         # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
         comp_raw = ti.get("completion_fact_ids")
@@ -2455,11 +2485,13 @@ class PuzzleWriter:
                 _seen_comp.append(_fid)
         comp = _seen_comp
         if not comp:
-            if changed and not gave_comp:
+            # v5 的 comp 非空已由 invalid_bundle 保证, 所以这条只对
+            # legacy 生效 —— v5 不会"空了就沿用旧合同"。
+            if changed or is_v5_review:
                 bad.append("completion_fact_ids")
             else:
                 comp = list(spec.completion_fact_ids or [])
-        if changed and not gave_core:
+        if (changed or is_v5_review) and not gave_core:
             bad.append("core_answer")
 
         # ---- quality_checks: **fail closed** ----

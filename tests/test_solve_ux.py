@@ -749,6 +749,140 @@ def test_closeout_p1_legacy_reviewer_unchanged():
           not (merged is None and "同步合同" in (why or "")), (merged, why))
 
 
+def test_final_closeout_v5_empty_values_rejected():
+    """Blocker: **显式空值**也不能绕过 v5 同步合同。
+
+    `if ti.get(name) is None` 只拦得住"key 缺失"。审稿人完全可以回一个
+    **存在但为空**的字段(`core_answer=""` / `facts=[]` / ...), 而下面的
+    legacy 兼容逻辑会把它当成"没给", 偷偷沿用旧 spec 内容 —— 混合版本稿
+    照样通过。
+
+    这一组逐个把字段置成空值(而不是 pop 掉 key), 全部必须 reject。
+    """
+    print("\n[final] v5 显式空值 -> 必须 reject")
+    import copy as _copy
+
+    base = _pass_review()
+
+    def run(ti):
+        fc = FakeClient([LLMResult(tool_input=ti, model="m")])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        return w._review_spec(ident_spec())
+
+    # ---- 文本字段置空 ----
+    for field in ("puzzle", "answer", "core_answer"):
+        t = _copy.deepcopy(base)
+        t[field] = ""
+        merged, why, rewrite = run(t)
+        check(f"{field}='' -> 拒", merged is None, (field, merged))
+        check(f"  {field} 的拒绝理由点名空/无效",
+              "为空/无效" in (why or ""), why)
+        # 纯空白也算空
+        t2 = _copy.deepcopy(base)
+        t2[field] = "   "
+        merged2, why2, _ = run(t2)
+        check(f"{field}='   ' -> 拒", merged2 is None, (field, merged2))
+
+    # ---- 列表字段置空 ----
+    for field in ("completion_fact_ids", "facts", "solve_atoms", "fair_clues"):
+        t = _copy.deepcopy(base)
+        t[field] = []
+        merged, why, rewrite = run(t)
+        check(f"{field}=[] -> 拒", merged is None, (field, merged))
+        check(f"  {field} 的拒绝理由点名空/无效",
+              "为空/无效" in (why or ""), why)
+
+    # ---- 类型错误也算无效 ----
+    t3 = _copy.deepcopy(base)
+    t3["facts"] = "不是列表"
+    merged3, why3, _ = run(t3)
+    check("facts 类型错误 -> 拒", merged3 is None, merged3)
+    t4 = _copy.deepcopy(base)
+    t4["core_answer"] = 123
+    merged4, why4, _ = run(t4)
+    check("core_answer 类型错误 -> 拒", merged4 is None, merged4)
+
+    # ---- 正例: 完整非空 bundle 仍通过 ----
+    merged5, why5, _ = run(_copy.deepcopy(base))
+    check("完整非空 bundle -> 通过", merged5 is not None, (merged5, why5))
+    if merged5 is not None:
+        check("  用的是**新** facts(没被旧值覆盖)",
+              [f.text for f in merged5.facts] ==
+              [f["text"] for f in base["facts"]], merged5.facts)
+        check("  用的是**新** core_answer",
+              merged5.core_answer == base["core_answer"], merged5.core_answer)
+        check("  用的是**新** completion_fact_ids",
+              merged5.completion_fact_ids == base["completion_fact_ids"],
+              merged5.completion_fact_ids)
+
+
+def test_final_closeout_legacy_fallback_still_works():
+    """legacy(v4)审稿路径必须保持"空了就沿用旧值", 不被 v5 严格化误伤。"""
+    print("\n[final] legacy 仍允许沿用旧值")
+    base = _pass_review()
+    # 只回 decision + observed_signature + quality_checks, 其余全省略:
+    # v4 的合法形态(没改就原样沿用)。
+    legacy = ident_spec()
+    legacy.quality_policy_version = "quality-v4"
+    legacy.completion_fact_ids = []
+    # v4 的合法"没改"形态: pass + 原样回传谜面谜底, 其余省略由代码沿用。
+    # **必须**把 puzzle/answer 原样带回 —— 若不回,  会为真
+    # (空串 != 旧谜面), 于是要求整套同步。那是 v4 的既有语义, 与本批无关。
+    legacy_ti = {
+        "decision": "pass",
+        "puzzle": legacy.puzzle,
+        "answer": legacy.answer,
+        "observed_signature": base["observed_signature"],
+        "quality_checks": base["quality_checks"],
+    }
+    fc = FakeClient([LLMResult(tool_input=legacy_ti, model="m")])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    merged, why, rewrite = w._review_spec(legacy)
+    check("legacy 省略字段 -> 走 fallback, 不因空值被拒",
+          not (merged is None and "为空/无效" in (why or "")), (merged, why))
+    check("legacy 仍能返回 spec", merged is not None, why)
+    if merged is not None:
+        check("  沿用了旧 facts", len(merged.facts) == len(legacy.facts),
+              merged.facts)
+
+
+def test_final_closeout_status_must_be_ok():
+    """P1: established 的 status 必须**明确是 ok**(fail closed)。"""
+    print("\n[final] status 必须明确 ok")
+    from story.parser import NO, UNAVAILABLE, YES
+    cases = [
+        (YES, "ok", True, "是 + ok -> 建立"),
+        (NO, "ok", True, "不是 + ok -> 建立"),
+        ("无关", "ok", False, "无关 + ok -> 不建立"),
+        (UNAVAILABLE, "unavailable", False, "未判定 + unavailable -> 不建立"),
+        (YES, "unavailable", False, "是 + unavailable -> 不建立"),
+        (YES, "error", False, "是 + error -> 不建立(fail closed)"),
+        (YES, "", False, "是 + 空 status -> 不建立(fail closed)"),
+        (YES, "future_status", False,
+         "是 + 未知状态 -> 不建立(fail closed)"),
+        (NO, "error", False, "不是 + error -> 不建立"),
+    ]
+    for verdict, status, should, label in cases:
+        eng, clk = boot(ident_spec())
+        ask(eng, clk, "u1", "甲", "问题", verdict=verdict, status=status,
+            established_fact_ids=["f1", "f2"])
+        got = eng._established_fact_ids == {"f1", "f2"}
+        check(label, got is should, (verdict, status, eng._established_fact_ids))
+        if should:
+            check(f"  {label} -> 通关", eng.phase == Phase.REVEALING, eng.phase)
+        else:
+            check(f"  {label} -> 未通关", eng.phase != Phase.REVEALING,
+                  eng.phase)
+    # 默认参数(status 不传, QAResult 默认 "ok")必须仍能建立 ——
+    # 否则这条 fail-closed 会把正常路径一起关掉。
+    eng2, clk2 = boot(ident_spec())
+    ask(eng2, clk2, "u1", "甲", "问题", verdict=YES,
+        established_fact_ids=["f1", "f2"])
+    check("不传 status(默认 ok)-> 仍能建立并通关",
+          eng2.phase == Phase.REVEALING, eng2.phase)
+
+
+
 # ----------------------------------------------------------------------
 # 四句话产品语义 —— 与 prompt / schema 的一致性
 # ----------------------------------------------------------------------
@@ -842,6 +976,10 @@ def main():
         test_closeout_b4_clue_must_reach_completion,
         test_closeout_p1_reviewer_sync_fail_closed,
         test_closeout_p1_legacy_reviewer_unchanged,
+        # ---- Final closeout ----
+        test_final_closeout_v5_empty_values_rejected,
+        test_final_closeout_legacy_fallback_still_works,
+        test_final_closeout_status_must_be_ok,
         test_product_semantics_pinned,
         test_established_archive_boundary,
     ]
