@@ -47,6 +47,7 @@ class ActionKind(str, Enum):
     ANSWER = "answer"         # 调 LLM 回答一条提问
     HINT = "hint"             # 调 LLM 生成一条提示
     REVEAL = "reveal"         # 调 LLM 生成揭晓(谜底措辞)
+    AI_PLAYER = "ai_player"   # AI 玩家生成公开动作 / Host 或 Judge 裁决
     BROADCAST = "broadcast"   # 只更新状态/提示文案, 不调 LLM
     LOG = "log"
 
@@ -354,6 +355,9 @@ class Snapshot:
     danmaku: list[dict[str, Any]] = field(default_factory=list)
     notice: Optional[str] = None
     phase_hint: str = ""
+    # ---- AI 玩家 ----
+    # 只公开计量与在途状态；reservation token / round / spec_key 永不下发。
+    ai_player: dict[str, Any] = field(default_factory=dict)
     # ---- 统计 ----
     stat_questions: int = 0                 # 本题累计提问数
     stat_answered: int = 0                  # 本题累计已答数
@@ -404,6 +408,7 @@ class Snapshot:
             "danmaku": self.danmaku,
             "notice": self.notice,
             "phase_hint": self.phase_hint,
+            "ai_player": self.ai_player,
             "stats": {
                 "questions": self.stat_questions,
                 "answered": self.stat_answered,

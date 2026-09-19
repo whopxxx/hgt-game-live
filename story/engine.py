@@ -33,6 +33,7 @@ from .puzzle import PuzzleSignature, PuzzleSpec, runtime_spec_key
 from .state import (CMD_PREFIX, HINT_TOKENS, NEXT_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
+from .summon import LIKES_PER_SUMMON, SummonLedger
 
 log = logging.getLogger("story.engine")
 
@@ -257,6 +258,12 @@ class RoundEngine:
         self._notice = ""
         self._phase_hint = ""
 
+        # 直播 session 级 AI 玩家次数；跨题/揭晓不重置。
+        self._ai_player_ledger = SummonLedger()
+        self._ai_player_token_seq = 0
+        self._ai_player_next_at = 0.0
+        self._ai_player_gave_up_round = 0
+
     # ==================================================================
     # 生命周期
     # ==================================================================
@@ -273,6 +280,7 @@ class RoundEngine:
             if self._stopped:
                 return []
             self._stopped = True
+            self._release_current_ai_player_locked()
             self.phase = Phase.STOPPED
             self._notice = reason or "已停止"
             log.info("引擎停止: %s", self._notice)
@@ -338,27 +346,24 @@ class RoundEngine:
     def submit_interaction(self, ev: Any = None,
                            now: Optional[float] = None
                            ) -> list[EngineAction]:
-        """互动事件入口(Step 11: **characterization stub**)。
-
-        ## 这一步为什么是 no-op
-
-        Step 11 只打通"Like/Gift 能进业务链"这条路, **不记 Summon**、
-        不调 AI、不改 UI。真正的计量在 Step 13(Summon Ledger), 而它必须
-        等 Step 12 拿到真实协议语义之后才能写 —— 在证据之前实现累计器,
-        等于拿猜测当规格。
-
-        所以这里只是个**契约占位**: 定义好入口形状(收什么、返回什么),
-        让 Step 13 往里填。它现在返回空动作列表, 不碰任何状态。
-
-        ## 为什么要有这个占位(而不是 Step 13 直接加)
-
-        有了它, director 的分发逻辑、ingest 的事件类型、以及"keep_all 与
-        interaction_enabled 解耦"这三件事可以在**没有业务逻辑**的情况下
-        独立验证(测试直接打这个入口)。Step 13 填进来时, 那些 plumbing
-        测试一行都不用改。
-        """
-        # 故意的 no-op: 不改任何状态, 不产生动作。
-        return []
+        """把 Like.total 接入 AI 玩家次数；Gift 只保留 raw 计数。"""
+        with self._lock:
+            kind = str(getattr(ev, "kind", "") or "").lower()
+            if kind == "gift":
+                self._ai_player_ledger.on_gift_event(ev)
+                return []
+            if kind != "like":
+                return []
+            total = getattr(ev, "total", 0)
+            gained = self._ai_player_ledger.on_like_total(total, now=now)
+            if not gained:
+                return []
+            log.info("like total=%s -> AI玩家提问次数 +%d available=%d",
+                     total, gained, self._ai_player_ledger.available)
+            return [EngineAction(ActionKind.BROADCAST, {
+                "ai_player_questions_gained": gained,
+                "phase_changed": False,
+            })]
 
     def submit_danmaku(self, user_id, user_name: str, content: str,
                        now: Optional[float] = None,
@@ -836,6 +841,7 @@ class RoundEngine:
             self._history.clear()
             self._qa_log.clear()
             self._qa_archive.clear()
+            self._ai_player_gave_up_round = 0
             self._qa_total = 0
             self._qa_commit_seq = 0
             self._verdict_counts.clear()
@@ -1028,6 +1034,104 @@ class RoundEngine:
                     "notice": self._notice, "phase_changed": False}))
             return acts
 
+    def submit_ai_player_move(
+            self, token: str, round_index: int, spec_key: str,
+            kind: Optional[str] = None, text: str = "",
+            error: Optional[str] = None, now: Optional[float] = None,
+            ) -> list[EngineAction]:
+        """接收公开玩家的第一步，只在现场仍空闲时启动 Host/Judge。"""
+        now = self._now(now)
+        with self._lock:
+            if not self._ai_player_identity_ok_locked(
+                    token, round_index, spec_key):
+                self._ai_player_ledger.release(
+                    token, round_index, spec_key)
+                return []
+            if error or kind not in ("ask", "solve", "give_up") or not text:
+                return self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, error or "输出不合法")
+            if kind == "give_up":
+                self._ai_player_ledger.release(token, round_index, spec_key)
+                self._ai_player_gave_up_round = round_index
+                log.info("AI玩家本题 give_up，次数已退回")
+                return [EngineAction(ActionKind.BROADCAST, {
+                    "phase_changed": False})]
+            # 真人永远优先：第一步回来后、第二次 LLM 开始前再查一次。
+            if self._human_pressure_locked():
+                return self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, "真人提问优先")
+            if kind == "ask" and self._ai_player_duplicate_locked(text):
+                return self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, "问题重复")
+
+            payload = {
+                "stage": "ask" if kind == "ask" else "solve",
+                "token": token,
+                "expect_round": round_index,
+                "expect_spec_key": spec_key,
+                "text": text[:200],
+                "puzzle": self._puzzle,
+                "answer": self._answer,
+                "solve_atoms": list(self._solve_atoms),
+                "facts": ([f.to_dict() for f in self._spec.facts]
+                          if self._spec else []),
+                "transcript": self._transcript_locked(),
+                "timeout": self.cfg.qa_answer_timeout,
+                "max_retries": self.cfg.qa_answer_retries,
+            }
+            return [EngineAction(ActionKind.AI_PLAYER, payload)]
+
+    def submit_ai_player_result(
+            self, token: str, round_index: int, spec_key: str,
+            move_kind: str, text: str, verdict: str = "", comment: str = "",
+            solved: bool = False, failed: bool = False,
+            error: Optional[str] = None, now: Optional[float] = None,
+            ) -> list[EngineAction]:
+        """提交完整 AI ask/solve；只有成功上屏后才兑现一次次数。"""
+        now = self._now(now)
+        with self._lock:
+            if not self._ai_player_identity_ok_locked(
+                    token, round_index, spec_key):
+                self._ai_player_ledger.release(
+                    token, round_index, spec_key)
+                return []
+            if failed or error:
+                return self._ai_player_failed_locked(
+                    token, round_index, spec_key, now,
+                    error or "裁决技术失败")
+            if move_kind == "ask":
+                if verdict not in (P.YES, P.NO, P.IRRELEVANT):
+                    return self._ai_player_failed_locked(
+                        token, round_index, spec_key, now, "Host 返回无效")
+                shown_verdict = verdict
+            elif move_kind == "solve":
+                shown_verdict = "猜中了" if solved else P.NO
+            else:
+                return self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, "动作类型无效")
+
+            # AI 行使用同一个 QA 流，但不碰真人 questions/answered/viewers，
+            # 更不调用 `_record_human_established_locked`。
+            self._qid_seq += 1
+            rec = QARec(
+                qid=self._qid_seq, user_name="AI玩家", text=text[:200],
+                verdict=shown_verdict, comment=comment[:60],
+                kind="ai_player", ts=now)
+            self._append_qa_locked(rec)
+            if not self._ai_player_ledger.commit(
+                    token, round_index, spec_key):
+                raise RuntimeError("AI 玩家记录已上屏但 reservation 无法兑现")
+            self._ai_player_next_at = now + max(
+                0.0, float(self.cfg.ai_player_min_gap_seconds))
+            log.info("AI玩家：%s -> %s", text[:60], shown_verdict)
+            acts = [EngineAction(ActionKind.BROADCAST, {
+                "answer": rec.to_json(), "phase_changed": False})]
+            if move_kind == "solve" and solved:
+                log.info("AI玩家独立猜中第%d题", self._puzzle_index)
+                acts.extend(self._enter_revealing_locked(
+                    now, "ai_solved", "AI玩家"))
+            return acts
+
     def submit_hint(self, text: Optional[str] = None,
                     error: Optional[str] = None, now: Optional[float] = None,
                     expect_round: Optional[int] = None,
@@ -1113,7 +1217,7 @@ class RoundEngine:
             _detail("阶段 -> REVEALED (第 %d 题揭晓)", self._puzzle_index)
             self._next_puzzle_deadline = now + self.cfg.reveal_hold_seconds
             reason = self._reveal_pending_reason
-            if reason == "solved" and self._solved_by:
+            if reason in ("solved", "ai_solved") and self._solved_by:
                 self._notice = f"{self._solved_by} 猜中了！谜底揭晓"
             elif self._solved:
                 self._notice = "谜底揭晓"
@@ -1313,6 +1417,124 @@ class RoundEngine:
                 "stopped": bool(self._stopped),
             }
 
+    def snapshot_ai_player_input(self) -> dict[str, Any]:
+        """只读的公开玩家输入；不含 PuzzleSpec 或任何 hidden truth。"""
+        with self._lock:
+            return self._public_ai_player_input_locked()
+
+    def ai_player_second_call_allowed(
+            self, token: str, round_index: int, spec_key: str,
+            now: Optional[float] = None) -> bool:
+        """Director 真正发 Host/Judge HTTP 前的最后一次真人优先检查。"""
+        now = self._now(now)
+        with self._lock:
+            if not self._ai_player_identity_ok_locked(
+                    token, round_index, spec_key):
+                self._ai_player_ledger.release(token, round_index, spec_key)
+                return False
+            if self._human_pressure_locked():
+                self._ai_player_failed_locked(
+                    token, round_index, spec_key, now, "真人提问优先")
+                return False
+            return True
+
+    def _public_ai_player_input_locked(self) -> dict[str, Any]:
+        transcript: list[dict[str, Any]] = [
+            {"role": "puzzle", "text": self._puzzle}]
+        for rec in self._qa_archive:
+            if rec.kind == "hint":
+                transcript.append({"role": "hint", "text": rec.text})
+                continue
+            if rec.kind not in ("qa", "ai_player"):
+                continue
+            transcript.append({
+                "role": ("ai_player" if rec.kind == "ai_player"
+                         else "audience"),
+                "name": rec.user_name,
+                "text": rec.text,
+            })
+            transcript.append({
+                "role": "host", "verdict": rec.verdict,
+                "text": rec.comment,
+            })
+        return {
+            "round_index": self.round_index,
+            "spec_key": self._current_spec_key,
+            "puzzle": self._puzzle,
+            "transcript": transcript,
+        }
+
+    def _human_pressure_locked(self) -> bool:
+        return bool(self._pending or self._inflight or self._hint_pending
+                    or self._reveal_deadline is not None)
+
+    def _ai_player_identity_ok_locked(
+            self, token: str, round_index: int, spec_key: str) -> bool:
+        r = self._ai_player_ledger.detective_reservation
+        return bool(
+            self.phase == Phase.QA
+            and r is not None
+            and r.token == token
+            and r.round_index == round_index == self.round_index
+            and r.spec_key == spec_key == self._current_spec_key)
+
+    def _ai_player_duplicate_locked(self, text: str) -> bool:
+        norm = P.simplify_for_dedupe(text, 200)
+        return bool(norm and any(
+            P.simplify_for_dedupe(r.text, 200) == norm
+            for r in self._qa_archive
+            if r.kind in ("qa", "ai_player")))
+
+    def _ai_player_failed_locked(
+            self, token: str, round_index: int, spec_key: str,
+            now: float, why: str) -> list[EngineAction]:
+        released = self._ai_player_ledger.release(
+            token, round_index, spec_key)
+        if not released:
+            return []
+        self._ai_player_next_at = now + max(
+            0.0, float(self.cfg.ai_player_retry_seconds))
+        if why == "真人提问优先":
+            log.info("AI玩家让路真人，次数已退回")
+        else:
+            log.warning("AI玩家调用失败，次数已退回: %s", why)
+        return [EngineAction(ActionKind.BROADCAST, {
+            "phase_changed": False})]
+
+    def _release_current_ai_player_locked(self) -> bool:
+        r = self._ai_player_ledger.detective_reservation
+        if r is None:
+            return False
+        return self._ai_player_ledger.release(
+            r.token, r.round_index, r.spec_key)
+
+    def _schedule_ai_player_locked(self, now: float) -> list[EngineAction]:
+        if (not self.cfg.ai_player_enabled
+                or self.phase != Phase.QA
+                or self._ai_player_ledger.available < 1
+                or self._ai_player_ledger.detective_reservation is not None
+                or self._human_pressure_locked()
+                or self._ai_player_gave_up_round == self.round_index
+                or now < self._ai_player_next_at
+                or not self._current_spec_key):
+            return []
+        self._ai_player_token_seq += 1
+        token = f"ai-player-{self._ai_player_token_seq}"
+        if not self._ai_player_ledger.reserve(
+                token, self.round_index, self._current_spec_key, now=now):
+            return []
+        public = self._public_ai_player_input_locked()
+        log.info("AI玩家 start round=%d available_after_reserve=%d",
+                 self.round_index, self._ai_player_ledger.available)
+        return [EngineAction(ActionKind.AI_PLAYER, {
+            "stage": "move",
+            "token": token,
+            "expect_round": self.round_index,
+            "expect_spec_key": self._current_spec_key,
+            "puzzle": public["puzzle"],
+            "transcript": public["transcript"],
+        })]
+
     def _riddle_failed_locked(self, now: float, why: str) -> list[EngineAction]:
         self._setting_attempts += 1
         self.last_error = why
@@ -1502,6 +1724,10 @@ class RoundEngine:
         if acts:
             return acts
 
+        ai_acts = self._schedule_ai_player_locked(now)
+        if ai_acts:
+            return ai_acts
+
         # ④ 冷场重述(零成本): 长时间没人说话, 把谜面重述一遍并换句引导语
         idle = now - self._last_activity
         if idle >= self.cfg.restate_seconds:
@@ -1540,6 +1766,7 @@ class RoundEngine:
     # 阶段进入
     # ==================================================================
     def _enter_setting_locked(self, now: float, reason: str) -> list[EngineAction]:
+        self._release_current_ai_player_locked()
         self.phase = Phase.SETTING
         _detail("阶段 -> SETTING (第 %d 题开始出题)", self._puzzle_index + 1)
         self._setting_deadline = now + self.cfg.setting_timeout_seconds
@@ -1846,10 +2073,11 @@ class RoundEngine:
 
     def _enter_revealing_locked(self, now: float, reason: str,
                                 winner: str) -> list[EngineAction]:
+        self._release_current_ai_player_locked()
         self.phase = Phase.REVEALING
         self._reveal_pending_reason = reason
         self._reveals += 1
-        if reason == "solved":
+        if reason in ("solved", "ai_solved"):
             self._solved = True
             self._solved_by = winner
             self._solved_total += 1
@@ -1857,7 +2085,7 @@ class RoundEngine:
         self._pending.clear()
         self._inflight.clear()
         self._inflight_at.clear()
-        if reason == "solved":
+        if reason in ("solved", "ai_solved"):
             self._notice = f"{winner} 猜中了！正在揭晓谜底…"
         elif reason == "skip":
             self._notice = "收到换题请求，正在揭晓…"
@@ -1866,7 +2094,7 @@ class RoundEngine:
         self._phase_hint = self._notice
         return [EngineAction(ActionKind.REVEAL, {
             "reason": reason,
-            "winner": winner if reason == "solved" else "",
+            "winner": winner if reason in ("solved", "ai_solved") else "",
             "expect_round": self.round_index,
             "expect_spec_key": self._current_spec_key,
             "puzzle": self._puzzle, "answer": self._answer,
@@ -2118,6 +2346,17 @@ class RoundEngine:
                 danmaku=[d.to_json() for d in self._danmaku[-40:]],
                 notice=self._notice or None,
                 phase_hint=self._phase_hint,
+                ai_player={
+                    "questions_available": self._ai_player_ledger.available,
+                    "questions_earned":
+                        self._ai_player_ledger.summon_earned_total,
+                    "questions_used":
+                        self._ai_player_ledger.summon_consumed_total,
+                    "likes_progress": self._ai_player_ledger.likes_progress,
+                    "likes_per_question": LIKES_PER_SUMMON,
+                    "in_flight": bool(
+                        self._ai_player_ledger.detective_reservation),
+                },
                 stat_questions=self._questions_total,
                 stat_answered=self._answered_total,
                 stat_solved=self._solved_total,

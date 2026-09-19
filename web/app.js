@@ -509,7 +509,12 @@
 
   function renderStats(s) {
     const st = s.stats || {};
+    const ai = s.ai_player || {};
     const parts = [];
+    if (ai.questions_available != null) {
+      parts.push("AI玩家提问次数 <b>" + ai.questions_available
+        + "</b> · 每100赞+1");
+    }
     if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
     if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
     if (st.viewers_seen) parts.push("观众 <b>" + st.viewers_seen + "</b>");

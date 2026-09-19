@@ -683,14 +683,26 @@ def test_expired_fetcher_drops_interaction() -> None:
         os.unlink(path)
 
 
-def test_engine_submit_interaction_is_noop_stub() -> None:
-    """Step 11: Engine 的入口是 **characterization stub** —— 不改状态。"""
-    print("\n[11f] Engine submit_interaction 是 no-op 占位")
+def test_engine_submit_interaction_wires_like_only() -> None:
+    """Like 正式接账本；未知事件与 Gift 不改变次数。"""
+    print("\n[11f] Engine submit_interaction 只接 Like high-water")
     from story.engine import RoundEngine
     eng = RoundEngine(Config(sim_path="x", no_llm=True))
     before = (eng.phase, eng.round_index, eng._qa_total)
-    acts = eng.submit_interaction(object())
-    check("返回空动作", acts == [], acts)
+    check("未知事件返回空动作", eng.submit_interaction(object()) == [])
+    eng.submit_interaction(InteractionEvent(kind="like", total=487))
+    acts = eng.submit_interaction(InteractionEvent(kind="like", total=523))
+    check("跨档 Like 返回 BROADCAST",
+          len(acts) == 1 and acts[0].kind.value == "broadcast", acts)
+    check("Like 获得 1 次",
+          eng.snapshot().ai_player["questions_available"] == 1,
+          eng.snapshot().ai_player)
+    for _ in range(100):
+        eng.submit_interaction(InteractionEvent(
+            kind="gift", combo_count=9, repeat_count=9, total_count=999))
+    check("Gift 永远不增加次数",
+          eng.snapshot().ai_player["questions_available"] == 1,
+          eng.snapshot().ai_player)
     check("阶段/题号/QA 计数都没变",
           (eng.phase, eng.round_index, eng._qa_total) == before,
           (eng.phase, eng.round_index, eng._qa_total))
@@ -1455,7 +1467,7 @@ def main() -> int:
     test_interaction_disabled_blocks_business_chain()
     test_keep_all_still_logs_diagnostics()
     test_expired_fetcher_drops_interaction()
-    test_engine_submit_interaction_is_noop_stub()
+    test_engine_submit_interaction_wires_like_only()
     test_livesource_routes_interaction_to_inbox()
     # ---- Step 11 review-fix: 真实 WS 分发层 ----
     test_ws_dispatch_gift_reaches_chain_without_keep_all()

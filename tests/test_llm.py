@@ -411,6 +411,22 @@ def test_ux_g2_plain_qa_is_still_one_call():
           out[0].established_fact_ids if out else None)
 
 
+def test_ai_player_ask_is_exactly_one_host_call():
+    """AI 普通 ask 禁掉 solve 相关复核：Player 之外只调用一次 Host。"""
+    print("\n[AI-LLM] ask 的 Host 裁决恰好 1 次")
+    fc = FakeClient([_verdict_tool_irrelevant(cand=True)])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, _ = w.answer(
+        "谜面?", "谜底。", [], 0, "AI玩家", "地点重要吗？",
+        judge_solve=False, facts=riddle()["facts"],
+        completion_fact_ids=[])
+    check("只调一次 Host", len(fc.calls) == 1, len(fc.calls))
+    check("没有 Final Judge/候选重判",
+          fc.calls[0]["tool"]["name"] == "emit_verdict",
+          [c["tool"]["name"] for c in fc.calls])
+    check("正常返回公开裁决", out and out[0].verdict == "无关", out)
+
+
 def test_ux_h_legacy_still_judges():
     """Case H: 无合同 -> Final Judge 流程**完全不变**。"""
     print("\n[UX-H] legacy 无合同 -> 仍走 Final Judge")
@@ -4115,6 +4131,7 @@ def main():
     for t in (test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
               test_ux_g_v5_skips_final_judge,
+              test_ai_player_ask_is_exactly_one_host_call,
               test_ux_h_legacy_still_judges,
               test_ux_established_filtered_in_answer,
               test_reviewer_fixes_in_place,
