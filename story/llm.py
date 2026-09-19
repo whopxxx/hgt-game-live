@@ -945,7 +945,33 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
 
 【点评栏】≤12 字, 不包含谜底内容。
 「无关」时写一句引导: "发 #你的猜测 来问我" / "发个 是/不是 的猜测"
-「是」「不是」时写剧情相关的短句: "方向不对" / "好眼力" / "再想想" """
+「是」「不是」时写剧情相关的短句: "方向不对" / "好眼力" / "再想想"
+
+【touched_fact_ids 与 established_fact_ids 的区别 —— 必须分清】
+- `touched_fact_ids`: 这条提问**碰到了**这个方向。
+- `established_fact_ids`: 经过"这句话 + 你的 是/不是"之后,
+  **普通观众已经可以把该 fact 的完整内容当作已确认事实**。
+
+⚠️ 判据是"这轮问答有没有把那个 canonical fact **完整公开**",
+不是"我答了是还是不是"。
+
+例 1(答"是"但**没有** established):
+    fact  f1 = 门外女人是父亲的亲生女儿
+    提问  "她和父亲有关系吗？"
+    回答  是
+    touched = ["f1"]      established = []
+    原因: 只确认了"有关系", 没有公开确认"亲生女儿"这个完整事实。
+
+例 2(答"不是"却**有** established):
+    fact  f1 = 飞机没有机械故障
+    提问  "飞机有机械故障吗？"
+    回答  不是
+    touched = ["f1"]      established = ["f1"]
+    原因: 这个"不是"已经完整公开确认了 canonical fact。
+
+**"是"不等于 established; "不是"也不等于不能 established。**
+不确定时**宁可留空** —— 少标只会让观众多推一步, 多标会让系统
+替观众把题解掉。这个集合是**通关判定**的依据, 不是复盘用的。"""
 
 
 HINT_SYSTEM = """你在主持中文「海龟汤」推理直播。观众卡住了, 给一条**方向性**提示。
@@ -1277,6 +1303,25 @@ _TOOL_ANSWER = {
                                 "(没碰到就留空)。注意是'碰到/在问这个方向', "
                                 "不是'已经确认为真'。"),
                         },
+                        "established_fact_ids": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": (
+                                "经过'观众这句话 + 你的 是/不是 回答'之后, "
+                                "**普通观众已经可以把该 fact 的完整内容当作"
+                                "已确认事实**的那几条 id(没有就留空)。\n"
+                                "⚠️ 不是'碰到了', 是'完整公开确认了'。\n"
+                                "例1 fact f1='门外女人是父亲的亲生女儿'; "
+                                "问'她和父亲有关系吗', 答'是' "
+                                "-> touched=[f1], established=[] "
+                                "(只确认了'有关系', 没公开确认'亲生女儿')。\n"
+                                "例2 fact f1='飞机没有机械故障'; "
+                                "问'飞机有机械故障吗', 答'不是' "
+                                "-> touched=[f1], established=[f1] "
+                                "(这个'不是'已经完整公开确认了该 fact)。\n"
+                                "**'是'不等于 established; '不是'也不等于"
+                                "不能 established。** 看的是这轮问答是否把"
+                                "那个 canonical fact 完整公开了。"),
+                        },
                         "solution_candidate": {
                             "type": "boolean",
                             "description": (
@@ -1290,7 +1335,8 @@ _TOOL_ANSWER = {
                                 "只有 true 才会触发系统的最终判定。"),
                         },
                     },
-                    "required": ["id", "verdict", "solution_candidate"],
+                    "required": ["id", "verdict", "solution_candidate",
+                                 "established_fact_ids"],
                 },
             },
         },
@@ -2476,7 +2522,8 @@ class PuzzleWriter:
                facts: Optional[list] = None,
                spec: Optional[PuzzleSpec] = None,
                timeout: Optional[float] = None,
-               max_retries: Optional[int] = None
+               max_retries: Optional[int] = None,
+               completion_fact_ids: Optional[list] = None
                ) -> tuple[list[QAResult], Optional[str]]:
         """回答**一条**提问(逐条秒回)。返回 (results, error)。
 
@@ -2484,16 +2531,35 @@ class PuzzleWriter:
         自然语言 —— 判定依据是事实表。这样模型不会因为"谜底里提到过"就
         宽判, 而是必须对着有限的事实逐个对。
 
-        通关触发方式变了(方案 §23~§25):
-            旧: 裁决阶段可以自己给「揭晓」(实测经常误判, 且绕过了所有检查)
-            新: 裁决**只能**给 是/不是/无关 + `solution_candidate`;
-                `candidate=True` 才调 Final Judge。
+        ## v5: 通关由**代码集合覆盖**判定, 不再走 Final Judge
+
+        `completion_fact_ids` 非空(= 这道题有 v5 通关合同)时:
+
+            Answer 只做 是/不是/无关 + touched + established
+            + solution_candidate(保留为**分析指标**)
+            **不调 Final Judge, 也不产生 P.SOLVE**
+
+        为什么: 旧模型要求某一个观众独自同时说中 cause + mechanism,
+        于是"共同推理"根本不可能发生。新模型由 Engine 累计房间已公开
+        确认的 established facts, 覆盖到合同即刻揭晓 —— 最后补齐缺口的
+        那位观众获胜, 不必复述别人已推出来的部分。
+
+        顺带省掉大量 LLM 调用: 说中谜底的观众不再需要等待第二次裁判。
+
+        `completion_fact_ids` 为空时(老 archive / fallback / 题池老题)
+        **完全保持旧行为** —— 它们不该因为这次改动突然失去通关能力。
 
         为什么这样能省调用: 绝大多数提问是"他是医生吗"这种**单点事实提问**,
         它们不可能说中完整谜底。让模型先答一个 `solution_candidate=false`,
         代码就不调裁判了 —— judge_calls/answer_calls 从接近 100% 降下来。
         """
         spec = spec or self._spec_from_args(puzzle, answer, solve_atoms, facts)
+        # 判据以**显式参数**为准; 没传时回落到 spec 自带的合同。
+        # 这样 Engine(payload 里带合同) 与旧调用方(不带) 都能工作。
+        if completion_fact_ids is None:
+            completion_fact_ids = list(
+                getattr(spec, "completion_fact_ids", None) or [])
+        has_contract = bool(completion_fact_ids)
         tr = "\n".join(transcript[-40:]) if transcript else "(暂无)"
         user = (
             f"【谜面】{puzzle}\n"
@@ -2537,6 +2603,8 @@ class PuzzleWriter:
                     qid=qid, verdict=v, comment=cm,
                     touched_fact_ids=self._clean_fact_ids(
                         a.get("touched_fact_ids"), spec),
+                    established_fact_ids=self._clean_fact_ids(
+                        a.get("established_fact_ids"), spec),
                     solution_candidate=cand))
         elif res.text:
             # 回退: 文本解析(工具调用不可用时)。
@@ -2558,7 +2626,22 @@ class PuzzleWriter:
                 f" ({r0.comment})" if r0.comment else "",
                 r0.touched_fact_ids, r0.solution_candidate)
 
-        # ---- Final Judge **只对 candidate 调用**(方案 §25) ----
+        # ---- v5: 有通关合同 -> **绝不**调 Final Judge ----
+        #
+        # 这不是"省一次调用"的优化, 是**语义**要求: v5 的胜负由 Engine
+        # 对 established facts 做集合覆盖判定。若这里仍调 Judge 并把
+        # P.SOLVE 写回去, 就又有了一条绕开合同的通关路径 ——
+        # 观众说中一条 support 剧情也可能被判"猜中"。
+        #
+        # `solution_candidate` 保留下来, 但只作为分析指标(复盘时看
+        # 有多少人在尝试完整解谜), 不再是通关闸门。
+        if has_contract:
+            if r0.solution_candidate:
+                _detail("v5 有通关合同 -> 不调 Final Judge(候选仅作分析): %r",
+                        text[:40])
+            return results, res.error
+
+        # ---- legacy: Final Judge **只对 candidate 调用**(方案 §25) ----
         if not judge_solve or not answer or not r0.solution_candidate:
             return results, res.error
         # 纯信息索取(没给出任何假设)不可能同时"说出了谜底" —— 这种

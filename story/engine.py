@@ -169,6 +169,18 @@ class RoundEngine:
         #: 世界是什么)。只有 round 时, "同一题重出一稿"与"换了一题"
         #: 分不开; 只有内容时, 两道内容相同的题会被误判成同一道。
         self._current_spec_key = ""
+        # ---- v5 通关合同 + 房间共同推理状态 ----
+        #: 本题的通关合同(来自 spec.completion_fact_ids)。空 = legacy 题,
+        #: 胜负仍走 solution_candidate + Final Judge。
+        self._completion_fact_ids: set = set()
+        #: 揭晓时先念的那句话(来自 spec.core_answer)。
+        self._core_answer = ""
+        #: **房间已公开确认**的 fact 集合。每道新题清零。
+        #:
+        #: ⚠️ **只有真人 QA 能写它** —— 见 `_record_human_established_locked`。
+        #: 提示 / nudge / 将来 Detective 的自动作答绝不能碰, 否则系统会
+        #: 自己把题解掉。
+        self._established_fact_ids: set = set()
         self._qa_total = 0
         self._verdict_counts: dict[str, int] = {}
         self._last_ask: dict[tuple[str, str], float] = {}   # 去重
@@ -722,6 +734,23 @@ class RoundEngine:
             self._solve_atoms = [_atom_dict(a) for a in (solve_atoms or [])]
             self._fair_clues = [_clue_dict(c) for c in (fair_clues or [])]
             self._spec = spec
+            # ---- v5 通关合同 + 房间共同推理状态 ----
+            #
+            # **每道新题必须清零 established。** 不清零的话上一题的
+            # 共识会被算进下一题 —— 于是新题一上来就可能"已经满足合同",
+            # 直接白送一次揭晓。
+            #
+            # 合同/core_answer **从 spec 取**。没有 spec(兜底题 / 老调用方)
+            # 时留空 = legacy 路径, 不猜一个合同出来。
+            self._established_fact_ids = set()
+            if spec is not None:
+                self._completion_fact_ids = set(
+                    getattr(spec, "completion_fact_ids", None) or [])
+                self._core_answer = str(
+                    getattr(spec, "core_answer", "") or "")
+            else:
+                self._completion_fact_ids = set()
+                self._core_answer = ""
             # 运行时内容身份(Batch B closeout)。从**交付的题本身**算,
             # 而不是从 spec 对象 —— 兜底题 / 老调用方没有 spec 时也要有。
             #
@@ -824,6 +853,15 @@ class RoundEngine:
                     continue                   # 不在途(过期/重复): 忽略
                 if self.phase != Phase.QA:
                     continue
+                # ---- v5: 只有**真人问答**能建立事实 ----
+                #
+                # 抽成一个具名方法(而不是在这里内联几行), 是为了让
+                # 边界**显式可查**: 将来 Step 14 实现 Detective 时,
+                # `submit_detective(...)` 绝不能调用它。提示 / nudge
+                # 同样绝不能调用。
+                est = self._record_human_established_locked(
+                    r.established_fact_ids, verdict=r.verdict,
+                    status=r.status)
                 rec = QARec(qid=q.qid, user_name=q.user_name, text=q.text,
                             verdict=r.verdict, comment=r.comment, kind="qa", ts=now,
                             status=r.status,
@@ -831,6 +869,7 @@ class RoundEngine:
                             mechanism_hit=r.mechanism_hit,
                             matched_atoms=r.matched_atoms,
                             touched_fact_ids=list(r.touched_fact_ids or []),
+                            established_fact_ids=est,
                             solution_candidate=r.solution_candidate)
                 self._append_qa_locked(rec)
                 # 累加"观众已经探索过哪些方向"(方案 §32)。
@@ -848,6 +887,22 @@ class RoundEngine:
                         self._verdict_counts.get(r.verdict, 0) + 1
                 acts.append(EngineAction(ActionKind.BROADCAST, {
                     "answer": rec.to_json(), "phase_changed": False}))
+                # ---- v5: 代码集合覆盖判定 ----
+                #
+                # `completion <= established` 即通关。胜者是**补齐最后
+                # 一个缺口**的那位观众 —— 不要求他复述别人已经推出来的
+                # 内容。这就是"共同推理"。
+                #
+                # 并发: 整段在 Engine lock 下, 集合单调增长。第一次达到
+                # 覆盖即进入 revealing; 之后迟到的 worker 会因为
+                # `phase != QA` 被上面的分支丢弃, 不需要第二套 solved lock。
+                if (self._completion_fact_ids
+                        and self._completion_fact_ids
+                        <= self._established_fact_ids):
+                    log.info("第 %d 题的合同被补齐(由 %s): %s",
+                             self._puzzle_index, q.user_name, q.text[:30])
+                    acts.extend(self._solve_by_contract_locked(now, q.user_name))
+                    return acts
                 if r.verdict == P.SOLVE and \
                         self._reveals < self.cfg.max_reveals_per_puzzle:
                     log.info("第 %d 题被 %s 猜中: %s", self._puzzle_index,
@@ -1197,6 +1252,10 @@ class RoundEngine:
                 "fair_clues": list(self._fair_clues),
                 "facts": ([f.to_dict() for f in self._spec.facts]
                           if self._spec else []),
+                # v5 通关合同 —— worker 原样转给 `writer.answer()`。
+                # **不让 director 自己推断规则**: "这道题有没有合同"是
+                # Engine 的状态(它持有当前哪道题), director 只做搬运。
+                "completion_fact_ids": sorted(self._completion_fact_ids),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
                 # QA 自己的时延预算(见 config.qa_answer_timeout)。
@@ -1340,6 +1399,64 @@ class RoundEngine:
                 self._puzzle_index, sig.mechanism_family, sig.solution_shape,
                 len(self._recent_signatures))
 
+    def _record_human_established_locked(
+            self, raw_ids, verdict: str = "", status: str = "") -> list:
+        """把一条**真人 QA** 公开确认的事实并进房间共识。返回真正采纳的 id。
+
+        ## 为什么必须是一个具名方法(而不是内联三行)
+
+        这是**通关状态的唯一写入口**。把它抽出来, 边界就能被测试与注释
+        显式冻结:
+
+            submit_qa(human)          -> 可以调用
+            submit_detective(...)     -> **绝不能**调用  (Step 14)
+            submit_hint / nudge       -> **绝不能**调用
+            system 自动动作           -> **绝不能**调用
+
+        若将来 Detective 能写这个集合, 系统就会**自己把题解掉** —— 观众
+        什么也没说, 题就揭晓了。那是不可接受的。
+
+        ## Engine 侧的 defense-in-depth
+
+        `PuzzleWriter.answer()` 已经用 `_clean_fact_ids()` 过滤过一次
+        (丢掉不存在的 id、去重)。这里**再做一次**, 因为:
+
+          - 不能只信 worker —— 将来可能有别的 worker 实现;
+          - 这道题可能已经换了(`_identity_ok` 之前的部分路径), 于是
+            worker 按**旧** spec 过滤过的 id 对新 spec 可能非法。
+
+        技术失败 / 未判定**不建立任何事实**: 那两种情况下主持人根本没
+        做出判断, 不能把模型随手回的 id 当成"确认"。
+        """
+        if verdict == P.UNAVAILABLE or status == "unavailable":
+            return []
+        known = {f.id for f in (getattr(self._spec, "facts", None) or [])}
+        out: list = []
+        for x in (raw_ids or []):
+            fid = str(x).strip()
+            if not fid or fid in out:
+                continue
+            if known and fid not in known:
+                # 模型编了一个不存在的 id。丢掉, 不猜。
+                log.debug("established 含不存在的 fact id, 已丢弃: %r", fid)
+                continue
+            self._established_fact_ids.add(fid)
+            out.append(fid)
+        if out:
+            _detail("房间共识 +%s (共 %d 条)", out,
+                    len(self._established_fact_ids))
+        return out
+
+    def _solve_by_contract_locked(self, now: float,
+                                  winner: str) -> list[EngineAction]:
+        """v5 通关: 合同已被房间共识覆盖。
+
+        与 `_enter_revealing_locked(now, "solved", winner)` 是**同一个**
+        状态迁移 —— 这里只是多记一行日志说明触发原因是合同覆盖。
+        刻意不另造第二套 solved 路径。
+        """
+        return self._enter_revealing_locked(now, "solved", winner)
+
     def _enter_revealing_locked(self, now: float, reason: str,
                                 winner: str) -> list[EngineAction]:
         self.phase = Phase.REVEALING
@@ -1366,6 +1483,9 @@ class RoundEngine:
             "expect_round": self.round_index,
             "expect_spec_key": self._current_spec_key,
             "puzzle": self._puzzle, "answer": self._answer,
+            # v5: 揭晓时**先念这一句**(逐字, 不经 LLM)。空 = legacy 题,
+            # director 走原来的 `writer.reveal()` 文学加工路径。
+            "core_answer": self._core_answer,
             # 出题时定下的原子事实与公平线索 —— **必须一路带到 archive**。
             # director._archive_reveal() 早就读这两个字段了, 但 payload 一直
             # 没给, 于是落盘里恒为空数组, 赛后复盘"为什么这条没判中"时

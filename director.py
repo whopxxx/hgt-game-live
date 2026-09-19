@@ -417,6 +417,12 @@ class Director:
                 payload.get("user_name", ""), payload.get("text", ""),
                 solve_atoms=payload.get("solve_atoms"),
                 facts=payload.get("facts"),
+                # v5 通关合同 —— 由 Engine 从当前这道题带下来。
+                # **不让 director 自己推断**: "有没有合同"是 Engine 的
+                # 状态(它持有此刻哪道题在台上), director 只搬运。
+                # 合同非空 -> `answer()` 不调 Final Judge, 通关由 Engine
+                # 对 established facts 做集合覆盖判定。
+                completion_fact_ids=payload.get("completion_fact_ids"),
                 # QA 自己的短预算(见 config.qa_answer_timeout):
                 # 全局 AI_TIMEOUT=60/重试 3 次是给低频长任务定的, 直播问答
                 # 用那个会让观众等 4 分钟。

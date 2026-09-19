@@ -2445,6 +2445,259 @@ def test_runtime_spec_key_is_stable_and_distinguishes():
     check("不抛异常(空输入)", isinstance(runtime_spec_key(), str))
 
 
+# ======================================================================
+# UX-2: 房间共同推理(v5 通关合同)
+# ======================================================================
+def _v5_spec(completion, core_answer="这是核心答案。",
+             facts=None, atoms=None, puzzle=None, answer=None):
+    """造一份带 v5 通关合同的 spec。
+
+    `facts` 默认给出 f1/f2 两条 core/hidden, `atoms` 分别引用它们。
+    测试只关心"合同覆盖"这条逻辑, 所以结构保持最小。
+    """
+    from story.puzzle import (PuzzleFact, PuzzleSpec, SolveAtom, FairClue)
+    puzzle = puzzle or "门外站着一个女人, 屋里的人开了门就愣住。为什么?"
+    answer = answer or "门外女人是父亲的亲生女儿, 昨晚才相认。"
+    facts = facts if facts is not None else [
+        PuzzleFact(id="f1", text="门外女人是父亲的亲生女儿", kind="core",
+                   visibility="hidden"),
+        PuzzleFact(id="f2", text="门外女人昨晚与父亲同桌吃饭", kind="core",
+                   visibility="hidden"),
+    ]
+    atoms = atoms if atoms is not None else [
+        SolveAtom(id="a1", role="key", text="门外女人是父亲的亲生女儿",
+                  fact_ids=["f1"]),
+        SolveAtom(id="a2", role="key", text="她昨晚与父亲同桌吃饭",
+                  fact_ids=["f2"]),
+    ]
+    return PuzzleSpec(
+        id="vp1", title="门外", puzzle=puzzle, answer=answer,
+        core_answer=core_answer, completion_fact_ids=list(completion),
+        facts=facts, solve_atoms=atoms,
+        fair_clues=[FairClue(quote=puzzle[:6], supports_atoms=["a1"])],
+        hints=["注意她是谁", "注意昨晚", "注意饭桌"],
+        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+
+
+def boot_v5(cfg=None, completion=("f1", "f2"), **spec_kw):
+    """起一个引擎, 交一道**带通关合同**的题, 停在 QA。"""
+    clk = FakeClock()
+    eng = RoundEngine(cfg or mkcfg(), clock=clk)
+    eng.start()
+    sp = _v5_spec(completion, **spec_kw)
+    eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints), spec=sp)
+    assert eng.phase == Phase.QA, eng.phase
+    return eng, clk, sp
+
+
+def _answer_and_submit(eng, clk, uid, name, text, **kw):
+    """发一条'#提问' -> 拿 ANSWER 动作 -> 按 kw 回一个 QAResult。"""
+    acts = [a for a in say(eng, clk, uid, name, "#" + text)
+            if a.kind == ActionKind.ANSWER]
+    assert acts, "没有派发 ANSWER"
+    p = acts[0].payload
+    return eng.submit_qa([QAResult(qid=p["qid"], **kw)],
+                         expect_round=p.get("expect_round"),
+                         expect_spec_key=p.get("expect_spec_key")), p
+
+
+def test_ux_a_collective_solve():
+    """Case A: 集体身份题 —— 房间拼齐即通关, 不要求同一人复述。
+
+    已有真人 QA 建立了 f2(她昨晚与父亲同桌吃饭), 当前真人只说
+    "她是姐姐" 建立 f1(她的身份)。这句话**没有**"因为/所以",
+    也**没有**复述机制, 仍必须立即揭晓。
+    """
+    print("\n[UX-A] 集体身份题: 补齐缺口即通关")
+    eng, clk, sp = boot_v5()
+    # 第一位观众建立 f2
+    _, _ = _answer_and_submit(eng, clk, "u1", "甲", "她昨晚和父亲吃饭了吗",
+                              verdict="是", established_fact_ids=["f2"])
+    check("只覆盖 1/2 -> 仍在 QA", eng.phase == Phase.QA, eng.phase)
+    check("已积累 f2", eng._established_fact_ids == {"f2"},
+          eng._established_fact_ids)
+    # 第二位观众建立 f1 -> 合同覆盖
+    acts, _ = _answer_and_submit(eng, clk, "u2", "乙", "她是姐姐",
+                                 verdict="是", established_fact_ids=["f1"])
+    check("补齐缺口 -> REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是补齐者(乙)", eng._solved_by == "乙", eng._solved_by)
+    check("确实判为 solved", eng._solved, eng._solved)
+    rev = [a for a in acts if a.kind == ActionKind.REVEAL]
+    check("产生了 REVEAL 动作", len(rev) == 1, kinds(acts))
+    check("REVEAL 带上 core_answer",
+          rev and rev[0].payload.get("core_answer") == sp.core_answer,
+          rev[0].payload if rev else None)
+
+
+def test_ux_b_second_fact_completes():
+    """Case B: 飞行测试 —— 第二条补齐时直接揭晓。
+
+    不得要求观众说"机长如何松口气 + 数据合格 + 塔台事先知道"那一串。
+    """
+    print("\n[UX-B] 飞行测试: 第二条补齐直接揭晓")
+    from story.puzzle import PuzzleFact, SolveAtom, FairClue, PuzzleSpec
+    sp = PuzzleSpec(
+        id="fly", title="测试飞行",
+        puzzle="飞机落地后机长长舒一口气, 乘客却在鼓掌。为什么?",
+        answer="这是一次考核飞行, 复飞本就是测试项目。",
+        core_answer="这是一次预设的测试飞行, 复飞本身就是考核项目。",
+        completion_fact_ids=["f1", "f2"],
+        facts=[PuzzleFact(id="f1", text="这是测试/考核飞行", kind="core"),
+               PuzzleFact(id="f2", text="复飞本来就是测试项目", kind="core")],
+        solve_atoms=[SolveAtom(id="a1", role="key", text="这是一次测试飞行",
+                               fact_ids=["f1"]),
+                     SolveAtom(id="a2", role="key", text="复飞是考核项目",
+                               fact_ids=["f2"])],
+        fair_clues=[FairClue(quote="乘客却在鼓掌", supports_atoms=["a1"])],
+        hints=["注意掌声", "注意民航流程", "注意考核"],
+        prompt_version="riddle-v5", quality_policy_version="quality-v5")
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints), spec=sp)
+    _answer_and_submit(eng, clk, "u1", "甲", "这是测试飞行吗",
+                       verdict="是", established_fact_ids=["f1"])
+    check("第一条不够", eng.phase == Phase.QA, eng.phase)
+    _, _ = _answer_and_submit(eng, clk, "u2", "乙", "复飞是考核项目",
+                              verdict="是", established_fact_ids=["f2"])
+    check("第二条补齐 -> 揭晓", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者=乙", eng._solved_by == "乙", eng._solved_by)
+
+
+def test_ux_c_touched_is_not_established():
+    """Case C: touched 绝不能冒充 established。
+
+    问"她和父亲有关系吗"答"是" -> touched=[f1], established=[]。
+    绝不能通关。
+    """
+    print("\n[UX-C] touched 不能冒充 established")
+    eng, clk, sp = boot_v5()
+    _answer_and_submit(eng, clk, "u1", "甲", "她和父亲有关系吗",
+                       verdict="是", touched_fact_ids=["f1"],
+                       established_fact_ids=[])
+    check("touched 记下了", eng._touched_fact_ids == {"f1"},
+          eng._touched_fact_ids)
+    check("established 仍为空", eng._established_fact_ids == set(),
+          eng._established_fact_ids)
+    check("未通关", eng.phase == Phase.QA, eng.phase)
+
+
+def test_ux_d_illegal_fact_id_dropped():
+    """Case D: 模型回不存在的 id -> Engine 丢掉。"""
+    print("\n[UX-D] 非法 fact id 被丢弃")
+    eng, clk, sp = boot_v5()
+    _answer_and_submit(eng, clk, "u1", "甲", "随便猜",
+                       verdict="是", established_fact_ids=["f999", "f1"])
+    check("f999 被丢, f1 留下",
+          eng._established_fact_ids == {"f1"}, eng._established_fact_ids)
+    check("未通关(只覆盖 1/2)", eng.phase == Phase.QA, eng.phase)
+
+
+def test_ux_m_human_only_established():
+    """Case M: 只有真人 submit_qa 能累积; 提示/nudge 不能。
+
+    并在代码里冻结: 将来 Detective 的 submit path 绝不能写这个集合。
+    """
+    print("\n[UX-M] established 只能由真人 QA 建立")
+    eng, clk, sp = boot_v5()
+    _answer_and_submit(eng, clk, "u1", "甲", "第一条",
+                       verdict="是", established_fact_ids=["f1"])
+    before = set(eng._established_fact_ids)
+    check("真人 QA 建立了 f1", before == {"f1"}, before)
+    # 提示回调不得增加
+    eng.submit_hint("想想她是谁")
+    check("submit_hint 不增加", eng._established_fact_ids == before,
+          eng._established_fact_ids)
+    # 未判定不得增加
+    acts = [a for a in say(eng, clk, "u2", "乙", "#再猜")
+            if a.kind == ActionKind.ANSWER]
+    eng.submit_qa([QAResult(qid=acts[0].payload["qid"],
+                            verdict="未判定", status="unavailable",
+                            established_fact_ids=["f2"])])
+    check("技术失败不建立任何事实",
+          eng._established_fact_ids == before, eng._established_fact_ids)
+    # 直接调用具名方法必须存在(边界显式可查)
+    check("存在具名写入口 _record_human_established_locked",
+          hasattr(eng, "_record_human_established_locked"))
+
+
+def test_ux_new_puzzle_clears_established():
+    """每道新题必须清零 established, 否则新题可能一上来就白送揭晓。"""
+    print("\n[UX-new] 新题清零房间共识")
+    eng, clk, sp = boot_v5()
+    _answer_and_submit(eng, clk, "u1", "甲", "第一条",
+                       verdict="是", established_fact_ids=["f1"])
+    check("先有 f1", eng._established_fact_ids == {"f1"},
+          eng._established_fact_ids)
+    eng._enter_revealing_locked(clk.t, "giveup", "")
+    eng.submit_reveal("揭晓")
+    clk.advance(31.0)
+    eng.tick(clk.t)
+    sp2 = _v5_spec(("f1", "f2"))
+    eng.submit_riddle(sp2.puzzle, sp2.answer, list(sp2.hints), spec=sp2)
+    check("新题 established 清零", eng._established_fact_ids == set(),
+          eng._established_fact_ids)
+    check("新题合同重新装载",
+          eng._completion_fact_ids == {"f1", "f2"}, eng._completion_fact_ids)
+    check("新题 core_answer 重新装载", eng._core_answer == sp2.core_answer,
+          eng._core_answer)
+
+
+def test_ux_legacy_spec_has_no_contract():
+    """legacy 题(无合同)不得因为 v5 改动失去通关能力。"""
+    print("\n[UX-legacy] 无合同 -> 仍走旧 Final Judge 路径")
+    eng, clk = boot(mkcfg())
+    check("无合同 -> 合同集合为空", eng._completion_fact_ids == set(),
+          eng._completion_fact_ids)
+    acts = [a for a in say(eng, clk, "u1", "甲", "#完整解释")
+            if a.kind == ActionKind.ANSWER]
+    payload = acts[0].payload
+    check("ANSWER payload 带空合同",
+          payload.get("completion_fact_ids") == [],
+          payload.get("completion_fact_ids"))
+    eng.submit_qa([QAResult(qid=payload["qid"], verdict="揭晓",
+                            solution_candidate=True)],
+                  expect_round=payload.get("expect_round"),
+                  expect_spec_key=payload.get("expect_spec_key"))
+    check("legacy P.SOLVE 仍能通关", eng.phase == Phase.REVEALING, eng.phase)
+
+
+def test_ux_answer_payload_carries_contract():
+    """ANSWER payload 必须带合同 —— director 只搬运, 不推断。"""
+    print("\n[UX-payload] ANSWER payload 带通关合同")
+    eng, clk, sp = boot_v5()
+    acts = [a for a in say(eng, clk, "u1", "甲", "#问题")
+            if a.kind == ActionKind.ANSWER]
+    check("payload 带 completion_fact_ids",
+          acts[0].payload.get("completion_fact_ids") == ["f1", "f2"],
+          acts[0].payload.get("completion_fact_ids"))
+
+
+def test_ux_established_not_in_ui_json():
+    """established_fact_ids 只进 archive, **不进**上屏 JSON。"""
+    print("\n[UX-archive] established 落盘但不外露")
+    r = QARec(qid=1, user_name="甲", text="x", verdict="是",
+              established_fact_ids=["f1"], touched_fact_ids=["f1"])
+    check("to_json 不含 established", "established_fact_ids" not in r.to_json(),
+          r.to_json())
+    check("to_archive 含 established",
+          r.to_archive().get("established_fact_ids") == ["f1"],
+          r.to_archive())
+
+
+def test_ux_established_reaches_archive():
+    """端到端: 真人 QA 的 established 必须出现在 qa_archive 里。"""
+    print("\n[UX-archive2] established 一路到 qa_archive")
+    eng, clk, sp = boot_v5()
+    _answer_and_submit(eng, clk, "u1", "甲", "第一条",
+                       verdict="是", established_fact_ids=["f1"])
+    recs = [r for r in eng._qa_archive if r.kind == "qa"]
+    check("archive 里有记录", bool(recs), recs)
+    check("记录带 established",
+          recs and recs[-1].established_fact_ids == ["f1"],
+          recs[-1].established_fact_ids if recs else None)
+
+
 def test_runtime_spec_key_includes_completion_contract():
     """Case L: v5 通关合同**必须**进运行时身份。
 
@@ -2683,6 +2936,17 @@ def main():
              test_stale_return_cannot_advance_archive_identity,
              test_runtime_spec_key_is_stable_and_distinguishes,
              test_runtime_spec_key_includes_completion_contract,
+             # ---- UX-2: 房间共同推理 ----
+             test_ux_a_collective_solve,
+             test_ux_b_second_fact_completes,
+             test_ux_c_touched_is_not_established,
+             test_ux_d_illegal_fact_id_dropped,
+             test_ux_m_human_only_established,
+             test_ux_new_puzzle_clears_established,
+             test_ux_legacy_spec_has_no_contract,
+             test_ux_answer_payload_carries_contract,
+             test_ux_established_not_in_ui_json,
+             test_ux_established_reaches_archive,
              test_runtime_spec_key_covers_structure,
              test_engine_tracks_current_spec_key,
              test_async_payloads_carry_identity,

@@ -103,7 +103,21 @@ class QAResult:
     #   用来告诉提示系统"哪些方向观众已经探索过"(方案 §32/§33)。
     # solution_candidate: 粉丝是否在**尝试完整解释谜底**。只有 true 才调
     #   Final Judge —— 这是把 judge_calls/answer_calls 降下来的闸门。
+    #   v5 起它**只是分析指标**: 有通关合同的题由代码做集合覆盖判定,
+    #   不再看它。
     touched_fact_ids: Optional[list] = None
+    #: **已建立**的 fact —— 经过"观众这句话 + 主持人 是/不是"之后,
+    #: 普通观众已经可以把该 fact 的**完整内容**当作房间共识。
+    #:
+    #: 与 `touched_fact_ids` 的区别是这一层的全部意义:
+    #:     touched     = 问过这个方向      (比如"她与父亲有关系吗")
+    #:     established = 这个事实已公开确认为真
+    #:                   (比如"门外女人是父亲的亲生女儿")
+    #: v5 的通关合同就是靠它做集合覆盖判定。
+    #:
+    #: ⚠️ **只有真人 QA 能建立它。** 提示 / nudge / 将来 Detective 的
+    #: 自动作答**绝不能**碰这个集合 —— 否则系统会自己把题解掉。
+    established_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
 
 
@@ -130,10 +144,15 @@ class QARec:
     mechanism_hit: Optional[bool] = None
     matched_atoms: Optional[list] = None
     touched_fact_ids: Optional[list] = None
+    #: v5: 这条真人问答**公开确认**了哪些 fact。见 `QAResult` 的说明。
+    established_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
 
     def to_json(self) -> dict[str, Any]:
         # 上屏用: 只给前端展示需要的字段(不暴露内部判定细节)
+        #
+        # ⚠️ `established_fact_ids` **刻意不进这里**: 它是通关状态,
+        # 前端不需要、也不该看到内部 fact id。要复盘请用 `to_archive()`。
         return {
             "qid": self.qid,
             "user_name": self.user_name,
@@ -153,6 +172,7 @@ class QARec:
             "mechanism_hit": self.mechanism_hit,
             "matched_atoms": self.matched_atoms,
             "touched_fact_ids": self.touched_fact_ids,
+            "established_fact_ids": self.established_fact_ids,
             "solution_candidate": self.solution_candidate,
         })
         return d

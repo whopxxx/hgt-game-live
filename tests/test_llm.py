@@ -243,6 +243,82 @@ def review_rewrite(reason="没有公平推理路径", **kw):
     return d
 
 
+
+# ======================================================================
+# UX-2: v5 通关合同 -> Answer 不做最终判定
+# ======================================================================
+def _verdict_tool(established=None, touched=None, cand=False):
+    return LLMResult(tool_input={"answers": [{
+        "id": 1, "verdict": "是", "comment": "好眼力",
+        "solution_candidate": cand,
+        "touched_fact_ids": list(touched or []),
+        "established_fact_ids": list(established or []),
+    }]}, model="m")
+
+
+def test_ux_g_v5_skips_final_judge():
+    """Case G: 有通关合同 -> 只调**一次** client, 绝不调 emit_judgement。
+
+    若这里仍调 Final Judge, 就又多了一条绕开合同的通关路径: 观众说中
+    一条 support 剧情也可能被裁判判"猜中", 于是合同形同虚设。
+    """
+    print("\n[UX-G] v5 不调 Final Judge")
+    # 队列里**只准备一次** Answer 返回。若代码偷偷调裁判, FakeClient
+    # 会吐出 "no more canned results" 错误 —— 断言的就是"没调"。
+    fc = FakeClient([_verdict_tool(established=["f1"], cand=True)])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "她是姐姐",
+                        facts=riddle()["facts"],
+                        completion_fact_ids=["f1"])
+    check("只调了一次 client", len(fc.calls) == 1, len(fc.calls))
+    check("那一次是 emit_verdict",
+          fc.calls[0]["tool"]["name"] == "emit_verdict",
+          fc.calls[0]["tool"].get("name"))
+    check("没有 emit_judgement 调用",
+          all(c["tool"] and c["tool"]["name"] != "emit_judgement"
+              for c in fc.calls), [c["tool"] for c in fc.calls])
+    check("返回了一条结果", len(out) == 1, out)
+    check("established 被带回", out and out[0].established_fact_ids == ["f1"],
+          out[0].established_fact_ids if out else None)
+    check("**没有**被标成 P.SOLVE", out and out[0].verdict != "揭晓",
+          out[0].verdict if out else None)
+
+
+def test_ux_h_legacy_still_judges():
+    """Case H: 无合同 -> Final Judge 流程**完全不变**。"""
+    print("\n[UX-H] legacy 无合同 -> 仍走 Final Judge")
+    fc = FakeClient([
+        _verdict_tool(cand=True),
+        LLMResult(tool_input={"is_guess": True, "cause_hit": True,
+                              "mechanism_hit": True,
+                              "matched_atoms": ["a1", "a2"]}, model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer("谜面?", "谜底。", [], 1, "甲",
+                        "退潮时礁石露出, 所以灯是在标礁石位置",
+                        solve_atoms=riddle()["solve_atoms"],
+                        facts=riddle()["facts"],
+                        completion_fact_ids=[])
+    check("调了两次(verdict + judge)", len(fc.calls) == 2, len(fc.calls))
+    check("第二次是 emit_judgement",
+          fc.calls[1]["tool"]["name"] == "emit_judgement",
+          fc.calls[1]["tool"].get("name"))
+    check("legacy 仍能判出通关", out and out[0].verdict == "揭晓",
+          out[0].verdict if out else None)
+
+
+def test_ux_established_filtered_in_answer():
+    """模型编造的 fact id 在 worker 侧就被丢掉。"""
+    print("\n[UX-filter] answer() 过滤不存在的 established id")
+    fc = FakeClient([_verdict_tool(established=["f999", "f1", "f1"])])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "猜",
+                        facts=riddle()["facts"])
+    check("f999 被丢、去重后只剩 f1",
+          out and out[0].established_fact_ids == ["f1"],
+          out[0].established_fact_ids if out else None)
+
+
 def test_riddle_tool():
     print("[出题: 强制工具]")
     fc = FakeClient([
@@ -2524,7 +2600,12 @@ def test_qa_budget_reaches_final_judge():
 
 
 def main():
-    for t in (test_riddle_tool, test_reviewer_fixes_in_place,
+    for t in (test_riddle_tool,
+              # ---- UX-2: v5 通关合同 ----
+              test_ux_g_v5_skips_final_judge,
+              test_ux_h_legacy_still_judges,
+              test_ux_established_filtered_in_answer,
+              test_reviewer_fixes_in_place,
               test_messages_timeout_override,
               test_answer_passes_qa_budget_to_client,
               test_qa_budget_reaches_final_judge,
