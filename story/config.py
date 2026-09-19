@@ -220,7 +220,13 @@ class Config:
     giveup_seconds: float = 1800.0        # 硬性兜底, 一般轮不到它
 
     # ---- 谜题循环 ----
-    reveal_hold_seconds: float = 30.0     # 揭晓展示时长(用户指定 30s)
+    reveal_hold_seconds: float = 60.0     # 揭晓展示时长(用户指定 60s)
+    # 0..reveal_core_focus_seconds 只显示核心答案(超大字号);
+    # 之后追加完整解释 + 共同解谜。见 web/app.js 的 renderReveal。
+    # 为什么要有这个分段: 实播里核心答案和完整解释**同时**上屏, 而
+    # fitReveal 会把正文一路缩到 22px 才塞得下 —— "原来如此"那一下
+    # 根本看不清。先给 15 秒只有核心答案的独占时间, 再把细节铺开。
+    reveal_core_focus_seconds: float = 15.0
     # 出题在途超时。**必须大于 gen_riddle 的最坏耗时**: 它内部最多 3 次
     # 生成 + 每次一次质检, 实测单次 4-27 秒, 最坏能跑到一分多钟。
     # 实测踩过: 原来设 45 秒, 引擎在外面判超时, 而 gen_riddle 内部还在跑,
@@ -253,6 +259,19 @@ class Config:
     # 所以补池要同时看 playable —— `stock >= target` 但 `playable <
     # playable_min` 时**仍然**补。
     pool_playable_min: int = 1
+    # ---- 揭晓窗口专用目标(60 秒是**最富裕**的补池窗口) ----
+    # QA 期间补池必须和直播抢网关, 所以目标保守(target=5/playable=1)。
+    # REVEALED 是引擎**完全空闲**的 60 秒 —— 观众在看答案, 没有任何
+    # 在途请求。这时把目标抬高, 让"看答案 -> 下一题直接出现"真正成立
+    # (而不是 60 秒后又回到现场生成、观众干等)。
+    # 仍然单飞串行 + 受 pool_max_size 约束, 不并行生成多个。
+    pool_reveal_target_size: int = 7
+    pool_reveal_playable_target: int = 2
+    # 距下一题不足这个秒数就不再**启动**新请求(在途的不用强杀)。
+    # 为什么: 60 秒到点时下一题**绝不能等待** future —— 它必须
+    # "池里有就直接上, 没有就回落现场生成"。留 15 秒给最后一道题
+    # 落地, 免得 deadline 那一刻正好有一个跑了一半的 future 挂着。
+    pool_reveal_start_guard_seconds: float = 15.0
     # 补池的硬上限: 库存到这儿就停, **即使 playable 仍然是 0**。
     # 为什么必须有: 若那批题是被"某个窗口条件"整体挡住的(比如最近
     # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
@@ -400,6 +419,36 @@ class Config:
                 f"pool_playable_min({self.pool_playable_min}) 为负, 已按 0 处理"
                 f"(0 = 关掉\"下一题缺货\"这个触发条件, 只看长期库存)。"
             )
+        # ---- 揭晓窗口 ----
+        if not (0 <= self.reveal_core_focus_seconds < self.reveal_hold_seconds):
+            warns.append(
+                f"reveal_core_focus_seconds({self.reveal_core_focus_seconds}) "
+                f"必须落在 [0, reveal_hold_seconds({self.reveal_hold_seconds})) "
+                f"内: 核心答案独占时段不能是负的, 也不能长过整个揭晓展示"
+                f"(否则完整解释永远不会出现)。"
+            )
+        if self.reveal_hold_seconds <= 0:
+            warns.append(
+                f"reveal_hold_seconds({self.reveal_hold_seconds}) <= 0: "
+                f"揭晓会瞬间跳过, 观众看不到答案。"
+            )
+        if self.pool_reveal_target_size < self.pool_target_size:
+            warns.append(
+                f"pool_reveal_target_size({self.pool_reveal_target_size}) < "
+                f"pool_target_size({self.pool_target_size}): 揭晓窗口是"
+                f"最富裕的补池时机, 目标不该比 QA 期间还低。"
+            )
+        if self.pool_reveal_target_size > self.pool_max_size:
+            warns.append(
+                f"pool_reveal_target_size({self.pool_reveal_target_size}) > "
+                f"pool_max_size({self.pool_max_size}): 揭晓目标高于硬上限, "
+                f"永远补不到。"
+            )
+        if self.pool_reveal_start_guard_seconds < 0:
+            warns.append(
+                f"pool_reveal_start_guard_seconds("
+                f"{self.pool_reveal_start_guard_seconds}) 为负, 已按 0 处理。"
+            )
         if self.pool_prefetch_backoff_s <= 0:
             warns.append(
                 f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "
@@ -498,8 +547,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="多久无人发言就重述谜面(零成本), 默认 120")
     ap.add_argument("--giveup-seconds", type=float, default=1800.0,
                     help="硬性兜底(一般轮不到), 默认 1800")
-    ap.add_argument("--reveal-hold", type=float, default=30.0,
-                    help="揭晓展示时长(秒), 默认 30")
+    ap.add_argument("--reveal-hold", type=float, default=60.0,
+                    help="揭晓展示时长(秒), 默认 60")
+    ap.add_argument("--reveal-core-focus", type=float, default=15.0,
+                    help="揭晓前多少秒只显示核心答案(超大字号), 默认 15")
     ap.add_argument("--tick-hz", type=float, default=4.0,
                     help="调度线程频率, 默认 4")
     ap.add_argument("--stall-seconds", type=float, default=120.0,
@@ -563,6 +614,7 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         restate_seconds=a.restate_seconds,
         giveup_seconds=a.giveup_seconds,
         reveal_hold_seconds=a.reveal_hold,
+        reveal_core_focus_seconds=a.reveal_core_focus,
         max_hints=a.max_hints,
         hint_questions_per_level=a.hint_questions_per_level,
         hint_min_gap_seconds=a.hint_min_gap_seconds,

@@ -141,6 +141,20 @@ class PoolPrefetcher:
         #: 兜底取 target: max 没配时不该比 target 更小(那会让滞回失效)。
         self._max_size = max(
             self._target_size, int(getattr(cfg, "pool_max_size", 10) or 0))
+        # ---- U1: 揭晓窗口专用目标 ----
+        # QA 期间补池要和直播抢网关, 目标保守; REVEALED 是引擎**完全空闲**
+        # 的 60 秒(观众在看答案, 没有任何在途请求), 这时把目标抬高,
+        # 让"看答案 -> 下一题直接出现"真正成立。
+        # 兜底取 target: 没配时不该比 QA 期间还低(那会让揭晓窗口白费)。
+        self._reveal_target = max(
+            self._target_size,
+            int(getattr(cfg, "pool_reveal_target_size", 7) or 0))
+        self._reveal_playable_target = max(
+            self._playable_min,
+            int(getattr(cfg, "pool_reveal_playable_target", 2) or 0))
+        self._reveal_guard_s = max(
+            0.0, float(getattr(cfg, "pool_reveal_start_guard_seconds", 15.0)
+                       or 0.0))
         self._backoff_s = float(getattr(cfg, "pool_prefetch_backoff_s", 30.0) or 30.0)
 
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
@@ -289,19 +303,25 @@ class PoolPrefetcher:
             # "6 道候选全被挡、回落现场生成"的场景。反过来, 只按
             # playable 判启动会让窗口拥挤时狂补(盘上其实堆满了),
             # 所以启动也保留 stock < min 这条腿。
+            #
+            # ---- U1: REVEALED 用更高的目标 ----
+            # 揭晓窗口是引擎完全空闲的 60 秒, 不抢网关, 所以目标抬高到
+            # `_reveal_target` / `_reveal_playable_target`。其余阶段沿用
+            # QA 的保守目标。"多播一道"的判定也更容易 —— 只要 playable
+            # 还没到 reveal 目标就继续补。
+            target, need_playable = self._effective_targets()
             need = (stock < self._min_size
-                    or (playable < self._playable_min
+                    or (playable < need_playable
                         and stock < self._max_size))
             if not self._refill_active and need:
                 self._refill_active = True
                 log.info("补池周期启动: 库存 %d < 低水位 %d, 或 可播 %d < %d",
-                         stock, self._min_size, playable, self._playable_min)
+                         stock, self._min_size, playable, need_playable)
             elif self._refill_active and (
-                    stock >= self._target_size
-                    and playable >= self._playable_min):
+                    stock >= target and playable >= need_playable):
                 self._refill_active = False
                 log.info("补池周期结束: 库存 %d >= 高水位 %d 且 可播 %d >= %d",
-                         stock, self._target_size, playable, self._playable_min)
+                         stock, target, playable, need_playable)
                 return
             if not self._refill_active:
                 self.skip_count += 1
@@ -313,6 +333,14 @@ class PoolPrefetcher:
 
             # ---- ⑩ 低压力门 ----
             if not self._low_pressure():
+                return
+
+            # ---- ⑩b U1: 临近下一题就不再**启动**新请求 ----
+            # 60 秒到点时下一题**绝不能等待** future: 池里有就直接上,
+            # 没有就回落现场生成。留 `pool_reveal_start_guard_seconds`
+            # 秒的余量, 免得 deadline 那一刻正好挂着一个跑了一半的任务。
+            # **在途的不用强杀** —— 它跑完就进池子, 下一题用不上也无妨。
+            if self._deadline_too_close():
                 return
 
             # ---- ⑪ 占住"在途"标记 ----
@@ -485,6 +513,52 @@ class PoolPrefetcher:
             return True
         return False
 
+    def _effective_targets(self) -> tuple:
+        """当前该用哪一组 (stock 高水位, playable 最低要求)。
+
+        QA / 其他阶段 -> 保守的 `_target_size` / `_playable_min`
+        (补池要和直播抢网关, 目标太高会互相拖慢);
+        REVEALED      -> 抬高的 `_reveal_target` / `_reveal_playable_target`
+        (引擎完全空闲的 60 秒, 这是唯一能把池子补厚的窗口)。
+
+        探针读不到 phase 时退回保守组 —— 宁可少补, 不要在没有确认
+        窗口空闲的情况下狂打网关。
+        """
+        try:
+            p = self._probe() or {}
+        except Exception:                       # noqa: BLE001
+            log.exception("读压力探针异常, 用保守目标")
+            return self._target_size, self._playable_min
+        from .state import Phase
+        if p.get("phase") == Phase.REVEALED:
+            return self._reveal_target, self._reveal_playable_target
+        return self._target_size, self._playable_min
+
+    def _deadline_too_close(self) -> bool:
+        """U1: 距下一题不足 guard 秒 -> 不再**启动**新请求。
+
+        只挡"启动", 不碰在途任务 —— urllib 请求无法取消, 强杀只会让
+        那一次生成白烧。已经飞着的跑完就进池子, 下一题用不上也无妨。
+
+        只在 REVEALED 且**确实拿到**剩余秒数时判定。探针给 None
+        (不在 REVEALED / 没有 deadline)一律按"不限"处理 —— 少一次
+        生成远比误判成"快截稿了"而长期不补池安全。
+        """
+        if self._reveal_guard_s <= 0:
+            return False
+        try:
+            p = self._probe() or {}
+        except Exception:                       # noqa: BLE001
+            log.exception("读压力探针异常, 本次不启动")
+            return True                         # fail closed: 不启动
+        left = p.get("reveal_remaining_seconds")
+        if left is None:
+            return False
+        try:
+            return float(left) <= self._reveal_guard_s
+        except (TypeError, ValueError):
+            return True                         # 读到脏值 -> 不启动
+
     def _generation_inputs(self) -> dict:
         try:
             d = self._probe_inputs()
@@ -628,6 +702,10 @@ class PoolPrefetcher:
                 "playable": self._playable(self._generation_inputs()),
                 "playable_min": self._playable_min,
                 "max_size": self._max_size,
+                # U1: 揭晓窗口的专用目标(内省/复盘用)。
+                "reveal_target": self._reveal_target,
+                "reveal_playable_target": self._reveal_playable_target,
+                "reveal_guard_s": self._reveal_guard_s,
 
                 "added": self.added_count,
                 "generation_fail": self.generation_fail_count,

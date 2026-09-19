@@ -1252,12 +1252,20 @@ class RoundEngine:
         出题 LLM, 而那正是"补池不能和直播抢网关"要避免的。
         """
         with self._lock:
+            # U1: 距下一题还有多少秒(只读)。补池用它做"临近 deadline 不再
+            # 启动新请求"的判断 —— 60 秒到点时下一题**绝不能等待** future。
+            # None = 不是在 REVEALED, 或没有 deadline(补池那边按"不限制"处理)。
+            reveal_remaining = None
+            if self.phase == Phase.REVEALED and self._next_puzzle_deadline:
+                reveal_remaining = max(
+                    0.0, self._next_puzzle_deadline - self._now(None))
             return {
                 "phase": self.phase,
                 "pending": len(self._pending),
                 "inflight": len(self._inflight),
                 "hint_inflight": bool(self._hint_pending),
                 "reveal_inflight": self._reveal_deadline is not None,
+                "reveal_remaining_seconds": reveal_remaining,
                 # 用 `_stopped` 而不是 phase == STOPPED: 后者在 `stop()`
                 # 里与前者同锁同写, 但 `_stopped` 才是那个真正的标志位
                 # (should_stop 也是读它)。补池只关心"还该不该干活"。
@@ -1857,6 +1865,29 @@ class RoundEngine:
             next_ms = None
             if self.phase == Phase.REVEALED and self._next_puzzle_deadline:
                 next_ms = max(0, int((self._next_puzzle_deadline - now) * 1000))
+            # ---- U1: 揭晓正文 ----
+            # **只在 REVEALED 阶段**下发。REVEALING 时 `_revealed` 可能还是
+            # 空/上一题的, 提前给等于泄露 hidden truth。
+            #
+            # 注意 `_core_answer` **不在** `_enter_setting_locked` 的重置
+            # 列表里(见那里的注释), 所以它可能残留上一题的值 —— 必须由
+            # phase 门控, **不能**靠"它是不是空串"来判断。
+            core_out = ""
+            full_out = ""
+            detail_visible = False
+            if self.phase == Phase.REVEALED:
+                full_out = self._revealed or ""
+                core_out = self._core_answer or ""
+                # 经过时间从 deadline 反推 —— `_next_puzzle_deadline` 是
+                # `进入 REVEALED 的时刻 + reveal_hold_seconds`, 所以这里
+                # 不需要再存一个"揭晓开始时刻"。
+                if self._next_puzzle_deadline:
+                    shown = self.cfg.reveal_hold_seconds - max(
+                        0.0, self._next_puzzle_deadline - now)
+                    detail_visible = shown >= self.cfg.reveal_core_focus_seconds
+                else:
+                    # 没有 deadline(理论上不该发生) -> 保守: 不显示细节。
+                    detail_visible = False
             elapsed = None
             if self.phase in (Phase.QA, Phase.REVEALING) and self._puzzle_started:
                 elapsed = max(0, int((now - self._puzzle_started) * 1000))
@@ -1885,6 +1916,9 @@ class RoundEngine:
                 puzzle_index=self._puzzle_index,
                 puzzle_elapsed_ms=elapsed,
                 revealed_answer=self._revealed,
+                revealed_core_answer=core_out,
+                revealed_full_answer=full_out,
+                reveal_detail_visible=detail_visible,
                 solved=self._solved,
                 solved_by=self._solved_by,
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],

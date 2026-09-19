@@ -19,21 +19,6 @@
           <span id="puzzle-elapsed"></span>
         </div>
         <div id="puzzle"></div>
-        <div id="reveal" class="hidden">
-          <div id="reveal-label">谜底揭晓</div>
-          <div id="reveal-body"></div>
-          <!--
-            揭晓贡献链: "这题大家是怎么一起推出来的"。
-            刻意放在正文**之后** —— 核心答案始终是视觉第一层, 贡献链是
-            对它的注解, 不是第二份谜底。字号也明显小于正文。
-            只在 REVEALING / REVEALED 阶段由服务端下发内容。
-          -->
-          <div id="reveal-contrib" class="hidden">
-            <div id="reveal-contrib-title"></div>
-            <div id="reveal-contrib-list"></div>
-          </div>
-          <div id="reveal-next"></div>
-        </div>
       </section>
 
       <!-- ============ 下半部: 问答流(持续上滚) ============ -->
@@ -47,6 +32,39 @@
         <div id="hintbar" class="hidden"></div>
         <div id="stats"></div>
       </section>
+
+      <!--
+        ============ 揭晓工作区(U1) ============
+        ⚠️ 位置: #content 的直接子节点, **与 #top / #bottom 平级** ——
+        不是嵌在 #top 里。它 position:absolute; inset:0, 所以拿到的
+        是整个舞台(1080x1920), 揭晓时覆盖下半部的问答区, 而上半部的
+        谜面在它之上仍可见。
+
+        为什么必须移出来: 早先它嵌在 #top 内(靠盖住谜面工作), 而 #top
+        是 overflow:hidden 且高度由 layout() 按谜面内容动态分配 ——
+        完整的核心答案 + 解释根本放不下, 只能靠 fitReveal() 把字号一路
+        缩到 22px。移到这里之后字号才有真正的空间。
+
+        前 reveal_core_focus_seconds 秒只显示 #reveal-core(超大字号),
+        之后 reveal_detail_visible=true 才追加 #reveal-body + 贡献链。
+      -->
+      <div id="reveal" class="hidden">
+        <div id="reveal-label">谜底揭晓</div>
+        <div id="reveal-core"></div>
+        <div id="reveal-who" class="hidden"></div>
+        <div id="reveal-body" class="hidden"></div>
+        <!--
+          揭晓贡献链: "这题大家是怎么一起推出来的"。
+          刻意放在正文**之后** —— 核心答案始终是视觉第一层, 贡献链是
+          对它的注解, 不是第二份谜底。字号也明显小于正文。
+          只在 REVEALING / REVEALED 阶段由服务端下发内容。
+        -->
+        <div id="reveal-contrib" class="hidden">
+          <div id="reveal-contrib-title"></div>
+          <div id="reveal-contrib-list"></div>
+        </div>
+        <div id="reveal-next"></div>
+      </div>
     </div>
 
     <!-- 调试面板(独立列, 不遮挡内容) -->

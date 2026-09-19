@@ -1,7 +1,11 @@
 /* 竖屏 AI 海龟汤直播 —— 1080x1920, 两段式布局
  *
- *  上半部 (#top):    谜面(大字, 固定不动) + 揭晓覆盖层
+ *  上半部 (#top):    谜面(大字, 固定不动)
  *  下半部 (#bottom): 问答流(持续上滚) + 思考中 + 提示 + 统计
+ *
+ *  揭晓时 (#reveal, #content 的直接子节点) 覆盖下半部:
+ *    0..reveal_core_focus_seconds  只显示核心答案(64px, 不缩放)
+ *    之后                          追加完整解释 + 共同解谜
  */
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -76,17 +80,28 @@ html, body {
   white-space: pre-line;
 }
 #puzzle.restate { animation: breathe 1.2s ease-in-out 2; }
-#puzzle.hidden { display: none; }   /* 揭晓时隐藏, 避免与谜底叠字 */
+#puzzle.hidden { display: none; }   /* U1 起揭晓时不再隐藏(谜面保持可见) */
 @keyframes breathe { 50% { color: #ffe9b8; } }
 
 /* 揭晓覆盖层(不透明: 盖住下面的谜面/问答, 不叠字) */
+/* ---- 揭晓工作区(U1) ----
+   ⚠️ 它是 #content 的直接子节点(与 #top / #bottom 平级), inset:0 ->
+   拿到整个舞台 1080x1920。揭晓时覆盖下半部的问答区, 而上半部的谜面
+   在它之上仍可见(它从 y=0 开始, 但内容用 padding-top 让开谜面区)。
+
+   早先它嵌在 #top 内(靠盖住谜面工作), 高度被 #top 的 900px 盒子限制,
+   完整的核心答案放不下 -> fitReveal() 只能把字号一路缩到 22px。
+   现在有整屏空间, 核心答案固定在 64px, **不参与任何缩放**。 */
 #reveal {
   position: absolute; inset: 0;
   background: linear-gradient(180deg, #17130a 0%, #0c0a06 100%);
-  padding: 150px 80px 70px;
+  /* 谜面在揭晓时保持可见(占上方 #top 的高度, 由 layout() 动态算,
+     实测 589~1000)。揭晓正文从 `top` 推入的 CSS 变量下方开始 ——
+     不写死 560, 因为谜面长短会改变 #top 的高度。
+     `--top-h` 由 app.js 的 layout() 写入, 兜底 620。 */
+  padding: calc(var(--top-h, 620px) + 40px) 80px 80px;
   display: flex; flex-direction: column;
-  justify-content: center;
-  gap: 28px;
+  gap: 26px;
   overflow: hidden;
   z-index: 20;
 }
@@ -96,18 +111,37 @@ html, body {
   color: #d4af6e; font-size: 38px; letter-spacing: 8px;
   text-align: center;
 }
-#reveal-body {
+/* 核心答案: 视觉第一层, 超大且**绝不缩放**。
+   字号写死在 CSS, 不被 JS 改动 —— 那正是"缩到 22px"的病根。 */
+#reveal-core {
   flex: 0 0 auto;
-  color: #f7ecd2; font-size: 42px; line-height: 1.7;
+  color: #fff6e0; font-size: 64px; line-height: 1.45;
+  font-weight: 700; letter-spacing: 2px;
+  overflow-wrap: anywhere; word-break: break-word;
+  text-align: left;
+  text-shadow: 0 0 34px rgba(255,214,120,.28);
+}
+#reveal-core.hidden { display: none; }
+/* "XX 补齐最后线索" —— 只在该题是 solved 时出现 */
+#reveal-who {
+  flex: 0 0 auto;
+  color: #ffd15e; font-size: 30px; letter-spacing: 2px;
+  text-align: left;
+}
+#reveal-who.hidden { display: none; }
+/* 完整解释: **只对这一块**做字号适配(见 fitReveal)。
+   它是唯一允许被压缩的区域 —— 核心答案与贡献链都不参与。 */
+#reveal-body {
+  flex: 0 1 auto; min-height: 0;
+  color: #f7ecd2; font-size: 34px; line-height: 1.6;
   letter-spacing: 1.5px;
   overflow-wrap: anywhere; word-break: break-word;
   text-align: left;
-  /* 极端长文 + 两条贡献链仍超高时的兜底: 优先保证不互相覆盖。
-     正常情况下 fitReveal() 会缩字号把它压进可用高度, 走不到这里。 */
   overflow-y: auto;
 }
+#reveal-body.hidden { display: none; }
 /* ---- 揭晓贡献链 ----
-   字号**明显小于**正文(fitReveal 只缩正文, 不缩这里), 因为它是
+   字号**明显小于**核心答案, 因为它是
    "这题大家怎么推出来的"的注解, 不是第二份谜底。 */
 #reveal-contrib {
   flex: 0 0 auto;
@@ -118,7 +152,7 @@ html, body {
 }
 #reveal-contrib.hidden { display: none; }
 #reveal-contrib-title {
-  color: #d4af6e; font-size: 25px; letter-spacing: 6px;
+  color: #d4af6e; font-size: 28px; letter-spacing: 6px;
 }
 #reveal-contrib-list {
   display: flex; flex-direction: column; gap: 12px;
@@ -173,6 +207,11 @@ html, body {
   display: flex; flex-direction: column;
   gap: 14px;
 }
+/* 揭晓期间下半部整个让给答案(任务书 U1)。
+   ⚠️ 必须真的 `display:none`, 不能只靠 #reveal 盖住 —— 实测过:
+   只靠 z-index 时问答流/提示/统计仍会从揭晓面板的 padding 区透出来
+   (它们没被盖住的部分照常绘制)。DOM 保留, 下一题直接恢复。 */
+#bottom.hidden { display: none; }
 #qa-title {
   flex: 0 0 auto;
   display: flex; align-items: center; gap: 20px;

@@ -19,10 +19,11 @@
     puzzle: $("puzzle"),
     reveal: $("reveal"), revealBody: $("reveal-body"), revealNext: $("reveal-next"),
     revealLabel: $("reveal-label"),
+    revealCore: $("reveal-core"), revealWho: $("reveal-who"),
     revealContrib: $("reveal-contrib"),
     revealContribTitle: $("reveal-contrib-title"),
     revealContribList: $("reveal-contrib-list"),
-    top: $("top"), bottom: $("bottom"),
+    top: $("top"), bottom: $("bottom"), content: $("content"),
     qa: $("qa"), qaBody: $("qa-body"),
     thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
     stats: $("stats"), toast: $("toast"),
@@ -107,37 +108,49 @@
 
   // 揭晓层字号自适应: 42px 基准, 内容超高就缩, 下限 22px。
   //
-  // ⚠️ 可用高度必须**按 DOM 实际高度算**, 不能像早先那样写死
-  // (`clientHeight - 150 - 90 - 90`)。写死的常数在加入贡献链之后就错了:
-  // 贡献链有内容时它会再吃掉一块高度, 而常数还是老样子, 于是正文会
-  // 被算得比实际可用空间大 —— 表现为谜底或贡献链被裁掉。
+  // ⚠️ 可用高度必须**按 DOM 实际高度算**, 不能像早先那样写死常数。
   //
-  // 只对 #reveal-body 缩字号: 贡献链本身字号就小(见 CSS), 缩它只会
-  // 让它不可读, 而它最多 1~2 条(completion 合同上限就是 2 个 fact)。
-  let lastRevealText = null;
-  function fitReveal(text) {
-    if (lastRevealText === text) return;
-    lastRevealText = text;
+  // U1 起**只对 #reveal-body(完整解释)缩字号**:
+  //   - #reveal-core 是视觉第一层, 字号由 CSS 定死 64px, **绝不改**。
+  //     早先两者共用一个正文块, fitReveal 会一路缩到 22px —— 那正是
+  //     "原来如此那一下看不清"的根因。
+  //   - 贡献链字号小且最多 1~2 条(completion 合同上限 2 个 fact),
+  //     缩它只会让它不可读。
+  // 所以这里只留一个可压缩区域, 下限 34px。
+  const REVEAL_EXPLAIN_BASE = 34;
+  const REVEAL_EXPLAIN_MIN = 34;
+  let lastRevealFitKey = null;
+  function fitReveal(fullText, coreText) {
+    // 只在"会影响布局的东西"变化时重算 —— 每次推送都量 DOM 会很贵,
+    // 而这函数在 4Hz 的推送里被调用。
+    const key = [fullText || "", coreText || "",
+                 el.revealContrib.classList.contains("hidden"),
+                 el.revealBody.classList.contains("hidden")].join("");
+    if (lastRevealFitKey === key) return;
+    lastRevealFitKey = key;
+    if (el.revealBody.classList.contains("hidden")) return;
     const rs = getComputedStyle(el.reveal);
     const padding = (parseFloat(rs.paddingTop) || 0)
                   + (parseFloat(rs.paddingBottom) || 0);
     const gap = parseFloat(rs.rowGap || rs.gap || "0") || 0;
+    // 固定高度的块: 标题 + 核心答案 + "谁补齐的" + 贡献链(可见时) + 倒计时
+    let fixed = el.revealLabel.offsetHeight + el.revealCore.offsetHeight;
+    const whoHidden = el.revealWho.classList.contains("hidden");
+    if (!whoHidden) fixed += el.revealWho.offsetHeight;
     const contribHidden = el.revealContrib.classList.contains("hidden");
-    // 固定高度的块: 标题 + 贡献链(可见时) + 倒计时行
-    const fixed = el.revealLabel.offsetHeight
-                + (contribHidden ? 0 : el.revealContrib.offsetHeight)
-                + el.revealNext.offsetHeight;
-    // flex 的 gap 出现在**每个**可见块之间, 块数 = 标题 + 正文 +
-    // (贡献链) + 倒计时。
-    const visibleBlocks = contribHidden ? 3 : 4;
+    if (!contribHidden) fixed += el.revealContrib.offsetHeight;
+    fixed += el.revealNext.offsetHeight;
+    // flex 的 gap 出现在**每个**可见块之间。
+    const visibleBlocks = 3 + (whoHidden ? 0 : 1) + (contribHidden ? 0 : 1);
     const avail = el.reveal.clientHeight - padding - fixed
                 - gap * (visibleBlocks - 1);
     if (!(avail > 0)) return;          // 布局还没稳, 别把字号缩成 0
-    let fs = 42;
-    for (let i = 0; i < 12 && fs > 22; i++) {
-      el.revealBody.style.fontSize = fs + "px";
+    let fs = REVEAL_EXPLAIN_BASE;
+    el.revealBody.style.fontSize = fs + "px";
+    for (let i = 0; i < 14 && fs > REVEAL_EXPLAIN_MIN; i++) {
       if (el.revealBody.scrollHeight <= avail) break;
       fs -= 2;
+      el.revealBody.style.fontSize = fs + "px";
     }
   }
 
@@ -198,31 +211,72 @@
     el.revealContrib.classList.remove("hidden");
   }
 
-  // 揭晓覆盖层
+  // 揭晓工作区(U1)
+  //
+  // 分两段显示:
+  //   0..reveal_core_focus_seconds  只显示核心答案(超大字号)
+  //   之后(reveal_detail_visible)   追加完整解释 + 共同解谜
+  //
+  // `reveal_detail_visible` 由**服务端**算(见 engine.snapshot) —— 前端
+  // 不自己计时, 否则刷新/重连后计时会从 0 重来, 与服务端不一致。
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
     el.reveal.classList.toggle("hidden", !on);
-    // 揭晓时**隐藏谜面** —— 否则揭晓层是半透明的, 两层文字会叠在一起
-    // (就是"揭晓时字被遮挡"的根因)。
-    el.puzzle.classList.toggle("hidden", on);
+    // ⚠️ U1 起**不再**隐藏谜面: 揭晓工作区已从 #top 移出, 从 y=0 起用
+    // padding-top 让开谜面区。谜面在上半部保持可见 —— 观众要对照着看
+    // "原来谜面那句话是这个意思"。
+    //
+    // 但**下半部的问答工作区要让位**(任务书: 揭晓期间下半部整个给答案)。
+    // 只视觉隐藏, DOM 与 Engine 数据都保留 —— 下一题直接恢复, 不需要
+    // 重建任何东西。
+    el.bottom.classList.toggle("hidden", on);
     if (!on) {
       // 揭晓层整体关掉时, 贡献链也跟着收起来 —— 否则下一题进入
       // revealing 之前会残留上一题的名字。
       renderRevealContributors({reveal_contributors: []});
+      el.revealCore.textContent = "";
+      el.revealWho.textContent = "";
+      el.revealWho.classList.add("hidden");
+      el.revealBody.textContent = "";
+      lastRevealFitKey = null;
       return;
     }
-    renderRevealContributors(s);
-    if (el.revealBody.textContent !== s.revealed_answer) {
-      el.revealBody.textContent = s.revealed_answer;
-      lastRevealText = null;              // 让 fitReveal 重新算字号
-      fitReveal(s.revealed_answer);
+
+    // ---- 核心答案: legacy 题没有 core_answer -> fallback 到完整谜底 ----
+    const core = s.revealed_core_answer || s.revealed_full_answer
+               || s.revealed_answer || "";
+    const full = s.revealed_full_answer || s.revealed_answer || "";
+    if (el.revealCore.textContent !== core) el.revealCore.textContent = core;
+
+    // ---- "XX 补齐最后线索" —— 只在该题是 solved 时出现 ----
+    const who = s.solved && s.solved_by ? (s.solved_by + " 补齐最后线索") : "";
+    if (who) {
+      el.revealWho.textContent = who;
+      el.revealWho.classList.remove("hidden");
     } else {
-      // 正文没变, 但贡献链的显隐改变了可用高度 -> 重算一次。
-      // (不能无条件调: fitReveal 内部有 lastRevealText 短路, 这里
-      //  显式清掉缓存才是真的重算。)
-      lastRevealText = null;
-      fitReveal(s.revealed_answer);
+      el.revealWho.textContent = "";
+      el.revealWho.classList.add("hidden");
     }
+
+    // ---- 完整解释: 只在细节可见、且确实与核心答案不同的时候显示 ----
+    // 若 full === core(legacy 单段题), 显示两块就是同一句话出现两次。
+    const showDetail = !!s.reveal_detail_visible && full && full !== core;
+    el.revealBody.classList.toggle("hidden", !showDetail);
+    if (showDetail && el.revealBody.textContent !== full) {
+      el.revealBody.textContent = full;
+      lastRevealFitKey = null;
+    }
+    // ---- 共同解谜: **也只在细节阶段**显示 ----
+    // 前 core_focus 秒是核心答案独占的, 摆一屏名字会把它挤下去
+    // (任务书: 0–15s 不要同时显示完整解释 / 完整贡献链)。
+    if (showDetail) {
+      renderRevealContributors(s);
+    } else {
+      renderRevealContributors({reveal_contributors: []});
+    }
+    // 核心/贡献链的显隐改变了可用高度 -> 重算解释区字号。
+    fitReveal(full, core);
+
     if (s.next_puzzle_ms != null) {
       el.revealNext.textContent = Math.ceil(s.next_puzzle_ms / 1000) + " 秒后开启新谜题";
     } else {
@@ -416,13 +470,27 @@
       fs -= 3;
     }
 
-    const want = el.puzzle.scrollHeight + 190;
+    // ⚠️ 这里读 `el.puzzle.scrollHeight` —— 对 `display:none` 的元素它恒为
+    // 0, 于是 `want=190` 会被钳到 TOP_MIN。早先 renderReveal 在揭晓时把
+    // #puzzle 设为 hidden, 于是**每次进入揭晓上下分割都会跳到 620/1300**。
+    // 当时因为揭晓层是 #top 内的绝对定位覆盖层所以看不出来; U1 把揭晓
+    // 工作区移出 #top 之后, 那个跳动就会直接可见。
+    // 现在 renderReveal **不再隐藏谜面**(谜面本就该在揭晓时保持可见),
+    // 所以 scrollHeight 始终有效, 这个坑从源头消失了。
+    // 下面这行是防御: 万一将来有人又去隐藏它, 至少不会算出 0。
+    const puzzleH = el.puzzle.classList.contains("hidden")
+                  ? Math.max(0, lastTopH - 190)      // 沿用上次测得的高度
+                  : el.puzzle.scrollHeight;
+    const want = puzzleH + 190;
     let height = Math.min(TOP_MAX, Math.max(TOP_MIN, want));
     height = Math.min(height, avail - BOTTOM_MIN);
     if (height !== lastTopH) {
       lastTopH = height;
       el.top.style.height = height + "px";
       el.bottom.style.top = height + "px";
+      // U1: 揭晓工作区的 padding-top 跟着谜面区走 —— 它要把正文推到
+      // 谜面下方。写死一个常数会在谜面长短变化时压到/远离谜面。
+      el.content.style.setProperty("--top-h", height + "px");
     }
   }
   new ResizeObserver(layout).observe(el.puzzle);

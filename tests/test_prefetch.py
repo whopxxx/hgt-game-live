@@ -1700,6 +1700,203 @@ def test_max_size_below_target_is_flagged():
     check("playable_min 为负有告警", any("playable_min" in x for x in w3), w3)
 
 
+# ======================================================================
+# U1: 揭晓窗口(60s)专用补池目标 + 临近 deadline 不再启动
+# ======================================================================
+
+def _reveal_probe(remaining=None, **kw):
+    """一个"在 REVEALED、引擎空闲"的探针。"""
+    d = {"phase": Phase.REVEALED, "pending": 0, "inflight": 0,
+         "hint_inflight": False, "reveal_inflight": False,
+         "reveal_remaining_seconds": remaining, "stopped": False}
+    d.update(kw)
+    return d
+
+
+def _qa_probe(remaining=None):
+    return {"phase": Phase.QA, "pending": 0, "inflight": 0,
+            "hint_inflight": False, "reveal_inflight": False,
+            "reveal_remaining_seconds": remaining, "stopped": False}
+
+
+def test_u1_reveal_uses_higher_target():
+    """**U1-A**: REVEALED 期间补池目标抬高到 reveal_target。
+
+    QA 期间 target=5; 揭晓窗口补到 7 —— 那是唯一"引擎完全空闲"的时间
+    窗, 观众在看答案, 补池不与直播抢网关。
+    """
+    print("\n[U1-A] REVEALED 用更高的补池目标")
+    with tmpdir() as d:
+        # QA: stock=6 >= target=5 -> 不该补
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+                  probe=lambda: _qa_probe(), pool_reveal_target_size=7)
+        fill(pf.pool, 6)
+        pf.on_tick()
+        check("QA: stock=6 已到 target(5) -> 不补",
+              len(ex.submitted) == 0, len(ex.submitted))
+        # REVEALED: 同一个 stock=6 < reveal_target=7 -> 该启动
+        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor(),
+                   probe=lambda: _reveal_probe(remaining=50.0),
+                   pool_reveal_target_size=7)
+        fill(pf2.pool, 6)
+        pf2.on_tick()
+        check("**REVEALED: stock=6 < reveal_target(7) -> 启动**",
+              pf2.stats()["refill_active"] is True,
+              pf2.stats()["refill_active"])
+        check("并且真的提交了",
+              len(pf2._executor.submitted) == 1,
+              len(pf2._executor.submitted))
+
+
+def test_u1_reveal_playable_target():
+    """**U1-B**: REVEALED 期间要求 playable >= reveal_playable_target(2)。"""
+    print("\n[U1-B] REVEALED 的 playable 目标更高")
+    with tmpdir() as d:
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor(),
+                  probe=lambda: _reveal_probe(remaining=50.0),
+                  pool_playable_min=1, pool_reveal_playable_target=2,
+                  pool_reveal_target_size=7)
+        fill(pf.pool, 1)                   # stock=1, playable=1
+        tgt, need = pf._effective_targets()
+        check("REVEALED: 目标组是 reveal 组", (tgt, need) == (7, 2), (tgt, need))
+        pf.on_tick()
+        check("playable=1 < 2 -> 仍要补", pf.stats()["refill_active"] is True,
+              pf.stats()["refill_active"])
+
+
+def test_u1_qa_still_uses_conservative_target():
+    """**U1-C**: 非 REVEALED 阶段仍是保守目标(QA 要跟直播抢网关)。"""
+    print("\n[U1-C] QA 仍用保守目标")
+    with tmpdir() as d:
+        pf = mkpf(d, executor=_SyncExecutor(),
+                  pool_reveal_target_size=7, pool_reveal_playable_target=2)
+        tgt, need = pf._effective_targets()
+        check("QA: 目标组是保守组 (5,1)", (tgt, need) == (5, 1), (tgt, need))
+    with tmpdir() as d:
+        pf2 = mkpf(d, executor=_SyncExecutor(),
+                   probe=lambda: _reveal_probe(remaining=50.0),
+                   pool_reveal_target_size=7, pool_reveal_playable_target=2)
+        tgt2, need2 = pf2._effective_targets()
+        check("REVEALED: 切到 reveal 组 (7,2)", (tgt2, need2) == (7, 2),
+              (tgt2, need2))
+
+
+def test_u1_deadline_guard_blocks_new_requests():
+    """**U1-D**: 距下一题 <= guard 秒 -> 不再**启动**新请求。
+
+    60 秒到点时下一题绝不能等待 future。留 15 秒余量, 免得 deadline
+    那一刻正好挂着一个跑了一半的任务。
+    """
+    print("\n[U1-D] 临近 deadline 不再启动")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+                  probe=lambda: _reveal_probe(remaining=5.0),
+                  pool_min_size=2, pool_reveal_target_size=7,
+                  pool_reveal_start_guard_seconds=15.0)
+        pf.on_tick()
+        check("剩余 5s <= guard 15s -> **不启动**",
+              len(ex.submitted) == 0, len(ex.submitted))
+        check("latch 仍开着(只是这一拍不启动)",
+              pf.stats()["refill_active"] is True)
+    with tmpdir() as d:
+        ex2 = _SyncExecutor()
+        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex2,
+                   probe=lambda: _reveal_probe(remaining=40.0),
+                   pool_min_size=2, pool_reveal_target_size=7,
+                   pool_reveal_start_guard_seconds=15.0)
+        pf2.on_tick()
+        check("剩余 40s > guard -> 照常启动",
+              len(ex2.submitted) == 1, len(ex2.submitted))
+
+
+def test_u1_deadline_guard_ignores_non_reveal():
+    """探针给 None(不在 REVEALED)-> 不限制。"""
+    print("\n[U1-E] 非揭晓阶段不受 deadline guard 影响")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+                  probe=lambda: _qa_probe(remaining=None),
+                  pool_reveal_start_guard_seconds=15.0)
+        pf.on_tick()
+        check("QA + remaining=None -> 照常补",
+              len(ex.submitted) == 1, len(ex.submitted))
+
+
+def test_u1_multiple_generations_within_one_reveal():
+    """**U1-F**: 同一个 60s REVEALED 窗口里能连续补多道(单飞, 串行)。"""
+    print("\n[U1-F] 一个揭晓窗口内连续补多道")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+                  probe=lambda: _reveal_probe(remaining=50.0),
+                  pool_min_size=2, pool_target_size=5,
+                  pool_reveal_target_size=7, pool_reveal_playable_target=1)
+        for _ in range(12):
+            pf.on_tick()
+        n = pf.pool.stock_count()
+        check("**补到了 reveal_target(7)**", n >= 7, n)
+        check("不会无限补(受 max_size=10 约束)", n <= 10, n)
+        check("补了不止一道(确实连续工作)",
+              len(ex.submitted) >= 5, len(ex.submitted))
+
+
+def test_u1_reveal_never_blocks_next_puzzle():
+    """**U1**: deadline 那一刻下一题**不等** future —— 池里有就直接上。
+
+    补池是后台行为, `pop_next` 永远不该被它挡住。这里验的是"在途任务
+    存在时, pop_next 仍能立刻拿到题"。
+    """
+    print("\n[U1-H] 下一题不等补池 future")
+    with tmpdir() as d:
+        from story.prefetch import _PENDING
+        pool = PuzzlePool.open(mkcfg(d))
+        fill(pool, 3)
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=pool, executor=ex,
+                  probe=lambda: _reveal_probe(remaining=50.0))
+        for _ in range(3):
+            pf.on_tick()
+        check("**确实有在途任务(未完成)**", pf._future is not None)
+        got = pool.pop_next()
+        check("**在途任务存在时 pop_next 仍立刻拿到题**", got is not None)
+        check("拿到的确实是一道题", bool(getattr(got, "puzzle", "")))
+
+
+def test_u1_guard_config_validation():
+    """U1 新增配置的 validate 告警 + 默认值。"""
+    print("\n[U1-G] reveal 配置校验")
+    w = Config(sim_path="x", reveal_hold_seconds=60.0,
+               reveal_core_focus_seconds=15.0).validate()
+    check("正常核心焦点时长无告警",
+          not any("reveal_core_focus" in x for x in w), w)
+    w2 = Config(sim_path="x", reveal_hold_seconds=30.0,
+                reveal_core_focus_seconds=45.0).validate()
+    check("**焦点时长 >= 展示时长 会告警**",
+          any("reveal_core_focus" in x for x in w2), w2)
+    w3 = Config(sim_path="x", reveal_hold_seconds=30.0,
+                reveal_core_focus_seconds=-1.0).validate()
+    check("负焦点时长会告警", any("reveal_core_focus" in x for x in w3), w3)
+    w4 = Config(sim_path="x", pool_reveal_target_size=3,
+                pool_target_size=5).validate()
+    check("reveal_target < target 会告警",
+          any("pool_reveal_target_size" in x for x in w4), w4)
+    w5 = Config(sim_path="x", pool_reveal_target_size=99,
+                pool_max_size=10).validate()
+    check("reveal_target > max 会告警",
+          any("pool_reveal_target_size" in x for x in w5), w5)
+    c = Config(sim_path="x")
+    check("默认 reveal_hold 是 60s", c.reveal_hold_seconds == 60.0,
+          c.reveal_hold_seconds)
+    check("默认 core_focus 是 15s", c.reveal_core_focus_seconds == 15.0,
+          c.reveal_core_focus_seconds)
+    check("默认 reveal_target 是 7", c.pool_reveal_target_size == 7,
+          c.pool_reveal_target_size)
+    check("默认 guard 是 15s", c.pool_reveal_start_guard_seconds == 15.0,
+          c.pool_reveal_start_guard_seconds)
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -1760,6 +1957,15 @@ def main():
         test_prefetch_stats_exposes_playable,
         test_playable_min_zero_restores_q9_behavior,
         test_max_size_below_target_is_flagged,
+        # ---- U1: 揭晓窗口专用目标 + deadline guard ----
+        test_u1_reveal_uses_higher_target,
+        test_u1_reveal_playable_target,
+        test_u1_qa_still_uses_conservative_target,
+        test_u1_deadline_guard_blocks_new_requests,
+        test_u1_deadline_guard_ignores_non_reveal,
+        test_u1_multiple_generations_within_one_reveal,
+        test_u1_reveal_never_blocks_next_puzzle,
+        test_u1_guard_config_validation,
     ]
     for t in tests:
         t()

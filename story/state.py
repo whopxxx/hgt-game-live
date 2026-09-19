@@ -301,6 +301,19 @@ class Snapshot:
     #: 本身早就公开过, 但**"哪几条刚好在通关路径上"**是新的信息 ——
     #: 提前下发等于让前端(以及任何抓包的观众)提前知道题目快解开了。
     reveal_contributors: list[dict[str, Any]] = field(default_factory=list)
+    # ---- 揭晓正文(U1) ----
+    #: 核心答案 —— 一句话的"原来如此"。**只在 REVEALED 阶段**下发。
+    #: 与 `revealed_answer` 分开的理由: 60 秒揭晓的前 15 秒只该显示
+    #: 这一句(超大字号), 完整解释随后才铺开。合成一段文本的话前端
+    #: 没法把它们分开渲染, 而按标点猜切分是在赌谜底的书写格式。
+    #: legacy 题没有 core_answer -> 空串, 前端 fallback 到 full。
+    revealed_core_answer: str = ""
+    #: 完整解释。**只在 REVEALED 阶段**下发(REVEALING 不提前给)。
+    revealed_full_answer: str = ""
+    #: 完整解释是否该显示(揭晓 > reveal_core_focus_seconds 后为 true)。
+    #: ⚠️ 由**服务端按 phase + 经过时间**算, 不是前端自己计时 ——
+    #: 前端刷新/重连后仍要与服务端一致, 而前端本地计时会从 0 重来。
+    reveal_detail_visible: bool = False
     qa_total: int = 0                       # 含已滑出快照的条数 -> 前端只追加不重排
     pending_count: int = 0                  # 排队中(未答)的提问数 -> "AI 正在思考…"
     # ---- 提示 / 空闲 ----
@@ -346,6 +359,10 @@ class Snapshot:
             "puzzle_index": self.puzzle_index,
             "puzzle_elapsed_ms": self.puzzle_elapsed_ms,
             "revealed_answer": self.revealed_answer,
+            # U1: 核心答案 / 完整解释分开下发 + 是否显示细节。
+            "revealed_core_answer": self.revealed_core_answer,
+            "revealed_full_answer": self.revealed_full_answer,
+            "reveal_detail_visible": self.reveal_detail_visible,
             "solved": self.solved,
             "solved_by": self.solved_by,
             "qa_log": self.qa_log,

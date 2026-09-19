@@ -298,6 +298,87 @@ def test_solve_and_reveal():
           s.next_puzzle_ms is not None and s.next_puzzle_ms > 0, s.next_puzzle_ms)
 
 
+def test_u1_reveal_snapshot_two_phase():
+    """**U1**: 揭晓正文分两段下发, 且**只在 REVEALED**。
+
+        QA / REVEALING   三个字段都为空/false(不提前泄 hidden truth)
+        REVEALED 0..focus  core 有值, full 有值, detail_visible=false
+        REVEALED > focus   detail_visible=true
+    """
+    print("\n[U1-Engine] 揭晓快照两段式")
+    eng, clk = boot(mkcfg(reveal_hold_seconds=60.0,
+                          reveal_core_focus_seconds=15.0))
+    # ---- QA: 三个字段都空 ----
+    s = eng.snapshot()
+    check("QA: core 为空", s.revealed_core_answer == "", s.revealed_core_answer)
+    check("QA: full 为空", s.revealed_full_answer == "", s.revealed_full_answer)
+    check("QA: detail_visible=False", s.reveal_detail_visible is False)
+    # ---- REVEALING: 仍不下发 ----
+    eng.submit_danmaku("u1", "甲", "#是同伴的肉")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="揭晓")])
+    check("确实在 REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    s = eng.snapshot()
+    check("**REVEALING 不提前下发 core**", s.revealed_core_answer == "",
+          s.revealed_core_answer)
+    check("**REVEALING 不提前下发 full**", s.revealed_full_answer == "",
+          s.revealed_full_answer)
+    # ---- REVEALED, 未到 focus: core+full 有值, detail=false ----
+    eng.submit_reveal("完整解释在此。")
+    s = eng.snapshot()
+    check("REVEALED: full 有值", s.revealed_full_answer == "完整解释在此。",
+          s.revealed_full_answer)
+    check("REVEALED 刚开始: detail_visible=False",
+          s.reveal_detail_visible is False, s.reveal_detail_visible)
+    # ---- 推进到 focus 之后 ----
+    clk.advance(20.0)
+    s = eng.snapshot()
+    check("**过了 focus -> detail_visible=True**",
+          s.reveal_detail_visible is True, s.reveal_detail_visible)
+
+
+def test_u1_reveal_core_falls_back_when_absent():
+    """**U1**: legacy 题没有 core_answer -> 前端靠 full fallback。
+
+    Engine 侧只需保证: 没有 spec 时 `revealed_core_answer` 是空串
+    (而不是 None 或上一题的残留)。
+    """
+    print("\n[U1-Engine] 无 core_answer 时字段为空串")
+    eng, clk = boot(mkcfg(reveal_hold_seconds=60.0))
+    eng.submit_danmaku("u1", "甲", "#猜中了")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="揭晓")])
+    eng.submit_reveal("只有完整谜底。")
+    s = eng.snapshot()
+    check("core 是空串(不是 None)", s.revealed_core_answer == "",
+          repr(s.revealed_core_answer))
+    check("full 正常", s.revealed_full_answer == "只有完整谜底。",
+          s.revealed_full_answer)
+    check("snapshot.to_json 也带上这三个字段",
+          "revealed_core_answer" in s.to_json()
+          and "revealed_full_answer" in s.to_json()
+          and "reveal_detail_visible" in s.to_json())
+
+
+def test_u1_pressure_exposes_reveal_remaining():
+    """**U1**: pressure() 暴露 reveal_remaining_seconds(只读)。"""
+    print("\n[U1-Engine] pressure 暴露剩余秒数")
+    eng, clk = boot(mkcfg(reveal_hold_seconds=60.0))
+    check("QA 时是 None",
+          eng.pressure().get("reveal_remaining_seconds") is None,
+          eng.pressure().get("reveal_remaining_seconds"))
+    eng.submit_danmaku("u1", "甲", "#猜中了")
+    eng.tick()
+    eng.submit_qa([QAResult(qid=1, verdict="揭晓")])
+    eng.submit_reveal("谜底。")
+    left = eng.pressure().get("reveal_remaining_seconds")
+    check("REVEALED 时有值且接近 60", left is not None and 55 <= left <= 60,
+          left)
+    clk.advance(30.0)
+    left2 = eng.pressure().get("reveal_remaining_seconds")
+    check("过了 30s 后约剩 30", left2 is not None and 25 <= left2 <= 31, left2)
+
+
 def test_reveal_once():
     print("[一题只揭晓一次]")
     eng, clk = boot(mkcfg(max_reveals_per_puzzle=1))
@@ -1134,7 +1215,8 @@ def test_reveal_payload_carries_atoms():
 def test_signature_recorded_and_passed_on():
     """Q4: 出题后记下指纹, 下一题的 RIDDLE 动作里带上最近指纹。"""
     clk = FakeClock()
-    eng = RoundEngine(mkcfg(), clock=clk)
+    # 短 hold: 用 advance(31.0) 跨"揭晓 -> 下一题"(与展示时长无关)。
+    eng = RoundEngine(mkcfg(reveal_hold_seconds=5.0), clock=clk)
     eng.start()
     sig = {"mechanism_family": "hidden_function",
            "solution_shape": "hidden_function_explains_behavior",
@@ -1214,7 +1296,7 @@ def test_touched_facts_accumulate_and_reset():
 
 def test_candidate_count_and_reset_on_new_puzzle():
     """Q5: candidate 计数, 以及开新题时清空。"""
-    eng, clk = boot(mkcfg())
+    eng, clk = boot(mkcfg(reveal_hold_seconds=5.0, ))
     ans = [a for a in say(eng, clk, "u1", "甲", "#完整解释")
            if a.kind == ActionKind.ANSWER]
     eng.submit_qa([QAResult(qid=ans[0].payload["qid"], verdict="是",
@@ -1259,7 +1341,8 @@ def test_retry_riddle_keeps_avoid_and_recent():
     也就是说**只要发生一次外层 retry, 就能绕过整个 Q4**。
     """
     clk = FakeClock()
-    eng = RoundEngine(mkcfg(riddle_max_attempts=3), clock=clk)
+    eng = RoundEngine(mkcfg(riddle_max_attempts=3,
+                            reveal_hold_seconds=5.0), clock=clk)
     eng.start()
     # 先播一题, 让它有 used_titles 与 signature
     eng.submit_riddle("第一题。为什么?", "底", ["a", "b", "c"],
@@ -1393,7 +1476,7 @@ def test_fallback_does_not_pollute_quota():
 def test_fallback_rotates():
     """P1: 兜底题要轮换 —— 总用同一道, 观众一看就知道出题挂了。"""
     clk = FakeClock()
-    eng = RoundEngine(mkcfg(riddle_max_attempts=1), clock=clk)
+    eng = RoundEngine(mkcfg(reveal_hold_seconds=5.0, riddle_max_attempts=1), clock=clk)
     eng.start()
     eng.submit_riddle(None, error="挂了")
     p1 = eng._puzzle
@@ -2593,7 +2676,10 @@ def _v5_spec(completion, core_answer="这是核心答案。",
 def boot_v5(cfg=None, completion=("f1", "f2"), **spec_kw):
     """起一个引擎, 交一道**带通关合同**的题, 停在 QA。"""
     clk = FakeClock()
-    eng = RoundEngine(cfg or mkcfg(), clock=clk)
+    # 默认给个**短**的揭晓展示时长: 调用方普遍用 advance(31.0) 跨过
+    # "揭晓 -> 下一题", 那测的是别的东西。U1 把默认提到 60s 之后,
+    # 31s 跨不过去了 —— 但把它改成 61 会让这些用例看起来在测那个数。
+    eng = RoundEngine(cfg or mkcfg(reveal_hold_seconds=5.0), clock=clk)
     eng.start()
     sp = _v5_spec(completion, **spec_kw)
     eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints), spec=sp)
@@ -3255,7 +3341,11 @@ def main():
              test_h1_cli_flags_wired, test_question_routing, test_concurrency_cap,
              test_answer_flow, test_ordering_and_missing, test_inflight_timeout,
              test_no_duplicate_worker_per_qid, test_answer_payload_carries_qa_budget,
-             test_dedupe_and_cap, test_solve_and_reveal, test_reveal_once,
+             test_dedupe_and_cap, test_solve_and_reveal,
+             test_u1_reveal_snapshot_two_phase,
+             test_u1_reveal_core_falls_back_when_absent,
+             test_u1_pressure_exposes_reveal_remaining,
+             test_reveal_once,
              test_next_puzzle_cycle,
              test_timeline_hints_and_reveal, test_timeline_survives_busy_chat,
              test_timeline_countdown_fields,
