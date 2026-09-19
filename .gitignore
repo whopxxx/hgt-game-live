@@ -17,6 +17,14 @@ data/_*.py
 # Chrome 直播窗口的用户数据目录(160MB+)
 data/_liveprofile/
 
+# ---- 外部题库(Batch H) ----
+# 抓下来的原始 dump + 归一后的 curated_raw。**绝不入库**:
+#   1. 体量大(SE 抓一轮就是几 MB, 全量 dump 是 GB 级);
+#   2. 里面是**别人的**受版权保护的内容, 入库等于我们再分发一份;
+#   3. 它是可复现的 —— tools/import_*.py 重跑一次就有, 没有版本化价值。
+# 真正需要版本化的是**导入脚本**与 attribution, 不是这些中间产物。
+data_external/
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
