@@ -3647,8 +3647,7 @@ def test_g2e_kind_visibility_swap_is_normalized():
     """**G2-E**: kind/visibility 明显填反 -> 原地换回来。
 
     实播日志 `fact fN kind 非法: public` —— `public` 显然是 **visibility**
-    值。只有两个字段**互相**都是对方的合法取值时才能安全交换; 其它非法
-    取值一律交 Reviewer, 代码不猜。
+    值。只有两个字段**互相**都是对方的合法取值时才能安全交换。
     """
     print("\n[G2-E] kind/visibility 填反 -> 原地交换")
     from story.quality import validate_spec
@@ -3663,17 +3662,86 @@ def test_g2e_kind_visibility_swap_is_normalized():
     check("**字段真的被换回来了**",
           s.facts[2].kind == "support" and s.facts[2].visibility == "public",
           (s.facts[2].kind, s.facts[2].visibility))
-    # 非互换情形的非法值 -> 仍然硬拒(不猜)
-    s2 = _v5_fixture()
-    s2.facts[2].kind = "weird"
-    vr2 = validate_spec(s2)
-    check("**拼错的 kind 仍硬拒(代码不猜)**", not vr2.ok, vr2.why())
-    # 只有一半像 -> 也不能猜(一个合法一个不合法 = 不是"填反")
+    # ---- G4-A: 半错位也不再整稿扔掉 ----
+    #   kind = "public"(合法 visibility) / visibility = "hidden"(合法)
+    #   这不是完整互换 -> 以前落到 r.fail -> 整稿重出。实播里那三条
+    #   `fact f7 kind 非法: public` 走的正是这条路。
     s3 = _v5_fixture()
     s3.facts[2].kind = "public"
-    s3.facts[2].visibility = "public"   # 两个都是 visibility 值
+    s3.facts[2].visibility = "public"
     vr3 = validate_spec(s3)
-    check("**两个都是 visibility 值 -> 不交换, 硬拒**", not vr3.ok, vr3.why())
+    check("**半错位不再硬拒(交 reviewer 修)**", vr3.ok, vr3.why())
+    check("**并且真的被记成 fixable**",
+          any("kind" in m for m in vr3.fixable), vr3.fixable)
+
+
+def test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft():
+    """**G4-A**（本批最高价值 regression）: `kind=public` **不再换稿**。
+
+    这是 G2 的**真实漏口**: G2 的注释写着"其它非法 kind/visibility 交
+    Reviewer 修", 但代码落的是 `r.fail()` —— 只有**完整互换**才会被自动
+    纠正。实播日志里最常出现的其实是**半错位**:
+
+        kind       = "public"    <- 合法 visibility
+        visibility = "hidden"    -> 合法 visibility, 但不在 FACT_KINDS 里
+
+    于是 `visibility in FACT_KINDS` 为假 -> 不满足交换 -> fail -> 整稿
+    扔掉 -> 重新生成。G2 声称消灭的那类白请求**一次都没减少**。
+
+    新契约: generator 只调 **1** 次, reviewer 就地修 kind, audit 照常。
+    """
+    print("\n[G4-A] fact kind=public -> reviewer 就地修, generator 仍 1 次")
+    from story.puzzle import PuzzleFact
+    P = _GOOD_PUZ
+    bad = riddle()
+    bad["facts"][2] = dict(bad["facts"][2])
+    bad["facts"][2]["kind"] = "public"       # 合法 visibility, 非法 kind
+    bad["facts"][2]["visibility"] = "hidden"
+    # reviewer 返回**修好 kind 的同一稿**(事实内容一字不改)
+    fixed = review_ok(P)
+    fixed["facts"] = [dict(f) for f in fixed["facts"]]
+    fixed["facts"][2]["kind"] = "support"
+    fixed["facts"][2]["visibility"] = "public"
+    fc = FakeClient([
+        LLMResult(tool_input=bad, model="m"),
+        LLMResult(tool_input=fixed, model="m"),
+        _truth_tool(truthful=True, consistent=True),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("**generator 只有 1 次(不换稿)**",
+          names.count("emit_riddle") == 1, names)
+    check("reviewer 被调用来修",
+          names.count("emit_review") == 1, names)
+    check("**最终出题成功**", bool(spec.puzzle), spec.puzzle[:30])
+    check("kind 已合法",
+          all(f.kind in ("core", "support", "exclusion")
+              for f in (spec.facts or [])),
+          [(f.id, f.kind) for f in (spec.facts or [])])
+    # 事实文本**没有被 reviewer 借机改写**
+    check("**fact.text 原样保留(没有借机重写事实)**",
+          spec.facts[2].text == bad["facts"][2]["text"],
+          (spec.facts[2].text, bad["facts"][2]["text"]))
+    # 空 text / 缺 id 仍然硬拒 —— 那已经不是"enum 标错"
+    s = _v5_fixture()
+    s.facts[2].text = ""
+    from story.quality import validate_spec
+    check("**fact text 为空仍硬拒**", not validate_spec(s).ok)
+    _ = PuzzleFact  # 保持 import 被使用
+
+
+def test_g4a_enums_are_imported_for_the_swap():
+    """**G4-A**: 交换判据依赖的两个枚举必须真的可用。"""
+    print("\n[G4-A2] FACT_KINDS / FACT_VISIBILITY")
+    from story.puzzle import FACT_KINDS, FACT_VISIBILITY
+    check("FACT_KINDS 是 kind 的那三个",
+          set(FACT_KINDS) == {"core", "support", "exclusion"}, FACT_KINDS)
+    check("FACT_VISIBILITY 是 visibility 的那两个",
+          set(FACT_VISIBILITY) == {"public", "hidden"}, FACT_VISIBILITY)
+    check("**两个枚举不相交(所以'互换'才是无歧义的)**",
+          not (set(FACT_KINDS) & set(FACT_VISIBILITY)),
+          (FACT_KINDS, FACT_VISIBILITY))
 
 
 def test_g2f_reviewer_technical_failure_retries_same_candidate():
@@ -3889,6 +3957,9 @@ def main():
               test_g2f_reviewer_technical_failure_retries_same_candidate,
               test_g2f_audit_technical_failure_retries_same_candidate,
               test_g2f_no_draft_requests_are_capped,
+              # ---- G4-A: fact enum 错位不再换稿 ----
+              test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft,
+              test_g4a_enums_are_imported_for_the_swap,
               test_q2_discovery_beats_schema_and_prompts,
               test_q2_v7_pool_quarantined_but_v8_eligible,
               test_q2_reviewer_all_four_new_fields_required,

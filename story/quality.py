@@ -253,18 +253,42 @@ def validate_spec(spec: PuzzleSpec,
             #
             # 这是**唯一**一种代码可以安全自作主张的情况: 只有当
             #     kind 是合法 visibility **且** visibility 是合法 kind
-            # 时, 交换两个字段是无歧义的(两个值都各得其所)。其它任何
-            # 非法取值(拼错、枚举外的词、空字符串)一律**交 Reviewer 修**,
-            # 代码不猜 —— 猜错会把一条事实的性质悄悄改掉。
+            # 时, 交换两个字段是无歧义的(两个值都各得其所)。
             if (f.kind in FACT_VISIBILITY
                     and f.visibility in FACT_KINDS):
                 log.info("fact %s 的 kind/visibility 填反了(%r/%r), "
                          "原地交换", f.id, f.kind, f.visibility)
                 f.kind, f.visibility = f.visibility, f.kind
             else:
-                r.fail(f"fact {f.id} kind 非法: {f.kind}")
+                # ---- G4-A: 其它 enum 错位 -> **可修**, 不再整稿重造 ----
+                #
+                # G2 在这里写的是 `r.fail()`, 于是**这条真实故障根本没被
+                # 消灭**。模型最常产生的其实不是完整互换, 而是半错位:
+                #
+                #     kind = "public"      <- 合法 visibility
+                #     visibility = "hidden" <- 合法 visibility
+                #
+                # 此时 `visibility in FACT_KINDS` 为假 -> 不满足上面的
+                # 交换条件 -> 落到 fail -> 整稿扔掉。实播日志里那三条
+                # `fact f7 kind 非法: public` 走的正是这条路。
+                #
+                # 现在改成: 交给 reviewer **只修 kind/visibility**。
+                # 它是"某个字段填了另一个枚举里的词", 不是"事实内容坏了"。
+                r.can_fix(
+                    f"fact {f.id} 的 kind 非法({f.kind!r} 不在 {FACT_KINDS} "
+                    f"里): **只把 kind 改成合法值之一**({FACT_KINDS}), "
+                    f"并确认 visibility 是 {FACT_VISIBILITY} 之一。"
+                    f"**保持 fact.id 与 fact.text 原样** —— 不要借机重写"
+                    f"这条事实的内容, 也不要增删 facts。")
         if f.visibility not in FACT_VISIBILITY:
-            r.fail(f"fact {f.id} visibility 非法: {f.visibility}")
+            # 同上: 与 kind 那条配对, 但也可能**只有** visibility 错
+            # (kind 合法) —— 那种情况上面那条不会触发, 必须在这里兜住。
+            if f.kind in FACT_KINDS:
+                r.can_fix(
+                    f"fact {f.id} 的 visibility 非法({f.visibility!r} 不在 "
+                    f"{FACT_VISIBILITY} 里): **只把 visibility 改成 "
+                    f"{FACT_VISIBILITY} 之一**。**保持 fact.id 与 fact.text "
+                    f"原样**, 不要增删 facts。")
 
     # ---- solve_atoms ----
     #
