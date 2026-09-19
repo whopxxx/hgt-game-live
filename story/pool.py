@@ -446,6 +446,70 @@ class PuzzlePool:
                     n += 1
             return n
 
+    def stock_signatures(self,
+                         limit: Optional[int] = None) -> list:
+        """**只读**快照: 当前库存题(能进 `pop_next` 候选集的那些)的
+        `PuzzleSignature` 列表。
+
+        ## 为什么需要它(G4-B)
+
+        离线预热(`prefill_pool.py`)要在还没有观众的时候给自己造一个
+        "最近看过什么"的窗口 —— 否则它会连补 5 道**结构完全相同**的题,
+        而这 5 道互相挡着, `playable_count` 仍然是 1。预热看起来达标,
+        真开播时库存立刻塌掉。
+
+        之前的实现是预热脚本**直接摸 `self._items`**, 然后:
+            if isinstance(rec, dict): sig = rec.get("signature")
+        `_items` 里装的是 `PuzzleSpec` **对象**, 不是 dict —— 于是
+        `isinstance` 恒为假, 这个函数**永远返回 []**。预热的跨题约束
+        从来没有生效过。
+
+        直接读 `spec.signature` 也是错的: `_items` 里还躺着
+        **旧 policy 的隔离题**与**已经 used 的题**, 它们会污染 prefill
+        的 recent, 让预热去避一堆根本不会被播的 pair。
+
+        所以新增这个公开方法, 语义与 `stock_count()` **完全对齐**:
+            not used  +  过 `_validate_pool_spec()`(含 quality policy 门)
+
+        ## 纯只读
+
+        绝不改 `_used` / 绝不 `_persist_used` / 绝不 `shuffle` / 绝不
+        `pop`。返回的是 `PuzzleSignature` **副本**(`from_dict(to_dict())`),
+        调用方拿到的对象与池内对象不共享任何可变状态 —— 否则预热脚本
+        顺手改一下 signature 就会**直接改掉池子里的题**。
+
+        `limit`: 数够就早退(同 `stock_count`)。
+
+        不抛异常(与本模块其他公开方法一致)。
+        """
+        from .puzzle import PuzzleSignature
+        out: list = []
+        try:
+            with self._lock:
+                for s in self._items:
+                    if limit is not None and len(out) >= limit:
+                        break
+                    if spec_key(s) in self._used:
+                        continue
+                    try:
+                        ok, _ = self._validate_pool_spec(s)
+                    except Exception:               # noqa: BLE001
+                        log.exception("签名快照校验异常, 该题跳过")
+                        continue
+                    if not ok:
+                        continue
+                    sig = getattr(s, "signature", None)
+                    if sig is None:
+                        continue
+                    try:
+                        out.append(PuzzleSignature.from_dict(sig.to_dict()))
+                    except Exception:               # noqa: BLE001
+                        log.exception("签名快照序列化异常, 该题跳过")
+                        continue
+        except Exception:                           # noqa: BLE001
+            log.exception("stock_signatures 异常, 返回已收集的部分")
+        return out
+
     def _candidate_block_reason_locked(self, spec: PuzzleSpec,
                                        recent: Optional[list],
                                        avoid: Optional[list],

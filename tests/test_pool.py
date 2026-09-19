@@ -25,7 +25,7 @@ from story.puzzle import (  # noqa: E402
     DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
     PuzzleSpec, SolveAtom,
 )
-from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.pool import POOL_VERSION, PuzzlePool, spec_key  # noqa: E402
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.state import Phase  # noqa: E402
 
@@ -41,6 +41,36 @@ def check(name, cond, extra=""):
 
 
 # ----------------------------------------------------------------------
+
+def _write_raw_pool(d, specs):
+    """把 specs **直接写进 pool.jsonl**, 绕过 `add()` 的准入校验。
+
+    用途: 造"盘上有一道旧 policy 的题"这种状态 —— `add()` 会拒它,
+    但真实盘子上就是这样(版本 bump 之前加的), 正是隔离逻辑要处理的。
+    """
+    path = os.path.join(d, "pool.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for s in specs:
+            rec = {"pool_version": POOL_VERSION, "spec": s.to_archive(),
+                   "added_by": "pool", "added_at": 0.0}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+
+def _variant(i, puzzle, tag="池"):
+    """换谜面的**开头一句**, 但保留 good_spec 的 fair_clues 引用。
+
+    为什么不直接换整段谜面: `good_spec` 的两条 `fair_clues.quote` 是从
+    **原谜面**里逐字摘的。换掉整段 -> quote 立刻失配 -> G2-B 之后这
+    只算 fixable(不再硬拒), 但 `add()` 要求 fixable 为空 -> 入池被拒。
+    测 G4-B 却因为夹具自己造的第二重问题变红, 那不是实现的问题。
+    """
+    # 追加而不是替换 —— good_spec 的两条 quote 分别落在谜面的**开头**与
+    # **中段**, 砍掉前半句会让第一条 quote 失配。追加一个从句最安全:
+    # 两个旧 quote 都还在, 而 spec_key 是内容的哈希 -> 题目确实不同。
+    tail = "这和他那天穿的%s色外套有关吗?" % ("红" if i % 2 else "蓝")
+    return puzzle + tail
+
 def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
     """一个结构上完全合格的 spec(照 test_puzzle.good_spec 的形状)。"""
     pz = puzzle or ("灯塔守塔人每晚都亮灯, 但只在退潮的那几个小时亮。涨潮后他"
@@ -1666,6 +1696,172 @@ def test_playable_count_never_raises():
         check("**垃圾 recent 返回 int 而不是抛**", ok)
 
 
+
+# ======================================================================
+# G4-B —— 预热必须真的看得见池内 signature
+# ======================================================================
+def test_g4b_stock_signatures_returns_spec_signatures_not_empty():
+    """**G4-B**: `stock_signatures()` 必须真的返回签名。
+
+    这是一个**确定的代码 bug**: 预热脚本原来的实现是
+
+        for rec in pool._items:
+            if isinstance(rec, dict):
+                sig = rec.get("signature")
+
+    而 `_items` 里装的是 `PuzzleSpec` **对象** —— `isinstance` 恒为假,
+    于是每一轮 recent 都是 `[]`, 跨题约束从来没生效过。
+
+    危害不是"少一道题": 预热会连补 5 道**结构完全相同**的题, 打印
+    "达标", 而这 5 道互相挡着 —— 真开播时 `playable_count` 立刻塌。
+    预热看起来成功, 库存却是假的。
+    """
+    print("\n[G4-B1] stock_signatures 真的返回签名")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(good_spec())
+        sigs = pool.stock_signatures()
+        check("**库存有 1 道 -> 快照有 1 条(不是永远空表)**",
+              len(sigs) == 1, len(sigs))
+        if sigs:
+            s = sigs[0]
+            check("拿到的是 PuzzleSignature",
+                  hasattr(s, "mechanism_family"), type(s))
+            check("内容与池内一致",
+                  (s.mechanism_family, s.solution_shape)
+                  == ("hidden_function",
+                      "hidden_function_explains_behavior"),
+                  (s.mechanism_family, s.solution_shape))
+
+
+def test_g4b_stock_signatures_is_read_only_and_returns_copies():
+    """快照必须**纯只读**, 且返回副本 —— 否则预热脚本改 signature
+    就等于直接改池子里的题。"""
+    print("\n[G4-B2] 只读 + 返回副本")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(good_spec())
+        before_stock = pool.stock_count()
+        before_used = len(pool._used)
+        sigs = pool.stock_signatures()
+        check("不改库存数", pool.stock_count() == before_stock)
+        check("**不写 used**", len(pool._used) == before_used, len(pool._used))
+        sigs[0].mechanism_family = "MUTATED"
+        again = pool.stock_signatures()
+        check("**改快照不污染池内对象**",
+              again[0].mechanism_family != "MUTATED",
+              again[0].mechanism_family)
+
+
+def test_g4b_old_policy_and_used_items_do_not_pollute():
+    """旧 policy / 已 used 的题**不能**进 prefill 的 recent。
+
+    预热若看见一道 quality-v6 的题, 它会去避开一个**永远不会被播**的
+    pair —— 白白缩小了可选空间。同理已 used 的题。
+    """
+    print("\n[G4-B3] 旧 policy / used 不污染快照")
+    with tmpdir() as d:
+        cur = good_spec()
+        old = good_spec(id="old1")
+        old.puzzle = _variant(9, old.puzzle, "旧政策")
+        old.quality_policy_version = "quality-v6"
+        _write_raw_pool(d, [cur, old])
+        pool = PuzzlePool.open(mkcfg(d))
+        sigs = pool.stock_signatures()
+        check("**旧 policy 那道不在快照里**", len(sigs) == 1, len(sigs))
+        from story.pool import spec_key as _sk
+        pool._used.add(_sk(cur))
+        check("**used 之后不再出现在快照里**",
+              len(pool.stock_signatures()) == 0,
+              len(pool.stock_signatures()))
+        check("(对照) stock_count 同样口径",
+              pool.stock_count() == 0, pool.stock_count())
+
+
+def test_g4b_limit_early_exit():
+    """`limit` 数够就早退(补池只判断 3 种阈值, 不需要精确值)。"""
+    print("\n[G4-B4] limit 早退")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        for i in range(4):
+            s = good_spec(id="p%d" % i)
+            s.puzzle = _variant(i, s.puzzle)
+            pool.add(s)
+        check("limit=2 -> 恰好 2 条", len(pool.stock_signatures(limit=2)) == 2,
+              len(pool.stock_signatures(limit=2)))
+        check("不传 limit -> 全部", len(pool.stock_signatures()) == 4,
+              len(pool.stock_signatures()))
+
+
+def test_g4b_never_raises_on_empty_or_broken_pool():
+    """空池 / 异常都不抛(与本模块其他公开方法一致)。"""
+    print("\n[G4-B5] 空池不抛")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        try:
+            check("空池 -> []", pool.stock_signatures() == [])
+            check("空池带 limit -> []", pool.stock_signatures(limit=3) == [])
+        except Exception as e:                  # noqa: BLE001
+            check("空池绝不抛", False, e)
+
+
+def test_g4b_prefill_sees_existing_stock_in_recent():
+    """**G4-B 核心**: prefill 的 recent 必须**看得见池内已有的题**。
+
+    实播危害: 池里已有一道 hidden_function / hidden_function_explains_behavior,
+    预热却看不到它 -> `choose_blueprint` 又选同一个 pair -> 补进来
+    的新题与旧题结构重复 -> cross gate 把新题挡住 -> playable 仍然是 1。
+    """
+    print("\n[G4-B6] prefill 看得见已有库存(端到端)")
+    import random
+    import prefill_pool as PF
+    from story.quality import Quotas, choose_blueprint
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(good_spec())
+        recent = PF._recent_sigs(pool, mkcfg(d))
+        check("**prefill 读到了 1 条 recent**", len(recent) == 1, len(recent))
+        blocked = ("hidden_function", "hidden_function_explains_behavior")
+        hits = 0
+        for seed in range(60):
+            bp = choose_blueprint(recent, rng=random.Random(seed),
+                                  quotas=Quotas())
+            if (bp.mechanism_family, bp.solution_shape) == blocked:
+                hits += 1
+        check("**60 个种子一次都没选中已有 pair**", hits == 0, hits)
+
+
+def test_g4b_prefill_batch_does_not_self_duplicate():
+    """**G4-B 批量**: 连续补进的新题不能互相结构重复。
+
+    这是"库存是假的"最直接的检验 —— 旧实现在这里会补出一堆同 pair
+    的题(因为每一轮 recent 都是 [])。
+    """
+    print("\n[G4-B7] 连续补进的新题彼此不重复")
+    import random
+    import prefill_pool as PF
+    from story.quality import Quotas, choose_blueprint
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        seen = []
+        rng = random.Random(7)
+        for i in range(5):
+            recent = PF._recent_sigs(pool, mkcfg(d))
+            bp = choose_blueprint(recent, rng=rng, quotas=Quotas())
+            pair = (bp.mechanism_family, bp.solution_shape)
+            seen.append(pair)
+            s = good_spec(id="q%d" % i)
+            s.puzzle = _variant(i, s.puzzle, "补池")
+            s.signature.mechanism_family = bp.mechanism_family
+            s.signature.solution_shape = bp.solution_shape
+            s.blueprint.mechanism_family = bp.mechanism_family
+            s.blueprint.solution_shape = bp.solution_shape
+            pool.add(s)
+        dup = len(seen) - len(set(seen))
+        check("**5 道补出来没有 exact pair 重复**", dup == 0, seen)
+        check("库存在涨", pool.stock_count() == 5, pool.stock_count())
+
+
 def main():
     tests = [
         # 验收点 1
@@ -1736,6 +1932,14 @@ def main():
         test_c6a_dark_gate_blocks_both_directions,
         test_c6a_delivery_gate_is_shared_with_generator,
         test_playable_count_never_raises,
+        # ---- G4-B: 预热看得见池内 signature ----
+        test_g4b_stock_signatures_returns_spec_signatures_not_empty,
+        test_g4b_stock_signatures_is_read_only_and_returns_copies,
+        test_g4b_old_policy_and_used_items_do_not_pollute,
+        test_g4b_limit_early_exit,
+        test_g4b_never_raises_on_empty_or_broken_pool,
+        test_g4b_prefill_sees_existing_stock_in_recent,
+        test_g4b_prefill_batch_does_not_self_duplicate,
     ]
     for t in tests:
         t()

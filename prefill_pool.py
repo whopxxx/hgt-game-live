@@ -155,7 +155,9 @@ def _one(writer, pool: PuzzlePool, cfg: Config, rng, a) -> bool:
     """
     from story.quality import Quotas, choose_blueprint
 
-    recent = [r.signature for r in _recent_sigs(pool, cfg)]
+    # 每一道都**重新读**库存签名 —— 刚补进去的那道必须立刻进入下一道
+    # 的 recent, 否则同一个 pair 会连着补好几道(G4-B)。
+    recent = _recent_sigs(pool, cfg)
     bp = choose_blueprint(recent, rng=rng, quotas=Quotas.from_config(cfg))
     try:
         spec = writer.gen_spec(
@@ -176,7 +178,7 @@ def _one(writer, pool: PuzzlePool, cfg: Config, rng, a) -> bool:
 
 
 def _recent_sigs(pool: PuzzlePool, cfg: Config) -> list:
-    """从池子里取最近的 signature —— 跨题配额要看**盘上有什么**。
+    """当前库存题的 signature —— 跨题配额要看**盘上真正能播的**有什么。
 
     这是预热与直播 prefetch 的一个**有意差别**: 直播的 recent 来自
     Engine(观众已经看过什么), 而预热时还没有观众, 能参考的只有池子
@@ -184,31 +186,32 @@ def _recent_sigs(pool: PuzzlePool, cfg: Config) -> list:
     结构重复" —— 否则会补进 5 道一模一样的题, 而它们互相挡着,
     playable 仍然是 1。
 
-    ⚠️ 直接读 `pool._items` 而不是加一个公开方法: 池子的公开 API 是
-    `pop_next` / `add` / `stock_count` / `playable_count`, 而"把全部
-    记录暴露出来"会给别的调用方一个绕过 `pop_next` 事务语义的口子。
-    预热是个**离线运维脚本**, 它读内部状态是可接受的; 加公开 API 不是。
+    ## G4-B: 这里曾经是**永远返回 []** 的
 
-    读不到(池子结构变了 / 空池)一律返回空表 —— 预热少一点跨题约束
-    最多少补一道, 而读崩会让整个脚本停在那儿。
+    旧实现直接摸 `pool._items`:
+
+        for rec in pool._items:
+            if isinstance(rec, dict):
+                sig = rec.get("signature")
+
+    而 `_items` 里装的是 `PuzzleSpec` **对象** —— `isinstance(rec, dict)`
+    恒为假, 于是每一轮 recent 都是空的。脚本仍然会打印"达标", 但它
+    补出来的 5 道题可能全是同一个 mechanism/shape; 等第一道真播完进入
+    Engine 的 recent, 剩下的立刻被动态门挡住。**预热成功, 开播即塌。**
+
+    现在走 `PuzzlePool.stock_signatures()`: 只取 `not used` + 过静态
+    校验(含 quality policy 门)的题, 且返回副本。旧 policy / 已 used
+    的题不会污染 prefill 的 recent。
+
+    调用方**每一道之后都要重新调这个函数**(见 `main` 的循环)——
+    刚补进去的题要立刻进入下一道的 recent, 否则同一个 pair 会连补
+    好几道。
     """
-    from story.puzzle import PuzzleSignature
-    out: list = []
     try:
-        items = list(getattr(pool, "_items", None) or [])
+        return list(pool.stock_signatures())
     except Exception:                           # noqa: BLE001
-        return out
-    for rec in items:
-        sig = None
-        if isinstance(rec, dict):
-            sig = rec.get("signature")
-        if not sig:
-            continue
-        try:
-            out.append(PuzzleSignature.from_dict(sig))
-        except Exception:                       # noqa: BLE001
-            continue
-    return out
+        log.exception("读取库存签名失败, 本次按空窗口处理")
+        return []
 
 
 if __name__ == "__main__":
