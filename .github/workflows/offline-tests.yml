@@ -149,6 +149,20 @@ jobs:
       - name: 离线套件 lazy_curator
         run: uv run tests/test_lazy_curator.py
 
+      # Batch H4-A: **neurostellar/haiguitang** 主源导入器。
+      # 要守的四件事:
+      #   (a) deterministic sanitation 在任何 LLM **之前** —— 清洗免费,
+      #       Reviewer 花钱; 顺序反了就是把预算花在残缺条目上;
+      #   (b) **不伪造许可证** —— 该源没有 license 字段, 走
+      #       `usage_basis=project_approved_public_dataset`, 而**不是**
+      #       硬填一个 CC BY-SA / MIT;
+      #   (c) 只做 **exact** 去重(这一轮明确不做语义/embedding/跨源聚类);
+      #   (d) `select_candidate` 能选中项目批准的源 —— 防的是一次
+      #       **silent no-op**: 下载 3729 条、normalize 成功, 然后
+      #       一条都不审, 而日志上看不出异常。
+      - name: 离线套件 haiguitang_import
+        run: uv run tests/test_haiguitang_import.py
+
       # 单元测试覆盖不到的**装配**问题(线程/端口/信号/落盘接线)。
       # director 是常驻进程, 没有"跑完就退出"的模式, 所以用 timeout 兜底:
       # 正常情况一定是被 timeout 杀掉的(退出码 124), 那时看日志判定。

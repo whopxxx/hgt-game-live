@@ -89,23 +89,34 @@ def source_priority(rec: Any) -> tuple:
     第一版刻意简单、确定性 —— 复杂的排名在数据量只有几百条时收益为负,
     而且会让"为什么这道先审"变得无法解释。
 
-    顺序按**来源可信度**:
-        0  TurtleBench            出题时就按海龟汤组织的, 命中率最高
-        1  SE situation/story/mystery   SE 上最接近叙事题的标签
-        2  SE 其它(含 lateral-thinking) 已知混着数学/物理/字谜, 最后审
+    ## H4-A §十: 顺序按**新**的来源分层
+
+        0  neurostellar/haiguitang   出题时就按海龟汤生成, 先验最合理
+        1  TurtleBench                按海龟汤组织, 但只有 32 道独立故事
+        2  SE situation/story/mystery SE 上最接近叙事题的标签
+        3  其它 SE                    已知混着数学/物理/字谜
         9  未知来源
 
-    ⚠️ 注意这**只是排序**, 不是准入。第 2 档里也可能有真海龟汤,
-    第 0 档里也可能有垃圾 —— 最终裁定权在 curated-v2 那三门。
+    ⚠️ haiguitang 排第 0 **只是审题顺序**, 不是准入加分。它一样要过
+    curated-v3 全部十三条 —— 任务书 §十/§十五 明确: 它是"高质量候选源",
+    不是"白名单直通源"。
+
+    ⚠️ 也**不是** acceptance bonus: 排在前面只意味着"同样没审过时先审它",
+    与"它更容易被收"是两件事。混起来会让验收报告里的 yield 变成自证。
+
+    第 2/3 档里也可能有真海龟汤, 第 0/1 档里也可能有垃圾 —— 最终裁定权
+    在 curated-v3 那十三门。
     """
     src = str(getattr(rec, "source", "") or "").lower()
     tags = {str(t).lower() for t in (getattr(rec, "tags", None) or [])}
-    if "turtlebench" in src:
+    if "haiguitang" in src:
         return (0, str(getattr(rec, "external_id", "")))
-    if tags & {"situation", "story", "mystery"}:
+    if "turtlebench" in src:
         return (1, str(getattr(rec, "external_id", "")))
-    if "stackexchange" in src or "puzzling" in src:
+    if tags & {"situation", "story", "mystery"}:
         return (2, str(getattr(rec, "external_id", "")))
+    if "stackexchange" in src or "puzzling" in src:
+        return (3, str(getattr(rec, "external_id", "")))
     return (9, str(getattr(rec, "external_id", "")))
 
 
