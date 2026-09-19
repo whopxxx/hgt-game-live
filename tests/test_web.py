@@ -1016,6 +1016,11 @@ window.addEventListener("load", async () => {
       const sizedPuzzle = (n, seed) =>
         (seed.repeat(Math.ceil(n / seed.length) + 1)).slice(0, n - 4)
         + "为什么？";
+      const withLineBreaks = (text, every) => {
+        const chars = Array.from(text);
+        for (let i = every; i < chars.length; i += every) chars[i] = "\n";
+        return chars.join("");
+      };
       const pv = document.getElementById("puzzle-viewport");
       const puzzle = document.getElementById("puzzle");
 
@@ -1051,7 +1056,10 @@ window.addEventListener("load", async () => {
             "U4-2: 中等谜面字号不得低于 46px");
 
       // Case 3/4: 220 字 overflow 后真实移动、到底，且永不侵入 QA。
-      const longPuzzle = sizedPuzzle(220, "男人每晚都会记录窗边灯光和走廊脚步的先后顺序，");
+      // 显式分段，避免 Windows/Linux 中文字体度量不同导致 220 个连续字
+      // 在某个平台恰好能塞下，从而把“overflow 行为”误测成“字符数行为”。
+      const longPuzzle = withLineBreaks(sizedPuzzle(220,
+        "男人每晚都会记录窗边灯光和走廊脚步的先后顺序，"), 10);
       const longState = {phase: "qa", puzzle_index: 52, story_index: 52,
         puzzle: longPuzzle, revealed_answer: "", qa_log: [], qa_total: 0};
       send(longState);
@@ -1086,7 +1094,7 @@ window.addEventListener("load", async () => {
       check(pv.scrollTop >= beforeSnapshot,
             "U4-3: 无关 4Hz snapshot 不得重启滚动");
       await waitFor(() => pv.dataset.scrollState === "bottom",
-                    "U4-3: 长谜面应到达底部");
+                    "U4-3: 长谜面应到达底部", 5000);
       check(pv.scrollTop + pv.clientHeight >= pv.scrollHeight - 1,
             "U4-3: 长谜面最后一行必须完整进入 viewport");
 
@@ -1125,8 +1133,9 @@ window.addEventListener("load", async () => {
             "U4-8: core_answer 永远静态");
 
       // Case 7: 300 字完整解释自动滚一遍并停在底部。
-      const longAnswer = ("纸片的位置是他故意留下的记号，走廊灯光与脚步声让他怀疑有人进入房间。"
-        .repeat(12)).slice(0, 300);
+      // 宽 Latin 词组会在词间自然换行且留下行尾空间；比依赖平台中文字体
+      // 的刚好换行稳定，也不依赖 reveal-body 是否保留源文本换行。
+      const longAnswer = "WWWWWWWWWWWWWWWWWW ".repeat(20).slice(0, 300);
       send({phase: "revealed", puzzle_index: 52, story_index: 52,
             puzzle: longPuzzle, revealed_answer: longAnswer,
             revealed_core_answer: "纸片是防入侵记号。",
@@ -1136,7 +1145,7 @@ window.addEventListener("load", async () => {
       await waitFor(() => rb.dataset.scrollState === "moving" && rb.scrollTop > 0,
                     "U4-7: 长汤底顶部停留后应真实移动");
       await waitFor(() => rb.dataset.scrollState === "bottom",
-                    "U4-7: 长汤底应滚到结尾");
+                    "U4-7: 长汤底应滚到结尾", 5000);
       check(rb.scrollTop + rb.clientHeight >= rb.scrollHeight - 1,
             "U4-7: 长汤底最后一行必须完整可见");
 
