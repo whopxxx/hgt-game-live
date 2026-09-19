@@ -1867,7 +1867,12 @@ def test_solution_candidate_definition():
     sc = props["solution_candidate"]
     check("类型是 boolean", sc["type"] == "boolean", sc)
     check("给了具体例子", "退潮时礁石露出来" in sc["description"], sc)
-    check("说明只有 true 才触发判定", "才会触发" in sc["description"], sc)
+    # 措辞更新: 旧描述写"只有 true 才会触发系统的最终判定", v6 起
+    # 有合同的题 true 只触发 **completion 复核**(它不能判 solved),
+    # 所以这里断言的是"说清了 true 会触发什么"。
+    check("说清了 true 触发的是候选复核",
+          "completion semantic" in sc["description"]
+          and "不能直接判 solved" in sc["description"], sc)
     v = props["verdict"]
     check("枚举里没有揭晓", "揭晓" not in v["enum"], v["enum"])
     check("枚举就是三种", v["enum"] == ["是", "不是", "无关"], v["enum"])

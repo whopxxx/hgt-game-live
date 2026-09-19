@@ -423,6 +423,13 @@ class Director:
                 # 合同非空 -> `answer()` 不调 Final Judge, 通关由 Engine
                 # 对 established facts 做集合覆盖判定。
                 completion_fact_ids=payload.get("completion_fact_ids"),
+                # v6 completion 复核需要的两个快照 —— 同样由 Engine
+                # (dispatch 那一刻)给出, director 只搬运, 不推断。
+                #   core_answer: 复核判断"最小语义拆分"的基准
+                #   established: 复核只看"当前这句话"是否补上了**还没**
+                #                建立的那几条, 所以必须知道房间已有什么
+                core_answer=payload.get("core_answer", ""),
+                room_established_fact_ids=payload.get("established_fact_ids"),
                 # QA 自己的短预算(见 config.qa_answer_timeout):
                 # 全局 AI_TIMEOUT=60/重试 3 次是给低频长任务定的, 直播问答
                 # 用那个会让观众等 4 分钟。

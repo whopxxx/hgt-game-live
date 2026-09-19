@@ -539,16 +539,28 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
     return bool(sig and (sig.mechanism_family or sig.solution_shape))
 
 
-def _facts_block(spec: "PuzzleSpec") -> str:
+def _facts_block(spec: "PuzzleSpec", completion_fact_ids=None) -> str:
     """把 spec 的 facts 渲染成给裁决模型的"判定依据"块。
 
     facts 是主持判断"是/不是/无关"的**唯一依据**(方案 §22)。每条带上
     id 与 kind, 让模型能把 `touched_fact_ids` 填对。
+
+    `completion_fact_ids` 非空时, 属于通关合同的那几条会额外标上
+    `[通关核心]` —— 这是 **prompt 内部标记**, 目的是让第一层 Answer
+    知道"房间真正缺的是哪几条", 从而不再把明显已经说出核心机制的
+    句子判成 established=[]。
+
+    ⚠️ 这个标记**绝不下发前端**: 它只出现在发给模型的 user prompt 里。
+    前端只拿 verdict/comment, 既没有 fact ID 也没有这个标签。
     """
     if not spec or not spec.facts:
         return "(本题未提供事实表, 请依据谜面与谜底自洽判断)"
-    return "\n".join(
-        f"- {f.id} [{f.kind}] {f.text}" for f in spec.facts)
+    comp = {str(x) for x in (completion_fact_ids or []) if str(x).strip()}
+    lines = []
+    for f in spec.facts:
+        mark = " [通关核心]" if f.id in comp else ""
+        lines.append(f"- {f.id} [{f.kind}]{mark} {f.text}")
+    return "\n".join(lines)
 
 
 #: 文本回退路径判断"像不像完整解"的保守启发式。
@@ -980,19 +992,40 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
 【touched_fact_ids 与 established_fact_ids 的区别 —— 必须分清】
 - `touched_fact_ids`: 这条提问**碰到了**这个方向。
 - `established_fact_ids`: 经过"这句话 + 你的 是/不是"之后,
-  **普通观众已经可以把该 fact 的完整内容当作已确认事实**。
+  **普通观众已经可以把该 fact 的核心命题当作已确认事实**。
 
-⚠️ 判据是"这轮问答有没有把那个 canonical fact **完整公开**",
-不是"我答了是还是不是"。
+⚠️ 判据是 fact 的**核心语义**是否已经被公开建立, **不是**是否逐字
+复述了 canonical 文本。同一个机制用别的话说出来, 一样算建立。
 
-例 1(答"是"但**没有** established):
-    fact  f1 = 门外女人是父亲的亲生女儿
-    提问  "她和父亲有关系吗？"
+**算 established(核心语义已经建立)**:
+- 同义词 / 口语化说法
+- 语序变化
+- 省略不影响核心意思的修饰
+- 用更普通的话表达了同一个机制
+
+**不算 established(只是沾边)**:
+- 只是沾边、只说题材
+- 只说一个模糊方向
+- 需要你根据隐藏谜底补一大步才能成立
+
+例 1(措辞完全不同, 但**建立**了):
+    fact  f1 = 古董商通过自买自卖制造虚高成交记录
+    提问  "他自己把箱子送去拍, 又自己把价格拍高, 就是在刷这个箱子的
+           成交记录。"
+    回答  是
+    touched = ["f1"]      established = ["f1"]
+    原因: 没有逐字说"制造虚高成交记录", 但普通人已经得到了
+          **完全相同的核心机制**。
+
+例 2(答"是"但**没有**建立):
+    fact  f1 = 古董商通过自买自卖制造虚高成交记录
+    提问  "他是在炒作吗？"
     回答  是
     touched = ["f1"]      established = []
-    原因: 只确认了"有关系", 没有公开确认"亲生女儿"这个完整事实。
+    原因: "炒作"只是**方向**, 没有公开建立"自买自卖 / 制造成交记录"
+          这个机制。
 
-例 2(答"不是"却**有** established):
+例 3(答"不是"却**建立**了):
     fact  f1 = 飞机没有机械故障
     提问  "飞机有机械故障吗？"
     回答  不是
@@ -1000,8 +1033,15 @@ ANSWER_SYSTEM = """你是海龟汤的裁决机。依据【事实表】判断提�
     原因: 这个"不是"已经完整公开确认了 canonical fact。
 
 **"是"不等于 established; "不是"也不等于不能 established。**
-不确定时**宁可留空** —— 少标只会让观众多推一步, 多标会让系统
-替观众把题解掉。这个集合是**通关判定**的依据, 不是复盘用的。"""
+
+标 `[通关核心]` 的那几条是**房间真正缺的东西**, 判它们时尤其要按
+**核心语义**判 —— 观众用普通话说出同一个机制, 就应该建立, 不要因为
+措辞和事实表不一样而留空。
+
+拿不准是否只是"沾边"时**不要**建立; 但如果普通观众已经能从这句公开
+话语里复述出**同一个核心命题**, 就应当 established, 不要因为措辞不同
+而留空。少标不是"让观众多推一步" —— 真实直播里它会让已经答中的玩家
+永远结束不了。"""
 
 
 HINT_SYSTEM = """你在主持中文「海龟汤」推理直播。观众卡住了, 给一条**方向性**提示。
@@ -1337,20 +1377,30 @@ _TOOL_ANSWER = {
                             "type": "array", "items": {"type": "string"},
                             "description": (
                                 "经过'观众这句话 + 你的 是/不是 回答'之后, "
-                                "**普通观众已经可以把该 fact 的完整内容当作"
+                                "**普通观众已经可以把该 fact 的核心命题当作"
                                 "已确认事实**的那几条 id(没有就留空)。\n"
-                                "⚠️ 不是'碰到了', 是'完整公开确认了'。\n"
-                                "例1 fact f1='门外女人是父亲的亲生女儿'; "
-                                "问'她和父亲有关系吗', 答'是' "
-                                "-> touched=[f1], established=[] "
-                                "(只确认了'有关系', 没公开确认'亲生女儿')。\n"
-                                "例2 fact f1='飞机没有机械故障'; "
-                                "问'飞机有机械故障吗', 答'不是' "
-                                "-> touched=[f1], established=[f1] "
-                                "(这个'不是'已经完整公开确认了该 fact)。\n"
+                                "⚠️ 判据是**核心语义**是否已经建立, **不是**"
+                                "是否逐字复述 canonical 文本。同义词、口语、"
+                                "语序变化、省略非核心修饰、用更普通的话表达"
+                                "同一个机制 —— **都算建立**。\n"
+                                "不算: 只是沾边 / 只说题材 / 只说一个模糊方向"
+                                "/ 需要你按隐藏谜底补一大步才成立。\n"
+                                "例1(措辞不同但**建立**了): "
+                                "f1='古董商通过自买自卖制造虚高成交记录'; "
+                                "观众'他自己送拍又自己拍高, 就是在刷这个箱子的"
+                                "成交记录', 答'是' -> established=[f1] "
+                                "(措辞不同, 核心机制完全相同)。\n"
+                                "例2(只是方向 -> **不建立**): "
+                                "同一 f1, 观众'他是在炒作吗', 答'是' "
+                                "-> established=[] (没公开建立自买自卖机制)。\n"
+                                "例3(答'不是'却**建立**): "
+                                "f1='飞机没有机械故障'; 问'飞机有机械故障吗', "
+                                "答'不是' -> established=[f1]。\n"
                                 "**'是'不等于 established; '不是'也不等于"
-                                "不能 established。** 看的是这轮问答是否把"
-                                "那个 canonical fact 完整公开了。"),
+                                "不能 established。**\n"
+                                "标了 `[通关核心]` 的那几条请**尤其**按核心"
+                                "语义判 —— 拿不准是否只是沾边时不要建立, 但"
+                                "普通观众已能复述出同一核心命题时不要留空。"),
                         },
                         "solution_candidate": {
                             "type": "boolean",
@@ -1361,8 +1411,14 @@ _TOOL_ANSWER = {
                                 "  '和灯塔有关吗'                 -> false\n"
                                 "  '是不是退潮后礁石露出来'        -> 边界, 偏 false\n"
                                 "  '退潮时礁石露出来, 所以灯是在标礁石位置' -> true\n"
-                                "普通事实提问('他是医生吗'/'死人了么')一律 false。"
-                                "只有 true 才会触发系统的最终判定。"),
+                                "普通事实提问('他是医生吗'/'死人了么')一律 false。\n"
+                                "触发什么取决于本题:\n"
+                                "  legacy(无通关合同): 可能触发旧 Final Judge。\n"
+                                "  quality-v6(有通关合同): 若合同尚未被房间"
+                                "覆盖, 只会触发 **completion semantic"
+                                " verifier** —— 它**只能补 established fact"
+                                " IDs, 不能直接判 solved**, 胜负仍由系统按合同"
+                                "覆盖判定。"),
                         },
                     },
                     "required": ["id", "verdict", "solution_candidate",
@@ -1838,6 +1894,78 @@ _TOOL_JUDGE = {
             },
         },
         "required": ["is_guess", "cause_hit", "mechanism_hit"],
+    },
+}
+
+
+# ======================================================================
+# completion verifier(v6) —— **不是**第二个胜负入口
+# ======================================================================
+# 为什么需要它(真实直播证据): 第一层 Answer 会因为措辞保守而漏标 ——
+# 房间明明已经用普通话说出了核心机制("自送自拍、刷高价成交记录、抬高
+# 箱子价值"), 却返回 established=[]。于是合同永远覆盖不满, 一串"是"
+# 之后不揭晓。
+#
+# ⚠️ 它**绝不能**是第二个通关入口。它只回答一个问题:
+#
+#     当前真人的公开表达, 结合房间此前已经公开确认的内容,
+#     实际建立了哪些"尚未建立"的 completion facts?
+#
+# 它**不返回 solved**, 不改 verdict, 不碰 Engine。胜负仍然只有一条:
+#
+#     RoundEngine.submit_qa -> 累计 established -> 合同 ⊆ established
+#
+# 为什么另起一套而不是复用 JUDGE_SYSTEM: 那套是 legacy 的
+# cause/mechanism 裁判, 判的是"是否说中谜底核心真相"。这道题问的是
+# 一个**弱得多**的问题("这条 fact 的核心语义是否已被公开说出")。
+# 复用会让 v6 悄悄退回旧语义。
+COMPLETION_VERIFY_SYSTEM = """你是海龟汤直播的**通关事实复核员**。
+
+房间里已经有一批"尚未建立"的通关事实。你要判断: 结合**房间此前已经
+确认过的内容**与**当前这位观众刚刚说出的话**, 其中哪几条的核心语义
+**实际上已经被公开建立**了。
+
+你不是裁判, 不判断"这题解出来了没有"。你只回答上面那一个问题。
+
+【判据】看的是 fact 的**核心命题**是否已被公开表达, 不是措辞是否一致。
+
+算建立:
+- 同义词 / 口语化
+- 语序变化
+- 省略不影响核心意思的修饰
+- 用更普通的话表达同一个机制
+
+不算建立:
+- 只是沾边、只说题材、只说一个模糊方向
+- 需要你按隐藏谜底补一大步才能成立
+
+⚠️ 若某条 fact 本身**含比【核心答案】更细的修饰**(那是不该出现的边界
+情况), **不要**因为这些不影响核心答案的非核心修饰而拒绝匹配。
+但**不得忽略**会改变下面任何一项的限定:
+- 主体是谁
+- 因果方向
+- 目的
+- 核心机制
+
+【输出】只输出**匹配上的 fact id**。没匹配上就留空数组。
+不要输出解释, 不要输出 solved, 不要输出任何其它字段。"""
+
+_TOOL_COMPLETION_VERIFY = {
+    "name": "emit_completion_match",
+    "description": "回传哪些通关事实的核心语义已被公开建立",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "matched_completion_fact_ids": {
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "核心语义**已经被公开建立**的 fact id(只填下面"
+                    "【仍缺的通关事实】里列出的 id)。没有就留空数组。\n"
+                    "这里**没有** solved 字段 —— 通关由系统按合同覆盖"
+                    "判定, 不归你负责。"),
+            },
+        },
+        "required": ["matched_completion_fact_ids"],
     },
 }
 
@@ -2671,7 +2799,9 @@ class PuzzleWriter:
                spec: Optional[PuzzleSpec] = None,
                timeout: Optional[float] = None,
                max_retries: Optional[int] = None,
-               completion_fact_ids: Optional[list] = None
+               completion_fact_ids: Optional[list] = None,
+               core_answer: str = "",
+               room_established_fact_ids: Optional[list] = None,
                ) -> tuple[list[QAResult], Optional[str]]:
         """回答**一条**提问(逐条秒回)。返回 (results, error)。
 
@@ -2697,9 +2827,27 @@ class PuzzleWriter:
         `completion_fact_ids` 为空时(老 archive / fallback / 题池老题)
         **完全保持旧行为** —— 它们不该因为这次改动突然失去通关能力。
 
+        ## v6: 强候选的 completion 语义复核
+
+        v5 在真实直播里暴露出一个缺口: 第一层 Answer 措辞过于保守, 房间
+        明明已经用普通话说出核心机制, 它却回 `established=[]` —— 于是
+        合同永远覆盖不满, 连续十几个「是」也不揭晓。
+
+        所以 v6 在**强候选**上补一次复核(`_completion_verify`)。它:
+
+        - 只在 `有合同 + status=ok + verdict=是 + candidate=True +
+          合同尚未覆盖` 时触发 —— 普通问答**绝不多调一次 LLM**;
+        - **只回 completion fact IDs**, 且严格过滤(不存在的 / support /
+          已建立的 / 非合同的 一律丢弃);
+        - 补进 `r0.established_fact_ids`, **绝不**改 verdict、绝不产生
+          P.SOLVE。
+
+        ⚠️ 胜负入口仍然只有 Engine 的合同覆盖判定 —— 见
+        `RoundEngine.submit_qa`。这里没有第二条路。
+
         为什么这样能省调用: 绝大多数提问是"他是医生吗"这种**单点事实提问**,
         它们不可能说中完整谜底。让模型先答一个 `solution_candidate=false`,
-        代码就不调裁判了 —— judge_calls/answer_calls 从接近 100% 降下来。
+        代码就不调复核了 —— judge_calls/answer_calls 从接近 100% 降下来。
         """
         spec = spec or self._spec_from_args(puzzle, answer, solve_atoms, facts)
         # 判据以**显式参数**为准; 没传时回落到 spec 自带的合同。
@@ -2711,7 +2859,8 @@ class PuzzleWriter:
         tr = "\n".join(transcript[-40:]) if transcript else "(暂无)"
         user = (
             f"【谜面】{puzzle}\n"
-            f"【事实表(判定依据)】\n{_facts_block(spec)}\n\n"
+            f"【事实表(判定依据)】\n"
+            f"{_facts_block(spec, completion_fact_ids=completion_fact_ids)}\n\n"
             f"【谜底(辅助你理解语义, 绝不能说出口)】"
             f"{answer or '(未记录, 请依据事实表判断)'}\n\n"
             f"【之前已答】\n{tr}\n\n"
@@ -2740,12 +2889,14 @@ class PuzzleWriter:
                     log.info("点评泄露谜底, 已丢弃: %r", cm[:30])
                     cm = ""
                 # ---- candidate 的确定性兜底(方案 review P1) ----
-                # 只信模型自报, 一旦它把**完整答案**误判成 false, Final Judge
+                # 只信模型自报, 一旦它把**完整答案**误判成 false, 复核就
                 # 永远看不到它 —— 观众明明说全了, 系统只回"是", 非常伤体验。
-                # 这里宁可多调一次裁判(多花的是一次 LLM 调用), 也不能漏判。
+                # 这里宁可多走一次复核(多花的是一次 LLM 调用), 也不能漏判。
                 cand = bool(a.get("solution_candidate")) or _looks_like_solution(text)
                 if cand and not a.get("solution_candidate"):
-                    log.info("模型未标为候选, 但句式像完整解 -> 仍送裁判: %r",
+                    # 中性措辞: 走的是**候选复核**, 不是旧 cause/mechanism
+                    # Final Judge。排日志时不要被这句话误导回旧语义。
+                    log.info("模型未标为候选, 但句式像完整解 -> 仍触发候选复核: %r",
                              text[:40])
                 results.append(QAResult(
                     qid=qid, verdict=v, comment=cm,
@@ -2774,19 +2925,29 @@ class PuzzleWriter:
                 f" ({r0.comment})" if r0.comment else "",
                 r0.touched_fact_ids, r0.solution_candidate)
 
-        # ---- v5: 有通关合同 -> **绝不**调 Final Judge ----
+        # ---- v5/v6: 有通关合同 -> **绝不**调 Final Judge ----
         #
-        # 这不是"省一次调用"的优化, 是**语义**要求: v5 的胜负由 Engine
+        # 这不是"省一次调用"的优化, 是**语义**要求: v5 起的胜负由 Engine
         # 对 established facts 做集合覆盖判定。若这里仍调 Judge 并把
         # P.SOLVE 写回去, 就又有了一条绕开合同的通关路径 ——
         # 观众说中一条 support 剧情也可能被判"猜中"。
         #
         # `solution_candidate` 保留下来, 但只作为分析指标(复盘时看
         # 有多少人在尝试完整解谜), 不再是通关闸门。
+        #
+        # v6 额外: 强候选 + 合同未覆盖时, 补一次 **completion 语义复核**。
+        # 它只补 established_fact_ids, 不碰 verdict —— 见 `_completion_verify`。
         if has_contract:
-            if r0.solution_candidate:
-                _detail("v5 有通关合同 -> 不调 Final Judge(候选仅作分析): %r",
-                        text[:40])
+            if not r0.solution_candidate:
+                return results, res.error
+            _detail("v6 有通关合同 -> 不调 Final Judge(候选走合同复核): %r",
+                    text[:40])
+            self._completion_verify(
+                r0, spec=spec, completion_fact_ids=completion_fact_ids,
+                room_established_fact_ids=room_established_fact_ids,
+                core_answer=core_answer, transcript=transcript,
+                user_name=user_name, text=text,
+                timeout=timeout, max_retries=max_retries)
             return results, res.error
 
         # ---- legacy: Final Judge **只对 candidate 调用**(方案 §25) ----
@@ -2820,6 +2981,112 @@ class PuzzleWriter:
                 r0.verdict = P.UNAVAILABLE
                 r0.status = "unavailable"
         return results, res.error
+
+    def _completion_verify(self, r0: "QAResult", *, spec: "PuzzleSpec",
+                           completion_fact_ids, room_established_fact_ids,
+                           core_answer: str, transcript: list,
+                           user_name: str, text: str,
+                           timeout: Optional[float] = None,
+                           max_retries: Optional[int] = None) -> None:
+        """v6 强候选的 completion 语义复核。**就地**补 r0.established_fact_ids。
+
+        ⚠️ 这个函数**只能**写 `r0.established_fact_ids`。它不得改
+        `r0.verdict`、不得产生 `P.SOLVE`、不得碰 Engine —— 一旦它能让
+        自己判 solved, 就产生了**第二条胜负入口**, 那条路会绕开
+        `_record_human_established_locked` 的 human-only 边界。胜负
+        永远只有一条:
+
+            RoundEngine.submit_qa -> 累计 established -> 合同 ⊆ established
+
+        触发条件(全部满足, 否则**一次 LLM 都不调**):
+
+            has_contract
+            AND r0.status == "ok"
+            AND r0.verdict == P.YES
+            AND r0.solution_candidate is True
+            AND missing 非空
+
+        技术失败(timeout / 空 tool input / 解析失败)时
+        **fail-open-for-gameplay, fail-closed-for-state**:
+
+            保留第一层"是/不是/无关"
+            不新增 established
+            不报"未判定"
+            不 solved
+            只打 warning
+
+        因为第一层回答已经成功 —— 复核只是锦上添花, 不该把成功的裁决
+        拖垮。反过来, 复核失败也绝不允许"顺手"给一个 established。
+        """
+        completion = {str(x) for x in (completion_fact_ids or [])
+                      if str(x).strip()}
+        if not completion:
+            return
+        # status 必须显式 ok: 与 `_record_human_established_locked` 同一套
+        # fail-closed 推理 —— "没标"不等于"没问题"。
+        if str(getattr(r0, "status", "") or "") != "ok":
+            return
+        if r0.verdict != P.YES:
+            return
+        if not r0.solution_candidate:
+            return
+        room = {str(x) for x in (room_established_fact_ids or [])
+                if str(x).strip()}
+        direct = {str(x) for x in (r0.established_fact_ids or [])
+                  if str(x).strip()}
+        missing = completion - room - direct
+        if not missing:
+            return                       # 第一层已经补齐 -> 不必复核
+
+        by_id = {f.id: f for f in (spec.facts or [])}
+        miss_txt = "\n".join(
+            f"- {fid} {by_id[fid].text}" for fid in sorted(missing)
+            if fid in by_id) or "(无)"
+        room_txt = "\n".join(
+            f"- {fid} {by_id[fid].text}" for fid in sorted(room)
+            if fid in by_id) or "(暂无)"
+        tr = "\n".join(transcript[-40:]) if transcript else "(暂无)"
+        user = (
+            f"【核心答案】\n{core_answer or '(未记录)'}\n\n"
+            f"【仍缺的通关事实】\n{miss_txt}\n\n"
+            f"【房间此前已确认】\n{room_txt}\n\n"
+            f"【之前公开问答】\n{tr}\n\n"
+            f"【当前真人发言】\n{user_name}：{text}\n\n"
+            f"【第一层公开裁决】\n{r0.verdict}"
+        )
+        res = self.client.messages(COMPLETION_VERIFY_SYSTEM, user,
+                                   max_tokens=200,
+                                   tool=_TOOL_COMPLETION_VERIFY,
+                                   temperature=0,
+                                   timeout=timeout, max_retries=max_retries)
+        ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
+        raw_ids = ti.get("matched_completion_fact_ids")
+        if not isinstance(raw_ids, list):
+            # 技术失败(空 tool input / 超时 / 解析不动)。
+            log.warning("completion 复核无有效返回, 保留第一层裁决 %s: %r",
+                        r0.verdict, text[:30])
+            return
+        # ---- 严格过滤: 只接受**仍在 missing 里的** completion id ----
+        # 任何 f999 / support fact / 已建立的 id / 非 completion id 全部丢弃。
+        verified = []
+        for x in raw_ids:
+            fid = str(x).strip()
+            if fid and fid in missing and fid not in verified:
+                verified.append(fid)
+        if len(verified) != len([x for x in raw_ids if str(x).strip()]):
+            log.debug("completion 复核返回了非法 id, 已过滤: %r -> %r",
+                      raw_ids, verified)
+        if not verified:
+            _detail("completion 复核无新增: %r", text[:40])
+            return
+        # 就地补进第一层结果。stable_union: 保持既有顺序 + 追加新 id。
+        merged = list(r0.established_fact_ids or [])
+        for fid in verified:
+            if fid not in merged:
+                merged.append(fid)
+        r0.established_fact_ids = merged
+        r0.completion_verified_fact_ids = list(verified)
+        log.info("completion 复核补入 %s: %r", verified, text[:30])
 
     @staticmethod
     def _clean_fact_ids(raw, spec: "PuzzleSpec") -> list:

@@ -870,6 +870,8 @@ class RoundEngine:
                             matched_atoms=r.matched_atoms,
                             touched_fact_ids=list(r.touched_fact_ids or []),
                             established_fact_ids=est,
+                            completion_verified_fact_ids=list(
+                                r.completion_verified_fact_ids or []) or None,
                             solution_candidate=r.solution_candidate)
                 self._append_qa_locked(rec)
                 # 累加"观众已经探索过哪些方向"(方案 §32)。
@@ -887,6 +889,23 @@ class RoundEngine:
                         self._verdict_counts.get(r.verdict, 0) + 1
                 acts.append(EngineAction(ActionKind.BROADCAST, {
                     "answer": rec.to_json(), "phase_changed": False}))
+                # ---- v6: 通关进度可观测 ----
+                #
+                # 没有这行, 复盘时只能看到一串"是"和一串"不是", 根本分不清
+                # 是"观众没说到点子上"还是"prompt 太保守"。真实故障就是
+                # 这样发生的。
+                #
+                # ⚠️ **只打 fact ID**, 不打 fact 文本 / core_answer / answer ——
+                # INFO 日志会进 data/run.log, 打文本等于把隐藏真相摊在日志里。
+                if self._completion_fact_ids:
+                    _covered = sorted(
+                        self._completion_fact_ids & self._established_fact_ids)
+                    _remain = sorted(
+                        self._completion_fact_ids - self._established_fact_ids)
+                    log.info("v6进度 qid=%s candidate=%s established+=%s "
+                             "covered=%s remaining=%s",
+                             q.qid, bool(r.solution_candidate), est,
+                             _covered, _remain)
                 # ---- v5: 代码集合覆盖判定 ----
                 #
                 # `completion <= established` 即通关。胜者是**补齐最后
@@ -1256,6 +1275,17 @@ class RoundEngine:
                 # **不让 director 自己推断规则**: "这道题有没有合同"是
                 # Engine 的状态(它持有当前哪道题), director 只做搬运。
                 "completion_fact_ids": sorted(self._completion_fact_ids),
+                # v6: 给 completion 复核用的两个**只读快照**。
+                #
+                # 这是 dispatch 那一刻的状态 —— worker 回来时房间可能又
+                # 建立了新事实, 但复核只需要知道"这句话说之前房间有什么",
+                # 这正是快照的语义。**不要**把 Engine 引用交给 worker:
+                # 那会让 worker 线程直接读引擎内部状态。
+                #
+                # `core_answer` 只进 prompt(复核要拿它当"最小拆分"的
+                # 基准), 同样不下发前端。
+                "core_answer": self._core_answer,
+                "established_fact_ids": sorted(self._established_fact_ids),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
                 # QA 自己的时延预算(见 config.qa_answer_timeout)。

@@ -118,6 +118,15 @@ class QAResult:
     #: ⚠️ **只有真人 QA 能建立它。** 提示 / nudge / 将来 Detective 的
     #: 自动作答**绝不能**碰这个集合 —— 否则系统会自己把题解掉。
     established_fact_ids: Optional[list] = None
+    #: v6: 其中**由 completion semantic verifier 复核补入**的那几条。
+    #:
+    #: 为什么单独记: 复盘时必须能区分
+    #:     第一层 Answer 直接 established   vs   复核兜底补回
+    #: 两者的比例就是"第一层 prompt 到底是太保守还是刚好"的度量 ——
+    #: 没有这个字段只能看到一串没头没尾的"是"。
+    #:
+    #: 只进 archive(`QARec.to_archive`), **不进前端 JSON**。
+    completion_verified_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
 
 
@@ -146,6 +155,8 @@ class QARec:
     touched_fact_ids: Optional[list] = None
     #: v5: 这条真人问答**公开确认**了哪些 fact。见 `QAResult` 的说明。
     established_fact_ids: Optional[list] = None
+    #: v6: 上述集合里, **由 completion 复核补入**的那几条(只进 archive)。
+    completion_verified_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
 
     def to_json(self) -> dict[str, Any]:
@@ -153,6 +164,7 @@ class QARec:
         #
         # ⚠️ `established_fact_ids` **刻意不进这里**: 它是通关状态,
         # 前端不需要、也不该看到内部 fact id。要复盘请用 `to_archive()`。
+        # `completion_verified_fact_ids` 同理 —— 它是分析字段, 更不该外露。
         return {
             "qid": self.qid,
             "user_name": self.user_name,
@@ -173,6 +185,8 @@ class QARec:
             "matched_atoms": self.matched_atoms,
             "touched_fact_ids": self.touched_fact_ids,
             "established_fact_ids": self.established_fact_ids,
+            "completion_verified_fact_ids":
+                self.completion_verified_fact_ids,
             "solution_candidate": self.solution_candidate,
         })
         return d

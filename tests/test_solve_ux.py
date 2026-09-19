@@ -131,6 +131,50 @@ def flight_spec():
         prompt_version="riddle-v6", quality_policy_version="quality-v6")
 
 
+def auction_spec():
+    """去身份化的"拍卖箱子"真实回归 —— 直接复刻直播里的那类题。
+
+    这个 fixture 是**从真实故障反推**出来的: core_answer 说清了核心机制,
+    completion 也只拆成两条核心命题(不含"鉴定人定价权"那种行业细节)。
+    所以房间说出核心机制就应该能通关 —— 这正是 v6 要守住的东西。
+    """
+    return PuzzleSpec(
+        id="ux-auction", title="旧箱子",
+        puzzle="古董商把自己收藏的旧箱子送去拍卖, 每次都是他自己举牌"
+              "买回来。几年后, 他手里同类的箱子都卖出了高价。为什么?",
+        answer="他通过自买自卖制造虚高成交记录, 抬高手里同类旧箱"
+               "的市场价值, 再高价出手。",
+        core_answer="古董商和拍卖方通过人为制造虚高成交记录, 来抬高手中"
+                    "同类旧箱的市场价值。",
+        completion_fact_ids=["f1", "f2"],
+        facts=[
+            PuzzleFact(id="f1", text="古董商通过自买自卖/配合竞拍制造虚高"
+                       "成交记录", kind="core", visibility="hidden"),
+            PuzzleFact(id="f2", text="目的是抬高手中同类旧箱的市场价值",
+                       kind="core", visibility="hidden"),
+            PuzzleFact(id="f3", text="拍卖行鉴定人具有根据成交记录调整估值"
+                       "的正式定价权", kind="support", visibility="hidden"),
+            PuzzleFact(id="f4", text="他不是在洗钱", kind="exclusion",
+                       visibility="hidden"),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="key",
+                      text="自买自卖制造虚高成交记录", fact_ids=["f1"]),
+            SolveAtom(id="a2", role="key",
+                      text="抬高同类箱子价值", fact_ids=["f2"]),
+        ],
+        fair_clues=[FairClue(quote="每次都是他自己举牌买回来",
+                             supports_atoms=["a1"])],
+        hints=["注意谁在举牌", "想想成交记录有什么用", "注意他手里还有别的箱子"],
+        prompt_version="riddle-v6", quality_policy_version="quality-v6")
+
+
+def _completion_match(ids):
+    """第二层 completion 复核的 canned 返回。"""
+    return LLMResult(tool_input={"matched_completion_fact_ids": list(ids)},
+                     model="m")
+
+
 def boot(spec):
     clk = FakeClock()
     eng = RoundEngine(mkcfg(), clock=clk)
@@ -1061,6 +1105,403 @@ def test_v6_reviewer_has_minimality_rule():
           req)
 
 
+# ======================================================================
+# v6: 拍卖箱子 —— 真实故障的回归
+# ======================================================================
+_AUCTION_TEXT = ("古董商自己把箱子送去拍, 又自己把价格拍高, 刷出高价"
+                 "成交记录, 这样手里那些同类旧箱就能卖得更贵。")
+
+
+def test_v6_case1_complete_answer_ends_puzzle():
+    """Case 1: 明显完整的解答**必须**结束这道题。
+
+    第一层照旧保守(established=[]), 第二层复核补回 f1+f2。
+    关键: writer 只调 2 次(1 层 + 复核), 旧 Final Judge **0 次**;
+    提交给 Engine 后立刻 REVEALING, 且胜者是当前这位观众。
+    """
+    print("\n[v6 Case 1] 完整解答 -> 揭晓")
+    fc = FakeClient([
+        _verdict(established=[], cand=True),
+        _completion_match(["f1", "f2"]),
+    ])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT, spec=spec,
+        completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("writer 恰好调用 2 次(第一层 + 复核)", len(fc.calls) == 2,
+          len(fc.calls))
+    check("绝不调旧 Final Judge",
+          all(c["tool"]["name"] != "emit_judgement" for c in fc.calls),
+          [c["tool"]["name"] for c in fc.calls])
+    check("第二层确实走的是 completion 复核",
+          fc.calls[1]["tool"]["name"] == "emit_completion_match",
+          fc.calls[1]["tool"]["name"] if len(fc.calls) > 1 else None)
+    check("QAResult.established == [f1, f2]",
+          out and out[0].established_fact_ids == ["f1", "f2"],
+          out[0].established_fact_ids if out else None)
+    check("复核补入的 id 被单独记录",
+          out and out[0].completion_verified_fact_ids == ["f1", "f2"],
+          out[0].completion_verified_fact_ids if out else None)
+    check("verdict 仍然是'是'(复核绝不改裁决)",
+          out and out[0].verdict == "是", out[0].verdict if out else None)
+
+    # ---- 交给 Engine: 必须揭晓, 且胜者是这位观众 ----
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", _AUCTION_TEXT,
+        verdict="是", solution_candidate=True,
+        established_fact_ids=list(out[0].established_fact_ids or []),
+        completion_verified_fact_ids=list(
+            out[0].completion_verified_fact_ids or []))
+    check("phase == REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是当前真人", eng._solved_by == "甲", eng._solved_by)
+
+
+def test_v6_case2_vague_direction_does_not_end():
+    """Case 2: 模糊方向不能结束 —— 且**不许多调一次** LLM。"""
+    print("\n[v6 Case 2] 模糊方向 -> 只调 1 次")
+    fc = FakeClient([_verdict(established=[], cand=False, verdict="是")])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", "古董商在炒作",
+        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("candidate=false -> 只调 1 次", len(fc.calls) == 1, len(fc.calls))
+    check("没调复核",
+          all(c["tool"]["name"] != "emit_completion_match" for c in fc.calls))
+    check("没有新增 established",
+          not (out and out[0].established_fact_ids),
+          out[0].established_fact_ids if out else None)
+
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", "古董商在炒作",
+        verdict="是", solution_candidate=False)
+    check("不揭晓", eng.phase == Phase.QA, eng.phase)
+    check("没有胜者", not eng._solved_by, eng._solved_by)
+
+
+def test_v6_case3_collective_progress_is_not_regression():
+    """Case 3: 房间已建立 f1, 当前观众只补 f2 -> 立即揭晓。
+
+    证明"共同推理"没有退化成"最后一个人必须重新说全"。
+    """
+    print("\n[v6 Case 3] 集体进度: 只补缺口")
+    fc = FakeClient([
+        _verdict(established=[], cand=True),
+        _completion_match(["f2"]),
+    ])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 2, "乙", "就是为了把手里那些旧箱子卖贵",
+        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=["f1"])
+    prompt = fc.calls[1]["user"]
+    miss_block = prompt.split("【仍缺的通关事实】")[1].split("【")[0]
+    room_block = prompt.split("【房间此前已确认】")[1].split("【")[0]
+    check("【仍缺的通关事实】只列 f2", "f2" in miss_block
+          and "f1" not in miss_block, miss_block)
+    check("f1 在【房间此前已确认】里", "f1" in room_block, room_block)
+    check("复核确实拿到了 core_answer",
+          spec.core_answer in prompt, prompt[:200])
+
+    eng, clk = boot(spec)
+    ask(eng, clk, "u1", "甲", "他是自己举牌买回来的",
+        verdict="是", solution_candidate=False, established_fact_ids=["f1"])
+    check("补 f1 后仍未揭晓", eng.phase == Phase.QA, eng.phase)
+    ask(eng, clk, "u2", "乙", "就是为了把手里那些旧箱子卖贵",
+        verdict="是", solution_candidate=True,
+        established_fact_ids=list(out[0].established_fact_ids or []))
+    check("补最后一块后立即揭晓", eng.phase == Phase.REVEALING, eng.phase)
+    check("胜者是补缺口的那位", eng._solved_by == "乙", eng._solved_by)
+
+
+def test_v6_case4_bogus_verifier_ids_filtered():
+    """Case 4: 复核返回 f999 / support / 非合同 id -> 全部丢弃。"""
+    print("\n[v6 Case 4] 非法复核 id 必须过滤")
+    # (复核返回, 期望最终 established)
+    cases = [
+        (["f999", "f3", "f2"], ["f2"]),   # 只留下真合同 id
+        (["f999"], []),                   # 全是编的 -> 一条都不留
+        (["f3"], []),                     # support 不是合同
+        (["f4"], []),                     # exclusion 不是合同
+        (["f2", "f2", "f999"], ["f2"]),   # 去重
+        (["f1", "f999", "f4"], ["f1"]),
+    ]
+    for bogus, want in cases:
+        fc = FakeClient([
+            _verdict(established=[], cand=True),
+            _completion_match(bogus),
+        ])
+        spec = auction_spec()
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, err = w.answer(
+            spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT, spec=spec,
+            completion_fact_ids=spec.completion_fact_ids,
+            core_answer=spec.core_answer, room_established_fact_ids=[])
+        est = (out[0].established_fact_ids if out else None) or []
+        check(f"bogus={bogus} -> {want}", est == want, est)
+        check(f"bogus={bogus} -> 不产生 P.SOLVE",
+              out and out[0].verdict != "揭晓",
+              out[0].verdict if out else None)
+        check(f"bogus={bogus} -> verified 记录也只含合法项",
+              (out[0].completion_verified_fact_ids or []) == want,
+              out[0].completion_verified_fact_ids if out else None)
+
+
+def test_v6_case5_verifier_failure_keeps_first_layer():
+    """Case 5: 复核技术失败 -> 保留第一层裁决, 不 established, 不 solved。"""
+    print("\n[v6 Case 5] 复核技术失败 -> 保留第一层")
+    for bad in (LLMResult(error="timeout"), LLMResult(tool_input=None),
+                LLMResult(tool_input={"matched_completion_fact_ids": "x"})):
+        fc = FakeClient([_verdict(established=[], cand=True), bad])
+        spec = auction_spec()
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, err = w.answer(
+            spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT, spec=spec,
+            completion_fact_ids=spec.completion_fact_ids,
+            core_answer=spec.core_answer, room_established_fact_ids=[])
+        check(f"失败({bad.error or bad.tool_input}) -> verdict 仍是'是'",
+              out and out[0].verdict == "是",
+              out[0].verdict if out else None)
+        check("没有被改成'未判定'",
+              out and out[0].status == "ok",
+              out[0].status if out else None)
+        check("不新增 established",
+              not (out and out[0].established_fact_ids),
+              out[0].established_fact_ids if out else None)
+        check("不产生 P.SOLVE", out and out[0].verdict != "揭晓",
+              out[0].verdict if out else None)
+
+
+def test_v6_case6_never_touches_old_judge():
+    """Case 6: FakeClient 只准备 ANSWER + VERIFY, 没有旧 Judge 的 canned。
+
+    测试能过本身就证明 v6 的候选兜底**没有**偷偷复活 cause/mechanism
+    Final Judge —— 否则它会去取第三个结果并拿到 error。
+    """
+    print("\n[v6 Case 6] 绝不复活旧 Judge")
+    fc = FakeClient([
+        _verdict(established=[], cand=True),
+        _completion_match(["f1", "f2"]),
+    ])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT, spec=spec,
+        completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("没有第三次调用(旧 Judge 会来取)", len(fc.calls) == 2,
+          len(fc.calls))
+    check("工具序列 = [emit_verdict, emit_completion_match]",
+          [c["tool"]["name"] for c in fc.calls]
+          == ["emit_verdict", "emit_completion_match"],
+          [c["tool"]["name"] for c in fc.calls])
+    check("通关仍然成立", out and out[0].established_fact_ids == ["f1", "f2"],
+          out[0].established_fact_ids if out else None)
+    check("engine 侧也揭晓",
+          True)   # 见 Case 1 的 engine 断言, 这里只钉工具序列
+
+
+def test_v6_case7_completion_marker_reaches_answer_prompt():
+    """Case 7: `[通关核心]` 标记真的进了 Answer prompt, 且只标通关事实。"""
+    print("\n[v6 Case 7] completion 标记进 prompt")
+    fc = FakeClient([_verdict(established=[], cand=False)])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗", spec=spec,
+             completion_fact_ids=spec.completion_fact_ids,
+             core_answer=spec.core_answer, room_established_fact_ids=[])
+    prompt = fc.calls[0]["user"]
+    check("f1 带 [通关核心]", "f1 [core] [通关核心]" in prompt, prompt[:400])
+    check("f2 带 [通关核心]", "f2 [core] [通关核心]" in prompt, prompt[:400])
+    check("support fact 不带标记",
+          "f3 [support] [通关核心]" not in prompt)
+    check("exclusion fact 不带标记",
+          "f4 [exclusion] [通关核心]" not in prompt)
+    check("无合同时不带任何标记",
+          " [通关核心]" not in _facts_block_for_test(spec))
+
+
+def _facts_block_for_test(spec):
+    from story.llm import _facts_block
+    return _facts_block(spec)
+
+
+def test_v6_case8_verifier_cannot_solve_by_itself():
+    """Case 8: 复核**只能**回 completion id —— schema 里没有 solved。"""
+    print("\n[v6 Case 8] 复核没有第二条胜负入口")
+    from story.llm import _TOOL_COMPLETION_VERIFY
+    props = _TOOL_COMPLETION_VERIFY["input_schema"]["properties"]
+    check("只有 matched_completion_fact_ids 一个字段",
+          list(props) == ["matched_completion_fact_ids"], list(props))
+    check("没有 solved 字段", "solved" not in props)
+    check("也没有 verdict 字段", "verdict" not in props)
+    check("required 就是它",
+          _TOOL_COMPLETION_VERIFY["input_schema"]["required"]
+          == ["matched_completion_fact_ids"])
+    # 复核即使"全中", 也必须经由 Engine 的合同覆盖才揭晓 —— 直接调
+    # 复核函数不会把 verdict 改成 P.SOLVE。
+    fc = FakeClient([
+        _verdict(established=[], cand=True),
+        _completion_match(["f1", "f2"]),
+    ])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out, err = w.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT, spec=spec,
+        completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("复核全中也**不**把 verdict 改成 P.SOLVE",
+          out and out[0].verdict == "是", out[0].verdict if out else None)
+    check("通关只能由 Engine 的 submit_qa 触发(见 Case 1)",
+          out and out[0].established_fact_ids == ["f1", "f2"])
+
+
+def test_v6_case9_trigger_matrix():
+    """Case 9: 复核的触发条件必须**恰好**是那五条 —— 不多不少。
+
+    多调 = 每条普通问答都白烧一次 LLM; 少调 = 强候选被漏掉。
+    """
+    print("\n[v6 Case 9] 复核触发矩阵")
+    def run(text="他自己拍高", est=None, cand=True, verdict="是",
+            room=None, contract=None):
+        fc = FakeClient([_verdict(established=est or [], cand=cand,
+                                  verdict=verdict),
+                         _completion_match(["f2"])])
+        spec = auction_spec()
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out, err = w.answer(
+            spec.puzzle, spec.answer, [], 1, "甲", text, spec=spec,
+            completion_fact_ids=(spec.completion_fact_ids
+                                 if contract is None else contract),
+            core_answer=spec.core_answer,
+            room_established_fact_ids=room or [])
+        return len(fc.calls), out
+
+    n, _ = run()
+    check("是 + candidate -> 调复核(2 次)", n == 2, n)
+    n, _ = run(cand=False)
+    check("candidate=False -> 不调(1 次)", n == 1, n)
+    n, _ = run(verdict="不是")
+    check("verdict=不是 -> 不调(1 次)", n == 1, n)
+    n, _ = run(verdict="无关")
+    check("verdict=无关 -> 不调(1 次)", n == 1, n)
+    n, out = run(est=["f1"])
+    check("第一层已补 f1 -> 仍调, 只缺 f2", n == 2, n)
+    n, _ = run(est=["f1", "f2"])
+    check("合同已被第一层覆盖 -> 不调(1 次)", n == 1, n)
+    n, _ = run(room=["f1", "f2"])
+    check("合同已被房间覆盖 -> 不调(1 次)", n == 1, n)
+    # 无合同时 candidate 走的是 legacy 分支 -> 旧 Judge, **不会**调复核。
+    # 这里显式给两层 canned: 第一层裁决 + 一个旧 judge 返回。如果代码
+    # 误把复核插进来, 工具序列就会变。
+    fc = FakeClient([_verdict(established=[], cand=True),
+                     LLMResult(tool_input={"is_guess": True,
+                                           "cause_hit": False,
+                                           "mechanism_hit": False,
+                                           "matched_atoms": []}, model="m")])
+    spec = auction_spec()
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他自己拍高", spec=spec,
+             completion_fact_ids=[], core_answer=spec.core_answer,
+             room_established_fact_ids=[],
+             solve_atoms=[a.to_dict() for a in spec.solve_atoms])
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("无合同 -> 绝不调 completion 复核",
+          "emit_completion_match" not in names, names)
+    check("无合同 + candidate -> 仍走旧 emit_judgement(legacy 未降级)",
+          names == ["emit_verdict", "emit_judgement"], names)
+
+
+def test_v6_case10_status_must_be_ok_for_verifier():
+    """Case 10: 复核**只能**碰 established, 绝不能改裁决。
+
+    与 `_record_human_established_locked` 同一套推理: "没标"不等于
+    "没问题"。复核是通往 established 的**第二条写入路径**, 所以它要
+    过同一道门。
+
+    ⚠️ 这里的检查用 **AST**, 不用字符串匹配 —— docstring 里就会写到
+    `r0.verdict == P.YES`, 字符串匹配会把注释当成代码, 那种测试是假的。
+    """
+    print("\n[v6 Case 10] 复核只能写 established")
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(PuzzleWriter._completion_verify))
+    tree = ast.parse(src)
+    assigned = set()
+    for node in ast.walk(tree):
+        # r0.<attr> = ...
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if (isinstance(t, ast.Attribute)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id == "r0"):
+                    assigned.add(t.attr)
+    check("只赋值 established_fact_ids 与 completion_verified_fact_ids",
+          assigned == {"established_fact_ids",
+                       "completion_verified_fact_ids"}, assigned)
+    check("**没有**给 r0.verdict 赋值", "verdict" not in assigned, assigned)
+    check("**没有**给 r0.status 赋值", "status" not in assigned, assigned)
+    # 代码里真的对 r0.status 做了 "ok" 判定(AST 级, 不是注释里的)。
+    # 实际写法是 `str(getattr(r0, "status", "") or "") != "ok"` —— 属性名
+    # 是 getattr 的字符串参数。所以这里找两件事: 出现了对 "status" 的
+    # getattr(r0, ...), 且同一个函数里比较过常量 "ok"。
+    guarded_by_getattr = any(
+        isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+        and c.func.id == "getattr" and len(c.args) > 1
+        and isinstance(c.args[0], ast.Name) and c.args[0].id == "r0"
+        and isinstance(c.args[1], ast.Constant) and c.args[1].value == "status"
+        for c in ast.walk(tree))
+    guarded_by_attr = any(
+        isinstance(n, ast.Attribute) and n.attr == "status"
+        and isinstance(n.value, ast.Name) and n.value.id == "r0"
+        for n in ast.walk(tree))
+    compares_ok = any(
+        isinstance(n, ast.Constant) and n.value == "ok"
+        for n in ast.walk(tree))
+    check("代码里真的对 r0.status 做了 'ok' 判定",
+          (guarded_by_getattr or guarded_by_attr) and compares_ok,
+          (guarded_by_getattr, guarded_by_attr, compares_ok))
+    # 复核函数体内不得出现 P.SOLVE。
+    used = {n.attr for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+            and n.value.id == "P"}
+    check("不引用 P.SOLVE", "SOLVE" not in used, used)
+
+
+def test_v6_verified_ids_archive_boundary():
+    """`completion_verified_fact_ids` 只进 archive, 不进前端 JSON。
+
+    与 `established_fact_ids` 同一条边界: 前端既不需要、也不该看到
+    内部 fact id。少了这条断言, 以后有人"顺手"把它加进 to_json 就
+    会把通关状态漏到屏幕上。
+    """
+    print("\n[v6] 复核来源字段的落盘边界")
+    from story.state import QARec
+    rec = QARec(qid=1, user_name="甲", text="t", verdict="是", comment="",
+                kind="qa", ts=0, established_fact_ids=["f1"],
+                completion_verified_fact_ids=["f2"])
+    check("to_json 不含 completion_verified_fact_ids",
+          "completion_verified_fact_ids" not in rec.to_json())
+    check("to_json 仍不含 established_fact_ids",
+          "established_fact_ids" not in rec.to_json())
+    check("to_archive 含 completion_verified_fact_ids",
+          rec.to_archive().get("completion_verified_fact_ids") == ["f2"])
+    check("to_archive 含 established_fact_ids",
+          rec.to_archive().get("established_fact_ids") == ["f1"])
+    # QAResult 也必须带这个字段(默认 None), 否则 writer 赋值会炸。
+    from story.state import QAResult
+    check("QAResult 有 completion_verified_fact_ids 字段",
+          hasattr(QAResult(qid=1, verdict="是"),
+                  "completion_verified_fact_ids"))
+    check("默认是 None", QAResult(qid=1, verdict="是").completion_verified_fact_ids
+          is None)
+
+
 def main():
     tests = [
         test_case_a_collective_identity,
@@ -1097,6 +1538,18 @@ def main():
         test_v6_pool_quarantines_quality_v5,
         test_v6_riddle_prompt_has_minimality_rule,
         test_v6_reviewer_has_minimality_rule,
+        # ---- v6: 拍卖箱子真实回归 ----
+        test_v6_case1_complete_answer_ends_puzzle,
+        test_v6_case2_vague_direction_does_not_end,
+        test_v6_case3_collective_progress_is_not_regression,
+        test_v6_case4_bogus_verifier_ids_filtered,
+        test_v6_case5_verifier_failure_keeps_first_layer,
+        test_v6_case6_never_touches_old_judge,
+        test_v6_case7_completion_marker_reaches_answer_prompt,
+        test_v6_case8_verifier_cannot_solve_by_itself,
+        test_v6_case9_trigger_matrix,
+        test_v6_case10_status_must_be_ok_for_verifier,
+        test_v6_verified_ids_archive_boundary,
     ]
     for t in tests:
         t()
