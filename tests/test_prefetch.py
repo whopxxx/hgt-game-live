@@ -1276,7 +1276,7 @@ def test_review_side_channel_reset_on_entry():
     w = PuzzleWriter(client=_BadClient())
     w._last_review_decision = "pass"
     w._last_review_issues = ["上一题的毛病"]
-    out, why, rw = w._review_spec(good_spec())
+    out, why, rw, _t = w._review_spec(good_spec())
     check("确实走了失败路径", out is None and rw is True, (out, why, rw))
     check("**decision 被清零, 没继承 'pass'**",
           w._last_review_decision == "", repr(w._last_review_decision))
