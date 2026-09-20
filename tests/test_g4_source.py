@@ -422,13 +422,35 @@ def _dr_with_prefetch(cfg, pf):
 
 
 def test_prewarm_skipped_when_playable():
-    """§九-9: 冷启动已有 playable -> **0 次**额外生成调用。"""
+    """§九-9: 冷启动已有 playable -> **0 次**额外生成调用。
+
+    ⚠️ 这里**必须显式打开预热**。第一版用了 `mkcfg(d)` 的默认值, 而
+    默认是 `pool_prewarm_max_rounds=0`(关掉预热)—— 于是"0 次生成"
+    在**任何实现下**都成立, 这条测试测的是空气。变异实验抓到了它
+    (把阈值改成 `>= 99999`, 即"永远不跳过", 测试仍然全绿)。
+
+    所以现在两件事同时成立才有意义:
+      * 预热**是开着的**(所以"0 次"不是因为预热被关);
+      * playable >= 1(所以"0 次"是 §九-9 的效果)。
+    下面再补一条**反证**: 同样开着预热, 把 playable 换成 0, 就必须
+    真的发一次生成 —— 两条一起才能区分"跳过了"和"根本没跑"。
+    """
     print("\n[G4-2-9] 已有可播 -> 0 次生成")
     with tmpdir() as d:
-        dr = _dr_with_prefetch(mkcfg(d), _CountingPrefetcher(1, []))
+        dr = _dr_with_prefetch(
+            mkcfg(d, pool_prewarm_max_rounds=3),
+            _CountingPrefetcher(1, [("ok", "", {})]))
         dr._prewarm()
         check("**一次生成都没发**", dr._prefetcher.calls == 0,
               dr._prefetcher.calls)
+    # ---- 反证: 同配置、playable=0 -> 必须发 ----
+    with tmpdir() as d:
+        dr = _dr_with_prefetch(
+            mkcfg(d, pool_prewarm_max_rounds=3),
+            _CountingPrefetcher(0, [("ok", "", {})]))
+        dr._prewarm()
+        check("**反证: playable=0 时确实发了**(所以上面不是'没跑')",
+              dr._prefetcher.calls == 1, dr._prefetcher.calls)
 
 
 def test_prewarm_runs_when_empty():
