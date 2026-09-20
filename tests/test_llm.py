@@ -1488,6 +1488,123 @@ def test_v4_signature_schema_has_new_dimensions():
           <= set(rs["required"]), rs["required"])
 
 
+def test_r2_hard_contract_never_requires_closing_question():
+    """**R2**: hard contract 不得假设谜面一定以问句结尾。
+
+    为什么必须有一条**静态**测试: R1 已经让 `validate_spec` 不再因
+    "没有结尾问句"判 fixable, `CHECK_SYSTEM` 也写明了它**不是**毛病。
+    但 `core_answer_direct` 还是 hard gate, 而它的 schema / 提示词当时
+    仍写着"必须直接回答谜面**末尾那个问题**" —— 于是一个完全合法的
+    汤面:
+
+        每天晚上十二点, 她都会从门外听见自己敲门。
+
+    仍可能被 Reviewer 判 `core_answer_direct=false`, 而这一项是门,
+    等于**从侧门把"必须问号"重新装回来**。
+
+    这条测试不跑 LLM(那是概率), 而是**逐字钉住契约文案**:
+    凡是描述 core_answer / 删除测试的地方, 都不能再要求"谜面末尾有
+    问题"; 必须改成"直接解释主要异常 / 核心悬念; 有显式问题则回答它"。
+    """
+    print("\n[R2] hard contract 不再要求末尾问句")
+    from story.llm import (_TOOL_CHECK, _TOOL_STRUCTURE, _TOOL_RIDDLE,
+                           CHECK_SYSTEM, STRUCTURE_SYSTEM, RIDDLE_SYSTEM)
+
+    # 旧的"必须回答末尾问题"措辞在任何契约文本里都不该再出现。
+    # 这里刻意用**子串**扫全文, 而不是逐个字段断言 —— 漏掉一处
+    # (比如又加了个新工具) 就会被抓住。
+    stale = ("回答谜面末尾那个问题", "回答谜面最后那个问题",
+             "回答谜面末尾的问题", "回答谜面最后的问题")
+    for name, text in (("CHECK_SYSTEM", CHECK_SYSTEM),
+                       ("STRUCTURE_SYSTEM", STRUCTURE_SYSTEM),
+                       ("RIDDLE_SYSTEM", RIDDLE_SYSTEM)):
+        for bad in stale:
+            check(f"**{name} 不再出现「{bad}」**", bad not in text, bad)
+
+    # 新语义必须在场: 至少提到"主要异常 / 核心悬念"这个说法之一
+    for name, text in (("CHECK_SYSTEM", CHECK_SYSTEM),
+                       ("STRUCTURE_SYSTEM", STRUCTURE_SYSTEM),
+                       ("RIDDLE_SYSTEM", RIDDLE_SYSTEM)):
+        check(f"**{name} 改成解释「主要异常 / 核心悬念」**",
+              ("主要异常" in text or "核心悬念" in text), name)
+
+    # ---- schema 层: 三个 core_answer 描述都不许再要求末尾问句 ----
+    ck = _TOOL_CHECK["input_schema"]["properties"]
+    # ⚠️ `core_answer_direct` / `completion_contract_minimal` 嵌在
+    # `quality_checks.properties` 里, 不在顶层 —— 路径写错会 KeyError。
+    ckqc = ck["quality_checks"]["properties"]
+    cad = ckqc["core_answer_direct"]["description"]
+    ccm = ckqc["completion_contract_minimal"]["description"]
+    for label, txt in (("_TOOL_CHECK.core_answer_direct", cad),
+                       ("_TOOL_CHECK.completion_contract_minimal", ccm)):
+        for bad in stale:
+            check(f"**{label} 不再出现「{bad}」**", bad not in txt, bad)
+        check(f"**{label} 提到主要异常 / 核心悬念**",
+              ("主要异常" in txt or "核心悬念" in txt), txt[:80])
+    # core_answer_direct 要显式说"没有问句也不算 false"
+    check("**_TOOL_CHECK.core_answer_direct 明说没有问句不要判 false**",
+          ("没有问句" in cad or "不必" in cad), cad[:120])
+
+    # _TOOL_CHECK.core_answer 自身的描述(修复时回传的那个字段)
+    ck_ca = ck["core_answer"]["description"]
+    for bad in stale:
+        check(f"**_TOOL_CHECK.core_answer 不再出现「{bad}」**",
+              bad not in ck_ca, bad)
+    check("**_TOOL_CHECK.core_answer 提到主要异常 / 核心悬念**",
+          ("主要异常" in ck_ca or "核心悬念" in ck_ca), ck_ca[:120])
+
+    # _TOOL_STRUCTURE.core_answer(Stage B)
+    st_ca = _TOOL_STRUCTURE["input_schema"]["properties"]["core_answer"][
+        "description"]
+    for bad in stale:
+        check(f"**_TOOL_STRUCTURE.core_answer 不再出现「{bad}」**",
+              bad not in st_ca, bad)
+    check("**_TOOL_STRUCTURE.core_answer 提到主要异常 / 核心悬念**",
+          ("主要异常" in st_ca or "核心悬念" in st_ca), st_ca[:120])
+
+    # _TOOL_RIDDLE.core_answer —— classic 生成器仍可**偏好**问句, 但
+    # hard 文案不能再假设它一定存在。
+    rd_ca = _TOOL_RIDDLE["input_schema"]["properties"]["core_answer"][
+        "description"]
+    for bad in stale:
+        check(f"**_TOOL_RIDDLE.core_answer 不再出现「{bad}」**",
+              bad not in rd_ca, bad)
+    check("**_TOOL_RIDDLE.core_answer 提到主要异常 / 核心悬念**",
+          ("主要异常" in rd_ca or "核心悬念" in rd_ca), rd_ca[:120])
+
+
+def test_r2_decision_fix_examples_drop_person_and_question():
+    """**R2**: `_TOOL_CHECK.decision.description` 的 fix 例子里不能再有
+    「第一人称 / 没结尾问句」。
+
+    这条特别阴: `CHECK_SYSTEM` 明说"这两样不是毛病", 而同一份 schema 的
+    `decision` 描述却把 `fix` 举成"第一人称/没结尾问句"。模型同时收到
+    两条互相冲突的指令 —— 即使代码不再注入 must_fix, schema 本身也会
+    诱导 Reviewer 去 fix 它们。
+    """
+    print("\n[R2] decision=fix 的例子已去掉人称/问句")
+    from story.llm import _TOOL_CHECK
+    d = _TOOL_CHECK["input_schema"]["properties"]["decision"]["description"]
+    # ⚠️ 不能简单断言 "第一人称" not in d —— 新文案**故意**提到它(为了说
+    # 它**不是**毛病)。要钉住的是: 它不再是 **fix 的例子**。
+    fix_line = ""
+    for line in d.splitlines():
+        if line.strip().startswith("fix"):
+            fix_line = line
+            break
+    check("**找到 fix 那一行**", bool(fix_line), "见 decision.description")
+    check("**fix 例子不含「第一人称」**", "第一人称" not in fix_line, fix_line)
+    check("**fix 例子不含「问句」**", "问句" not in fix_line, fix_line)
+    # 但必须**显式**说清这两样不是毛病(否则模型会自己往那方向猜)
+    check("**明说第一人称不是毛病**", "第一人称" in d and "不是" in d,
+          "见 decision.description")
+    check("**明说无问句不是毛病**", "问句" in d and "不是" in d,
+          "见 decision.description")
+    # fix 仍然要有一个真实例子(meta 文本), 不能空掉
+    check("**fix 仍有真实例子(元文本)**",
+          "元文本" in fix_line or "【谜底】" in fix_line, fix_line)
+
+
 def test_v4_check_system_freezes_reviewer_scope():
     """Step 04 冻结的职责边界必须写进 Prompt —— 否则模型会去兼管全局配额。"""
     print("\n[V4-3] CHECK_SYSTEM 冻结 Reviewer 职责")
@@ -5383,6 +5500,9 @@ def main():
               # ---- Step 04: Riddle / Reviewer v4 ----
               test_v4_prompt_versions_bumped,
               test_v4_signature_schema_has_new_dimensions,
+              # ---- R2: 无问号合法性闭环 ----
+              test_r2_hard_contract_never_requires_closing_question,
+              test_r2_decision_fix_examples_drop_person_and_question,
               test_v4_check_system_freezes_reviewer_scope,
               test_v4_riddle_system_states_orthogonality,
               test_v4_observed_fields_flow_to_signature,

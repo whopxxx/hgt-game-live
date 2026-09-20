@@ -77,7 +77,7 @@ log = logging.getLogger(__name__)
 #:     说出核心机制, 合同却永远覆盖不满, 于是一串"是"之后无语揭晓。
 #:   - v6 起 `completion_contract_minimal` 增加"不得严于 core_answer":
 #:     做删除测试 —— 删掉某个身份/权限/制度/职业/流程细节后, 观众仍然
-#:     能回答谜面最后的问题, 那个细节就不属于 completion。
+#:     能完整解释谜面的主要异常 / 核心悬念, 那个细节就不属于 completion。
 #:   - `Answer` 侧同时新增 completion verifier(见 `story/llm.py`), 但那
 #:     只补 `established_fact_ids`, **不产生第二个胜利入口**。
 #:
