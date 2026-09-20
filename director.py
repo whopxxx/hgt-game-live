@@ -991,9 +991,37 @@ class Director:
                 # 早先这里只认 "pool", 于是 curated 题的 aired 永远停在
                 # false —— "这道题真的播完了吗"查不出来, 而 curated 池
                 # 恰恰是我们最想统计播出情况的那一批。
+                #
+                # ---- G4 / G4-R1: 来源标签改了, 这张表必须跟着改 ----
+                # G4-2 §八 把池题的 provenance 从含糊的 `pool` 拆成了
+                # `keyword2_pool` / `curated` / `keyword2_live` /
+                # `classic_blueprint` / `engine_fallback`。但**这里**当时
+                # 漏了跟着改, 于是:
+                #
+                #     keyword2_pool 的题 pop_next 时写了 aired:false,
+                #     播完后**没有任何一行**把它改成 true。
+                #
+                # 后果不是题复活(used 已经记下了), 而是**播出完成账本
+                # 永久停在未播** —— "这道题到底播完了没有"再也查不出来,
+                # 而这正是 H2-F 当初加这一段的**唯一**目的。
+                #
+                # 所以这里改成**显式分派表**, 而不是 if/else 链:
+                #   * 表里没有的来源(live 生成的一切)一律**不写任何池**
+                #     —— 它们不在池里, 写进池账本就是上面那段注释警告的
+                #     那个隐蔽不一致;
+                #   * `pool` 保留为**旧 archive / 旧运行时**的兼容别名
+                #     (G4 之前落盘的 spec 带的就是这个名字), 不能删。
+                #
+                # ⚠️ 新增来源时必须同时改这张表 —— 漏了就是 P1 复发,
+                # 而且是**静默**复发(不报错, 只是账本慢慢失真)。
                 _src = payload.get("spec_source")
-                _pool = (self.curated_pool if _src == "curated"
-                         else self.pool if _src == "pool" else None)
+                _pool = {
+                    "keyword2_pool": self.pool,     # G4-2 起的生成池主来源
+                    "curated": self.curated_pool,   # H2-F
+                    "pool": self.pool,              # 兼容 G4 之前的落盘
+                }.get(_src)
+                # `keyword2_live` / `classic_blueprint` / `engine_fallback`
+                # 刻意**不在表里** —— 它们不是池题, 不进池账本。
                 if _pool is not None and payload.get("spec") is not None:
                     try:
                         _pool.mark_used(payload.get("spec"), aired=True)
@@ -1387,6 +1415,34 @@ class Director:
         """
         if self._prefetcher is None or self.pool is None:
             return
+        # ---- G4-R1: `--no-llm` / 无 client 时**根本不该预热** ----
+        #
+        # ⚠️ 这一条是 P0 修好之后才**暴露出来**的: 之前预热在 IDLE 下
+        # 立刻就 `interrupted` 了(见 `prewarm_should_continue` 的说明),
+        # 于是它**从来没走到** writer 那一步 —— 而 `--no-llm` 时
+        # `writer is None`。把让路修好之后, 预热真的往下走, 就在
+        # Stage A 那一步撞上了 `NoneType` 属性错误。
+        #
+        # (这里刻意**不写出那个方法名** —— `test_prefetch` 有一条源码级
+        # 断言:"director.py 里不出现 Stage A 的方法名", 它守的是 live
+        # 路径不许调 Stage A。注释里写出名字会把它误判成违规。)
+        #
+        # 也就是说: 旧的那个 bug **掩盖**了这一个。两个都得修 ——
+        # 修了让路却不修这个, 冒烟立刻出现 Traceback。
+        #
+        # 判定复用 prefetcher 自己的 `_enabled()`(它已经正确处理了
+        # `writer is None` / `pool is None` / `pool_prefetch_enabled`),
+        # 而不是在这里再抄一遍条件 —— 两份会漂。
+        #
+        # ⚠️ 用 `getattr` 取而不是直接调: 测试里的替身 prefetcher
+        # (`_CountingPrefetcher` 之类)只实现预热真正用到的那几个方法,
+        # 没有 `_enabled`。缺省按"启用"处理 —— 那正是**替身存在时的旧
+        # 行为**, 于是既有用例逐位不变。真实 `PoolPrefetcher` 永远有
+        # 这个方法, 所以这条兼容分支在**生产路径上不可达**。
+        _enabled = getattr(self._prefetcher, "_enabled", None)
+        if _enabled is not None and not _enabled():
+            log.info("预热跳过: 补池未启用(no_llm / 无 client / 补池关闭)")
+            return
         budget = float(getattr(self.cfg, "pool_prewarm_max_seconds", 90.0)
                        or 0.0)
         max_rounds = int(getattr(self.cfg, "pool_prewarm_max_rounds", 2) or 0)
@@ -1405,12 +1461,37 @@ class Director:
         log.info("预热: 冷启动 playable=0, 最多 %d 轮 / %.0fs 内取一道",
                  max_rounds, budget)
         t0 = time.monotonic()
+        # ---- G4-R1: 预热必须注入**它自己的**让路谓词 ----
+        #
+        # ⚠️ 不注入的话这条路径在真实环境里**一道题都出不来**: 预热跑在
+        # `engine.start()` 之前, 此刻 `engine.phase == Phase.IDLE`, 而后台
+        # 判据 `_should_continue` 只认 QA / REVEALED —— 于是 Stage A 的
+        # 第一笔调用还没发出就已经 `interrupted`。
+        #
+        # 谓词的语义见 `PoolPrefetcher.prewarm_should_continue`: 只看
+        # "停了吗 / 预算到了吗", **不看相位**(预热期间本来就没有直播在跑)。
+        try:
+            sc = self._prefetcher.prewarm_should_continue(
+                deadline=t0 + budget, should_abort=self._stop.is_set)
+        except AttributeError:
+            # 替身 prefetcher(测试)可能没有这个方法 —— 退回后台判据,
+            # 即**行为与 G4-R1 之前逐位相同**。这里刻意不 fail closed:
+            # 预热是优化, 为了一个缺失的可选方法而整段不跑是更差的选择。
+            sc = None
         for i in range(max_rounds):
             if time.monotonic() - t0 > budget:
                 break
             try:
                 kind, detail, _extra = self._prefetcher._generate_one_inner(
-                    inputs)
+                    inputs, sc)
+            except TypeError:
+                # 旧签名(只收 inputs)的替身。同上, 退回旧行为。
+                try:
+                    kind, detail, _extra = \
+                        self._prefetcher._generate_one_inner(inputs)
+                except Exception as e:          # noqa: BLE001
+                    log.exception("预热第 %d 轮异常: %s", i + 1, e)
+                    break
             except Exception as e:              # noqa: BLE001
                 log.exception("预热第 %d 轮异常: %s", i + 1, e)
                 break

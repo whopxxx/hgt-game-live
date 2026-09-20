@@ -2739,7 +2739,30 @@ class _KeywordWriter:
             return None
         if self._a_interrupt:
             return {"interrupted": True}
-        return dict(self._stage_a)
+        # ---- G4-R1: 替身也必须**真的**调用谓词 ----
+        #
+        # ⚠️ 不调的话, "谓词被注入了没有"这件事在测试上**不可见** ——
+        # 而 G4-R1 的 P0 修的正是"注入"本身。第一版 `gen_spec` 只收
+        # `**kw` 就把它丢了, 于是"去掉注入"这个变异**不会变红**(测的是
+        # 空气)。这与 G4 的 M9 同型: 断言像在测那个机制, 执行路径根本
+        # 没走到。
+        #
+        # ⚠️ **调用次数必须与生产件同构**: 真的 `gen_keyword_idea` 在
+        # **调用前**与**返回后**各问一次(见 `story/llm.py`), 所以这里
+        # 也是两次。只问一次会让 `test_g2_*` 那些数谓词调用次数的用例
+        # 偏移一格 —— 那会变成"替身比生产件宽松"的另一种形式。
+        #
+        # ⚠️ 让路时返回的是 `{"interrupted": True}` 而**不是** None。
+        # 两者的分类**不同**(见 `keyword_spec`): None -> "gen_fail"
+        # (真的失败, 要退避), `{"interrupted": True}` -> "interrupted"
+        # (让路, 不计失败不退避)。替身返回 None 会把一次**故意的取消**
+        # 记成故障 —— 生产件不这么做。
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        idea = dict(self._stage_a)
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        return idea
 
     def structure_original_idea(self, *, title, puzzle, answer, avoid=None,
                                 recent=None, should_continue=None,
@@ -2755,15 +2778,37 @@ class _KeywordWriter:
             s.metrics = {"interrupted": True, "ok": False,
                          "generation_mode": "keyword2"}
             return s
+        # G4-R1: 同 `gen_keyword_idea` —— 谓词必须被真的问到。
+        if should_continue is not None and not should_continue():
+            s = good_spec()
+            s.puzzle = ""
+            s.error = ""
+            s.metrics = {"interrupted": True, "ok": False,
+                         "generation_mode": "keyword2"}
+            return s
         if self._spec is not None:
             return self._spec
         # 默认: 造一道合格题, 但**谜面用 Stage A 的**(证明冻结生效)。
         return good_spec(puzzle=puzzle, answer=answer, title=title,
                          metrics={"generation_mode": "keyword2", "ok": True})
 
-    def gen_spec(self, **kw):
-        """keyword2 模式下**不该**被调用。记下来供断言。"""
-        self.gen_spec_calls.append(kw)
+    def gen_spec(self, should_continue=None, **kw):
+        """classic 链的替身。
+
+        ⚠️ G4-R1: **必须显式收下 `should_continue` 并真的调用它**。
+        第一版写的是 `def gen_spec(self, **kw)` —— `should_continue` 被
+        吞进 `**kw` 直接丢掉, 于是"预热走 classic 链时谓词有没有被注入"
+        这件事**完全测不出来**: 去掉注入, 替身照样返回一道题, 断言照样
+        绿。生产件的 `gen_spec` 是在每次昂贵调用前问一次的, 替身不能比
+        生产件更宽松。
+        """
+        self.gen_spec_calls.append({"should_continue": should_continue, **kw})
+        if should_continue is not None and not should_continue():
+            s = good_spec()
+            s.puzzle = ""
+            s.error = ""
+            s.metrics = {"interrupted": True, "ok": False}
+            return s
         return variant(len(self.gen_spec_calls))
 
 

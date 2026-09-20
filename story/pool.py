@@ -135,6 +135,20 @@ _HEX = frozenset("0123456789abcdef")
 #: `LazyCurator`/预热 CLI)。测试可以改它来指向临时文件。
 _CURATED_DECISIONS_PATH = os.path.join("data", "curated_decisions.jsonl")
 
+#: G4-R1: 两遍 soft diversity 的**唯一真相**。见 `PuzzlePool._passes()`。
+#:
+#: `(soft_ok,)` 序列: `False` = Pass 1(完整门) / `True` = Pass 2(忽略纯
+#: diversity)。两个生产池都是 `(False, True)`, 且**遍序必须一致** ——
+#: 先偏好不撞的, 再兜底撞的。
+#:
+#: ⚠️ 表里没有的 `pool_kind`(测试替身 / 老实例 / 手工构造)落到 `(False,)`,
+#: 即"只有完整门"。这是**兼容意图**, 不是遗漏: 那些对象从来没有承诺过
+#: 两遍语义, 给它们 Pass 2 等于悄悄放宽它们的准入。
+_PASS_LADDER: dict = {
+    "curated": (False, True),       # H4-E
+    "generated": (False, True),     # G4-B
+}
+
 
 def set_curated_decisions_path(path: str) -> None:
     """改决策账本路径(**只给测试/装配用**)。
@@ -423,8 +437,16 @@ class PuzzlePool:
         curated 写过 `(False,)` —— 那是把 Pass 2 整条删掉了, 于是
         "配额占满仍可播"立刻退回 0(测试当场红)。**两遍是一个前后关系,
         删掉后一遍不是"更严格", 是让 H4-E 治过的病复发。**
+
+        ⚠️ **G4-R1**: 这张表以前只是**文档**, 实现里写死 `return
+        (False, True)`。两者当时恰好等价(生产只有 curated / generated
+        两种池), 但那是巧合, 不是契约 —— 未知池会静默享受 Pass 2, 而
+        文档承诺的是 `(False,)`。既然这轮要收口, 就让它按表走:
+        实现与文档**同一份真相**, 顺带把"测试替身 / 老实例行为不变"
+        这条真正落实。
         """
-        return (False, True)
+        return _PASS_LADDER.get(
+            str(getattr(self, "pool_kind", "") or ""), (False,))
 
     # ------------------------------------------------------------------
     @classmethod

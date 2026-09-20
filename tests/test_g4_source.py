@@ -222,6 +222,36 @@ def _inline_riddle(dr):
         _D.threading.Thread = real
 
 
+def _inline_reveal(dr, payload):
+    """同步跑一次 `_reveal`。
+
+    ⚠️ `_reveal` 和 `_riddle` 一样**起后台线程**(`work()` 在线程里跑, 而
+    账本写入在 `work()` 内部)。不 inline 的话断言会在写盘之前执行 ——
+    第一版就是这样: 账本里只有 `pop_next` 写的那一行 `air:false`,
+    `mark_used(aired=True)` 还在另一个线程里没跑完。**那条红是测试的
+    竞态, 不是被测代码的缺口**。
+
+    复用 `_inline_riddle` 同一套 `threading.Thread` 替身(把 `start()`
+    变成同步调用), 这样两条路径的 inline 语义完全一致。
+    """
+    import director as _D
+    real = _D.threading.Thread
+
+    class _Inline:
+        def __init__(self, target=None, daemon=None, name=None, **kw):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    _D.threading.Thread = _Inline
+    try:
+        dr._reveal(payload)
+    finally:
+        _D.threading.Thread = real
+
+
 def _accept_curated(spec, d):
     """把一道 curated 题登记成"已提交"。
 
@@ -526,6 +556,393 @@ def test_prewarm_disabled_by_zero():
 
 
 # ======================================================================
+# 五之二、G4-R1 P0: **真** Phase.IDLE 预热回归
+# ======================================================================
+#
+# ## 为什么这一条必须存在(上一轮为什么没抓到 P0)
+#
+# 上面那批 prewarm 用例全部用 `_CountingPrefetcher` —— 一个只会返回
+# `("ok", "", {})` 的替身。它**证明不了任何关于让路的事**: 替身里根本
+# 没有 `_should_continue`, 也没有 `keyword_spec` 那一段, 所以
+#
+#     engine.phase == Phase.IDLE -> _should_continue() == False
+#                              -> keyword_spec 第一行就 interrupted
+#
+# 这条**真实路径**从来没有被任何断言走过。于是 G4 报告里写的
+# "playable=0 -> 最多 N 轮 / 90s 取一道", 在真实 Director 上**做不到**,
+# 而测试全绿。
+#
+# 这是本项目反复出现的同一类失败: **断言像在测那个机制, 执行路径根本
+# 没走到**(H4-F M2 / G2 M7 / G3 M1 / G4 M9 同型)。所以这一条刻意用
+# **真的** `PoolPrefetcher` + 真的 `keyword_spec` + 真的 `pool.add`,
+# 只把最外层的 LLM writer 换成假件。
+
+def _mk_real_prefetch_director(d, **kw):
+    """建一个 **真 prefetcher** 的 Director, writer 是假件。
+
+    与 `_dr_with_prefetch` 的区别: 那个换掉的是**整个 prefetcher**,
+    这个只换掉**最外层的 writer** —— 中间的 `PoolPrefetcher` /
+    `keyword_spec` / `Pool.add` / `_should_continue` 全是生产件。
+    这正是 P0 藏身的地方。
+    """
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).resolve().parent / "test_prefetch.py"
+    spec = importlib.util.spec_from_file_location("_tp_prefetch", p)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    cfg = mkcfg(d, **kw)
+    cfg.pool_prefetch_enabled = True
+    if "pool_keyword_seed_enabled" not in kw:
+        cfg.pool_keyword_seed_enabled = True
+    dr = _mk_director(cfg)
+    # 真 prefetcher 的协作者: 只换 writer 与 bag(不读真实 corpus)。
+    w = m._KeywordWriter()
+    dr._prefetcher.writer = w
+    # ⚠️ **只在 keyword 链启用时**注入 bag。无条件注入会把 kill-switch
+    # (`--no-keyword-seed`) 顶掉 —— bag 一在, `_keyword_enabled()` 就为
+    # 真, 于是"classic 链"那条用例实际测的还是 keyword 链(第一版就是
+    # 这么挂的), 而它照样能"通过", 只是通过得毫无意义。
+    if cfg.pool_keyword_seed_enabled:
+        dr._prefetcher._bag = m._fake_bag()
+        dr._prefetcher._bag_meta = {"corpus_version": "test-fixture",
+                                    "keyword_count": 12, "source": "test"}
+        dr._prefetcher._keyword_session_seed = 20260920
+    return dr, w
+
+
+def test_prewarm_real_idle_phase_generates_one():
+    """**G4-R1 P0**: 真 `Phase.IDLE` 下预热必须真的出一道题。
+
+    走的是完整组合路径:
+
+        RoundEngine 初始 Phase.IDLE
+        -> Director._prewarm()
+        -> 真 PoolPrefetcher._generate_one_inner()
+        -> keyword_spec (真)
+        -> 假 LLM writer
+        -> pool.add (真)
+
+    ⚠️ **不**先把 engine phase 人工改成 QA / REVEALED。那正是这一条的
+    全部意义 —— 预热发生在 `engine.start()` **之前**, IDLE 是**预期**
+    状态, 不是要先绕开的障碍。
+    """
+    print("\n[G4-R1-P0] 真 Phase.IDLE 预热 -> 真的进池")
+    from story.state import Phase
+    with tmpdir() as d:
+        dr, w = _mk_real_prefetch_director(d, pool_prewarm_max_rounds=2)
+        check("**相位确实是 IDLE**", dr.engine.phase == Phase.IDLE,
+              dr.engine.phase)
+        check("反证: 后台让路判据在 IDLE 下是 False",
+              dr._prefetcher._should_continue() is False,
+              "若这条变了, 说明 P0 的成因描述已经过时")
+        before = dr._prefetcher._playable(
+            dr._prefetcher._generation_inputs())
+        check("冷启动 playable == 0", before == 0, before)
+
+        dr._prewarm()
+
+        check("**Stage A 被真的调用了**", len(w.keyword_calls) == 1,
+              len(w.keyword_calls))
+        check("**Stage B 被真的调用了**", len(w.structure_calls) == 1,
+              len(w.structure_calls))
+        check("**没有走 classic 链**", w.gen_spec_calls == [],
+              len(w.gen_spec_calls))
+        after = dr._prefetcher._playable(
+            dr._prefetcher._generation_inputs())
+        check("**预热后 playable >= 1**", after >= 1, after)
+        check("池里真的多了一道", dr.pool.stock_count() >= 1,
+              dr.pool.stock_count())
+
+
+def test_prewarm_real_idle_classic_killswitch():
+    """**G4-R1 P0 对称性**: `--no-keyword-seed` 时预热同样必须活。
+
+    只修 keyword2 那条链是不够的 —— kill-switch 一开, 预热会**原样**
+    回到 P0。两条链在这一点上必须对称, 所以这里单独走一遍 classic
+    路径(真 prefetcher + `pool_keyword_seed_enabled=False`)。
+    """
+    print("\n[G4-R1-P0b] classic kill-switch 下预 warm 也要活")
+    from story.state import Phase
+    with tmpdir() as d:
+        dr, w = _mk_real_prefetch_director(
+            d, pool_prewarm_max_rounds=2, pool_keyword_seed_enabled=False)
+        check("相位是 IDLE", dr.engine.phase == Phase.IDLE, dr.engine.phase)
+        check("kill-switch 生效: 走 classic 链",
+              dr._prefetcher._keyword_enabled() is False)
+        dr._prewarm()
+        check("**classic 链被真的调用了**", len(w.gen_spec_calls) == 1,
+              len(w.gen_spec_calls))
+        check("keyword 链一次都没调", w.keyword_calls == [],
+              len(w.keyword_calls))
+        after = dr._prefetcher._playable(
+            dr._prefetcher._generation_inputs())
+        check("**预热后 playable >= 1**", after >= 1, after)
+
+
+def test_prewarm_injection_reaches_playtest_gate():
+    """**G4-R1 P0 的第二处落脚点**: 注入必须一路传到**试玩开始前**。
+
+    ## 为什么单列一条
+
+    `_finish_one` 里还有一处让路检查(试玩之前)。它默认**走不到** ——
+    `playtest_enabled` 默认 False, 所以上面那两条预热用例根本不会经过
+    它。于是"注入漏传到 `_finish_one`"这个变异**不会变红**(实测 M3)。
+
+    这正是本项目反复出现的形状: 一个机制有**多处**让路点, 测试只覆盖
+    了其中一处, 剩下的漏改也照样绿。所以这里显式打开试玩, 把那条路径
+    逼出来。
+
+    ## 断言的是什么
+
+    预热 + 试玩都开着时, 试玩**必须真的跑**(`run` 被调用一次)。若
+    `_finish_one` 用的是后台判据 `self._should_continue`, 它在 IDLE 下
+    返回 False -> 试玩前让路 -> 整道题被丢弃 -> `run` 零调用。
+    """
+    print("\n[G4-R1-P0d] 注入必须传到试玩前(否则该处漏改也看不出来)")
+    with tmpdir() as d:
+        calls = {"run": 0}
+
+        class _PT:
+            def run(self, spec):
+                calls["run"] += 1
+                from story.playtest import PASS, PlaytestResult
+                return PlaytestResult(status=PASS)
+
+        dr, w = _mk_real_prefetch_director(
+            d, pool_prewarm_max_rounds=2, playtest_enabled=True)
+        dr._prefetcher._playtester = _PT()
+        check("试玩确实开着", dr._prefetcher._playtest_enabled() is True)
+        dr._prewarm()
+        check("**试玩被真的调用了(说明没在 IDLE 上误让路)**",
+              calls["run"] == 1, calls["run"])
+        after = dr._prefetcher._playable(
+            dr._prefetcher._generation_inputs())
+        check("**预热后 playable >= 1**", after >= 1, after)
+
+
+def test_prewarm_skipped_when_prefetch_disabled():
+    """**G4-R1 连带**: `--no-llm` / 补池关闭时预热必须**安静跳过**。
+
+    ## 为什么这条必须存在
+
+    它是修 P0 时**才暴露**出来的第二个洞: 旧代码里预热在 IDLE 下立刻
+    `interrupted`, 于是**从来没走到** writer 那一步 —— 而 `--no-llm` 时
+    `writer is None`。P0 一修好, 预热真的往下走, 立刻撞出
+
+        AttributeError: 'NoneType' object has no attribute 'gen_keyword_idea'
+
+    **旧 bug 掩盖了新 bug**。这条测试钉住的是"修了让路之后也不再撞"。
+
+    真实症状出现在装配冒烟里(`--no-llm`): 日志里多一条 Traceback, 而
+    CI 的冒烟步骤**正是**靠 `grep -q Traceback` 判失败的。
+    """
+    print("\n[G4-R1-P0e] no-llm / 补池关闭 -> 预热安静跳过, 不抛")
+    with tmpdir() as d:
+        # 真 prefetcher, 但 writer 是 None(与 `--no-llm` 装配一致)。
+        cfg = mkcfg(d, pool_prefetch_enabled=True, pool_prewarm_max_rounds=2)
+        dr = _mk_director(cfg)
+        check("前提: 装配确实给了 None writer(no_llm)",
+              dr._prefetcher.writer is None, dr._prefetcher.writer)
+        check("`_enabled()` 为 False", dr._prefetcher._enabled() is False)
+
+        # ⚠️ **要抓住的是"内部有没有抛"**, 而不是"`_prewarm` 有没有把异常
+        # 冒出来"。第一版只断言 `stock_count() == 0` —— 那个断言在变异下
+        # **不红**: 去掉守卫后预热确实在 `None.gen_keyword_idea` 上抛了,
+        # 但 `_prewarm` 自己 try/except 吞掉它(那是它的正确行为: 预热
+        # 绝不阻止启动)。于是股池仍是空的, `stock == 0` 照样成立。
+        #
+        # 真正被破坏的东西在 `_prewarm` 的**可观测面之外**: 日志里多一条
+        # `AttributeError` Traceback —— 而 CI 的装配冒烟正是靠
+        # `grep -q Traceback` 判失败的。所以这里把 logger 的输出抓下来
+        # 直接断言"没有 Traceback", 与 CI 用**同一个**判据。
+        import logging
+        recs = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                recs.append(record)
+
+        cap = _Cap()
+        plog = logging.getLogger("story.director")
+        plog.addHandler(cap)
+        try:
+            dr._prewarm()
+        finally:
+            plog.removeHandler(cap)
+
+        check("**预热没有生成任何东西**",
+              dr.pool.stock_count() == 0, dr.pool.stock_count())
+        tb = [r for r in recs if r.exc_info]
+        check("**日志里没有异常(CI 冒烟同款判据)**", tb == [],
+              [str(r.getMessage())[:60] for r in tb])
+
+
+def test_prewarm_predicate_ignores_phase_but_respects_budget():
+    """预热谓词与后台谓词是**两个东西**, 各自的边界都要钉住。
+
+    | 条件 | `_should_continue` | `prewarm_should_continue` |
+    |---|---|---|
+    | IDLE(开播前) | False | **True**(预算内) |
+    | 预算已过 | — | **False** |
+    | stop 已置 | False | **False** |
+
+    第一行是 P0 的修法; 后两行是"预热仍然**有界**"的证明 —— 否则
+    "让它能跑"就变成了"让它无限跑"。
+    """
+    print("\n[G4-R1-P0c] 预热谓词: 不看相位, 但看预算与停止")
+    import time as _t
+    with tmpdir() as d:
+        dr, _w = _mk_real_prefetch_director(d)
+        pf = dr._prefetcher
+        check("后台判据在 IDLE 下 False", pf._should_continue() is False)
+        sc = pf.prewarm_should_continue(
+            deadline=_t.monotonic() + 30.0, should_abort=dr._stop.is_set)
+        check("**预热判据在 IDLE 下 True**", sc() is True)
+        sc_expired = pf.prewarm_should_continue(
+            deadline=_t.monotonic() - 1.0)
+        check("**预算已过 -> False**", sc_expired() is False)
+        dr._stop.set()
+        check("**stop 已置 -> False**", sc() is False)
+
+
+# ======================================================================
+# 五之三、G4-R1 P1: keyword2_pool 的 aired 账本
+# ======================================================================
+def _worked(d):
+    """读 generated 池的 used ledger, 返回 {spec_key: (aired,)} 之类的映射。"""
+    import json
+    p = os.path.join(d, "used.jsonl")
+    rows = []
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    return rows
+
+
+def _aired_map(d):
+    """`{key: [air...]}` —— 同一 key 可能有多行(pop 写 false, reveal 写 true)。
+
+    ⚠️ 字段名是 `air`(`pool._persist_used`), **不是** `aired`。第一版
+    按 `aired` 读, 于是每行都取到 None —— 断言 `== [False]` 假红, 而
+    "reveal 补记"那条则因为 `[None] != [False, True]` 也红。两处红都
+    是**读错了字段**, 不是被测代码的问题。按 `air` 读才是真的在验
+    `mark_used(aired=...)` 的落盘。
+    """
+    out = {}
+    for r in _worked(d):
+        out.setdefault(r.get("key") or r.get("spec_key"), []).append(
+            r.get("air"))
+    return out
+
+
+def test_keyword2_pool_reveal_marks_aired():
+    """**G4-R1 P1**: `keyword2_pool` 的题播完后必须补记 `aired=True`。
+
+    ## 缺口
+
+    G4-2 §八 把池题来源从 `pool` 改成了 `keyword2_pool`, 但 `_reveal()`
+    里的分派表**没跟着改**(它只认 `"pool"`)。于是:
+
+        pop_next  -> 写了 aired:false
+        reveal    -> **一行都不写**
+
+    题不会复活(used 已记), 但"这道题到底播完没有"**永久查不出来**
+    —— 那正是 H2-F 加这一段账本的**唯一**目的。
+
+    ## 怎么测
+
+    真的走 `pop_next`(写 false)再真的走 `_reveal` 的账本那一段(写
+    true), 然后断言**两次都落盘了**。不 mock `mark_used` —— 那样就
+    测不到"分派表选对了池"这件事。
+    """
+    print("\n[G4-R1-P1] keyword2_pool: pop->aired:false, reveal->aired:true")
+    with tmpdir() as d:
+        dr = _mk_director(mkcfg(d))
+        spec = _good_gen_spec()
+        check("题入池", dr.pool.add(spec), "add")
+
+        popped = dr.pool.pop_next(recent_signatures=[], avoid=[])
+        check("pop_next 拿到题", popped is not None)
+        am = _aired_map(d)
+        key = list(am)[0]
+        check("**pop_next 写了 aired:false**", am[key] == [False], am)
+
+        # 走 `_reveal` 里那段账本。用真 payload 形状(engine 就是这么发的)。
+        _inline_reveal(dr, {"spec_source": "keyword2_pool", "spec": popped,
+                            "expect_round": None, "answer": "x"})
+        am2 = _aired_map(d)
+        check("**reveal 补记了 aired:true**", am2.get(key) == [False, True],
+              am2)
+
+
+def test_keyword2_live_never_touches_pool_ledger():
+    """反证: **非池来源**绝不能写进 generated 池的 aired 账本。
+
+    没有这条, 上面那条用 `if _pool is not None` 蒙对也能绿 —— 而
+    "所有来源都往池账本里写"正是这段注释警告过的隐蔽不一致
+    (live 题当前进程不算已用, 重启后突然算)。
+    """
+    print("\n[G4-R1-P1b] keyword2_live / fallback 不写池账本")
+    with tmpdir() as d:
+        dr = _mk_director(mkcfg(d))
+        spec = _good_gen_spec()
+        dr.pool.add(spec)
+        popped = dr.pool.pop_next(recent_signatures=[], avoid=[])
+        before = len(_worked(d))
+        for src in ("keyword2_live", "live_generate", "engine_fallback",
+                    "classic_blueprint"):
+            _inline_reveal(dr, {"spec_source": src, "spec": popped,
+                                "expect_round": None, "answer": "x"})
+        check("**一行都没多写**", len(_worked(d)) == before,
+              (before, len(_worked(d))))
+
+
+def test_legacy_pool_label_still_marks_aired():
+    """兼容: G4 之前落盘的 spec 带的是裸 `pool`, 这条别名不能删。
+
+    旧 archive / 旧运行时里躺着的是这个名字; 删掉它 = 那批题的 aired
+    永远停在 false —— 与 P1 是**同一个**故障, 只是来源不同。
+    """
+    print("\n[G4-R1-P1c] 旧标签 'pool' 仍是合法别名")
+    with tmpdir() as d:
+        dr = _mk_director(mkcfg(d))
+        dr.pool.add(_good_gen_spec())
+        popped = dr.pool.pop_next(recent_signatures=[], avoid=[])
+        key = list(_aired_map(d))[0]
+        _inline_reveal(dr, {"spec_source": "pool", "spec": popped,
+                    "expect_round": None, "answer": "x"})
+        check("**旧标签也补记 aired:true**",
+              _aired_map(d).get(key) == [False, True], _aired_map(d))
+
+
+def test_passes_ladder_matches_doc():
+    """**G4-R1 四**: `_passes()` 的文档表与实现必须**同一份真相**。
+
+    修之前: 文档写 `未知池 -> (False,)`, 实现无条件 `return (False, True)`。
+    生产只有 curated / generated 两种池, 所以当时**恰好**等价 —— 但那是
+    巧合。未知池会静默享受 Pass 2, 而文档承诺没有。
+
+    这里同时钉住两侧: 两个生产池必须仍是两遍(行为不变), 未知池必须
+    只有一遍(按文档)。
+    """
+    print("\n[G4-R1-4] _passes 查表: 生产两遍, 未知一遍")
+    p = PuzzlePool.__new__(PuzzlePool)
+    for kind in ("curated", "generated"):
+        p.pool_kind = kind
+        check(f"**{kind} 仍是两遍(行为不变)**", p._passes() == (False, True),
+              p._passes())
+    for kind in ("", "weird", "unknown"):
+        p.pool_kind = kind
+        check(f"未知池 {kind!r} 只有一遍(按文档)",
+              p._passes() == (False,), p._passes())
+
+
+# ======================================================================
 # 六、provenance(§九-12)
 # ======================================================================
 def test_source_labels_are_distinguishable():
@@ -644,6 +1061,16 @@ def main():
         test_prewarm_stops_after_one,
         test_prewarm_is_bounded_and_never_blocks,
         test_prewarm_disabled_by_zero,
+        # ---- G4-R1: 三个真实路径缺口 ----
+        test_prewarm_real_idle_phase_generates_one,
+        test_prewarm_real_idle_classic_killswitch,
+        test_prewarm_injection_reaches_playtest_gate,
+        test_prewarm_skipped_when_prefetch_disabled,
+        test_prewarm_predicate_ignores_phase_but_respects_budget,
+        test_keyword2_pool_reveal_marks_aired,
+        test_keyword2_live_never_touches_pool_ledger,
+        test_legacy_pool_label_still_marks_aired,
+        test_passes_ladder_matches_doc,
         test_source_labels_are_distinguishable,
         test_banner_prints_source_mode,
     ]

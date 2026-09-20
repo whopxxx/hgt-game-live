@@ -850,6 +850,63 @@ class PoolPrefetcher:
         # SETTING / REVEALING / IDLE 之外的一切 —— 让路。
         return False
 
+    # ------------------------------------------------------------------
+    def prewarm_should_continue(self, deadline=None,
+                                should_abort=None) -> Any:
+        """G4-R1: **预热专用**的协作式取消谓词 —— 与 `_should_continue`
+        是**两个东西**, 绝不能互相替代。
+
+        ## 为什么不能复用 `_should_continue`(P0)
+
+        预热跑在 `engine.start()` **之前**, 那一刻 `engine.phase == Phase.IDLE`。
+        而 `_should_continue` 只认 QA / REVEALED, 对 IDLE 一律 False ——
+        于是预热在**第一笔 Stage A 都没发出之前**就拿到 `interrupted`:
+
+            冷启动真正需要预热的那一刻, 永远拿不到题。
+
+        修法**不是**往 `_should_continue` 里加一个 `or phase == IDLE`:
+        那会把 G1 治好的后台让路纪律整条毁掉(后台什么时候都能跑 ==
+        "在直播最忙时抢网关"复发)。正确做法是**关注点分离**:
+
+            `_should_continue`          直播忙不忙   —— 有相位概念, 只在开播后成立
+            `prewarm_should_continue`   还该不该等   —— 只看 停止 / 总预算
+
+        预热期间本来就没有直播在跑, 所以"让路给直播"这个概念**不适用**;
+        它唯一该停的理由是"已经等够了"。
+
+        ## 返回的是**谓词**, 不是判定结果
+
+        调用方拿到的是闭包。这样预算的起点(`t0`)由调用方决定, 而这个类
+        不需要知道"预热是从哪一刻开始的"。
+
+        ## 时间预算的真实语义 —— cooperative
+
+        `deadline` 之后**不再启动新的昂贵调用**; 已经在途的那一次 HTTP
+        请求**允许自然返回**。这不是"硬 kill timeout", 也做不到 ——
+        `urllib` 的请求发出去就取消不了, 假装能强杀只会让日志说谎。
+        所以 90s 是**协作式预算**: 它的价值是"最坏情况下多发 0 次调用",
+        而不是"到点立刻停"。
+
+        ⚠️ `should_abort` 是给 `Director._prewarm` 传 `self._stop.is_set`
+        用的 —— Ctrl-C / 停止信号必须能在预热中途生效, 否则"预热不影响
+        可用性"就是假的。
+        """
+
+        def _go() -> bool:
+            try:
+                if should_abort is not None and should_abort():
+                    return False
+                if deadline is not None and time.monotonic() > deadline:
+                    return False
+            except Exception:                   # noqa: BLE001
+                # fail closed: 谓词自己绝不抛。读不到状态时宁可停手 ——
+                # 预热少一道题的成本远小于把一个异常冒进启动流程。
+                log.exception("预热谓词异常, 停手")
+                return False
+            return True
+
+        return _go
+
     def _generation_inputs(self) -> dict:
         try:
             d = self._probe_inputs()
@@ -875,7 +932,8 @@ class PoolPrefetcher:
             with self._lock:
                 self._pending_result = (kind, detail, extra)
 
-    def _generate_one_inner(self, inputs: dict) -> tuple:
+    def _generate_one_inner(self, inputs: dict,
+                            should_continue=None) -> tuple:
         """返回 `(kind, detail, extra)`。
 
         `extra` 目前只带一个 key: `playtest`(试玩 status)或 `interrupted`。
@@ -888,10 +946,39 @@ class PoolPrefetcher:
 
         `pool_keyword_seed_enabled=False` 时**完整**回到下面那条 —— 它是
         kill-switch, 不是"废弃路径", 所以两条都在这里显式并存。
+
+        ## G4-R1: `should_continue` 的**注入点**
+
+        默认 `None` => 用 `self._should_continue`(后台让路判据), 于是
+        **普通后台行为逐位不变**。传别的谓词进去的只有一个调用者: 冷启动
+        预热(`Director._prewarm`)。
+
+        ## 为什么必须能注入 —— P0
+
+        预热跑在 `engine.start()` **之前**, 那一刻 `engine.phase` 是
+        `Phase.IDLE`。而 `_should_continue` 是一条**直播让路**判据, 只认
+        QA / REVEALED —— IDLE 一律返回 False。于是预热会在**第一笔 Stage A
+        都没发出之前**就拿到 `interrupted`:
+
+            真实环境里预热永远生成不了第一道题。
+
+        修法**不是**放宽 `_should_continue`(那会把 G1 治好的"后台与 live
+        抢网关"整条纪律毁掉), 而是让执行层接受一个**预热专用**谓词。
+        两条判据的**关注点不同**, 所以是两个东西:
+
+            `_should_continue`      直播忙不忙(有相位概念, 只有开播后才成立)
+            `_prewarm_should_continue`  该不该继续等(只看 stop + 总预算)
+
+        ⚠️ 注入必须**一路传到底**, 否则 `--no-keyword-seed` 的预热照样死:
+        它要穿过 keyword Stage A/B、classic `gen_spec`、Reviewer / audit
+        的协作检查、以及试玩开始前那一处。任何一处漏传 == 那条链的预热
+        回归原样。
         """
+        if should_continue is None:
+            should_continue = self._should_continue
         if self._keyword_enabled():
-            return self._generate_keyword_one(inputs)
-        return self._generate_classic_one(inputs)
+            return self._generate_keyword_one(inputs, should_continue)
+        return self._generate_classic_one(inputs, should_continue)
 
     # ------------------------------------------------------------------
     def _init_keyword_bag(self, cfg: Any) -> None:
@@ -967,7 +1054,8 @@ class PoolPrefetcher:
             return False
         return self._bag is not None
 
-    def _generate_keyword_one(self, inputs: dict) -> tuple:
+    def _generate_keyword_one(self, inputs: dict,
+                              should_continue=None) -> tuple:
         """G2: `2-key -> Stage A -> Stage B`, 之后与 classic 路径**完全共用**。
 
         ## 让路检查点(§九)
@@ -997,14 +1085,21 @@ class PoolPrefetcher:
         Stage A/B 把已经修好的'后台与 live 抢网关'问题带回来。"
 
         任何一处 false -> `interrupted`(不计 gen_fail、不退避)。
+
+        ⚠️ **G4-R1**: 谓词由参数注入(默认 `self._should_continue`)。预热
+        传的是它**自己**的谓词 —— 见 `_generate_one_inner` 的 P0 说明。
+        注入必须传进 `keyword_spec`(①②)与 `_finish_one`(试玩前), 这两处
+        是预热路径上仅有的两个判让路的地方。
         """
+        if should_continue is None:
+            should_continue = self._should_continue
         from .keyword_seed import keyword_spec
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
         spec, reason = keyword_spec(
             self.writer, self._bag, self._keyword_session_seed,
             avoid=avoid, recent=recent,
-            should_continue=self._should_continue,
+            should_continue=should_continue,
             corpus_version=self._bag_meta.get("corpus_version", ""))
         if spec is None:
             if reason == "interrupted":
@@ -1012,14 +1107,23 @@ class PoolPrefetcher:
                         {"interrupted": True})
             return ("gen_fail", "keyword2 未成题", {})
         # ---- 之后与 classic 路径完全一致(试玩 / add) ----
-        return self._finish_one(spec, {})
+        return self._finish_one(spec, {}, should_continue)
 
-    def _generate_classic_one(self, inputs: dict) -> tuple:
-        """旧路径: `pick_blueprint -> gen_spec`。**逐位不变**。
+    def _generate_classic_one(self, inputs: dict,
+                              should_continue=None) -> tuple:
+        """旧路径: `pick_blueprint -> gen_spec`。
 
         保留它是为了 §八 的 kill-switch —— `pool_keyword_seed_enabled=False`
         必须完整回到这里。
+
+        ⚠️ **G4-R1**: 谓词由参数注入(默认后台判据), 所以"逐位不变"指的是
+        后台**行为**不变 —— 而不是说这条链永远只认 `self._should_continue`。
+        预热走 classic 链时(`--no-keyword-seed`)必须也能被注入, 否则
+        kill-switch 一开, 预热又回到 P0 那个"IDLE -> False -> 永远一道都
+        出不来"。两条链在这一点上**必须对称**。
         """
+        if should_continue is None:
+            should_continue = self._should_continue
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
         extra: dict = {}
@@ -1038,7 +1142,7 @@ class PoolPrefetcher:
             avoid=avoid, blueprint=bp, recent=recent,
             max_attempts=self._prefetch_attempts,
             budget_s=self._prefetch_budget,
-            should_continue=self._should_continue,
+            should_continue=should_continue,
             # bp is None 时**真的**跳过 blueprint 硬校验, 而不是退回
             # 默认 blueprint(那是已经修过的 bug)。与 live 路径同一写法。
             enforce_blueprint=bp is not None)
@@ -1057,10 +1161,11 @@ class PoolPrefetcher:
             return ("gen_fail",
                     (spec.error if spec is not None else "spec=None")
                     or "空谜面", {})
-        return self._finish_one(spec, extra)
+        return self._finish_one(spec, extra, should_continue)
 
     # ------------------------------------------------------------------
-    def _finish_one(self, spec: Any, extra: dict) -> tuple:
+    def _finish_one(self, spec: Any, extra: dict,
+                    should_continue=None) -> tuple:
         """**两条链共用的收尾**: 试玩(可选) -> `pool.add`。
 
         G2 把这一段从 `_generate_one_inner` 里抽出来, 因为 keyword2 链与
@@ -1091,8 +1196,14 @@ class PoolPrefetcher:
         #
         # 两层检查并不冲突: 这里管"要不要**开始**", 而 playtester 自己
         # 内部若也有协作取消, 管的是"试玩**过程中**还继续吗"。
+        #
+        # ⚠️ G4-R1: 用注入的谓词, **不是** `self._should_continue` —— 预热
+        # 走到这里时相位仍是 IDLE, 用后台判据会把"试玩前的让路"变成"预热的
+        # 必然取消"。这是 P0 的第二处落脚点(第一处在 Stage A 之前)。
+        if should_continue is None:
+            should_continue = self._should_continue
         if self._playtest_enabled():
-            if not self._should_continue():
+            if not should_continue():
                 log.info("补池: 直播变忙, 试玩前让路(已生成的稿子丢弃)")
                 return ("interrupted", "直播变忙, 试玩前让路",
                         {"interrupted": True})
