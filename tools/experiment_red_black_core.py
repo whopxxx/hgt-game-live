@@ -2,15 +2,41 @@
 # coding: utf-8
 """红汤/黑汤 **汤底** 创意基线实验 (只生成隐藏故事, 不生成汤面)。
 
+## R1: 这一版换掉了什么(以及为什么)
+
+v1 自己造了一个单主题池 `SUBJECTS`, 每道只抽一个 subject, 而 user prompt
+写的是"可以围绕「{subject}」, 也可以不围绕"。
+
+**那等于把约束取消了**, 也换掉了产品真正的机制。20 条原文直接证实了后果:
+模型迅速掉回它最熟悉的高概率母题 —— 旧恋人 / 病重父亲 / 等亲人回家 /
+纪念亡者 / 温情告别。红汤不像红汤, 黑汤大面积塌成伤感文学。
+
+**两随机关键词不是装饰, 也不是为了检查字面命中。** 它的作用是给每次创作
+一个**外部随机碰撞**, 压住 AI 的高概率惯性、防止故事越生成越趋同。所以:
+
+    * 删除自造的 `SUBJECTS`;
+    * 直接复用**生产同款**的 `KeywordBag`
+      (`load_bag(DEFAULT_CORPUS_PATH, seed)` -> `bag.draw()`);
+    * 每道抽 **2 个随机关键词**(独立词库随机重组, 不保留原始搭配);
+    * 原样记录 `keywords` / corpus version / session seed / draw index;
+    * **不**检查两个词有没有字面出现, **不**强迫它们成为机关;
+    * **也**不再说"可以不围绕" —— 那会把约束本身取消。
+
+由此, 本实验问的问题也随之改变了。它**不再**是:
+
+    ✗ 无约束时模型会想什么。
+
+而是:
+
+    ✓ 在极短红/黑方向提示 + 生产同款 2-key 随机扰动下,
+      模型能不能产生我们认可的汤底。
+
 ## 这个实验在问什么
 
-一个**产品审美**问题, 不是工程问题:
-
-> 在几乎没有约束的情况下, 模型自己会想出值得玩的红汤 / 黑汤故事吗?
-
-之前几轮的输入堆了几十条 shape 规则(长度 / 人称 / 问句 / fair_clues /
-discovery_beats / completion 合同 ...), 产出的东西越来越像"短篇悬疑案情
-简介"而不是海龟汤。这一轮把那些规则**全部拿掉**, 只看**原始创意分布**。
+一个**产品审美**问题, 不是工程问题。之前几轮的输入堆了几十条 shape 规则
+(长度 / 人称 / 问句 / fair_clues / discovery_beats / completion 合同 ...),
+产出的东西越来越像"短篇悬疑案情简介"而不是海龟汤。这一轮把那些规则**全部
+拿掉**, 只留"方向提示 + 两随机关键词", 看**原始创意分布**。
 
 所以本实验**故意**不做下面任何一件事:
 
@@ -20,23 +46,30 @@ discovery_beats / completion 合同 ...), 产出的东西越来越像"短篇悬�
     * 不跑 Reviewer, 不跑 truth audit, 不做任何自动评分 / 排名 / 筛选;
     * 不进 Stage B, 不入池, 不写 played / pool_used / archive / pooled 数据。
 
-只有: 一段 system + 一句 user -> 一个**完整隐藏故事** -> 原样存盘。
+只有: 一段 system + 一句 user(带两随机关键词) -> 一个**完整隐藏故事** ->
+原样存盘。
 
-## 与生产代码的接缝(单点)
+## 与生产代码的接缝
 
-只 import 两个东西:
+import 三样, 都只是**取材**与**传输**, 不含任何生成政策:
 
-    story.config.LLMConfig        —— 复用 base_url / api_key / model / 超时
-    story.llm.AnthropicMessagesClient —— 复用**传输层**(重试 / 超时 / 解析)
+    story.config.LLMConfig                —— base_url / api_key / model / 超时
+    story.llm.AnthropicMessagesClient     —— 传输层(重试 / 超时 / 解析)
+    story.keyword_seed.load_bag           —— **生产同款**抽词(2-key 随机碰撞)
+    story.keyword_corpus.DEFAULT_CORPUS_PATH
+    story.keyword_seed.derive_session_seed / KEYWORD_SEED_VERSION
 
 **不** import `PuzzleWriter`, **不** import `story.quality`, **不**碰
 `story.puzzle` 的任何 schema。理由是 `PuzzleWriter.__init__` 会把上游一堆
 生成政策常量拉进来; 本实验的要点恰恰是"**没有**那些政策时模型会想什么"。
-用最底层的 client 是唯一能保证"问的真的是裸问题"的接法。
 
-`AnthropicMessagesClient` 是纯传输层(构造时只读 `LLMConfig`), 所以 import
-它**不会**改变任何生产行为。这一点由 `tools/test_experiment_red_black_core.py`
-静态钉住(见那里的 `test_no_production_generation_imports`)。
+⚠️ `KeywordBag` 是**刻意**从生产借来的, 与上面那条禁令不冲突:
+本实验要测的正是"生产同款随机扰动"能不能把模型从惯性里拉出来。自己再写
+一个抽词器就等于把自变量换掉了 —— v1 就是这么跑偏的。
+
+`AnthropicMessagesClient` / `KeywordBag` 都是纯函数式或只读各自配置, 所以
+import 它们**不会**改变任何生产行为。这一点由
+`tests/test_experiment_red_black_core.py` 静态钉住。
 
 ## Prompt 纪律(本实验最重要的一条)
 
@@ -44,9 +77,10 @@ discovery_beats / completion 合同 ...), 产出的东西越来越像"短篇悬�
 短到看起来"没写够" —— 那是**刻意的**。不要在这里加规则。
 
 历史上每次"补一条规则"都会把输出推得更像规范手册, 而这一轮要看的正是
-"没有手册时它原生会想什么"。`tools/test_experiment_red_black_core.py`
-会断言这两段 system 的长度上界, 防的是后来的模型顺手把它扩写成
-几十条规范的 prompt(那会让本实验的结论**不再成立**)。
+"方向提示 + 随机词碰撞"下它原生会想什么。
+`tests/test_experiment_red_black_core.py` 会断言这两段 system 的长度上界,
+防的是后来的模型顺手把它扩写成几十条规范的 prompt(那会让本实验的结论
+**不再成立**)。
 
 ## 不做内容筛选(很重要)
 
@@ -61,6 +95,7 @@ discovery_beats / completion 合同 ...), 产出的东西越来越像"短篇悬�
 
     .venv/Scripts/python.exe tools/experiment_red_black_core.py --run
     .venv/Scripts/python.exe tools/experiment_red_black_core.py --report-only
+    .venv/Scripts/python.exe tools/experiment_red_black_core.py --repair-technical
 
 产物(⚠️ `data/**/*.jsonl` 被 .gitignore 挡着, 归档要 `git add -f`):
 
@@ -77,7 +112,6 @@ import io
 import json
 import logging
 import os
-import random
 import sys
 import time
 import urllib.error
@@ -97,10 +131,18 @@ log = logging.getLogger(TAG)
 #: 每类固定的候选数。**跑之前写死**, 不许跑完再挑。
 N_PER_TYPE = 10
 
-#: 抽题 seed。红/黑两条序列各自独立, 免得两类的"第 k 个"被同一串随机数
-#: 绑在一起(它们之间没有任何需要配对的关系)。
+#: session seed 的**基** seed。红/黑两条序列各自派生一次, 免得两类的"第 k 个"
+#: 被同一串随机数绑在一起(它们之间没有任何需要配对的关系)。
+#:
+#: ⚠️ 这里用的是**生产同款**的 `derive_session_seed(base)` 派生, 而不是
+#: 自己 `random.Random(seed)`: 生产的 session seed 是 64 位混合出来的,
+#: 我们照抄那条路径, 才能说"和生产是同一套抽词"。
 SEED_RED = 20260921
 SEED_BLACK = 20260922
+
+#: 词库路径。走生产默认值(`story.keyword_corpus.DEFAULT_CORPUS_PATH`),
+#: 不自己拼路径 —— 否则生产换了词库、实验还指着旧文件。
+#: 由 `_corpus_path()` 在运行时取。
 
 #: 温度沿用生产的出题档(`Config.generate_temperature = 0.8`) —— 换了温度
 #: 就是在换一个"模型会想什么"的问题, 那会让本实验不再描述生产形态。
@@ -139,8 +181,14 @@ BLACK_SYSTEM = (
     "不靠血腥描写。"
 )
 
-#: 两类共用的 user 句。**一句话** —— 它只说明"交什么格式"。
-USER_PROMPT = "写一个完整的故事。"
+#: user 句 —— 一句话, 带上两个**随机关键词**。
+#:
+#: ⚠️ 三个"不要", 都是 R1 明确要求的:
+#:   1. 不要写"可以围绕 ... 也可以不围绕" —— 那会把约束本身取消(v1 的错);
+#:   2. 不要要求两个词字面出现在故事里;
+#:   3. 不要说"必须把关键词做成机关" —— 它们是**创意起点**, 不是命题作文。
+#: 所以这里只有"用它们作为创意起点"这一句, 不再解释。
+USER_PROMPT = "随机关键词：{a}、{b}。用它们作为创意起点，写一个完整的隐藏故事。"
 
 #: 强制工具调用: 只要一个字段。不要 title / puzzle / clues / facts。
 _TOOL_CORE = {
@@ -165,56 +213,69 @@ def _sha8(s: str) -> str:
 
 
 # ======================================================================
-# 主题抽样 —— 只用来给两次调用**不同的起点**, 不是内容约束
+# 抽词 —— **生产同款** KeywordBag(2-key 随机碰撞)
 # ======================================================================
-#: 极简主题词池。作用仅仅是"20 个候选不要全挤在同一个母题上"。
-#: ⚠️ 它们**不是**必需要素, 也不带 tone —— 只用来打散起点。
-#: 用随机抽而不是精心排列, 是为了不在这个环节偷偷注入人类偏好。
-SUBJECTS = [
-    "一间出租屋", "一次门诊复诊", "一段长途夜车", "一位老邻居",
-    "一场公司团建", "一台旧相机", "一个夏令营", "一份体检报告",
-    "一次同学聚会", "一间值班室", "一部老手机", "一趟搬家",
-    "一个直播间", "一次退租", "一部电梯", "一场婚礼",
-    "一间画室", "一次代班", "一个快递驿站", "一场暴雨",
-    "一间琴房", "一次过户", "一位护工", "一个旧保险箱",
-    "一次采访", "一间地下车库", "一部公交车", "一次体检加项",
-    "一间储物间", "一位新同事", "一座小岛", "一次保险理赔",
-    "一间病房", "一次家访", "一个二手鱼缸", "一场考试",
-    "一间洗衣房", "一次跨年", "一位网友", "一个寄存柜",
-]
+def _corpus_path() -> str:
+    """生产默认词库路径。不自己拼 —— 生产换库时实验跟着换。"""
+    from story.keyword_corpus import DEFAULT_CORPUS_PATH
+    return str(DEFAULT_CORPUS_PATH)
 
 
-def _draw_subjects(seed: int, n: int) -> list:
-    """按 seed 抽 n 个主题, **不放回**。可复现。"""
-    rng = random.Random(seed)
-    pool = list(SUBJECTS)
-    rng.shuffle(pool)
-    return pool[:n]
+def _make_bag(base_seed: int):
+    """建一个**生产同款**的词袋。返回 `(bag, meta)`。
+
+    用的是 `load_bag(path, derive_session_seed(base_seed))` —— 与
+    `director.py` / `story/prefetch.py` 里那条完全一样的路径。
+    """
+    from story.keyword_seed import derive_session_seed, load_bag
+    ss = derive_session_seed(base_seed)
+    bag, meta = load_bag(_corpus_path(), ss)
+    return bag, meta, int(ss)
+
+
+def _draw_two(bag) -> dict:
+    """从 bag 抽 2 个随机关键词。**原样返回** bag 的结果。
+
+    ⚠️ 刻意**不**在这里加任何"词好不好"的判断, 也不检查语义相关性 ——
+    随机碰撞本身就是创意扰动的来源(生产 §四 的原话)。
+    """
+    return bag.draw()
 
 
 def _system_for(kind: str) -> str:
     return RED_SYSTEM if kind == "red" else BLACK_SYSTEM
 
 
-def _user_for(subject: str) -> str:
-    return f"{USER_PROMPT}可以围绕「{subject}」, 也可以不围绕。"
+def _user_for(a: str, b: str) -> str:
+    return USER_PROMPT.format(a=a, b=b)
 
 
 # ======================================================================
 # 一次生成
 # ======================================================================
-def _one_candidate(client, kind: str, idx: int, subject: str) -> dict:
+def _one_candidate(client, kind: str, idx: int, draw: dict,
+                   corpus_meta: dict, session_seed: int) -> dict:
     """生成一个候选。**不做内容判断** —— 拿到什么存什么。
 
     只有技术失败(HTTP / 网络 / 没交出合法 story)才重试, 且重试次数记进
     `attempts`。技术失败**不是**内容质量信号。
+
+    `draw` 是 `KeywordBag.draw()` 的原始返回, 原样落盘以便复现:
+    同一词库 + 同一 session seed + 同一 draw index => 同一对关键词。
     """
     system = _system_for(kind)
-    user = _user_for(subject)
+    kws = list(draw.get("keywords") or [])
+    user = _user_for(kws[0], kws[1])
     rec = {
         "id": f"{kind}-{idx:02d}",
         "type": kind,
-        "subject": subject,
+        # ---- 抽词溯源(原样记录, 不复述/不改写) ----
+        "keywords": kws,
+        "keyword_corpus_version": str(corpus_meta.get("corpus_version") or ""),
+        "keyword_seed_version": _keyword_seed_version(),
+        "keyword_session_seed": session_seed,
+        "keyword_draw_index": int(draw.get("index") or 0),
+        "keyword_draw_relaxed": int(draw.get("relaxed") or 0),
         "system": system,
         "user": user,
         "attempts": 0,
@@ -251,6 +312,17 @@ def _one_candidate(client, kind: str, idx: int, subject: str) -> dict:
     return rec
 
 
+def _keyword_seed_version() -> str:
+    from story.keyword_seed import KEYWORD_SEED_VERSION
+    return str(KEYWORD_SEED_VERSION)
+
+
+def _session_seed(base_seed: int) -> int:
+    """把 base seed 派生成生产的 session seed(与 director 同一条路径)。"""
+    from story.keyword_seed import derive_session_seed
+    return int(derive_session_seed(base_seed))
+
+
 # ======================================================================
 # 落盘
 # ======================================================================
@@ -262,12 +334,20 @@ def _write_raw(records: list) -> None:
 
 
 def _write_manifest(cfg, records: list, base_sha: str, branch: str,
-                    git_head: str) -> None:
+                    git_head: str, corpus_meta: dict) -> None:
     ok = [r for r in records if r["story"]]
     bad = [r for r in records if not r["story"]]
     manifest = {
         "experiment": "red_black_core_stories",
-        "question": "无约束时模型自己会想出值得玩的红汤/黑汤故事吗",
+        "question": (
+            "在极短红/黑方向提示 + 生产同款 2-key 随机扰动下, "
+            "模型能不能产生我们认可的汤底。"
+        ),
+        "question_v1_retired": (
+            "v1 问的是'无约束时模型会想什么', 那版自己造单主题池且允许"
+            "'可以不围绕', 等于取消了约束 —— 20 条迅速塌回温情/怀旧母题。"
+            "R1 换回生产 KeywordBag 两随机关键词, 问题也随之改写。"
+        ),
         "base_sha": base_sha,
         "branch": branch,
         "git_head_at_run": git_head,
@@ -279,6 +359,29 @@ def _write_manifest(cfg, records: list, base_sha: str, branch: str,
         "n_per_type": N_PER_TYPE,
         "seed_red": SEED_RED,
         "seed_black": SEED_BLACK,
+        # ---- 抽词: 生产同款(2-key 随机碰撞) ----
+        "keyword_mechanism": {
+            "source": "story.keyword_seed.KeywordBag (生产同款, 直接复用)",
+            "corpus_path": "story.keyword_corpus.DEFAULT_CORPUS_PATH",
+            "corpus_version": str(corpus_meta.get("corpus_version") or ""),
+            "keyword_count": corpus_meta.get("keyword_count"),
+            "keyword_seed_version": _keyword_seed_version(),
+            "session_seed_red": _session_seed(SEED_RED),
+            "session_seed_black": _session_seed(SEED_BLACK),
+            "per_candidate": [
+                {
+                    "id": r["id"],
+                    "keywords": r.get("keywords"),
+                    "draw_index": r.get("keyword_draw_index"),
+                    "relaxed": r.get("keyword_draw_relaxed"),
+                }
+                for r in records
+            ],
+            "no_literal_check": (
+                "不检查两个关键词有没有字面出现在故事里; 也不要求它们成为"
+                "机关。随机碰撞本身就是创意扰动 —— 见生产 §四。"
+            ),
+        },
         "counts": {
             "total": len(records),
             "ok": len(ok),
@@ -295,10 +398,11 @@ def _write_manifest(cfg, records: list, base_sha: str, branch: str,
         "prompts": {
             "red_system": RED_SYSTEM,
             "black_system": BLACK_SYSTEM,
-            "user_template": USER_PROMPT + "可以围绕「{subject}」, 也可以不围绕。",
+            "user_template": USER_PROMPT,
             "tool": _TOOL_CORE,
             "red_system_chars": len(RED_SYSTEM),
             "black_system_chars": len(BLACK_SYSTEM),
+            "user_template_chars": len(USER_PROMPT),
             "red_system_sha8": _sha8(RED_SYSTEM),
             "black_system_sha8": _sha8(BLACK_SYSTEM),
         },
@@ -312,12 +416,10 @@ def _write_manifest(cfg, records: list, base_sha: str, branch: str,
             "没有排名。只有技术失败(HTTP/网络/输出超限)会重试, 记在 attempts。"
         ),
         "technical_repair_note": (
-            "第一轮跑到 18/20: black-02 与 black-08 是纯技术超限"
-            "(stop=max_tokens, JSON 未写完), 不是内容失败。因为"
-            "MAX_TOKENS=1400 会稳定砍掉偏长的那一档(实测成功稿最长 1982 字, "
-            "修复后 black-02 达 3228 字), 那等于给长故事加了隐形筛选。"
-            "故把预算提到 2600, 用 --repair-technical **只**重跑这两个槽位, "
-            "且**复用同一个 subject**(不重新抽题)。其余 18 条一字未动。"
+            "MAX_TOKENS 从 1400 提到 2600: 1400 会稳定砍掉偏长的那一档"
+            "(成功稿最长可达 1982 字), 等于给长故事加了隐形筛选。"
+            "若仍有纯技术超限, 用 --repair-technical **只**重跑那个槽位, "
+            "且**复用同一个 draw**(不重新抽关键词)。"
         ),
         "outputs": {
             "raw": "data/red_black_core_experiment/raw.jsonl",
@@ -370,6 +472,25 @@ def _write_reports(records: list, manifest: dict) -> None:
     A(f"- 原始结果: `{manifest['outputs']['raw']}`")
     A(f"- 逐条全文: `{manifest['outputs']['raw_report']}`")
     A("")
+    A("## 抽词机制 —— **生产同款 2-key 随机碰撞**")
+    A("")
+    km = manifest["keyword_mechanism"]
+    A(f"- 来源: `{km['source']}`")
+    A(f"- 词库: `{km['corpus_path']}` "
+      f"(corpus_version=`{km['corpus_version']}`, "
+      f"keyword_count=`{km['keyword_count']}`)")
+    A(f"- keyword seed version: `{km['keyword_seed_version']}`")
+    A(f"- session seed: red=`{km['session_seed_red']}` "
+      f"black=`{km['session_seed_black']}`")
+    A("- 每个候选: **独立抽 2 个随机关键词**, 不保留原始搭配, 不要求语义相关")
+    A(f"- {km['no_literal_check']}")
+    A("")
+    A("| id | 关键词 | draw index | relaxed |")
+    A("|---|---|---|---|")
+    for c in km["per_candidate"]:
+        A(f"| `{c['id']}` | {'/'.join(c['keywords'] or [])} | "
+          f"{c['draw_index']} | {c['relaxed']} |")
+    A("")
     A("## 实际使用的 Prompt(原文)")
     A("")
     A(f"### 红汤 system —— {manifest['prompts']['red_system_chars']} 字 "
@@ -403,7 +524,8 @@ def _write_reports(records: list, manifest: dict) -> None:
     A("| id | type | 主题 | 技术失败 | 字数 | 试次 |")
     A("|---|---|---|---|---|---|")
     for r in records:
-        A(f"| `{r['id']}` | {r['type']} | {r['subject']} | "
+        A(f"| `{r['id']}` | {r['type']} | "
+          f"{'/'.join(r.get('keywords') or [])} | "
           f"{'是' if r['technical_error'] else ''} | "
           f"{len(r['story']) if r['story'] else 0} | {r['attempts']} |")
     A("")
@@ -435,6 +557,31 @@ def _write_reports(records: list, manifest: dict) -> None:
     para = [len([p for p in r["story"].split("\n") if p.strip()]) for r in ok]
     if para:
         A(f"- **自然段数**: 最少 {min(para)}, 最多 {max(para)}")
+    # ---- 关键词实际落点(只统计, 不作判定) ----
+    A("")
+    A("### 关键词实际怎么用的(**只统计, 不作判定**)")
+    A("")
+    A("本轮**不检查**关键词有没有字面出现, 也不要求它们成为机关。")
+    A("下面只是把「前 400 字里出现了几个关键词」数出来, 供人参照。")
+    A("**命中少不等于坏** —— 词的作用是给创意一个外部起点, 不是命题作文。")
+    A("")
+    hit_dist = {}
+    for r in ok:
+        head = r["story"][:400]
+        n = len([k for k in (r.get("keywords") or []) if k in head])
+        hit_dist[r["id"]] = n
+    A(f"- 前 400 字命中 2 个: "
+      f"{len([i for i, n in hit_dist.items() if n == 2])}/{len(ok)} 条")
+    A(f"- 前 400 字命中 1 个: "
+      f"{len([i for i, n in hit_dist.items() if n == 1])}/{len(ok)} 条")
+    A(f"- 前 400 字命中 0 个: "
+      f"{len([i for i, n in hit_dist.items() if n == 0])}/{len(ok)} 条")
+    A("")
+    A("| id | 关键词 | 前 400 字命中 |")
+    A("|---|---|---|")
+    for r in ok:
+        A(f"| `{r['id']}` | {'/'.join(r.get('keywords') or [])} | "
+          f"{hit_dist[r['id']]}/2 |")
     A("")
     A("## 下一步(本轮**不做**)")
     A("")
@@ -453,7 +600,8 @@ def _write_reports(records: list, manifest: dict) -> None:
     B("不做筛选、不做排名。这就是模型交回来的原文。")
     B("")
     for r in records:
-        B(f"## {r['id']} — {r['type']} — {r['subject']}")
+        B(f"## {r['id']} — {r['type']} — 关键词: "
+          f"{'/'.join(r.get('keywords') or [])}")
         B("")
         if r["story"]:
             B(r["story"])
@@ -534,6 +682,8 @@ def main() -> int:
             records = [json.loads(x) for x in f if x.strip()]
         cfg = LLMConfig()
         client = AnthropicMessagesClient(cfg)
+        # 词库元信息 —— 修复路径也要能写进 manifest, 所以在这里同样建一次。
+        _bag_probe, corpus_meta, _ss = _make_bag(SEED_RED)
         todo = [i for i, r in enumerate(records) if not r["story"]]
         if not todo:
             log.info("没有技术失败的槽位, 无需修复")
@@ -543,9 +693,15 @@ def main() -> int:
         for i in todo:
             old = records[i]
             kind, idx = old["type"], int(old["id"].split("-")[1])
-            # ⚠️ 复用**同一个 subject**: 只换预算, 不换题目。
-            # 换 subject 就成了"重新抽一道", 那是在偷偷改实验条件。
-            new = _one_candidate(client, kind, idx, old["subject"])
+            # ⚠️ 复用**同一个 draw**: 只换预算, 不重抽关键词。
+            # 重抽就成了"重新抽一道题", 那是在偷偷改实验条件。
+            draw = {
+                "keywords": list(old.get("keywords") or []),
+                "index": old.get("keyword_draw_index"),
+                "relaxed": old.get("keyword_draw_relaxed"),
+            }
+            new = _one_candidate(client, kind, idx, draw, corpus_meta,
+                                 old.get("keyword_session_seed") or 0)
             if new["story"]:
                 records[i] = new
                 log.info("[%s] 修复成功 (%d 字, %d 次)",
@@ -554,7 +710,7 @@ def main() -> int:
                 log.error("[%s] 修复仍失败: %s",
                           new["id"], new["technical_error"][:160])
             _write_raw(records)
-        _write_manifest(cfg, records, base_sha, branch, git_head)
+        _write_manifest(cfg, records, base_sha, branch, git_head, corpus_meta)
         _write_reports(records, json.load(open(MANIFEST_JSON,
                                                encoding="utf-8")))
         ok = len([r for r in records if r["story"]])
@@ -573,17 +729,26 @@ def main() -> int:
              cfg.model, TEMPERATURE, MAX_TOKENS)
     client = AnthropicMessagesClient(cfg)
 
-    # ---- 主题**在第一次模型调用之前**就抽定(不许跑完再挑) ----
-    plan = ([("red", i + 1, s) for i, s in
-             enumerate(_draw_subjects(SEED_RED, N_PER_TYPE))] +
-            [("black", i + 1, s) for i, s in
-             enumerate(_draw_subjects(SEED_BLACK, N_PER_TYPE))])
-    log.info("已抽定 %d 个主题(red seed=%s / black seed=%s)",
-             len(plan), SEED_RED, SEED_BLACK)
+    # ---- 两个**生产同款**词袋: 红/黑各一条独立序列 ----
+    bag_red, corpus_meta, ss_red = _make_bag(SEED_RED)
+    bag_black, meta_black, ss_black = _make_bag(SEED_BLACK)
+    log.info("词袋就绪: corpus=%s keyword_count=%s seed_version=%s",
+             corpus_meta.get("corpus_version"), corpus_meta.get("keyword_count"),
+             _keyword_seed_version())
+    log.info("session_seed red=%s black=%s", ss_red, ss_black)
+
+    # ---- 关键词**在第一次模型调用之前**就抽定(不许跑完再挑) ----
+    plan = ([("red", i + 1, bag_red.draw(), ss_red) for i in range(N_PER_TYPE)]
+            + [("black", i + 1, bag_black.draw(), ss_black)
+               for i in range(N_PER_TYPE)])
+    log.info("已抽定 %d 组关键词", len(plan))
+    for kind, idx, d, _ss in plan:
+        log.info("  [%s-%02d] %s", kind, idx, "/".join(d["keywords"]))
 
     records = []
-    for kind, idx, subject in plan:
-        rec = _one_candidate(client, kind, idx, subject)
+    for kind, idx, draw, sess in plan:
+        # 红/黑各自的 corpus_meta 相同(同一个词库), 传红的那份即可。
+        rec = _one_candidate(client, kind, idx, draw, corpus_meta, sess)
         records.append(rec)
         if rec["story"]:
             log.info("[%s/%s] ok (%d 字, %d 次, %dms)",
@@ -596,7 +761,7 @@ def main() -> int:
         _write_raw(records)
 
     _write_raw(records)
-    _write_manifest(cfg, records, base_sha, branch, git_head)
+    _write_manifest(cfg, records, base_sha, branch, git_head, corpus_meta)
     _write_reports(records, json.load(open(MANIFEST_JSON, encoding="utf-8")))
 
     ok = len([r for r in records if r["story"]])

@@ -1,9 +1,10 @@
 {
   "experiment": "red_black_core_stories",
-  "question": "无约束时模型自己会想出值得玩的红汤/黑汤故事吗",
+  "question": "在极短红/黑方向提示 + 生产同款 2-key 随机扰动下, 模型能不能产生我们认可的汤底。",
+  "question_v1_retired": "v1 问的是'无约束时模型会想什么', 那版自己造单主题池且允许'可以不围绕', 等于取消了约束 —— 20 条迅速塌回温情/怀旧母题。R1 换回生产 KeywordBag 两随机关键词, 问题也随之改写。",
   "base_sha": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
   "branch": "experiment/red-black-core-stories",
-  "git_head_at_run": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
+  "git_head_at_run": "HEAD",
   "model_requested": "deepseek-v4.1-flash",
   "model_returned": [
     "deepseek-v4.1-flash"
@@ -14,6 +15,198 @@
   "n_per_type": 10,
   "seed_red": 20260921,
   "seed_black": 20260922,
+  "keyword_mechanism": {
+    "source": "story.keyword_seed.KeywordBag (生产同款, 直接复用)",
+    "corpus_path": "story.keyword_corpus.DEFAULT_CORPUS_PATH",
+    "corpus_version": "keyword2-vocab-v2",
+    "keyword_count": 1134,
+    "keyword_seed_version": "keyword2-vocab-v2",
+    "session_seed_red": 8442825726471463001,
+    "session_seed_black": 11128511528707715755,
+    "per_candidate": [
+      {
+        "id": "red-01",
+        "keywords": [
+          "灰姑娘",
+          "中毒"
+        ],
+        "draw_index": 1,
+        "relaxed": 0
+      },
+      {
+        "id": "red-02",
+        "keywords": [
+          "天花板",
+          "寒假作业"
+        ],
+        "draw_index": 2,
+        "relaxed": 0
+      },
+      {
+        "id": "red-03",
+        "keywords": [
+          "老婆",
+          "尝试"
+        ],
+        "draw_index": 3,
+        "relaxed": 0
+      },
+      {
+        "id": "red-04",
+        "keywords": [
+          "门",
+          "开车"
+        ],
+        "draw_index": 4,
+        "relaxed": 0
+      },
+      {
+        "id": "red-05",
+        "keywords": [
+          "转账",
+          "罪犯"
+        ],
+        "draw_index": 5,
+        "relaxed": 0
+      },
+      {
+        "id": "red-06",
+        "keywords": [
+          "毒药",
+          "抛弃"
+        ],
+        "draw_index": 6,
+        "relaxed": 0
+      },
+      {
+        "id": "red-07",
+        "keywords": [
+          "色彩",
+          "马戏团"
+        ],
+        "draw_index": 7,
+        "relaxed": 0
+      },
+      {
+        "id": "red-08",
+        "keywords": [
+          "没湿",
+          "杀害"
+        ],
+        "draw_index": 8,
+        "relaxed": 0
+      },
+      {
+        "id": "red-09",
+        "keywords": [
+          "暗号",
+          "巨型摩天轮"
+        ],
+        "draw_index": 9,
+        "relaxed": 0
+      },
+      {
+        "id": "red-10",
+        "keywords": [
+          "网约车",
+          "偷渡"
+        ],
+        "draw_index": 10,
+        "relaxed": 0
+      },
+      {
+        "id": "black-01",
+        "keywords": [
+          "塔吊",
+          "晚饭"
+        ],
+        "draw_index": 1,
+        "relaxed": 0
+      },
+      {
+        "id": "black-02",
+        "keywords": [
+          "火柴",
+          "光线"
+        ],
+        "draw_index": 2,
+        "relaxed": 0
+      },
+      {
+        "id": "black-03",
+        "keywords": [
+          "神殿",
+          "家族"
+        ],
+        "draw_index": 3,
+        "relaxed": 0
+      },
+      {
+        "id": "black-04",
+        "keywords": [
+          "婚礼",
+          "结婚戒指"
+        ],
+        "draw_index": 4,
+        "relaxed": 0
+      },
+      {
+        "id": "black-05",
+        "keywords": [
+          "无辜",
+          "骗子"
+        ],
+        "draw_index": 5,
+        "relaxed": 0
+      },
+      {
+        "id": "black-06",
+        "keywords": [
+          "1237",
+          "奇迹"
+        ],
+        "draw_index": 6,
+        "relaxed": 0
+      },
+      {
+        "id": "black-07",
+        "keywords": [
+          "过去",
+          "游轮"
+        ],
+        "draw_index": 7,
+        "relaxed": 0
+      },
+      {
+        "id": "black-08",
+        "keywords": [
+          "历史",
+          "恐龙"
+        ],
+        "draw_index": 8,
+        "relaxed": 0
+      },
+      {
+        "id": "black-09",
+        "keywords": [
+          "转账",
+          "散步"
+        ],
+        "draw_index": 9,
+        "relaxed": 0
+      },
+      {
+        "id": "black-10",
+        "keywords": [
+          "硬币用光",
+          "生孩子"
+        ],
+        "draw_index": 10,
+        "relaxed": 0
+      }
+    ],
+    "no_literal_check": "不检查两个关键词有没有字面出现在故事里; 也不要求它们成为机关。随机碰撞本身就是创意扰动 —— 见生产 §四。"
+  },
   "counts": {
     "total": 20,
     "ok": 20,
@@ -32,7 +225,7 @@
   "prompts": {
     "red_system": "你在为海龟汤设计隐藏故事。\n只写事情真正发生了什么, 不要写谜面(writer 之后会从故事里截取)。\n偏红汤: 真相本身要有分量, 值得最后揭晓 —— 不是普通事故, 也不是单纯的悲剧。",
     "black_system": "你在为海龟汤设计隐藏故事。\n只写事情真正发生了什么, 不要写谜面(writer 之后会从故事里截取)。\n偏黑汤: 真相揭晓后应让人明显不安或后背发凉 —— 靠关系、意图或世界规则, 不靠血腥描写。",
-    "user_template": "写一个完整的故事。可以围绕「{subject}」, 也可以不围绕。",
+    "user_template": "随机关键词：{a}、{b}。用它们作为创意起点，写一个完整的隐藏故事。",
     "tool": {
       "name": "emit_core_story",
       "description": "交出一个完整的隐藏故事。",
@@ -52,6 +245,7 @@
     },
     "red_system_chars": 94,
     "black_system_chars": 98,
+    "user_template_chars": 35,
     "red_system_sha8": "02e6ed12",
     "black_system_sha8": "d4fe029f"
   },
@@ -68,7 +262,8 @@
     "reviewer 分数",
     "自动分类器结果"
   ],
-  "no_filtering": "20 个候选全部原样保留 —— 没有删除 / 没有重抽到满意 / 没有排名。只有技术失败(HTTP/网络)会重试, 记在 attempts。",
+  "no_filtering": "20 个候选全部原样保留 —— 没有删除 / 没有重抽到满意 / 没有排名。只有技术失败(HTTP/网络/输出超限)会重试, 记在 attempts。",
+  "technical_repair_note": "MAX_TOKENS 从 1400 提到 2600: 1400 会稳定砍掉偏长的那一档(成功稿最长可达 1982 字), 等于给长故事加了隐形筛选。若仍有纯技术超限, 用 --repair-technical **只**重跑那个槽位, 且**复用同一个 draw**(不重新抽关键词)。",
   "outputs": {
     "raw": "data/red_black_core_experiment/raw.jsonl",
     "report": "data/red_black_core_experiment/report.md",

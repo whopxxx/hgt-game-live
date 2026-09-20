@@ -1,46 +1,46 @@
-00:24:46 INFO model=deepseek-v4.1-flash temperature=0.8 max_tokens=1400
-00:24:46 INFO 已抽定 20 个主题(red seed=20260921 / black seed=20260922)
-00:24:54 INFO [red/01] ok (1342 字, 1 次, 7937ms)
-00:24:59 INFO [red/02] ok (750 字, 1 次, 5155ms)
-00:25:06 WARNING [red-03] 技术失败(第 1 次): 工具调用返回空 input (stop=end_turn)
-00:25:17 WARNING [red-03] 技术失败(第 2 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:25:28 INFO [red/03] ok (1982 字, 3 次, 28844ms)
-00:25:35 INFO [red/04] ok (1497 字, 1 次, 7765ms)
-00:25:46 WARNING [red-05] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:25:54 INFO [red/05] ok (1465 字, 2 次, 18281ms)
-00:26:02 INFO [red/06] ok (1469 字, 1 次, 8233ms)
-00:26:10 WARNING [red-07] 技术失败(第 1 次): 工具调用返回空 input (stop=end_turn)
-00:26:18 INFO [red/07] ok (1473 字, 2 次, 15657ms)
-00:26:26 INFO [red/08] ok (1446 字, 1 次, 8656ms)
-00:26:37 WARNING [red-09] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:26:48 WARNING [red-09] 技术失败(第 2 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:26:58 INFO [red/09] ok (1629 字, 3 次, 31483ms)
-00:27:08 WARNING [red-10] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:27:15 INFO [red/10] ok (1204 字, 2 次, 17202ms)
-00:27:26 WARNING [black-01] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:27:35 INFO [black/01] ok (1856 字, 2 次, 20094ms)
-00:27:41 WARNING [black-02] 技术失败(第 1 次): 工具调用返回空 input (stop=end_turn)
-00:27:49 WARNING [black-02] 技术失败(第 2 次): 工具调用返回空 input (stop=end_turn)
-00:27:59 WARNING [black-02] 技术失败(第 3 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:27:59 ERROR [black/02] 技术失败: 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:28:10 WARNING [black-03] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:28:18 INFO [black/03] ok (1302 字, 2 次, 18328ms)
-00:28:26 INFO [black/04] ok (1272 字, 1 次, 7952ms)
-00:28:37 WARNING [black-05] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:28:45 INFO [black/05] ok (1321 字, 2 次, 18968ms)
-00:28:55 WARNING [black-06] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:29:03 WARNING [black-06] 技术失败(第 2 次): 工具调用返回空 input (stop=end_turn)
-00:29:12 INFO [black/06] ok (1645 字, 3 次, 27281ms)
-00:29:20 INFO [black/07] ok (1614 字, 1 次, 8437ms)
-00:29:31 WARNING [black-08] 技术失败(第 1 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:29:38 WARNING [black-08] 技术失败(第 2 次): 工具调用返回空 input (stop=end_turn)
-00:29:49 WARNING [black-08] 技术失败(第 3 次): 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:29:49 ERROR [black/08] 技术失败: 输出触顶(max_tokens=1400, 实出 1400), 工具调用没写完; 需要调大 max_tokens
-00:29:57 INFO [black/09] ok (1461 字, 1 次, 8844ms)
-00:30:07 INFO [black/10] ok (1654 字, 1 次, 9562ms)
-00:30:07 INFO 完成: 18/20 成功。原始 -> D:\whopxxwu\douyin\data\red_black_core_experiment\raw.jsonl
-00:30:28 INFO 技术修复: 2 个槽位 ['black-02', 'black-08']
-00:30:43 INFO [black-02] 修复成功 (3228 字, 1 次)
-00:30:55 INFO [black-08] 修复成功 (2132 字, 1 次)
-00:30:55 INFO 修复后: 20/20 成功
-00:31:27 INFO 报告已重出: D:\whopxxwu\douyin\data\red_black_core_experiment\report.md
+00:43:34 INFO model=deepseek-v4.1-flash temperature=0.8 max_tokens=2600
+00:43:34 INFO 词袋就绪: corpus=keyword2-vocab-v2 keyword_count=1134 seed_version=keyword2-vocab-v2
+00:43:34 INFO session_seed red=8442825726471463001 black=11128511528707715755
+00:43:34 INFO 已抽定 20 组关键词
+00:43:34 INFO   [red-01] 灰姑娘/中毒
+00:43:34 INFO   [red-02] 天花板/寒假作业
+00:43:34 INFO   [red-03] 老婆/尝试
+00:43:34 INFO   [red-04] 门/开车
+00:43:34 INFO   [red-05] 转账/罪犯
+00:43:34 INFO   [red-06] 毒药/抛弃
+00:43:34 INFO   [red-07] 色彩/马戏团
+00:43:34 INFO   [red-08] 没湿/杀害
+00:43:34 INFO   [red-09] 暗号/巨型摩天轮
+00:43:34 INFO   [red-10] 网约车/偷渡
+00:43:34 INFO   [black-01] 塔吊/晚饭
+00:43:34 INFO   [black-02] 火柴/光线
+00:43:34 INFO   [black-03] 神殿/家族
+00:43:34 INFO   [black-04] 婚礼/结婚戒指
+00:43:34 INFO   [black-05] 无辜/骗子
+00:43:34 INFO   [black-06] 1237/奇迹
+00:43:34 INFO   [black-07] 过去/游轮
+00:43:34 INFO   [black-08] 历史/恐龙
+00:43:34 INFO   [black-09] 转账/散步
+00:43:34 INFO   [black-10] 硬币用光/生孩子
+00:43:44 INFO [red/01] ok (1607 字, 1 次, 10094ms)
+00:43:54 INFO [red/02] ok (1535 字, 1 次, 9405ms)
+00:44:02 INFO [red/03] ok (1706 字, 1 次, 8688ms)
+00:44:11 INFO [red/04] ok (1637 字, 1 次, 8875ms)
+00:44:20 INFO [red/05] ok (1680 字, 1 次, 9125ms)
+00:44:32 INFO [red/06] ok (2110 字, 1 次, 11140ms)
+00:44:38 INFO [red/07] ok (1190 字, 1 次, 6734ms)
+00:44:45 INFO [red/08] ok (1114 字, 1 次, 6890ms)
+00:44:55 INFO [red/09] ok (1812 字, 1 次, 9890ms)
+00:45:02 INFO [red/10] ok (1130 字, 1 次, 7250ms)
+00:45:15 INFO [black/01] ok (2443 字, 1 次, 13140ms)
+00:45:27 INFO [black/02] ok (2119 字, 1 次, 11094ms)
+00:45:39 INFO [black/03] ok (2424 字, 1 次, 12437ms)
+00:45:46 INFO [black/04] ok (1251 字, 1 次, 7265ms)
+00:46:06 WARNING [black-05] 技术失败(第 1 次): 输出触顶(max_tokens=2600, 实出 2600), 工具调用没写完; 需要调大 max_tokens
+00:46:18 INFO [black/05] ok (2329 字, 2 次, 31859ms)
+00:46:29 INFO [black/06] ok (2257 字, 1 次, 10922ms)
+00:46:37 INFO [black/07] ok (1501 字, 1 次, 8452ms)
+00:46:43 INFO [black/08] ok (743 字, 1 次, 5484ms)
+00:46:53 INFO [black/09] ok (2135 字, 1 次, 10452ms)
+00:47:06 INFO [black/10] ok (2531 字, 1 次, 13047ms)
+00:47:42 INFO 报告已重出: D:\whopxxwu\douyin\data\red_black_core_experiment\report.md

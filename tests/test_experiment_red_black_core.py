@@ -170,11 +170,18 @@ def test_temperature_matches_production_generation():
 # 二、import 边界
 # ======================================================================
 def test_no_production_generation_imports():
-    """不得 import 生成政策层 —— 否则"裸问"不成立。"""
+    """不得 import 生成政策层 —— 否则"裸问"不成立。
+
+    ⚠️ `story.keyword_seed` 是**例外且必须**: R1 明确要求复用生产同款的
+    `KeywordBag` 两随机关键词。自己再写一个抽词器就等于把自变量换掉。
+    所以这里禁止的是 `story.quality` / `story.puzzle`(生成政策层), 而
+    `keyword_seed` 反过来是**要求存在**的 —— 见
+    `test_reuses_production_keyword_bag`。
+    """
     print("\n[RBC3] 只借传输层")
     imports = _top_level_imports()
     forbidden = {
-        "story.quality", "story.puzzle", "story.keyword_seed",
+        "story.quality", "story.puzzle",
         "story.engine", "story.state", "director",
     }
     hit = sorted(imports & forbidden)
@@ -186,7 +193,7 @@ def test_no_production_generation_imports():
           "PuzzleWriter" not in _code_only_source(),
           "可执行代码里出现了 PuzzleWriter")
 
-    # 允许的两个接缝必须**真的**被用到(否则说明它在别处拿了别的东西)
+    # 允许的接缝必须**真的**被用到(否则说明它在别处拿了别的东西)
     check("import 了 story.config", "story.config" in imports)
     check("import 了 story.llm", "story.llm" in imports)
 
@@ -197,6 +204,40 @@ def test_no_production_generation_imports():
             got |= {a.name for a in node.names}
     check("story.llm 只拿 AnthropicMessagesClient",
           got == {"AnthropicMessagesClient"}, f"实际 {sorted(got)}")
+
+
+def test_reuses_production_keyword_bag():
+    """必须复用**生产同款**的两随机关键词机制(R1 的核心要求)。
+
+    守三件事:
+
+      1. 不得再自造单主题池 `SUBJECTS` —— v1 就是那样跑偏的(模型迅速
+         塌回温情/怀旧母题);
+      2. 必须走 `load_bag` + `bag.draw()`, 也就是生产那条抽词路径;
+      3. user prompt **不得**出现"也可以不围绕" —— 那句话把约束取消了。
+    """
+    print("\n[RBC3b] 复用生产两随机关键词")
+    code = _code_only_source()
+    check("代码里没有自造 SUBJECTS 池",
+          "SUBJECTS = " not in code and "_draw_subjects" not in code,
+          "仍存在自造主题池")
+    check("走 load_bag(生产抽词)", "load_bag" in code)
+    check("走 bag.draw()", ".draw()" in code)
+    check("用生产词库路径(DEFAULT_CORPUS_PATH)",
+          "DEFAULT_CORPUS_PATH" in code)
+
+    # 三句必须**不存在**的话。
+    tpl = _literal("USER_PROMPT")
+    for bad in ("也可以不围绕", "可以不围绕", "或不围绕"):
+        check(f"user 不含「{bad}」", bad not in tpl, f"实际: {tpl}")
+    # 但必须**有**关键词占位。
+    check("user 含两个关键词占位",
+          "{a}" in tpl and "{b}" in tpl, f"实际: {tpl}")
+
+    # 系统提示里也不得再出现"可以不围绕"之类。
+    for nm in ("RED_SYSTEM", "BLACK_SYSTEM"):
+        s = _literal(nm)
+        check(f"{nm} 不含「不围绕」", "不围绕" not in s)
 
 
 def test_experiment_import_does_not_touch_production():
@@ -269,24 +310,70 @@ def test_no_surface_fields_emitted():
     check("schema 无汤面/结构化字段", not hit, f"命中 {hit}")
 
 
-def test_deterministic_subject_draw():
-    """抽题必须按 seed 可复现, 且**在第一次模型调用前**抽定。"""
-    print("\n[RBC7] 抽题可复现")
+def test_keyword_draw_is_reproducible_and_real():
+    """抽词必须**可复现**, 且抽出来的**确实是两个不同的真实词**。
+
+    这里**真跑**生产的 `KeywordBag`(纯 CPU, 不打模型、不联网): 同一个
+    base seed 派生出的 bag, 必须给出同一串 pair 序列 —— 否则报告里的
+    `keywords` / `draw_index` 就复现不了, 那两条溯源字段等于装饰。
+
+    另外确认抽出来的是**词库里的词**(不是自造的 subject 字符串): 每个词
+    都必须出现在 `data/keyword2_vocabulary.json` 的 `keywords` 里。
+    """
+    print("\n[RBC7] 抽词可复现")
+    import json
+    import tools.experiment_red_black_core as E
+
     seed_red = _literal("SEED_RED")
     seed_black = _literal("SEED_BLACK")
     n = _literal("N_PER_TYPE")
-
-    # 抽题函数是纯函数(只依赖入参), 可以安全 import; 但**常量**仍从源码读,
-    # 免得缓存让"改了 seed"这件事在测试里看不见。
-    from tools.experiment_red_black_core import _draw_subjects
-    a = _draw_subjects(seed_red, n)
-    b = _draw_subjects(seed_red, n)
-    check("同 seed 同序列", a == b)
-    check("不放回(无重复)", len(set(a)) == len(a), f"{a}")
-    check("恰好 N_PER_TYPE 个", len(a) == n)
-
-    # 红黑两条序列**独立**: 用不同 seed, 否则两类的"第 k 个"被绑在一起。
     check("红黑 seed 不同", seed_red != seed_black)
+
+    # ---- 可复现: 同 seed 两次建 bag, 序列一致 ----
+    b1, m1, ss1 = E._make_bag(seed_red)
+    b2, m2, ss2 = E._make_bag(seed_red)
+    check("同 seed 同 session seed", ss1 == ss2, f"{ss1} vs {ss2}")
+    seq1 = [tuple(b1.draw()["keywords"]) for _ in range(n)]
+    seq2 = [tuple(b2.draw()["keywords"]) for _ in range(n)]
+    check("同 seed 同 pair 序列", seq1 == seq2, f"{seq1} vs {seq2}")
+
+    # ---- 每个 draw 都是两个**不同**的词 ----
+    check("每道两个词互不相同",
+          all(a != b for a, b in seq1),
+          f"{[p for p in seq1 if p[0] == p[1]]}")
+    check("每道恰好 2 个词", all(len(p) == 2 for p in seq1))
+
+    # ---- 抽出来的必须是**词库里的真实词** ----
+    vocab = set()
+    with open(E._corpus_path(), encoding="utf-8") as f:
+        vocab = set(json.load(f)["keywords"])
+    allkw = [w for p in seq1 for w in p]
+    notin = [w for w in allkw if w not in vocab]
+    check("抽出的词都在真实词库里", not notin, f"不在词库: {notin}")
+
+    # ---- 同一个 bag 内不重复抽同一个 pair(cooldown 生效) ----
+    check("同一 bag 内 pair 不重复",
+          len(set(seq1)) == len(seq1), f"{seq1}")
+
+
+def test_no_literal_keyword_check_and_no_forcing():
+    """**不检查字面命中, 也不强迫关键词成为机关**(R1 明确要求)。
+
+    这条守的是"不要顺手加一个 checker": 一旦脚本里出现
+    `if kw not in story: reject` 之类的逻辑, 实验就从"随机扰动"变成了
+    "命题作文 + 命中判定", 产物会立刻变味。
+    """
+    print("\n[RBC9] 不检查字面命中")
+    code = _code_only_source()
+    # 不得在故事文本上做关键词包含判断。
+    for bad in ("not in story", "not in rec[\"story\"]", "kw in story",
+                "keyword in story", "require_keyword", "must_contain"):
+        check(f"无「{bad}」", bad not in code, "出现了字面命中检查")
+    # 也不得要求"必须成为机关"之类措辞。
+    for nm in ("RED_SYSTEM", "BLACK_SYSTEM"):
+        s = _literal(nm)
+        for bad in ("机关", "字面", "必须出现", "必须包含"):
+            check(f"{nm} 不含「{bad}」", bad not in s)
 
 
 def test_no_auto_filtering_or_scoring():
@@ -342,11 +429,13 @@ def main() -> int:
     test_prompts_stay_short()
     test_temperature_matches_production_generation()
     test_no_production_generation_imports()
+    test_reuses_production_keyword_bag()
     test_experiment_import_does_not_touch_production()
     test_never_writes_production_paths()
     test_no_surface_fields_emitted()
-    test_deterministic_subject_draw()
+    test_keyword_draw_is_reproducible_and_real()
     test_no_auto_filtering_or_scoring()
+    test_no_literal_keyword_check_and_no_forcing()
     print()
     if FAIL[0]:
         print(f"[RBC] {FAIL[0]} 条 FAIL")
