@@ -358,10 +358,18 @@ def test_reviewer_contract_matches_compiler_policy():
     for good in ("narrator_truthful", "mechanism_consistent"):
         check(f"**真实性硬门 {good} 仍在**", good in curated_fields)
     # ⑤ 自由生成链**没被顺手改**(§九: 只改 curated)
+    #
+    # ⚠️ **G4-E 加了第 9 项**: `livestream_safe`。原断言是 `len == 8`,
+    # 现在必须是 9 —— 而且**多出来的必须是它**, 不能是题型字段(那才是
+    # H4-D 警告过的"从后门装回去")。
     free_fields = _llm._quality_check_contract(
         type("S", (), {"source_type": ""})())
-    check("**自由生成链仍是 8 项**(§九 不跟改)",
-          len(free_fields) == 8, free_fields)
+    check("**自由生成链是 9 项**(G4-E 加了 livestream_safe)",
+          len(free_fields) == 9, free_fields)
+    check("**第 9 项就是 livestream_safe**",
+          free_fields[-1] == "livestream_safe", free_fields[-1])
+    check("**livestream_safe 也在 curated 门里**(两边都查 safety)",
+          "livestream_safe" in curated_fields)
     check("自由生成链**不含**题型字段",
           not (set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)),
           sorted(set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)))

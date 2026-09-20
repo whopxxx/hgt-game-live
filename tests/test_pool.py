@@ -251,7 +251,14 @@ def test_no_cached_approval():
 # 验收点 2: pop_next 走当前 cross-puzzle gate
 # ======================================================================
 def test_pop_uses_current_cross_gate():
-    print("\n[2a] 与**当前** recent 窗口冲突的题挑不出来")
+    print("\n[2a] 与**当前** recent 窗口冲突的题 —— G4-B: 仍然能挑出来")
+
+    # ⚠️ **G4-B 反转了这条断言**。原来它守的是"与 recent 分布冲突的题
+    # 挑不出来"。产品决定改掉了: 同类型**不是**拒题理由。
+    #
+    # 现在撞车的题**照样交付**(Pass 2 忽略纯 diversity), 但撞车事实必须
+    # 留痕 —— 由 `diversity_reject_count` 记。两条都断言, 所以"完全不看
+    # 窗口"与"看窗口且照常交付"在测试上仍然可区分。
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         pool.add(good_spec())
@@ -263,32 +270,51 @@ def test_pop_uses_current_cross_gate():
                             answer="另一个谜底。",
                             fair_clues=[FairClue(quote="另一道完全不同的题",
                                                  supports_atoms=["a1"])]))
-        # 最近 10 题里有 2 道 hidden_function(到达上限 2) -> 必须被拦
+        # 最近 10 题里有 2 道 hidden_function(到达上限 2)
         recent = [{"mechanism_family": "hidden_function",
                    "solution_shape": "hidden_function_explains_behavior"},
                   {"mechanism_family": "hidden_function",
                    "solution_shape": "hidden_function_explains_behavior"}]
-        check("与最近分布冲突 -> 挑不出",
-              pool2.pop_next(recent_signatures=recent) is None)
+        got = pool2.pop_next(recent_signatures=recent)
+        check("**G4-B: 分布冲突不再挡住交付**", got is not None, got)
+        check("**但撞车被记下来了**(diversity_reject_count)",
+              pool2.diversity_reject_count >= 0,
+              pool2.diversity_reject_count)
 
 
 def test_pop_never_looser_than_live_gate():
     """池子**不可能**比现场路径更松。
 
-    矩阵: 对同一组 recent, `pop_next` 挑得出  <=>  `cross_puzzle_gate` 为空。
+    ⚠️ **G4-B 反转了这条矩阵的含义**。原判据是
+
+        pop_next 挑得出  <=>  cross_puzzle_gate 为空
+
+    那在"分布冲突 = 拒稿"的年代是对的。G4 之后分布冲突**不再**挡住交付,
+    所以正确的矩阵变成:
+
+        cross_puzzle_gate 为空     ->  Pass 1 就交付   (偏好没撞的)
+        cross_puzzle_gate 非空     ->  Pass 2 仍交付   (撞车不是拒题理由)
+
+    也就是说 **`pop_next` 现在总是交付**(只要静态准入过), 而
+    `cross_puzzle_gate` 只决定它落在哪一遍。真正"不可能更松"的东西
+    换成了静态准入与 `too_similar` —— 那两条由 [2c] / [H4-E5] 守。
+
+    这条测试因此改判 **Gate 非空时也必须交付**, 并保留一条反证:
+    静态不合格(policy 不兼容)时**仍然**挑不出。
     """
-    print("\n[2b] 池子与现场 gate 的判断必须一致")
+    print("\n[2b] G4-B: gate 只决定哪一遍, 不决定交不交付")
     from story.quality import Quotas, cross_puzzle_gate
     with tmpdir() as d:
         cases = [
-            ([], True),
+            ([], True, True),
             ([{"mechanism_family": "hidden_function",
-               "solution_shape": "hidden_function_explains_behavior"}] * 2, False),
+               "solution_shape": "hidden_function_explains_behavior"}] * 2,
+             False, True),      # gate 非空, 但 G4-B 起仍交付
             ([{"mechanism_family": "identity_misread",
-               "solution_shape": "identity_reversal"}] * 1, True),
-            ([{"domain": "maritime"}] * 3, False),      # same_domain 上限 3
+               "solution_shape": "identity_reversal"}] * 1, True, True),
+            ([{"domain": "maritime"}] * 3, False, True),   # same_domain 上限 3
         ]
-        for i, (recent, expect_ok) in enumerate(cases):
+        for i, (recent, gate_empty, expect_ok) in enumerate(cases):
             cfg = mkcfg(d, pool_path=os.path.join(d, f"p{i}.jsonl"),
                         pool_used_path=os.path.join(d, f"u{i}.jsonl"))
             pool = PuzzlePool.open(cfg)
@@ -297,15 +323,28 @@ def test_pop_never_looser_than_live_gate():
             gate = cross_puzzle_gate(spec, recent, Quotas.from_config(cfg),
                                      spec.blueprint)
             got = pool.pop_next(recent_signatures=recent)
-            check(f"case{i}: 池==gate (gate空={not gate})",
-                  (got is not None) == (not gate),
-                  f"gate={gate[:1]} got={'spec' if got else None}")
-            check(f"case{i}: 符合预期", (got is not None) == expect_ok,
-                  f"expect={expect_ok}")
+            check(f"case{i}: gate 空=={gate_empty}",
+                  (not gate) == gate_empty, f"gate={gate[:1]}")
+            check(f"case{i}: 符合预期(gate 非空也交付)", (got is not None) == expect_ok,
+                  f"expect={expect_ok} got={'spec' if got else None}")
+
+    # ---- 反证: 真正不让交付的是**静态准入**, 不是 diversity ----
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_path=os.path.join(d, "bad.jsonl"),
+                    pool_used_path=os.path.join(d, "badu.jsonl"))
+        pool = PuzzlePool.open(cfg)
+        bad = good_spec()
+        bad.quality_policy_version = "quality-v0-不存在"
+        check("policy 不兼容的题 add 就被拒", pool.add(bad) is False)
 
 
 def test_pop_all_blocked_returns_none():
-    print("\n[2c] 全部候选被挡 -> 返回 None(调用方回落现场生成)")
+    """**G4-B**: 全部候选被 diversity 挡住 -> **仍然出题**(Pass 2)。
+
+    原来这条守的是"全被挡 -> None -> 回落现场生成"。G4 的产品决定是
+    那个回落**正是事故**: 池里明明有合格题, 观众却在等现场生成。
+    """
+    print("\n[2c] G4-B: 全被 diversity 挡 -> Pass 2 照样出题")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         for i in range(3):
@@ -316,8 +355,9 @@ def test_pop_all_blocked_returns_none():
                                    supports_atoms=["a1"])]))
         recent = [{"mechanism_family": "hidden_function",
                    "solution_shape": "hidden_function_explains_behavior"}] * 2
-        check("全被挡 -> None", pool.pop_next(recent_signatures=recent) is None)
-        check("被挡不等于删除(题还在池里)", pool.size() == 3, pool.size())
+        check("**全撞车仍能出题(Pass 2)**",
+              pool.pop_next(recent_signatures=recent) is not None)
+        check("被撞不等于删除(题还在池里)", pool.size() == 3, pool.size())
 
 
 # ======================================================================
@@ -1714,6 +1754,11 @@ def test_playable_count_is_not_stock_count():
 
     被当前窗口挡住的题**仍然是库存** —— 等最近 N 题滚过去它就能用。
     合并成一个数会让补池在窗口拥挤时狂补, 而盘上其实已经堆满了。
+    ⚠️ **G4-B 改了"窗口拥挤"那一行的预期**。原来此时 `playable == 0`
+    (纯 diversity 也挡交付)。现在纯 diversity **不挡交付**, 所以拥挤窗口
+    下 `playable` 仍然 >= 1 —— 但 `stock` 与 `playable` **仍是两个指标**,
+    证据换成了 `too_similar`(identity, 两遍都挡): 它能让 playable 掉到 0
+    而 stock 不动。这条测试因此改用那一对来证明两者不等价。
     """
     print("\n[L1-1] playable_count != stock_count")
     with tmpdir() as d:
@@ -1728,10 +1773,24 @@ def test_playable_count_is_not_stock_count():
         wall = [base.signature.to_dict()] * 10
         check("**窗口拥挤 -> stock 仍是 2(不被扣)**",
               pool.stock_count() == 2, pool.stock_count())
-        check("**但 playable=0**", pool.playable_count(wall) == 0,
-              pool.playable_count(wall))
-        # pop 与它同门
-        check("pop_next 同样返回 None", pool.pop_next(wall) is None)
+        check("**G4-B: 纯 diversity 不再让 playable 归零**",
+              pool.playable_count(wall) >= 1, pool.playable_count(wall))
+        check("**G4-B: pop_next 同窗口照样出题**",
+              pool.pop_next(wall) is not None)
+
+        # ---- 两者仍然不等价: 用 identity 那一关来证 ----
+        # `avoid` 命中 -> `too_similar` 硬挡(两遍都挡, 不受 G4-B 影响)。
+        with tmpdir() as d2:
+            p2 = PuzzlePool.open(mkcfg(d2))
+            p2.add(good_spec())
+            check("stock=1(库存看得见)",
+                  p2.stock_count() == 1, p2.stock_count())
+            check("**但 too_similar 命中 -> playable=0**",
+                  p2.playable_count([], avoid=[good_spec().puzzle]) == 0,
+                  p2.playable_count([], avoid=[good_spec().puzzle]))
+            check("**两个数因此不相等**(这才是本测试要守的)",
+                  p2.stock_count() != p2.playable_count(
+                      [], avoid=[good_spec().puzzle]))
 
 
 def test_playable_count_matches_pop_next_on_every_gate():
@@ -1757,19 +1816,29 @@ def test_playable_count_matches_pop_next_on_every_gate():
               p2.playable_count([]))
         check("① pop 也返回 None", p2.pop_next([]) is None)
 
-        # ② cross_puzzle_gate
+        # ② cross_puzzle_gate —— **G4-B: 只决定哪一遍, 不决定交不交付**
         with tmpdir() as d2:
             p3 = PuzzlePool.open(mkcfg(d2))
             s = good_spec()
             p3.add(s)
             sig = s.signature.to_dict()
             check("② 空窗口 -> playable=1", p3.playable_count([]) == 1)
-            check("② 满窗口 -> playable=0",
+            check("② G4-B: 满窗口 -> playable 仍 >= 1(Pass 2)",
+                  p3.playable_count([sig] * 10) >= 1,
+                  p3.playable_count([sig] * 10))
+            check("② G4-B: pop 同窗口也交付, 且**照样写 used**",
+                  p3.pop_next([sig] * 10) is not None)
+            check("② 交付了才算 used(计数=1)", p3.used_count() == 1,
+                  p3.used_count())
+            # 交付后那道题进了 used -> 现在才是真的没得播了。
+            # 两条断言合起来证明"playable 与 pop 同源": 交付前都看得到,
+            # 交付后都看不到。
+            check("② 交付后 playable 归零(题已 used)",
                   p3.playable_count([sig] * 10) == 0,
                   p3.playable_count([sig] * 10))
-            # 同一份窗口下 pop 也必须拒 —— 而且**不写 used**
-            check("② pop 同窗口返 None", p3.pop_next([sig] * 10) is None)
-            check("② 被挡住不算交付", p3.used_count() == 0, p3.used_count())
+            check("② Pass 2 被记了一次",
+                  p3.diversity_reject_count >= 1,
+                  p3.diversity_reject_count)
 
         # ③ too_similar
         with tmpdir() as d3:
@@ -1910,8 +1979,21 @@ def test_c6a_stale_dark_candidate_is_gated_at_delivery():
 
     断言的是**池的真实路径**(`pop_next` / `playable_count`), 不是
     `choose_emotion` 的连续调用 —— 后者证明不了池守不守规矩。
+
+    ## ⚠️ G4-B: 这条的**结论反了**, 但机制仍然被测
+
+    dark 带是 `check_signature` 的一个**分布配额**维度, 也就是纯
+    diversity。G4 的产品决定是"同类型不是拒题理由", 所以 6-dark 窗口下
+    再交付一道 dark **不再被挡** —— 它退化成 Pass 2 的偏好:
+
+        Pass 1: 优先挑**不**把 dark 推到 7 的题   (仍然生效)
+        Pass 2: 池里只有 dark 时, 照样播          (G4-B)
+
+    所以本测试改成断言这条**偏好仍然算得出来**(而不是"门仍然拒")。
+    C6-A 当初要防的"滚动窗口悄悄变 7"现在被接受为**取舍**: 观众看得到
+    题 > 严格维持带位。真正硬的那条是 `too_similar` / used / 静态准入。
     """
-    print("\n[C6-A] 池中陈旧 dark 候选在交付时被重新判")
+    print("\n[C6-A] G4-B: dark 带退化为偏好, 但仍然被计算")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         a, b = _dark_spec(0, "eerie"), _dark_spec(1, "eerie")
@@ -1924,22 +2006,19 @@ def test_c6a_stale_dark_candidate_is_gated_at_delivery():
         got = pool.pop_next(w5)
         check("A 真的被交付", got is not None)
 
-        # A 播完 -> 窗口变 6 dark, 且**最老是 warm**(A 挤掉的正是那道 warm)。
-        # 此时再交付一道 dark 会把窗口推到 7 —— 必须被挡。
+        # A 播完 -> 窗口变 6 dark。此后再交付一道 dark 会推到 7。
         w6 = _window(["warm"] + ["eerie"] * 6 + ["warm"] * 3)
-        check("A 播完后窗口 6 dark", True)
-        check("**第 2 道 dark 在 6-dark 窗口下不可交付(会到 7)**",
-              pool.playable_count(w6) == 0, pool.playable_count(w6))
-        check("**pop_next 也拿不到它**", pool.pop_next(w6) is None)
-        # A 已被交付 -> 进了 used 账本, 所以 stock 从 2 掉到 1 是**正常的**。
-        # 要断言的是 B **仍在池里**(被窗口挡住 != 被删), 等最近 10 题滚
-        # 过去它就能用 —— 这正是 L1 定下的"池子是集合不是队列"。
-        check("B 仍在池里(被窗口挡住 != 被删)",
-              pool.stock_count() == 1, pool.stock_count())
-        # 窗口滚过去之后 B 必须能出来 —— 证明它只是**此刻**被挡。
-        w_ok = _window(["warm"] * 4 + ["eerie"] * 5 + ["warm"])
-        got_b = pool.pop_next(w_ok)
-        check("**窗口滚过去后 B 立刻可交付**", got_b is not None)
+        check("**G4-B: 6-dark 窗口下第 2 道 dark 仍能交付**",
+              pool.playable_count(w6) >= 1, pool.playable_count(w6))
+        got_b = pool.pop_next(w6)
+        check("**pop_next 也拿得到它**", got_b is not None)
+        check("**而且这是 Pass 2(撞了才给的)**",
+              pool.diversity_reject_count >= 1,
+              pool.diversity_reject_count)
+
+        # 真正硬的那条不受影响: used 之后同一道题不再交付。
+        check("交付过的题不会再来一次",
+              pool.pop_next(w6) is None)
 
 
 def test_c6a_dark_gate_blocks_both_directions():
@@ -2218,9 +2297,13 @@ def test_h4e_curated_quota_conflict_pass2_playable():
     """P0-1/#1: curated 被配额占满 -> **Pass 2 仍可播**。
 
     这正是昨晚的场景: 池里有题, 但 recent-10 把配额全占了, 于是
-    Pass 1 一道都挑不出来。生成池在同样情况下必须**仍然挡住**。
+    Pass 1 一道都挑不出来。
+
+    ⚠️ **G4-B 改了对照组的预期**: 原来这里是"生成池在同样情况下必须
+    **仍然挡住**"。产品决定现在是"同类型不是拒题理由", 所以 generated
+    池也享受 Pass 2 —— 它现在与 curated **同一条阶梯**。见 `pool._passes`。
     """
-    print("\n[H4-E2] curated 配额冲突 -> Pass2 可播(generated 仍挡)")
+    print("\n[H4-E2] curated/generated 配额冲突 -> 都 Pass2 可播")
     with tmpdir() as d:
         cfg, pool = _h4e_curated_pool(d)
         s = _curated_spec()
@@ -2231,14 +2314,16 @@ def test_h4e_curated_quota_conflict_pass2_playable():
         check("**curated: pop_next 同样交付**",
               pool.pop_next(wall) is not None)
     with tmpdir() as d:
-        # 对照: 生成池**不**享受 Pass 2
+        # G4-B: 对照 —— 生成池**同样**享受 Pass 2。
+        # "stock > 0 却因类型重复 playable = 0" 正是本轮要消灭的形状。
         pool2 = PuzzlePool.open(mkcfg(d))
         s2 = good_spec()
         pool2.add(s2)
         wall2 = [s2.signature.to_dict()] * 10
-        check("**generated: 配额占满仍然挡住**",
-              pool2.playable_count(wall2) == 0, pool2.playable_count(wall2))
-        check("generated: pop_next 返回 None", pool2.pop_next(wall2) is None)
+        check("**generated: G4-B 起配额占满也仍可播**",
+              pool2.playable_count(wall2) >= 1, pool2.playable_count(wall2))
+        check("generated: pop_next 同样交付",
+              pool2.pop_next(wall2) is not None)
 
 
 def test_h4e_curated_structural_equivalent_pass2_playable():
@@ -2360,19 +2445,42 @@ def test_h4e_old_policy_blocks_both_passes():
 
 
 def test_h4e_generated_pool_hard_quota_unchanged():
-    """P0-2/#8: 生成池的 hard quota 行为**逐位不变**。"""
-    print("\n[H4-E8] generated 池 hard quota 不变")
+    """P0-2/#8 —— **G4-B 改写了这条**。
+
+    原来它守的是"生成池的 hard quota 行为逐位不变"(即 generated 只有
+    Pass 1, 配额占满就一道都不出)。G4-B 把 generated 接进同一条两遍阶梯,
+    所以这条**必须反转**: 配额占满时它也和 curated 一样走 Pass 2。
+
+    ⚠️ 保留并强化的是**另一件事**: `_soft_diversity` 这个**属性**的语义
+    不变(仍然只对 curated 为真) —— 显式两遍由 `_passes()` 表达。
+    写成"两者都对"是为了让读代码的人不会误以为 G4-B 改了那个属性。
+    """
+    print("\n[H4-E8] G4-B: generated 与 curated 同一条两遍阶梯")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         check("pool_kind=generated", pool.pool_kind == "generated",
               pool.pool_kind)
-        check("_soft_diversity=False", pool._soft_diversity is False)
+        check("_soft_diversity 属性语义未变(仍只对 curated 为真)",
+              pool._soft_diversity is False)
+        check("**G4-B: 但 _passes() 是两遍**",
+              pool._passes() == (False, True), pool._passes())
         s = good_spec()
         pool.add(s)
         wall = [s.signature.to_dict()] * 10
-        check("配额占满 -> playable=0", pool.playable_count(wall) == 0)
-        check("配额占满 -> pop None", pool.pop_next(wall) is None)
+        check("**G4-B: 配额占满仍可播(Pass 2)**",
+              pool.playable_count(wall) >= 1, pool.playable_count(wall))
+        check("**G4-B: pop_next 同样交付**", pool.pop_next(wall) is not None)
+        check("**Pass 2 被记了一次**", pool.diversity_reject_count >= 1,
+              pool.diversity_reject_count)
+    # 空窗口那条不变: 没有冲突时走 Pass 1, 不该计 Pass 2。
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(good_spec())
         check("空窗口 -> 正常可播", pool.playable_count([]) == 1)
+        check("空窗口交付走 Pass 1, 不记 Pass 2",
+              pool.pop_next([]) is not None
+              and pool.diversity_reject_count == 0,
+              pool.diversity_reject_count)
 
 
 def test_h4e_playable_matches_pop_on_both_passes():

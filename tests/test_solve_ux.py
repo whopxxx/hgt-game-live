@@ -1085,21 +1085,28 @@ def test_c6b_current_policy_field_lists_all_include_beats():
     check("**CHECK_SYSTEM 不再把 dramatic_payoff 当 curated 的门**",
           "clear_anomaly / unique_explanation / yes_no_progress" in
           _llm.CHECK_SYSTEM)
-    # _QUALITY_CHECK_FIELDS 必须真的是十二项 —— 标题与实现不能各说各话。
+    # _QUALITY_CHECK_FIELDS 必须真的是十三项 —— 标题与实现不能各说各话。
     #
     # H3-D3: 契约清单是**十二项**(v8 八项 + 题型四问), 但题型四问只对
-    # curated 题生效 —— 见 `_quality_check_contract`。自由生成链仍是
+    # curated 题生效 —— 见 `_quality_check_contract`。自由生成链当时是
     # 八项, 所以这里断言的是"清单有十二项", 而不是"每次都查十二项"。
+    #
+    # ⚠️ **G4-E 变成十三项**: 自由生成链补了 `livestream_safe`(直播安全
+    # 硬门)。它**不是**题型字段, 所以插在"好不好玩"四项之后、题型四问
+    # 之前 —— 位置见 `_QUALITY_CHECK_FIELDS` 里的说明。
     #
     # ⚠️ H4-D §七 / H4-D1 §二: curated 的门是**它自己的一套九项**
     # (与编译侧同名的六条内容门 + 冷知识门 + 两条真实性)。
-    check("_QUALITY_CHECK_FIELDS 确实是 12 项",
-          len(_llm._QUALITY_CHECK_FIELDS) == 12,
+    check("_QUALITY_CHECK_FIELDS 确实是 13 项",
+          len(_llm._QUALITY_CHECK_FIELDS) == 13,
           _llm._QUALITY_CHECK_FIELDS)
-    check("**自由生成链只查前 8 项**(题型四问不适用于它)",
+    check("**自由生成链查前 9 项**(含 livestream_safe; 题型四问不适用)",
           _llm._quality_check_contract(
               type("S", (), {"source_type": ""})())
-          == _llm._QUALITY_CHECK_FIELDS[:8])
+          == _llm._QUALITY_CHECK_FIELDS[:9])
+    check("**第 9 项是 livestream_safe 而不是题型字段**",
+          _llm._QUALITY_CHECK_FIELDS[8] == "livestream_safe",
+          _llm._QUALITY_CHECK_FIELDS[8])
     # ---- H4-D1 §四: 语义断言, **不是计数断言** ----
     #
     # ⚠️ 这里**曾经**是 `len(...) == 9`。那不够: 它让完全错误的字段映射
@@ -1465,7 +1472,7 @@ def test_v6_reviewer_has_minimality_rule():
     check("schema 描述含删除测试", "删除测试" in d)
     check("CHECK_SYSTEM 含 v6 段", "不得严于 core_answer" in CHECK_SYSTEM)
     check("CHECK_SYSTEM 含删除测试", "删除测试" in CHECK_SYSTEM)
-    # fail-closed 必须还在: 自由生成那 12 项仍全部 required。
+    # fail-closed 必须还在: 自由生成那 13 项仍全部 required。
     #
     # ⚠️ H4-D1 §二: `_TOOL_CHECK` 的 `required` 现在是**自由生成那一套**
     # (它同时是模块常量的默认值)。curated 题实际收到的那份由
@@ -1479,11 +1486,17 @@ def test_v6_reviewer_has_minimality_rule():
     # H3-D3: 题型四问并进了这次审稿调用(不再有独立的复核调用), 所以
     # required 从八项扩到十二项。**全部 required** 的语义没变: 任一项
     # 取值不对就整稿拒收。
-    check("自由生成那 12 项仍全部 required",
+    #
+    # ⚠️ **G4-E: 十二项 -> 十三项**, 多了 `livestream_safe`(直播安全
+    # 硬门)。它同样 must be required —— 若只加进常量而不进 schema 的
+    # required, 模型就不会答它, 于是 `_apply_review` 每一项都判"未全过"
+    # 而**整稿全灭**。所以这条断言同时是"新字段接上了线"的证据。
+    check("自由生成那 13 项仍全部 required",
           set(req) == {"narrator_truthful", "mechanism_consistent",
                        "core_answer_direct", "completion_contract_minimal",
                        "concrete_anomaly", "clue_recontextualized",
                        "dramatic_payoff", "reasoning_beats_nonredundant",
+                       "livestream_safe",
                        "story_reconstruction", "multi_step_deduction",
                        "single_trick", "no_external_knowledge_dependency"},
           req)

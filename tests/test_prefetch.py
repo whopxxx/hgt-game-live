@@ -264,7 +264,12 @@ def test_stock_count_excludes_old_policy():
 
 def test_stock_count_ignores_recent_window():
     """被当前窗口挡住的题**仍是库存** —— 那是"此刻能不能播", 不是
-    "库存有没有"。等最近 N 题滚过去它就能用。"""
+    "库存有没有"。
+
+    ⚠️ **G4-B**: 原来这里用"pop 被窗口挡住 -> None"来演示"两个指标不等"。
+    现在纯 diversity 不再挡交付, 所以改用 `too_similar`(identity, 两遍
+    都挡)——它同样能让 playable 掉到 0 而 stock 不动。
+    """
     print("\n[A3] stock_count 不扣 dynamic gate")
     with tmpdir() as d:
         cfg = mkcfg(d)
@@ -273,8 +278,16 @@ def test_stock_count_ignores_recent_window():
         sig = loaded._items[0].signature.to_dict()
         wall = [sig] * 10
         check("stock 仍数是 1", loaded.stock_count() == 1, loaded.stock_count())
-        check("**但 pop 被窗口挡住 -> None**",
-              loaded.pop_next(recent_signatures=wall) is None)
+        check("**G4-B: 纯 diversity 不再挡住 pop**",
+              loaded.pop_next(recent_signatures=wall) is not None)
+    # 交付一次 -> used 了, 现在才是"库存有但播不出"的干净例子。
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        PuzzlePool.open(cfg).add(good_spec())
+        loaded = PuzzlePool.open(cfg)
+        pz = good_spec().puzzle
+        check("**too_similar 命中 -> pop 返回 None**",
+              loaded.pop_next(avoid=[pz]) is None)
         # 被挡住 = 没交付 = 没标 used -> 库存**不变**。
         check("**被挡住后 stock 仍是 1(没交付就不扣库存)**",
               loaded.stock_count() == 1, loaded.stock_count())
@@ -925,7 +938,12 @@ def test_snapshot_taken_at_submit_time():
 
 
 def test_pop_next_still_uses_current_gate():
-    """补池时合格 != 播出时仍合格。pop_next 必须重新过**当前**窗口。"""
+    """补池时合格 != 播出时仍合格。pop_next 必须重新过**当前**窗口。
+
+    ⚠️ **G4-B**: 窗口里的**纯 diversity** 项不再挡交付, 所以这里改用
+    identity 那一关(`too_similar`)来证明"播出时仍然重判"—— 那一条
+    G4 没有放宽, 也是本测试真正关心的性质。
+    """
     print("\n[B15] pop_next 仍走当前 gate(补池不改这一点)")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
@@ -933,10 +951,9 @@ def test_pop_next_still_uses_current_gate():
         fill(pool, 1)
         pf.on_tick()
         check("补池后有 2 道", pool.stock_count() == 2, pool.stock_count())
-        sig = pool._items[0].signature.to_dict()
-        wall = [sig] * 10
-        got = pool.pop_next(recent_signatures=wall)
-        check("**被当前窗口挡住 -> None**", got is None, got)
+        pz = pool._items[0].puzzle
+        got = pool.pop_next(avoid=[pz])
+        check("**too_similar 仍然在交付时重判 -> None**", got is None, got)
 
 
 def test_disabled_prefetch_is_truly_off():
@@ -1380,37 +1397,30 @@ def test_shutdown_docstring_is_honest():
 def _blocked_pool(d, n=5):
     """一个 stock=n 但 playable=0 的池子 —— "6 道候选全被挡"的复刻。
 
-    怎么造出来的: 池子里每道题都是**同一个 signature**。`stock_count()`
-    **刻意不扣** dynamic gate(被窗口挡住的题仍然是库存), 所以它数到 n;
-    而 `pop_next`/`playable_count` 要过 `cross_puzzle_gate` —— 同一
-    mechanism+solution_shape 连着 10 道会撞 `same_mechanism` 配额,
-    于是一道都交付不出去。
+    怎么造出来的: 池子里每道题都被"当前窗口"挡住, 于是
+    `stock_count()` **刻意不扣** dynamic gate 仍然数到 n(被挡住的题
+    仍然是库存), 而 `playable_count` / `pop_next` 一道都交付不出去。
 
-    这正是实播里那个现场: `stock=5` / `playable=0` / 观众等出题。
+    ## ⚠️ G4-B 换掉了"挡住"的手段
 
-    用 `variant(i)` 而不是 `good_spec(...)`: 后者改谜面必须**同时**改
-    fair_clues 的 quote(校验会比对原文), 而 `variant()` 的文本整组是
-    自洽的。signature 再统一覆盖成同一个, 才撞得出配额。
+    原来靠**同一个 signature** 撞 `cross_puzzle_gate` 的配额。G4 把纯
+    diversity 降成偏好之后那条路**不再让 playable 归零**(只会让交付走
+    Pass 2), 于是这个夹具会**静默失去触发条件** —— 变得"看起来在测
+    L1-A, 其实池子完全健康", 而测试仍然全绿。这是本轮最容易踩的坑,
+    所以手段换成 `too_similar`。
 
-    返回值带一个 `wall`: 被当前窗口挡住**需要那个窗口真的存在** ——
-    `cross_puzzle_gate(spec, recent, ...)` 是拿 `spec` 和 `recent` 比
-    配额, 空窗口下什么都不冲突。所以调用方要把 `wall` 当 recent 传进
-    去, 才复现得出 `playable=0`(见 `_BlockedPool`)。
+    `too_similar` 满足全部三个要求: 是 **identity**(两遍都挡, G4 没动)、
+    是**当前窗口**的函数(正合 L1-A 要的形状: 库存有, 此刻播不出)、
+    且不写任何状态。`wall` 因此装的是**谜面文本**而不是 signature 列表
+    —— 调用方把它当 `avoid` 传(`_BlockedPool.inputs` 已经改好)。
     """
     cfg = mkcfg(d)
     pool = PuzzlePool.open(cfg)
     for i in range(n):
-        s = variant(i)
-        # 同一个 signature -> 撞 same_mechanism / same_solution_shape
-        s.signature = PuzzleSignature(
-            mechanism_family="hidden_function",
-            solution_shape="hidden_function_explains_behavior",
-            domain="maritime", emotion_mode="neutral",
-            relation="stranger", time_shape="habitual",
-            reveal_mode="meaning_flip")
-        assert pool.add(s), "前置构造失败: variant(%d) 没能入池" % i
-    # 最近 10 题全是这个 signature -> 池里每一道都被配额挡住。
-    wall = [pool._items[0].signature.to_dict()] * 10
+        assert pool.add(variant(i)), \
+            "前置构造失败: variant(%d) 没能入池" % i
+    # 每道题的谜面都进 avoid -> `too_similar` 对全部候选命中。
+    wall = [s.puzzle for s in pool._items]
     return _BlockedPool(cfg, pool, wall)
 
 
@@ -1420,6 +1430,10 @@ class _BlockedPool:
     补池的 `probe_inputs` 必须回这个 window, 否则 `playable_count` 在
     空窗口下看得见全部候选 —— 那是**正常**行为(池子确实有 5 道还没用过
     的题), 只是复现不出"现场一道都播不出来"。
+
+    ⚠️ G4-B: `wall` 里装的是**谜面文本**, 所以它走 `avoid` 而不是
+    `recent_signatures` —— 见 `_blocked_pool` 的说明(挡住的手段从
+    `cross_puzzle_gate` 换成了 `too_similar`)。
     """
     def __init__(self, cfg, pool, wall):
         self.cfg = cfg
@@ -1427,8 +1441,9 @@ class _BlockedPool:
         self.wall = wall
 
     def inputs(self, avoid=None):
-        return {"avoid": list(avoid or []),
-                "recent_signatures": [dict(x) for x in self.wall]}
+        # 池子自己的谜面**加上**调用方给的 avoid, 一起当"该避开的文本"。
+        return {"avoid": list(avoid or []) + list(self.wall),
+                "recent_signatures": []}
 
 
 def test_playable_count_is_readonly():
@@ -1443,17 +1458,18 @@ def test_playable_count_is_readonly():
         pool = PuzzlePool.open(cfg)
         for i in range(3):
             pool.add(variant(i))
-        sig = pool._items[0].signature.to_dict()
-        wall = [sig] * 10
+        # ⚠️ G4-B: 用 `too_similar`(identity, 两遍都挡)造"挡住"的状态。
+        # 纯 diversity 的窗口已经不再让两者归零了。
+        blocked = [s.puzzle for s in pool._items]
 
-        # ---- 一致: 被窗口挡住时两者都判 0 / None ----
-        check("**窗口挡住 -> playable=0**",
-              pool.playable_count(recent_signatures=wall) == 0,
-              pool.playable_count(recent_signatures=wall))
-        check("**同一个窗口 -> pop_next 也是 None**",
-              pool.pop_next(recent_signatures=wall) is None)
+        # ---- 一致: 被挡住时两者都判 0 / None ----
+        check("**挡住 -> playable=0**",
+              pool.playable_count([], avoid=blocked) == 0,
+              pool.playable_count([], avoid=blocked))
+        check("**同一个 avoid -> pop_next 也是 None**",
+              pool.pop_next([], avoid=blocked) is None)
         # ---- 一致: 没被挡住时两者都放行 ----
-        check("空窗口 -> playable=3",
+        check("无 avoid -> playable=3",
               pool.playable_count(recent_signatures=[]) == 3,
               pool.playable_count(recent_signatures=[]))
 
@@ -1464,7 +1480,7 @@ def test_playable_count_is_readonly():
             if os.path.exists(cfg.pool_used_path) else b""
         for _ in range(5):
             pool.playable_count(recent_signatures=[])
-            pool.playable_count(recent_signatures=wall)
+            pool.playable_count([], avoid=blocked)
         check("**_used 不变**", pool.used_count() == before_used,
               pool.used_count())
         check("**used jsonl 逐字节不变**",
@@ -1528,9 +1544,9 @@ def test_prefetch_l1_a_stock_ok_but_playable_zero():
                   probe_inputs=lambda: bp.inputs())
         check("前置: stock=5", bp.pool.stock_count() == 5,
               bp.pool.stock_count())
-        check("前置: **playable=0**",
-              bp.pool.playable_count(bp.wall) == 0,
-              bp.pool.playable_count(bp.wall))
+        check("前置: **playable=0**(被 too_similar 挡住)",
+              bp.pool.playable_count([], avoid=bp.wall) == 0,
+              bp.pool.playable_count([], avoid=bp.wall))
         pf.on_tick()
         check("**缺口触发 latch**", pf._refill_active is True)
         check("**真的提交了一次生成**", ex.total == 1, ex.total)
@@ -1571,7 +1587,8 @@ def test_prefetch_l1_c_max_size_stops_generation():
                   probe_inputs=lambda: bp.inputs())
         check("前置: stock=10", bp.pool.stock_count() == 10,
               bp.pool.stock_count())
-        check("前置: playable=0", bp.pool.playable_count(bp.wall) == 0)
+        check("前置: playable=0",
+              bp.pool.playable_count([], avoid=bp.wall) == 0)
         for _ in range(5):
             pf.on_tick()
         check("**零提交(到顶了)**", ex.total == 0, ex.total)
@@ -3122,12 +3139,29 @@ def test_g2_stage_b_schema_has_no_puzzle_field():
 
 
 def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
-    """题型配额满 -> keyword candidate 仍被 **HARD 拒**(§六 不放宽)。
+    """题型配额满 -> keyword candidate **不再被拒**, 但撞车必须留痕。
 
-    这条守住"keyword AI 仍属 AI-original, 分布对它还是硬约束"。用真
-    `structure_original_idea` + 一个 `recent` 已占满的窗口跑一遍。
+    ## ⚠️ G4-A 反转了这条
+
+    它原来守的是"keyword AI 仍属 AI-original, 分布对它还是硬约束"
+    (§六)。G4 的产品决定改掉了:
+
+        同类型不是拒题理由。
+        safety / correctness / playability / true duplicate 才是硬门。
+
+    所以配额墙**不再**拒稿 —— 一道 A+B+审稿+audit 全跑完的合格稿,
+    不该因为"recent 里 death 已经有 2 道"被扔掉。撞车事实进
+    `metrics["diversity_signals"]`, 由池子的 Pass 1 当偏好用。
+
+    ## 本测试真正守住的(没有放宽)
+
+    1. 稿子**交付了**(`spec.puzzle` 非空) —— 不是恒真的空断言;
+    2. 撞车**确实被算出来了**并记进 metrics —— 否则"降级"与"整段删掉"
+       无法区分;
+    3. 没有任何 error, 且错误**不来自 curated 门**(source_type 仍是空,
+       keyword2 仍是 AI-original 而不是 curated)。
     """
-    print("\n[G2-14] 配额墙仍硬拒 keyword candidate")
+    print("\n[G2-14] G4-A: 配额墙只记录, 不再硬拒 keyword candidate")
     from story.llm import PuzzleWriter, KEYWORD_IDEA_PROMPT_VERSION
     from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
     st = dict(riddle())
@@ -3150,10 +3184,14 @@ def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
     recent = [sig, sig, sig]           # 远超 same_mechanism/same_shape 上限
     spec = w.structure_original_idea(title=i["title"], puzzle=i["puzzle"],
                                      answer=i["answer"], recent=recent)
-    check("**被跨题门硬拒**(puzzle 为空)", not spec.puzzle, spec.puzzle[:40])
-    check("拒因是跨题重复", "跨题" in (spec.error or ""), spec.error)
-    check("cross_gate 记进了 metrics",
-          bool((spec.metrics or {}).get("cross_gate")), spec.metrics)
+    check("**G4-A: 配额撞车不再拒稿**(puzzle 非空)",
+          bool(spec.puzzle), spec.puzzle[:40])
+    check("**但撞车被算出来并记进了 metrics**",
+          bool((spec.metrics or {}).get("diversity_signals")),
+          (spec.metrics or {}).get("diversity_signals"))
+    check("**没有因此记 error**", not spec.error, spec.error)
+    check("**仍然不是 curated**(source_type 为空)",
+          not (spec.source_type or ""), spec.source_type)
     check("**错误不来自 curated 门**",
           "curated" not in (spec.error or "").lower(), spec.error)
 

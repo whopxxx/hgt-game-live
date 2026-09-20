@@ -1379,15 +1379,17 @@ JUDGE_SYSTEM = """你是海龟汤游戏的裁判。判断: **观众这句话, �
 #: nested required 和 `_apply_review` 的 fail-closed 检查覆盖, 否则新
 #: 维度会重演"缺字段 -> from_dict 静默补默认值 -> 配额被绕过"的老问题。
 #: 显式写出来, 加字段的人就会看到它。
-#: Reviewer 的 `quality_checks` 契约字段。**十三项都要填**, 但 v5 起
-#: **只有九项会拒稿** —— 见 `_CURATED_HARD_CHECK_FIELDS`。
+#: Reviewer 的 `quality_checks` 契约字段。**十五项都要填**, 但
+#: **只有门里的那几项会拒稿** —— 见 `_CURATED_HARD_CHECK_FIELDS` 与
+#: `_quality_check_contract`。
 #: 与 `_TOOL_CHECK` 的 nested required **两层都要** —— schema 由模型遵守,
 #: 不能把正确性押在它身上(与 `_OBSERVED_SIGNATURE_FIELDS` 同一套推理)。
 #:
-#: ⚠️ **这十三项不是"每次都全查"**: 后四项(题型四问)只对 **curated**
-#: 题有意义 —— 见 `_CURATED_QUALITY_CHECK_FIELDS`。全量十三项在
-#: `_QUALITY_CHECK_FIELDS` 里是为了让"契约清单"只有一处, 实际门控由
-#: `_quality_check_contract(spec)` 按题分派。
+#: ⚠️ **这些字段不是"每次都全查"**: 题型四问只对 **curated** 题有意义,
+#: `livestream_safe`(G4-E)则两边都查。全量列在这里是为了让"契约清单"
+#: 只有一处, 实际门控由 `_quality_check_contract(spec)` 按题分派。
+#: 所以**加字段必须同时改两处**: 这个元组 + `_quality_check_contract`
+#: 的切片上界/清单, 否则新字段是死的。
 _QUALITY_CHECK_FIELDS = (
     "narrator_truthful", "mechanism_consistent",
     "core_answer_direct", "completion_contract_minimal",
@@ -1396,6 +1398,31 @@ _QUALITY_CHECK_FIELDS = (
     # **不新增第四个内容审核 LLM**(任务书明确)。
     "concrete_anomaly", "clue_recontextualized",
     "dramatic_payoff", "reasoning_beats_nonredundant",
+    # ---- G4-E: 自由生成链的**直播安全硬门** ----
+    #
+    # ## 为什么必须补这一条
+    #
+    # G4 把题型 / 分布类判据全部降成 soft 之后, 自由生成链原契约那八项是:
+    # 真实性两项 + core_answer 两项 + "好不好玩"四项 —— **没有一项问
+    # "这段谜底能不能在直播间念出来"**。于是 keyword2 / classic 两条自由
+    # 生成链在 safety 上等于裸奔: 题完全可能通篇以严重伤害本身当噱头,
+    # 而八项全 true。
+    #
+    # curated 链从 H3-D3 起就有 `livestream_safe`(见
+    # `_CURATED_HARD_CHECK_FIELDS`), 但那套契约不能整套搬给自由生成链 ——
+    # 它的六个字段(`clear_anomaly` / `unique_explanation` /
+    # `no_obscure_system` / `no_external_media` …)是**外部题**的题型定义,
+    # 对 AI 原创的创作标准不成立。所以这里只借**一个**字段: 语义明确、
+    # 两边同名、且 schema 里已经有成熟的判据措辞(见 `_TOOL_CHECK` 的
+    # `livestream_safe.description`, 两条链**共用那一份**)。
+    #
+    # ⚠️ **位置是契约的一部分**: 必须紧跟 `reasoning_beats_nonredundant`,
+    # 也就是 `_quality_check_contract` 切片 `[:9]` 的**第 9 项**。若只把它
+    # append 到元组末尾, 切片会取到后面的题型四问(`story_reconstruction`
+    # …)而把 livestream_safe 留在切片外 —— 那正是本项第一版的 bug:
+    # 生产会对每一道自由生成的题索要它根本没被问过的题型字段, 于是
+    # **每一道题都判不合格**。(`qc_ok()` 缺字段时 test_llm 立刻红。)
+    "livestream_safe",
     # ---- H3-D3: 题型四问(§六) ----
     # 原先由**独立的一次调用** (`CuratedCompiler.story_review`) 回答, 于是
     # accepted 路径要 4 次 LLM。H3-D3 §一-2 要求降到 3 次, 所以并进这次
@@ -1545,7 +1572,11 @@ def _quality_check_contract(spec: Any) -> tuple:
     """
     if str(getattr(spec, "source_type", "") or "") == "curated":
         return _CURATED_HARD_CHECK_FIELDS
-    return _QUALITY_CHECK_FIELDS[:8]
+    #: G4-E: 自由生成链从八项变**九项** —— 第 9 项是 `livestream_safe`。
+    #: 切片上界必须跟着改, 否则新增的那一项只是躺在元组里没人查。
+    #: ⚠️ 它必须排在 `_QUALITY_CHECK_FIELDS` 的第 9 位(紧跟四项"好不好玩"),
+    #: **不能** append 到末尾 —— 末尾是题型四问, 切片会取错。
+    return _QUALITY_CHECK_FIELDS[:9]
 
 
 def _is_curated(spec: Any) -> bool:
@@ -2944,7 +2975,7 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
       narrator_truthful / mechanism_consistent / core_answer_direct /
       completion_contract_minimal / concrete_anomaly /
       clue_recontextualized / dramatic_payoff /
-      reasoning_beats_nonredundant
+      reasoning_beats_nonredundant / livestream_safe
 
     外部题库题(curated):
       clear_anomaly / unique_explanation / yes_no_progress /
@@ -2958,6 +2989,10 @@ hidden_function, 其实是 emotional_motive), 即便决定 pass 也要照实写 
 自由生成题的 `concrete_anomaly` 那几项问的是"这道**我们自己写的**题
 够不够好", 标准更高 —— 因为那是我们生成的, 不够好可以重出。现成题
 没有重出的余地, 只能判能不能用。
+
+⚠️ **唯一两边都查的是 `livestream_safe`**: 不管题是自己写的还是外部
+搬来的, "能不能在直播间直接念出来"都是**硬门**, 不随趣味标准放宽。
+死亡作为普通剧情事实 -> true; 拿重口 / 极端伤害本身当噱头 -> false。
 
 **只是信号的字段**(外部题库题才有; 如实填, 填什么都不影响收稿):
 
@@ -4016,7 +4051,23 @@ class PuzzleWriter:
                     last = spec
                     last.error = "叙事真实性审计不过: " + str(why)[:120]
                     continue
-            # ---- ⑤ 跨题门(全局分布, 方案 §20) ----
+            # ---- ⑤ 跨题门(全局分布) —— **G4-C: SOFT, 只记录不拒稿** ----
+            #
+            # G4 之前这里是 HARD(`continue`, 把整稿丢掉重出)。产品决定改掉了:
+            # Blueprint 可以继续用来"想生成什么", 但**成品本身合格**时不该
+            # 因为 observed signature 没精确落在 target 类型上而丢稿。
+            #
+            # 这个形状在 classic 链下尤其贵: 一稿是出稿+审稿+audit 三次昂贵
+            # 调用, 全跑完才因为"跟 recent 10 撞了 mechanism"扔掉, 然后
+            # 重抽 blueprint 再来一稿。配额本身是**偏好**, 不是合格性。
+            #
+            # 与 `structure_original_idea` 的 ④ 同源同口径, 落同一个
+            # metrics 键 —— 两条链的 diversity 语义必须一致。
+            #
+            # ⚠️ 下面 ⑥ `too_similar` 与上游全部**保持不变**: 文本
+            # near-duplicate 是 identity, 不是 diversity。truth audit /
+            # validate_spec / schema 同理。
+            #
             # quota 必须从 **runtime Config** 读。早先读的是 LLMConfig,
             # 于是用户在 Config 里调 quota_death 之类**完全不生效** ——
             # 而且同一题会出现两套 policy(director 选 blueprints 用真的,
@@ -4027,12 +4078,9 @@ class PuzzleWriter:
                 Quotas.from_config(rcfg) if rcfg is not None else None,
                 bp if enforce_blueprint else None)
             if xbad:
-                log.info("出题第 %d 稿不过跨题门: %s", attempts, xbad[:120])
-                _remember(seen_why, "跨题重复: " + "; ".join(xbad)[:120])
-                bad.append(spec.puzzle)
-                last = spec
-                last.error = "跨题重复: " + "; ".join(xbad)
-                continue
+                m["diversity_signals"] = list(xbad)
+                log.info("出题第 %d 稿与窗口分布撞了(G4-C: 只记录不拒稿): %s",
+                         attempts, xbad[:120])
             # ---- ⑥ 跟已出过的题文本太像? ----
             if avoid:
                 dup = _too_similar(spec.puzzle, avoid)
@@ -4381,24 +4429,35 @@ class PuzzleWriter:
                 m["truth_audit_issues"] = list(ta.get("conflicts") or [])
                 return _bail("叙事真实性审计不过: "
                              + str(ta.get("why") or "")[:120])
-        # ---- ④ 跨题门(**HARD, §六 不放宽**) ----
+        # ---- ④ 跨题门 —— **G4-A: SOFT, 只记录不拒稿** ----
         #
-        # keyword AI 仍属 AI-original, 所以题型分布对它**还是硬约束**。
-        # 与 curated 链(H4-F: 分布只记录不拒绝)是**相反**的口径 ——
-        # 这不是不一致, 是产品边界: 两条链的 diversity policy 本来就不同。
+        # G4 之前这里是 HARD(`return _bail("跨题重复: ...")`)。产品决定改掉了:
         #
-        # ⚠️ blueprint 传 `bp`(unconstrained 哨兵)而不是 None:
-        # `cross_puzzle_gate` 在 signature 缺失时会退回 blueprint 的预期值,
-        # 传 None 会让它去读 spec.blueprint(也是同一个哨兵), 效果一样;
-        # 显式传是为了让"这里没有 target 骨架"这件事一眼可见。
+        #     同类型不是拒题理由。
+        #     safety / correctness / playability / true duplicate 才是硬门。
+        #
+        # 而"生成完因题型 quota 直接丢稿"是有具体代价的: 一次 keyword2 成题
+        # 是 A+B+审稿+audit 四到六次昂贵调用, 全跑完了才因为
+        # "recent 10 里已经有 2 道 death" 把稿子扔掉 —— 观众那边表现为
+        # 现场生成反复失败、回落兜底。而这道题本身**完全合格**。
+        #
+        # `cross_puzzle_gate` 算出来的东西**一条都没丢**: 落进
+        # `metrics["diversity_signals"]`, archive / 日志里照样查得到
+        # "这一道跟窗口撞了哪些维度"。diversity 变成**偏好** ——
+        # 池子的 Pass 1 会优先挑不撞的, 实在没有才用撞的(见 `pool._passes`)。
+        #
+        # ⚠️ 这里**不**放宽的(见下面 ⑤ 与上游各步):
+        #      validate_spec / schema / truth audit / mechanism 一致性 /
+        #      too_similar(文本 near-duplicate = identity)
+        # 传 `bp`(unconstrained 哨兵)而不是 None 的理由不变: signature
+        # 缺失时 gate 会退回 blueprint 的预期值。
         rcfg = self._cfg()
         xbad = cross_puzzle_gate(
             spec, recent,
             Quotas.from_config(rcfg) if rcfg is not None else None,
             bp)
         if xbad:
-            m["cross_gate"] = list(xbad)
-            return _bail("跨题重复: " + "; ".join(xbad))
+            m["diversity_signals"] = list(xbad)
         # ---- ⑤ 跟已出过的题文本太像?(硬拒) ----
         if avoid:
             dup = _too_similar(spec.puzzle, avoid)

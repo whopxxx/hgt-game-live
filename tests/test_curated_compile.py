@@ -1031,11 +1031,17 @@ def test_h4f_real_content_hard_gate_still_rejects():
 
 
 def test_h4f_generated_pool_cross_gate_unchanged():
-    """§6-7/8: AI 原创链的 cross_puzzle_gate **硬行为不变**。
+    """§6-7/8: AI 原创链的 cross_puzzle_gate —— **G4-B 改了池子这一侧**。
 
-    产品边界是单向的: external curated 不看分布, **AI 原创链照旧看**。
+    原来守的是"external curated 不看分布, AI 原创链照旧看"(产品边界是
+    单向的)。**G4 把这条边界推平了**: 产品决定是"同类型不是拒题理由",
+    所以 AI 原创池也走两遍 —— Pass 1 偏好不撞的, Pass 2 兜底撞的。
+
+    真正**没有变**的是生成那一侧: `cross_puzzle_gate` 仍然被调用、
+    结果仍然算得出来, 只是从"拒稿"变成"记录 + 偏好"。这里断言池子
+    交付了题**并且**它确实撞了门(因此走的是 Pass 2), 两条都不是恒真。
     """
-    print("\n[H4-F] generated pool 的 cross gate 不变")
+    print("\n[H4-F / G4-B] generated pool 的 cross gate 降为偏好")
     import test_pool as TP
     from story.quality import Quotas, cross_puzzle_gate
     with TP.tmpdir() as d:
@@ -1043,9 +1049,15 @@ def test_h4f_generated_pool_cross_gate_unchanged():
         s = TP.good_spec()
         check("生成池入池", pool.add(s) is True)
         wall = [s.signature.to_dict()] * 10
-        check("**生成池配额满 -> playable=0(硬门未变)**",
-              pool.playable_count(wall) == 0, pool.playable_count(wall))
-        check("**生成池配额满 -> pop None**", pool.pop_next(wall) is None)
+        # 门**确实**算出了冲突 —— 否则下面那条"仍能交付"是在测空气。
+        check("前置: cross gate 确实非空",
+              bool(cross_puzzle_gate(s, wall, Quotas.from_config(pool.cfg),
+                                     s.blueprint)))
+        check("**G4-B: 配额满仍可播(Pass 2)**",
+              pool.playable_count(wall) >= 1, pool.playable_count(wall))
+        check("**G4-B: pop 同样交付**", pool.pop_next(wall) is not None)
+        check("**并且记为 Pass 2**", pool.diversity_reject_count >= 1,
+              pool.diversity_reject_count)
         # `cross_puzzle_gate()` 本体对 AI 原创仍然是硬判据
         gate = cross_puzzle_gate(s, wall, Quotas.from_config(pool.cfg),
                                  s.blueprint)

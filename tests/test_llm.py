@@ -233,7 +233,11 @@ def qc_ok(**kw):
          "core_answer_direct": True, "completion_contract_minimal": True,
          # quality-v8: 后四项查"好不好玩", 同样是 fail-closed 的硬门。
          "concrete_anomaly": True, "clue_recontextualized": True,
-         "dramatic_payoff": True, "reasoning_beats_nonredundant": True}
+         "dramatic_payoff": True, "reasoning_beats_nonredundant": True,
+         # G4-E: 自由生成链新增的**直播安全硬门**。语义: 死亡作为普通
+         # 剧情事实可以(true), 拿重口 / 极端伤害本身当噱头 -> false。
+         # 夹具里的题都是普通悬疑, 所以是 true。
+         "livestream_safe": True}
     d.update(kw)
     return d
 
@@ -1802,10 +1806,25 @@ def test_rejected_spec_never_returned():
 
 
 def test_rejected_by_cross_puzzle_gate_not_returned():
-    """P0-1: 被**跨题门**拒掉的稿子同样不能兜底播出。
+    """**G4-A 改写**: 跨题门撞车**不再**拒稿 —— 改成"记录 + 照常出题"。
 
-    这条最容易被忽略 —— 题目本身完全合格, 只是"和最近题结构重复"。
-    早先这种稿会作为 last 被返回, 于是配额形同虚设。
+    ## 这条测试原来守什么, 为什么必须改
+
+    P0-1 时它守的是: 被跨题门拒掉的稿子不能作为 `last` 兜底播出(否则
+    配额形同虚设)。G4-A 把跨题门整体降成 **soft**:
+
+        同类型不是拒题理由。
+        safety / correctness / playability / true duplicate 才是硬门。
+
+    于是一个"题目本身完全合格、只是跟 recent 窗口撞了 mechanism"的稿子
+    **应该**被交付, 而撞车事实落进 `metrics["diversity_signals"]` 供复盘。
+    这条测试因此必须**反转**断言 —— 否则它只是在证明旧行为还在。
+
+    ## 仍然守住的东西(没有放宽)
+
+    撞车**不影响**稿子的合格性, 但下面这些照旧硬: 结构校验 / 审稿 /
+    truth audit / `too_similar`。所以这里同时断言"稿子确实交付了"
+    与"撞车被记下来了"——两条都不是恒真。
     """
     from story.puzzle import PuzzleSignature
     dup = PuzzleSignature(mechanism_family="hidden_function",
@@ -1815,15 +1834,36 @@ def test_rejected_by_cross_puzzle_gate_not_returned():
     fc = FakeClient([
         LLMResult(tool_input=riddle()),
         LLMResult(tool_input=review_ok()),
-        LLMResult(tool_input=riddle(puzzle="二稿灯塔。为什么?")),
-        LLMResult(tool_input=review_ok("二稿灯塔。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     # 最近两道都是同一 (mechanism, shape) -> 配额已满
     spec = w.gen_spec(blueprint=fc.default_blueprint, recent=[dup, dup],
                       max_attempts=2)
-    check("跨题重复的稿不返回", not spec.puzzle, spec.puzzle)
-    check("带出跨题原因", "重复" in (spec.error or ""), spec.error)
+    check("**G4-A: 撞车不再拒稿, 稿子照常交付**", bool(spec.puzzle), spec.puzzle)
+    check("撞车被记进 diversity_signals 而不是 error",
+          bool((spec.metrics or {}).get("diversity_signals")),
+          (spec.metrics or {}).get("diversity_signals"))
+    check("**没有**因此记一条 error", not spec.error, spec.error)
+
+
+def test_g4_cross_gate_still_hard_for_text_duplicate():
+    """**G4-A 反证**: 降成 soft 的**只有**分布/题型, 文本近似仍是硬门。
+
+    没有这条的话, "把 cross gate 改成 soft" 与 "把整个 ⑤⑥ 段删掉"
+    在测试上无法区分 —— 而后者会连 `too_similar` 一起废掉。
+    """
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=review_ok()),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    same = riddle()["puzzle"]
+    spec = w.gen_spec(blueprint=fc.default_blueprint,
+                      avoid=[same],            # 和这道题文本一模一样
+                      max_attempts=1)
+    check("**文本 near-duplicate 仍然硬拒**", not spec.puzzle, spec.puzzle)
+    check("原因是 too_similar 不是 diversity",
+          "太像" in (spec.error or ""), spec.error)
 
 
 def test_director_only_airs_clean_spec():
@@ -4660,6 +4700,7 @@ def main():
               # ---- P0-4/5/6 ----
               test_rejected_spec_never_returned,
               test_rejected_by_cross_puzzle_gate_not_returned,
+              test_g4_cross_gate_still_hard_for_text_duplicate,
               test_director_only_airs_clean_spec,
               test_candidate_safety_net,
               test_touched_fact_ids_filtered,

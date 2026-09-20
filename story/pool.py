@@ -348,27 +348,83 @@ class PuzzlePool:
         self._used_trustworthy = False
         #: 排除了池内已有与已用过的题之后的"该避开"的谜面。
         self._avoid_extra: list[str] = []
-        # ---- H4-E: 池的身份(显式标记, **不猜路径**) ----
+        # ---- H4-E / G4-B: 池的身份(显式标记, **不猜路径**) ----
+        # 两种池都允许"第二遍"选择: Pass 1 用完整 diversity 门, 一道都没有
+        # 时 Pass 2 忽略分布配额(结构相似 != 同一道题)。
         #
-        # curated 池允许"第二遍"选择: Pass 1 用完整 diversity 门, 一道都没有
-        # 时 Pass 2 忽略分布配额(结构相似 != 同一道题)。生成的池**不**享受
-        # 这一遍 —— 它由 scheduler 主动避免必死 pair(S1), 而且我们自己造的题
-        # 可以重出, 外部题只能判"能不能播"。
+        # H4-E 原本只给 curated 这一遍, 理由是"生成的题可以重出, 外部题只能
+        # 判能不能播"。G4-B **推翻**了这条: 产品决定是"同类型不是拒题理由",
+        # 而实播症状是 `stock > 0` 却因 recent-10 配额占满导致 `playable == 0`
+        # —— 观众在等, 池里明明有合格题。所以 generated 也走两遍。
+        # 遍历阶梯见 `_passes()`(curated 与 generated 的 Pass 1 现在都忽略
+        # soft 维度, 两条链的 diversity 口径因此**一致**)。
         #
         # 为什么是显式字段而不是"路径 == curated_pool_path": `open_curated`
         # 会把 cfg 浅拷贝的 pool_path 覆盖成 curated 路径, 事后无法回推;
         # 而且两份 cfg 共用路径时推断会直接判错。所以由**构造者**写死。
         self.pool_kind: str = "generated"
+        #: G4-B: **Pass 2 真正起作用的次数**。每交付一道"Pass 1 挑不出、
+        #: 靠忽略 diversity 才拿到"的题就 +1。
+        #:
+        #: 为什么必须记: 这个数就是"diversity 到底挡住了多少"的直接读数。
+        #: 如果它长期是 0, 说明 Pass 2 从来没被用到 —— 那要么是池子很健康,
+        #: 要么是 `_passes()` 根本没生效(本项第一版把 generated 接成两遍时
+        #: 第一遍就是 hard-only, 于是 Pass 2 永远轮不到)。有这条计数,
+        #: "接了但没生效"就不会静默通过。
+        self.diversity_reject_count = 0
 
     # ------------------------------------------------------------------
     @property
     def _soft_diversity(self) -> bool:
-        """本池是否启用 H4-E 的两遍 soft diversity。**只有 curated 池**。
+        """本池是否启用两遍 soft diversity。**curated 与 generated 都启用**。
 
         `getattr` 是刻意的: 测试替身(`_FakePool` 等 duck-typed 对象)与
         老实例可能没有这个属性 —— 缺省按 `"generated"` 处理, 即**行为不变**。
         """
         return str(getattr(self, "pool_kind", "") or "") == "curated"
+
+    def _passes(self) -> tuple:
+        """本池的两遍 soft 阶梯 —— 喂给 `_candidate_block_reason_locked` 的
+        `soft_ok` 序列。
+
+        ## G4-B: generated 池也要两遍
+
+        原本只有 curated 池享受 Pass 2(H4-E), 理由是"生成的题可以重出,
+        外部题只能判能不能播"。G4 把这条**推翻**了: 产品决定是
+
+            同类型不是拒题理由。
+            safety / correctness / playability / true duplicate 才是硬门。
+
+        而实播症状是具体的: `stock > 0` 却 `playable == 0`, **只因为**
+        最近 10 题把 mechanism / domain / death 之类的配额占满了。补池看到
+        playable=0 就狂补, 补进来的新题被**同一个**窗口挡住 —— 一路补到
+        硬上限, 观众仍然在等。Pass 2 就是消灭这个形状的: Pass 1 先挑不同
+        类型的, 实在没有就忽略纯 diversity 照样播合格题。
+
+        ⚠️ Pass 2 **不是**放宽任何硬门。`_validate_pool_spec`(policy 兼容 /
+        curated 授权 / 静态校验 / used)与 `too_similar`(文本 near-duplicate
+        = identity)在 `_candidate_block_reason_locked` 里**两遍都执行**。
+
+        ## 为什么是查表而不是 `(False, True) if self._soft_diversity else (False,)`
+
+        `"generated"` 要**新**变成两遍, 但 `_soft_diversity` 的历史语义
+        (`== "curated"`)不能就地改 —— 它被 curated 的既有测试直接断言,
+        改掉等于让"curated 有 Pass 2"这条无据可依。所以把"两遍"这件事
+        写进这张显式的表:
+
+            curated    (False, True)    ← 两遍, 与 H4-E 的遍序一致
+            generated  (False, True)    ← G4-B 新增
+            未知池     (False,)         ← 行为不变(测试替身 / 老实例)
+
+        ⚠️ **`soft_ok` 的语义**(见 `_candidate_block_reason_locked`):
+        `False` = Pass 1 = **完整门**(有冲突就不选它);
+        `True`  = Pass 2 = 忽略纯 diversity 维度。
+        两个池的**遍序也必须一致**: 先偏好不撞的, 再兜底撞的。早先
+        curated 写过 `(False,)` —— 那是把 Pass 2 整条删掉了, 于是
+        "配额占满仍可播"立刻退回 0(测试当场红)。**两遍是一个前后关系,
+        删掉后一遍不是"更严格", 是让 H4-E 治过的病复发。**
+        """
+        return (False, True)
 
     # ------------------------------------------------------------------
     @classmethod
@@ -753,15 +809,17 @@ class PuzzlePool:
         不在这里读 `self._avoid_extra` —— `playable_count()` 要在同一把
         锁里对 N 道候选复用同一份, 每次重算就是 O(N·池大小)。
 
-        ## `soft_ok`: H4-E 的两遍选择(只对 curated 池第二遍用)
+        ## `soft_ok`: 两遍选择(见 `_passes()`)的第二遍
 
-        `False`(默认) = 完整门: 分布配额(soft)与结构等价都挡。
-        `True`         = 只保留 **hard** 门: 忽略 `check_signature` 的全部
+        `False` = 完整门: 分布配额(soft)与结构等价都挡。
+        `True`  = 只保留 **hard** 门: 忽略 `check_signature` 的全部
                          配额维度与 `is_structurally_duplicate`。
 
         依据: **同 mechanism_family + solution_shape != 同一道题**。结构相似
         是多样性偏好; 而"一道都播不了、掉进 fallback 循环"是事故(实播 22 题
         只出了 5 道 curated)。
+
+        ⚠️ G4 起 curated 与 generated **都**用这条阶梯 —— 见 `_passes()`。
 
         ⚠️ `soft_ok=True` **绝不**放宽 `too_similar` —— 那是文本 near-duplicate,
         是 identity/dedupe, 不是 diversity。同理 `_validate_pool_spec`(policy
@@ -832,10 +890,10 @@ class PuzzlePool:
             quotas = Quotas.from_config(self.cfg)
             used_texts = list(avoid or []) + self._avoid_extra
             n = 0
-            # H4-E: curated 走**两遍** —— Pass 1 完整门, Pass 2 只 hard 门。
+            # G4-B: 两遍 —— Pass 1 偏好 diversity, Pass 2 忽略纯 diversity。
             # 必须与 `_pop_next_locked` 的遍序**完全一致**, 否则"一个说能播、
             # 一个交付 None"的 bug 会以新形式复活(P0-3)。
-            passes = (False, True) if self._soft_diversity else (False,)
+            passes = self._passes()
             for soft_ok in passes:
                 for s in self._items:
                     if limit is not None and n >= limit:
@@ -1182,9 +1240,9 @@ class PuzzlePool:
             # 它的内容在循环里不变, 而 `too_similar` 是 O(池大小 × 历史)。
             used_texts = list(avoid or []) + self._avoid_extra
             blocked: list[str] = []
-            # H4-E: curated 走**两遍** —— Pass 1 完整门, Pass 2 只 hard 门。
-            # 遍序必须与 `_playable_count_locked` **完全一致**(P0-3)。
-            passes = (False, True) if self._soft_diversity else (False,)
+            # G4-B: 两遍 —— 与 `_playable_count_locked` 同一份阶梯。
+            # 遍序必须与它**完全一致**(P0-3)。
+            passes = self._passes()
             for soft_ok in passes:
                 for spec in cands:
                     # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
@@ -1213,7 +1271,14 @@ class PuzzlePool:
                         blocked.append(f"{spec.puzzle[:20]}…: used 写失败")
                         continue
                     self._used.add(spec_key(spec))
-                    log.info("题池出题: %s…", spec.puzzle[:30])
+                    if soft_ok:
+                        # G4-B: 这一道是 Pass 1 挑不出、靠忽略 diversity
+                        # 才拿到的。计一次 —— 见 `diversity_reject_count`。
+                        self.diversity_reject_count += 1
+                        log.info("题池出题(Pass 2: 忽略纯 diversity): %s…",
+                                 spec.puzzle[:30])
+                    else:
+                        log.info("题池出题: %s…", spec.puzzle[:30])
                     return spec
                 # 这一遍一道都没交付 -> 自然进入下一遍(Pass 2 放宽 diversity)。
                 # 注意: Pass 2 只是再看一遍同一批候选, 只不过 soft 维度不再
