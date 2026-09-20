@@ -975,16 +975,21 @@ class PoolPrefetcher:
         这条链比 classic 多一次**独立**的 LLM 阶段(Stage A), 所以让路检查
         必须覆盖它。四个位置:
 
-            ① Stage A 之前          (这里)
-            ② Stage A 之后 / B 之前  (这里)
+            ① Stage A 之前          (骨架内)
+            ② Stage A 之后 / B 之前  (骨架内)
             ③ Stage B 之后 / 审稿前  (Stage B 内部, 见 structure_original_idea)
             ④ 审稿之后 / audit 之前  (Stage B 内部, 同上)
+
+        ⚠️ **G4-2 §四: ①② 现在住在 `keyword_seed.keyword_spec` 里**,
+        因为 live 现场生成走的是**同一条链**(见 `director._riddle` 的
+        fallback)。两份实现会在"哪里写 metrics / 哪里判让路"上漂, 而
+        漂了以后 live 与 prefetch 出的题就不是同一种东西了。
 
         ③④ 落在 `structure_original_idea` 里是刻意的: 那里的检查点与
         `gen_spec` 的写法同源(同一个谓词、同一个 fail-closed 语义), 而
         在**这里**再抄一遍只会得到两份会漂的判定。
 
-        ## 为什么 ①② 必须在这里
+        ## 为什么 ①② 必须存在
 
         Stage A 是**新增的昂贵调用**。若不在它前后让路, 就会出现 G1 修掉
         的那个形状: 后台在 REVEALED 启动, 下一题已经开始现场生成, 而后台
@@ -993,69 +998,21 @@ class PoolPrefetcher:
 
         任何一处 false -> `interrupted`(不计 gen_fail、不退避)。
         """
+        from .keyword_seed import keyword_spec
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
-        extra: dict = {}
-
-        # ---- 抽词(§三: 从真实 corpus 的 unique pair 里不放回地取) ----
-        #
-        # ⚠️ G3 起**不再**用 `self._rng` / `draw_two_keywords`。那把 rng 与
-        # 那个人工词库现在只服务 classic 链与 G1 实验。bag 有自己的
-        # `random.Random(session_seed)`。
-        keys = self._bag.draw()
-        keywords = list(keys["keywords"])
-
-        # ---- 让路检查 ①: Stage A 之前 ----
-        if not self._should_continue():
-            return ("interrupted", "直播变忙, Stage A 前让路",
-                    {"interrupted": True})
-
-        idea = self.writer.gen_keyword_idea(
-            keywords, should_continue=self._should_continue)
-        if idea is None:
-            return ("gen_fail", "Stage A 未成题(自由成题失败)", {})
-        if idea.get("interrupted"):
-            return ("interrupted", "直播变忙, Stage A 让路",
-                    {"interrupted": True})
-
-        # ---- 让路检查 ②: Stage A 之后 / Stage B 之前 ----
-        #
-        # 这一次是**最容易被漏掉**的一处: Stage A 是一次几十秒的调用,
-        # 期间直播完全可能已经切进 SETTING。请求回不来了, 但**下一步
-        # 可以不发**。
-        if not self._should_continue():
-            return ("interrupted", "直播变忙, Stage A 后让路(稿子丢弃)",
-                    {"interrupted": True})
-
-        spec = self.writer.structure_original_idea(
-            title=idea.get("title", ""), puzzle=idea["puzzle"],
-            answer=idea["answer"], avoid=avoid, recent=recent,
-            should_continue=self._should_continue)
-
-        # ---- provenance(§十一 / §八): 只进 metrics/archive/日志 ----
-        #
-        # G3 增加 keyword seed / corpus version —— 复盘时要能回答
-        # "这对词是哪份 corpus 的哪个版本发的"。
-        try:
-            spec.metrics = dict(spec.metrics or {})
-            spec.metrics["generation_mode"] = "keyword2"
-            spec.metrics["keywords"] = keywords
-            spec.metrics["keyword_seed_version"] = KEYWORD_SEED_VERSION
-            spec.metrics["keyword_corpus_version"] = self._bag_meta.get(
-                "corpus_version", "")
-            spec.metrics["keyword_session_seed"] = self._keyword_session_seed
-        except Exception:                       # noqa: BLE001
-            log.exception("写 keyword2 provenance 失败(忽略)")
-
-        # ---- 让路(Stage B 内部已判, 这里只做归类) ----
-        if bool((getattr(spec, "metrics", None) or {}).get("interrupted")):
-            return ("interrupted", "直播变忙, Stage B 让路", {"interrupted": True})
-        if spec is None or not getattr(spec, "puzzle", ""):
-            return ("gen_fail",
-                    (spec.error if spec is not None else "spec=None")
-                    or "空谜面", {})
+        spec, reason = keyword_spec(
+            self.writer, self._bag, self._keyword_session_seed,
+            avoid=avoid, recent=recent,
+            should_continue=self._should_continue,
+            corpus_version=self._bag_meta.get("corpus_version", ""))
+        if spec is None:
+            if reason == "interrupted":
+                return ("interrupted", "直播变忙, keyword2 让路",
+                        {"interrupted": True})
+            return ("gen_fail", "keyword2 未成题", {})
         # ---- 之后与 classic 路径完全一致(试玩 / add) ----
-        return self._finish_one(spec, extra)
+        return self._finish_one(spec, {})
 
     def _generate_classic_one(self, inputs: dict) -> tuple:
         """旧路径: `pick_blueprint -> gen_spec`。**逐位不变**。

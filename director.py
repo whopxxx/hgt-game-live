@@ -99,12 +99,20 @@ class _SafeStream(logging.StreamHandler):
             self.handleError = lambda *_: None      # 静音, 不再吐 traceback
 
 
+#: `setup_logging` 实际用的控制台流。banner 必须写它而不是 `sys.stdout`
+#: —— 两者是同一个 fd 的两份 Python 对象, 而 `sys.stdout` 那份是带缓冲
+#: 的(见 `run()` 里 `_banner` 的说明)。`None` = 还没 setup 过, 退回
+#: `sys.stdout`。
+_console = None
+
+
 def setup_logging(level: str, log_file: str | None = None) -> None:
     """日志装配: 控制台 + (可选)文件。
 
     控制台只留**主干**信息, 明细全部写文件 —— 直播时控制台滚得太快,
     真要排查还是得翻文件。
     """
+    global _console
     root = logging.getLogger()
     root.handlers.clear()
 
@@ -119,6 +127,8 @@ def setup_logging(level: str, log_file: str | None = None) -> None:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    # banner 与日志共用这一份 —— 顺序才是确定的。
+    _console = console
     ch = _SafeStream(console)
     ch.setFormatter(_SafeFormatter(
         "%(asctime)s %(levelname)-5s %(name)s: %(message)s", datefmt="%H:%M:%S"))
@@ -284,6 +294,79 @@ class Director:
             self._lazy_curator = build_lazy_curator(
                 cfg, self.curated_pool, lc_writer, self.engine.pressure,
                 generation_probe=self.engine.snapshot_generation_inputs)
+
+        # ---- G4-2 §四: live 现场生成用的 keyword bag(懒建) ----
+        # 见 `_keyword_bag` 的说明: 这里**只置空占位**, 真正建在第一次
+        # 需要现场生成时。三个字段是本方法的缓存槽。
+        self._kw_bag = None
+        self._kw_bag_meta: dict = {}
+        self._kw_session_seed = None
+        self._kw_bag_built = False
+
+    # ------------------------------------------------------------------
+    def _keyword_bag(self):
+        """G4-2 §四: 现场生成用的 keyword bag。返回 `(bag, meta, seed)`。
+
+        `bag is None` => 走 classic Blueprint 链。三种情况:
+
+            ① `--no-keyword-seed`(kill-switch) —— **prefetch 与 live
+               同时**回 classic。两边读同一个 config flag, 所以不会
+               出现半切换。
+            ② corpus 不可用(显式降级, 与 prefetcher 同一套语义)
+            ③ 还没建过(懒建, 见下)
+
+        ## 为什么**懒建**而不是在 `__init__` 里建
+
+        `__init__` 里建会让**每一次**启动都读一遍词库 —— 包括 `--no-llm`
+        的冒烟测试、`--sim` 的回放、以及只跑引擎不起题的场景。那些都不
+        需要 keyword 词库, 白读一遍盘还会让启动日志多一行容易误读的
+        "keyword2 bag 就绪"。
+
+        懒建只在**真的要现场生成**时发生(池空 + 允许现场生成), 而那正是
+        需要它的唯一时刻。建失败时降级成 classic —— 与 prefetcher 的
+        `_init_keyword_bag` 逐字同语义(打 ERROR, 不抛)。
+
+        ## 与 prefetcher 的 bag 是**两个实例**
+
+        各自 `random.Random(同一个 session_seed)` —— 于是两边从同一个
+        种子出发, 但**不共享消费位置**。这是刻意的: live 现场生成是
+        稀有路径(池空才走), 让它去推进 prefetch 的 bag 会让"同 seed 下
+        补池序列"依赖"这一场现场生成过几次" —— 复盘时说不清。
+        两边各自从头抽, 各自可复现。
+
+        ⚠️ 它**不用** `self._rng`: 那把 rng 服务 live 的 blueprint 序列,
+        从它取数会改变既有可复现性(与 prefetcher 里那条注释同源)。
+        """
+        if not bool(getattr(self.cfg, "pool_keyword_seed_enabled", True)):
+            return None, {}, None
+        if self._kw_bag_built:
+            return self._kw_bag, self._kw_bag_meta, self._kw_session_seed
+        self._kw_bag_built = True
+        try:
+            from story.keyword_corpus import DEFAULT_CORPUS_PATH
+            from story.keyword_seed import derive_session_seed, load_bag
+            path = str(getattr(self.cfg, "keyword_corpus_path", "")
+                       or DEFAULT_CORPUS_PATH)
+            ss = getattr(self.cfg, "keyword_session_seed", None)
+            if ss is None:
+                qseed = getattr(self.cfg, "quality_seed", None)
+                if qseed is not None:
+                    ss = derive_session_seed(qseed)
+                else:
+                    ss = random.SystemRandom().getrandbits(64)
+            self._kw_bag, self._kw_bag_meta = load_bag(path, ss)
+            self._kw_session_seed = int(ss)
+            log.info("keyword2(live)bag 就绪: %s",
+                     __import__("story.keyword_seed", fromlist=["x"]
+                                ).describe_bag(self._kw_bag_meta, ss))
+        except Exception as e:                       # noqa: BLE001
+            self._kw_bag = None
+            self._kw_bag_meta = {}
+            self._kw_session_seed = None
+            log.error("keyword2 corpus 不可用(live 现场生成), "
+                      "整条 keyword2 链让位给 classic Blueprint 链"
+                      "(不会回退人工词库): %s: %s", type(e).__name__, e)
+        return self._kw_bag, self._kw_bag_meta, self._kw_session_seed
 
     # ------------------------------------------------------------------
     def _playtest_should_continue(self) -> bool:
@@ -629,26 +712,36 @@ class Director:
                 expect_round = payload.get("expect_round")
                 spec = None
                 source = "live_generate"
-                # ---- Batch H2-G: 取题顺序 curated -> 生成池 -> 现场生成 ----
+                # ---- G4-2 §三: 取题顺序 generated -> curated -> 现场生成 ----
                 #
-                # curated 排在最前是这批的**核心主张**: 外部现成好题的
-                # 认知反转密度比 AI 现场造的高得多, 所以有 curated 就先用。
+                # ⚠️ **curated 不再抢最高优先级**。H2-G 原本把它排在最前
+                # ("外部好题的认知反转密度比 AI 现场造的高"), G4-2 推翻了
+                # 这条产品决定:
                 #
-                # `pop_next` 在两处都一样: 它自带准入重校验 + 跨题门 +
-                # 先落盘再交付。所以 curated 池不会因为"排在前面"而绕过
-                # 任何一道门 —— 优先级只影响**顺序**, 不影响**标准**。
-                if self.curated_pool is not None:
+                #     默认直播的唯一主生成体系是 keyword2。
+                #     curated 是补充题源, 不是默认主产品。
+                #
+                # 两个后果:
+                #   1. `prefer_curated` 默认 False -> 这一段整体不跑
+                #      (curated_pool 是 None), 观众只感受到一套生成风格;
+                #   2. 即使显式 `--curated`, generated 池**仍然排前** ——
+                #      否则一开 curated 就立刻被外部题淹没, 默认口径
+                #      与 opt-in 口径的差别会大到不像同一个产品。
+                #
+                # `pop_next` 在两处都一样: 准入重校验 + 两遍选择 +
+                # 先落盘再交付。所以优先级只影响**顺序**, 不影响**标准**。
+                if self.pool is not None:
+                    spec = self.pool.pop_next(
+                        recent_signatures=recent,
+                        avoid=payload.get("avoid"))
+                    if spec is not None:
+                        source = "keyword2_pool"
+                if spec is None and self.curated_pool is not None:
                     spec = self.curated_pool.pop_next(
                         recent_signatures=recent,
                         avoid=payload.get("avoid"))
                     if spec is not None:
                         source = "curated"
-                if spec is None and self.pool is not None:
-                    spec = self.pool.pop_next(
-                        recent_signatures=recent,
-                        avoid=payload.get("avoid"))
-                    if spec is not None:
-                        source = "pool"
 
                 if spec is not None:
                     # 池子里来的: 结构已经齐了, 直接上屏。
@@ -676,24 +769,56 @@ class Director:
                     self._dispatch(self.engine.submit_riddle(
                         None, error=failure, expect_round=expect_round))
                 else:
-                    bp = self._pick_blueprint(recent)
-                    spec = self.writer.gen_spec(
-                        avoid=payload.get("avoid"), blueprint=bp,
-                        recent=recent,
-                        # bp is None 时**真的**跳过 blueprint 硬校验,
-                        # 而不是退回默认 blueprint。
-                        enforce_blueprint=bp is not None)
-                    # 只有**通过质量门**的 spec 才允许上直播。
-                    # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
-                    if spec.puzzle and not spec.error:
-                        self._submit_spec(spec, source,
-                                          expect_round=expect_round)
-                        if not spec.answer:
-                            log.info("本题未解析出谜底, 揭晓时将重新生成")
+                    # ---- G4-2 §四: live 现场生成**也走 keyword2** ----
+                    #
+                    # 原来这里恒为 `pick_blueprint -> gen_spec`(classic 链)。
+                    # G4-2 的产品决定是: 默认 keyword2 开启时, 现场生成必须
+                    # 与后台补池**同一套链**, 否则观众会看到风格断层 ——
+                    # 池子里是 keyword2 的题, 现场生成突然冒出 blueprint
+                    # 命题作文。
+                    #
+                    # kill-switch 仍然是 `--no-keyword-seed`: 显式关掉时
+                    # **prefetch 与 live 两边同时**回 classic(§四: "不能
+                    # 出现 prefetch=classic 而 live=keyword2, 或反过来")。
+                    # 两边读的是同一个 config flag, 所以半切换在结构上
+                    # 不可能发生 —— `_keyword_bag()` 与 prefetcher 的
+                    # `_keyword_enabled()` 判的是同一个开关。
+                    kw_bag, kw_meta, kw_seed = self._keyword_bag()
+                    if kw_bag is not None:
+                        from story.keyword_seed import keyword_spec
+                        spec, why = keyword_spec(
+                            self.writer, kw_bag, kw_seed,
+                            avoid=payload.get("avoid"), recent=recent,
+                            should_continue=None,
+                            corpus_version=kw_meta.get("corpus_version", ""))
+                        if spec is None:
+                            failure = ("keyword2 现场生成未成题(%s)" % why)
+                            log.warning("出题失败, 交回引擎走兜底: %s", failure)
+                        else:
+                            source = "keyword2_live"
+                            self._submit_spec(spec, source,
+                                              expect_round=expect_round)
+                            if not spec.answer:
+                                log.info("本题未解析出谜底, 揭晓时将重新生成")
                     else:
-                        # 记下来, **等释放锁之后**再提交 —— 见上面①
-                        failure = spec.error or "没有生成合格谜题"
-                        log.warning("出题失败, 交回引擎走兜底: %s", failure)
+                        bp = self._pick_blueprint(recent)
+                        spec = self.writer.gen_spec(
+                            avoid=payload.get("avoid"), blueprint=bp,
+                            recent=recent,
+                            # bp is None 时**真的**跳过 blueprint 硬校验,
+                            # 而不是退回默认 blueprint。
+                            enforce_blueprint=bp is not None)
+                        # 只有**通过质量门**的 spec 才允许上直播。
+                        # gen_spec 保证: 失败时一定 error 非空且 puzzle 为空。
+                        if spec.puzzle and not spec.error:
+                            self._submit_spec(spec, source,
+                                              expect_round=expect_round)
+                            if not spec.answer:
+                                log.info("本题未解析出谜底, 揭晓时将重新生成")
+                        else:
+                            # 记下来, **等释放锁之后**再提交 —— 见上面①
+                            failure = spec.error or "没有生成合格谜题"
+                            log.warning("出题失败, 交回引擎走兜底: %s", failure)
             except Exception as e:
                 log.exception("出题异常: %s", e)
                 failure = str(e)
@@ -1230,6 +1355,80 @@ class Director:
                 log.exception("调度异常: %s", e)
             self._stop.wait(interval)
 
+    # ------------------------------------------------------------------
+    def _prewarm(self) -> None:
+        """G4-2 §五: 冷启动有限预热。**绝不抛, 绝不阻止启动。**
+
+        ## 判定
+
+            prefetcher / pool 没建        -> 什么都不做
+            playable_count >= 1           -> **一次生成都不发**(§九-9)
+            playable_count == 0           -> 最多 `pool_prewarm_max_rounds`
+                                             轮 / `pool_prewarm_max_seconds` 秒,
+                                             拿到 1 道立刻收工(§九-10)
+
+        ## 为什么直接调 `_generate_one_inner` 而不是 `on_tick`
+
+        `on_tick` 带 latch / 退避 / deadline 一整层"**该不该现在开始**"的
+        判定, 而那些判定的前提(相位稳定、压力可读)在 `engine.start()`
+        之前**不成立** —— 开播前那一刻探针里没有相位。这里要的是"我就是
+        现在要一道", 所以绕过**调度层**, 只复用**执行层**。
+
+        复用的是同一条执行路径: 同一个 `_generate_one_inner` -> 同一套
+        Stage A/B / 审稿 / truth audit / 试玩 / `_finish_one` 入池。**没有
+        第二份生成实现** —— 那正是这轮反复强调的。
+
+        ## 有界 + 失败不阻止启动
+
+        轮数与秒数**双上限**, 先到者停。最坏情况是"预算烧完一道都没成":
+        打 WARNING 然后正常往下走 —— 引擎的兜底谜题会顶上, 直播不中断
+        (与 `allow_live_generation=False` 走同一条路径)。预热是**优化**,
+        不是可用性前提; 让它能把进程卡死就是把优化写成了单点故障。
+        """
+        if self._prefetcher is None or self.pool is None:
+            return
+        budget = float(getattr(self.cfg, "pool_prewarm_max_seconds", 90.0)
+                       or 0.0)
+        max_rounds = int(getattr(self.cfg, "pool_prewarm_max_rounds", 2) or 0)
+        if budget <= 0 or max_rounds <= 0:
+            return
+        try:
+            inputs = self._prefetcher._generation_inputs()
+            if self._prefetcher._playable(inputs) >= 1:
+                # §九-9: 已经有得播 -> **0 次**额外生成调用。
+                log.info("预热: 池里已有可播题, 跳过(0 次生成)")
+                return
+        except Exception:                       # noqa: BLE001
+            log.exception("预热: 读可播数异常, 跳过预热")
+            return
+
+        log.info("预热: 冷启动 playable=0, 最多 %d 轮 / %.0fs 内取一道",
+                 max_rounds, budget)
+        t0 = time.monotonic()
+        for i in range(max_rounds):
+            if time.monotonic() - t0 > budget:
+                break
+            try:
+                kind, detail, _extra = self._prefetcher._generate_one_inner(
+                    inputs)
+            except Exception as e:              # noqa: BLE001
+                log.exception("预热第 %d 轮异常: %s", i + 1, e)
+                break
+            if kind == "ok":
+                log.info("预热成功: 第 %d 轮拿到一道(%.1fs), 立即继续启动",
+                         i + 1, time.monotonic() - t0)
+                return
+            log.info("预热第 %d 轮未成题(%s): %s", i + 1, kind,
+                     str(detail)[:100])
+            # 下一轮必须重取快照 —— 上一轮的入池/失败会改变 recent/avoid。
+            try:
+                inputs = self._prefetcher._generation_inputs()
+            except Exception:                   # noqa: BLE001
+                break
+        log.warning("预热未拿到题(%.1fs) —— **正常启动**, "
+                    "第一题按 emergency fallback 处理",
+                    time.monotonic() - t0)
+
     def push(self) -> None:
         try:
             self.hub.publish(self.engine.snapshot().to_json())
@@ -1240,10 +1439,36 @@ class Director:
     def run(self) -> int:
         cfg = self.cfg
 
-        print("=" * 64)
-        print("  竖屏 AI 海龟汤直播")
-        print("=" * 64)
-        print(f"  输入源      : {cfg.source_label}")
+        # ---- 启动 banner 的输出去向 ----
+        #
+        # ⚠️ 这里**不能**直接 `print()`: `setup_logging()` 为了在 Windows
+        # 控制台上正确写中文, 把控制台句柄**重新 open** 成了 UTF-8 流
+        # (`open(sys.stdout.fileno(), "w", encoding="utf-8")`), 并把它
+        # 交给 logging 用。而 `sys.stdout` 仍然指着原来那个**带缓冲**的
+        # 包装 —— 两者是同一个 fd 的两份 Python 对象。
+        #
+        # 后果实测过: banner 的 `print()` 在进程退出时才 flush, 而那时
+        # 日志已经滚完几十行, 于是**读起来像是 banner 根本没打印**。
+        # 直接 `| head` / 重定向时更糟 —— 整个 banner 消失。
+        # (在干净基线上复现过, 不是本轮引入的。)
+        #
+        # 所以 banner 走 `_console` 显式 flush。日志用同一个 fd, 顺序
+        # 因此是确定的: banner 先出, 日志在后。
+        def _banner(line: str = "") -> None:
+            out = _console if _console is not None else sys.stdout
+            try:
+                out.write(line + "\n")
+                out.flush()          # ⚠️ 必须 —— 否则 banner 会在退出时才冒出来
+            except Exception:        # noqa: BLE001
+                try:
+                    print(line)
+                except Exception:    # noqa: BLE001
+                    pass
+
+        _banner("=" * 64)
+        _banner("  竖屏 AI 海龟汤直播")
+        _banner("=" * 64)
+        _banner(f"  输入源      : {cfg.source_label}")
         #: 认证态**只打一个词** —— 绝不打 Cookie 本体/长度/前缀/hash。
         #: 见 vendor/douyin_fetcher/ws_cookie.py 的敏感边界说明。
         if cfg.live_id:
@@ -1251,91 +1476,113 @@ class Director:
                 from vendor.douyin_fetcher.ws_cookie import describe_ws_auth
             except Exception:                       # pragma: no cover
                 from douyin_fetcher.ws_cookie import describe_ws_auth
-            print(f"  WS 认证态   : ws_auth="
+            _banner(f"  WS 认证态   : ws_auth="
                   f"{describe_ws_auth(getattr(cfg, 'douyin_live_cookie', None))}")
         if cfg.proxy:
-            print(f"  代理        : {cfg.proxy}")
+            _banner(f"  代理        : {cfg.proxy}")
         else:
-            print(f"  代理        : 无(直连)")
-        print(f"  回答节奏    : 逐条秒回, 并发 {cfg.qa_max_inflight}")
+            _banner(f"  代理        : 无(直连)")
+        _banner(f"  回答节奏    : 逐条秒回, 并发 {cfg.qa_max_inflight}")
         _n = cfg.hint_seconds
-        print(f"  时间轴      : 出题 -> " + " -> ".join(
+        _banner(f"  时间轴      : 出题 -> " + " -> ".join(
             f"{int((i + 1) * _n / 60)}min 提示{i + 1}"
             for i in range(cfg.max_hints)) +
             f" -> {int((cfg.max_hints + 1) * _n / 60)}min 揭晓")
-        print(f"  揭晓条件    : 有人猜中 / 时间轴走完（提问条数不设上限）")
-        print(f"  揭晓展示    : {cfg.reveal_hold_seconds:.0f}s 后开下一题")
-        print(f"  输出 JSONL  : {os.path.abspath(cfg.out_path)}")
-        print(f"  谜题 JSONL  : {os.path.abspath(cfg.puzzle_out_path)}")
+        _banner(f"  揭晓条件    : 有人猜中 / 时间轴走完（提问条数不设上限）")
+        _banner(f"  揭晓展示    : {cfg.reveal_hold_seconds:.0f}s 后开下一题")
+        _banner(f"  输出 JSONL  : {os.path.abspath(cfg.out_path)}")
+        _banner(f"  谜题 JSONL  : {os.path.abspath(cfg.puzzle_out_path)}")
         # 题池状态打出来 —— 否则"到底有没有在用池子"只能靠翻日志。
         if self.pool is None:
-            print("  题池        : 已关闭(pool_enabled=False)")
+            _banner("  题池        : 已关闭(pool_enabled=False)")
         else:
             st = self.pool.stats()
-            print(f"  题池        : {st['available']}/{st['size']} 道可用, "
+            _banner(f"  题池        : {st['available']}/{st['size']} 道可用, "
                   f"已用 {st['used']} (已播 {st['aired']})")
             # 库存 = 过得了准入门、且未用过的题数。它可能**小于** available
             # (盘上有、但 signature 被改坏所以播不出来)—— 两个都打,
             # 免得看到"可用 5 却一道都取不出来"时无从解释。
-            print(f"                库存(可播) {st['stock']} 道"
+            _banner(f"                库存(可播) {st['stock']} 道"
                   + ("" if st.get("trustworthy", True)
                      else "  ⚠️ used 账本不可信 -> 池子本次禁用!"))
+        # ---- G4-2 §二: **题源模式** —— 启动时必须一眼看得出来 ----
+        #
+        # 任务书原文要求的形状:
+        #
+        #     题源模式: keyword2 generated
+        #     curated: OFF
+        #
+        # 显式开启时再打 `curated: ON`。这一行是**运维读的第一行**, 因为
+        # "这一场到底会不会混进下载题" 是 G4-2 唯一想让人看出来的事 ——
+        # 早先要翻三四行 curated 池状态 + 一行取题顺序才能拼出来。
+        #
+        # ⚠️ 它必须**先于**下面那些细节行打印: 细节行回答"状态如何",
+        # 这一行回答"这是什么模式"。顺序反了读者会先陷进细节。
+        _kw_on = bool(getattr(cfg, "pool_keyword_seed_enabled", True))
+        _cur_on = bool(getattr(cfg, "prefer_curated", False))
+        if _kw_on:
+            _banner("  题源模式    : keyword2 generated")
+        else:
+            _banner("  题源模式    : classic Blueprint(--no-keyword-seed)")
+        _banner(f"  curated     : {'ON' if _cur_on else 'OFF'}"
+              + ("(--curated, 排在 generated 之后)"
+                 if _cur_on else "(默认关闭; 要用来 --curated)"))
         # ---- Batch H2-F/G: curated 池状态 ----
         # 不打印的话,"这场到底有没有在播外部题库"只能靠翻日志 —— 而
         # 这正是这批唯一想验证的事。**单独一行**, 与 AI 池区分开。
-        if not getattr(cfg, "prefer_curated", True):
-            print("  curated 池  : 已关闭(prefer_curated=False)")
+        if not _cur_on:
+            _banner("  curated 池  : 未加载(--curated 才加载; Lazy Curator 未启动)")
         elif self.curated_pool is None:
-            print("  curated 池  : 不可用(文件缺失或已关闭)")
+            _banner("  curated 池  : 不可用(文件缺失或已关闭)")
         else:
             cs = self.curated_pool.stats()
-            print(f"  curated 池  : {cs['available']}/{cs['size']} 道可用, "
+            _banner(f"  curated 池  : {cs['available']}/{cs['size']} 道可用, "
                   f"库存(可播) {cs['stock']} 道"
                   + ("" if cs.get("trustworthy", True)
                      else "  ⚠️ used 账本不可信 -> 本次禁用!"))
             if not getattr(cfg, "allow_live_generation", True):
-                print("                现场 AI 生成已关闭(H2-G): 池空则走兜底")
+                _banner("                现场 AI 生成已关闭(H2-G): 池空则走兜底")
             # ---- Batch H3-B: Lazy Curator 状态 ----
             # 任务书十七: 启动就要能看到"还有多少候选、审了多少、拒了
             # 多少、库存几位数"。**不打印题底。**
             if self._lazy_curator is None:
-                print("  lazy curator: 关闭(无 writer / 无 curated 池 / 已关)")
+                _banner("  lazy curator: 关闭(无 writer / 无 curated 池 / 已关)")
             else:
                 ls = self._lazy_curator.status()
-                print(f"  lazy curator: 开"
+                _banner(f"  lazy curator: 开"
                       f"(低水位 {ls['min']} -> 高水位 {ls['target']})")
-                print(f"    curated candidate : {ls['candidates']}")
-                print(f"    curated decided   : {ls['decided']}")
-                print(f"    curated rejected  : {ls['rejected']}")
-                print(f"    curated accepted  : {ls['accepted']}")
-                print(f"    curated 库存      : {ls['stock']} 道"
+                _banner(f"    curated candidate : {ls['candidates']}")
+                _banner(f"    curated decided   : {ls['decided']}")
+                _banner(f"    curated rejected  : {ls['rejected']}")
+                _banner(f"    curated accepted  : {ls['accepted']}")
+                _banner(f"    curated 库存      : {ls['stock']} 道"
                       f"(可播 {ls['playable']})")
         if self.pool is not None:
             if self._prefetcher is None:
-                print("  补池        : 关闭(不在 --no-llm 下生成)")
+                _banner("  补池        : 关闭(不在 --no-llm 下生成)")
             elif not getattr(cfg, "pool_prefetch_enabled", True):
-                print("  补池        : 已关闭(--no-prefetch)")
+                _banner("  补池        : 已关闭(--no-prefetch)")
             else:
-                print(f"  补池        : 低水位 {cfg.pool_min_size} -> "
+                _banner(f"  补池        : 低水位 {cfg.pool_min_size} -> "
                       f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
                 if getattr(cfg, "playtest_enabled", False):
-                    print(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "
+                    _banner(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "
                           f"猜不中不入池; Player temperature=0)")
                 else:
-                    print("  试玩        : 关(--playtest 开启)")
-            print(f"                {os.path.abspath(st['path'])}")
+                    _banner("  试玩        : 关(--playtest 开启)")
+            _banner(f"                {os.path.abspath(st['path'])}")
         if cfg.no_llm:
-            print("  LLM         : 已禁用(--no-llm), 使用固定文案")
+            _banner("  LLM         : 已禁用(--no-llm), 使用固定文案")
         else:
             for k, v in cfg.llm.masked().items():
-                print(f"  LLM {k:11s}: {v}")
-        print(f"  渲染页面    : http://{cfg.host}:{cfg.port}/  (?debug=1 开调试)")
+                _banner(f"  LLM {k:11s}: {v}")
+        _banner(f"  渲染页面    : http://{cfg.host}:{cfg.port}/  (?debug=1 开调试)")
         if cfg.open_window:
-            print(f"  直播窗口    : 已自动打开(最大化, 竖屏居中, 左右黑边)")
-            print(f"                直播伴侣用【窗口捕获】选它即可")
+            _banner(f"  直播窗口    : 已自动打开(最大化, 竖屏居中, 左右黑边)")
+            _banner(f"                直播伴侣用【窗口捕获】选它即可")
         else:
-            print(f"  直播伴侣    : 加浏览器源 -> 上面的地址, 画布 1080x1920")
-        print("=" * 64)
+            _banner(f"  直播伴侣    : 加浏览器源 -> 上面的地址, 画布 1080x1920")
+        _banner("=" * 64)
 
         for w in cfg.validate():
             log.warning("配置: %s", w)
@@ -1357,6 +1604,27 @@ class Director:
                          name="consume").start()
         threading.Thread(target=self._scheduler, daemon=True,
                          name="scheduler").start()
+
+        # ---- G4-2 §五: 冷启动 prewarm ----
+        #
+        # keyword2 是**两阶段**的(Stage A + Stage B + 审稿 + audit), 一次
+        # 现场生成要几十秒。若第一题就让观众等, 开播体验直接垮掉。
+        #
+        # 所以在进入第一题正式 SETTING **之前**做一次**有限**预热, 目标只是
+        # "至少 1 道可播":
+        #
+        #     * **不是**补到 target(默认 5)。补满要 3~5 轮, 每轮几十秒 ——
+        #       那是"开播前先静默三分钟", 对直播来说不可接受。1 道就够
+        #       把第一题顶过去, 剩下的由后台补池在 REVEALED 窗口续。
+        #     * 有**明确总预算**, 不能无限等。
+        #     * 失败(网关抖 / 出的题都不合格)**不阻止启动** —— 按
+        #       emergency fallback 处理, 与"池空"完全同一条路径。预热
+        #       是优化, 不是可用性前提: 让它能把进程卡死是把优化写成了
+        #       单点故障。
+        #
+        # 已经 playable >= 1 时**一次生成都不发**(§九-9): 那正是"预热"
+        # 这个词的反面 —— 已经在跑的后台补池不需要人来踢一脚。
+        self._prewarm()
 
         # 开场: 触发第一段
         for a in self.engine.start():

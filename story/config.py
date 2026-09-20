@@ -392,6 +392,22 @@ class Config:
     # 它只影响 keyword2 抽词, 与 live 出题的 rng / classic 链的
     # blueprint rng **完全隔离**。
     keyword_session_seed: Optional[int] = None
+
+    # ---- G4-2 §五: 冷启动 prewarm ----
+    #
+    # keyword2 是**两阶段**的, 一次现场生成几十秒。若第一题让观众等,
+    # 开播体验直接垮。所以进第一题正式 SETTING 之前做一次**有限**预热。
+    #
+    # ⚠️ 目标是"**至少 1 道**", 不是补到 `pool_target_size`。补满要 3~5
+    # 轮, 每轮几十秒 —— 那是"开播前先静默三分钟", 对直播不可接受。1 道
+    # 够把第一题顶过去, 剩下的交给后台补池在 REVEALED 窗口续。
+    #
+    # 双上限(轮数 / 秒数), 先到者停。失败**不阻止启动** —— 按 emergency
+    # fallback 处理。预热是优化, 不是可用性前提。
+    #
+    # 设 0 关掉预热(调试 / 离线用)。
+    pool_prewarm_max_rounds: int = 2
+    pool_prewarm_max_seconds: float = 90.0
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -411,11 +427,29 @@ class Config:
     #: 什么许可 / 是否翻译"。
     attributions_path: str = os.path.join("data", "ATTRIBUTIONS.jsonl")
 
-    #: **取题顺序(H2-G)**: curated 优先 -> AI 生成池 -> 现场生成。
+    #: **取题顺序(G4-2 起)**: 生成池(keyword2) -> curated -> keyword2 现场生成。
     #:
-    #: `prefer_curated=False` 时**完全不碰** curated 池(而不是"最后再
-    #: 试") —— 与 `pool_enabled` 同一条原则: 关掉就要是真的关掉。
-    prefer_curated: bool = True
+    #: ## 默认 False —— curated 是 **opt-in**
+    #:
+    #: 产品决定(任务书 §一/§二):
+    #:
+    #:     默认直播不再使用 external curated/downloaded 海龟汤作为主题源。
+    #:     默认直播的唯一主生成体系是 keyword2。
+    #:     下载的完整谜题保留为可选题库 / benchmark / emergency reserve,
+    #:     但默认不参与实播调度。
+    #:
+    #: 于是正常直播里观众**只感受到一套生成风格**。external 题的风格与
+    #: AI 生成题差得很远(谜面长度、语感、机关密度), 混在一起播会让
+    #: "这一场是什么调性"变得不可控 —— 那正是 H2 之后一直存在的问题。
+    #:
+    #: `False` 时**完全不碰** curated 池(而不是"最后再试"), 与
+    #: `pool_enabled` 同一条原则: 关掉就要是真的关掉 —— 连文件都不读,
+    #: Lazy Curator 也不启动(§二: 默认 0 次 LLM 调用)。
+    #:
+    #: 显式开启用 `--curated`。`--no-curated` 保留为兼容参数, 两者
+    #: 都写 `prefer_curated`; 默认值本身就是 False, 所以不写任何 flag
+    #: 时就是"关"。
+    prefer_curated: bool = False
     #: **现场 AI 生成默认关闭**(H2-G 第一阶段)。
     #:
     #: 理由: 这批的目的正是"看看题源换掉以后风格是不是立刻变好"。
@@ -853,12 +887,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="keyword bag 的 session seed。默认由 quality_seed "
                          "派生; quality_seed 也没给时启动随机一次并写进 "
                          "INFO 日志(可从日志抄回来重放)")
-    # ---- Batch H2-F/G: curated 池 ----
+    # ---- Batch H2-F/G: curated 池(**G4-2 起 opt-in**) ----
+    #
+    # ⚠️ `--curated` 与 `--no-curated` **写同一个 dest**(`prefer_curated`),
+    # 所以两者天然不会打架 —— `argparse` 的后者覆盖前者, 而 dataclass 的
+    # 默认值(False)就是"不写任何 flag 时"的口径。
+    #
+    # 为什么不做成两个独立布尔: 两个开关管同一件事, 迟早会出现
+    # `--curated --no-curated` 同时给而代码只读其中一个的情况, 那时
+    # "到底开没开"就得靠猜。一个 dest 让"最后写的那个赢"成为唯一规则。
+    ap.add_argument("--curated", dest="prefer_curated",
+                    action="store_true",
+                    help="**显式启用** external curated(下载题库)作为补充题源。"
+                         "默认**关闭** —— 默认直播的唯一主生成体系是 "
+                         "keyword2, 观众只感受到一套生成风格。开了之后: "
+                         "加载 curated 池 + 启动 Lazy Curator + 允许下载题"
+                         "进入取题顺序(**仍排在 generated 之后**)。")
     ap.add_argument("--no-curated", dest="prefer_curated",
                     action="store_false",
-                    help="不使用 curated(外部题库)池。默认**优先**用它 —— "
-                         "这是 Batch H2 的核心: 外部好题的认知反转密度比 "
-                         "AI 现场造的高。关掉时连文件都不读")
+                    help="显式关闭 curated(与不写 flag 同义, 保留为兼容参数)。")
+    ap.set_defaults(prefer_curated=False)
     ap.add_argument("--curated-pool", dest="curated_pool_path", default=None,
                     help="curated 池文件路径(默认 data/curated_pool.jsonl)")
     ap.add_argument("--no-live-generate", dest="allow_live_generation",

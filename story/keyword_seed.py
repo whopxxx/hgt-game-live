@@ -511,3 +511,79 @@ def draw_two_keywords(rng: random.Random,
         "keywords": [rng.choice(bank[slot_a]), rng.choice(bank[slot_b])],
         "slots": [slot_a, slot_b],
     }
+
+
+# ======================================================================
+# 四、G4-2: **两条路径共用的 keyword2 起题骨架**
+# ======================================================================
+#
+# 原来只有 `PoolPrefetcher._generate_keyword_one` 里那一份(后台补池)。
+# G4-2 §四 要求 live 现场生成**也**走同一条链:
+#
+#     pool 空且必须现场生成
+#       -> draw 2 independent keywords -> Stage A -> Stage B
+#       -> generated Reviewer -> truth audit -> validate -> safety/dup 硬门
+#
+# 而**不是**回到 classic Blueprint —— 否则观众会看到风格断层(池子里
+# 是 keyword2 的题, 现场生成突然冒出 blueprint 命题作文)。
+#
+# ⚠️ 这个抽取是**刻意的**: 两份实现会在"哪里写 metrics / 哪里判让路 /
+# 哪里补 provenance"这些细节上漂, 而漂了以后 live 与 prefetch 出的题
+# 就不是同一种东西了 —— 那正是本轮要消灭的形状。所以骨架只写一次。
+def keyword_spec(writer, bag, session_seed: int, *,
+                 avoid=None, recent=None, should_continue=None,
+                 corpus_version: str = ""):
+    """跑一遍 `抽词 -> Stage A -> Stage B + provenance`。
+
+    返回 `(spec, reason)`:
+
+        spec 非 None  -> 成题(调用方接着走试玩/入池/上屏)
+        spec 为 None  -> `reason` 说明为什么没成
+
+    `reason` 的取值是**结构化**的, 调用方据此分流:
+
+        "interrupted"  直播变忙, 让路 —— **不计失败不退避**(G1 语义)
+        "gen_fail"     Stage A 没成题 / Stage B 空谜面 —— 真的失败
+
+    ⚠️ 这里**不**做试玩、**不**入池、**不**上屏 —— 那些是调用方的
+    契约(live 直接 submit, prefetch 走 pool.add)。骨架只负责"产出一
+    个合格的 spec"。
+    """
+    # ---- 让路检查 ①: Stage A 之前 ----
+    if should_continue is not None and not should_continue():
+        return None, "interrupted"
+
+    keys = bag.draw()
+    keywords = list(keys["keywords"])
+
+    idea = writer.gen_keyword_idea(keywords, should_continue=should_continue)
+    if idea is None:
+        return None, "gen_fail"
+    if idea.get("interrupted"):
+        return None, "interrupted"
+
+    # ---- 让路检查 ②: Stage A 之后 / Stage B 之前(最容易漏的一处) ----
+    if should_continue is not None and not should_continue():
+        return None, "interrupted"
+
+    spec = writer.structure_original_idea(
+        title=idea.get("title", ""), puzzle=idea["puzzle"],
+        answer=idea["answer"], avoid=avoid, recent=recent,
+        should_continue=should_continue)
+
+    # ---- provenance: 只进 metrics/archive/日志 ----
+    try:
+        spec.metrics = dict(spec.metrics or {})
+        spec.metrics["generation_mode"] = "keyword2"
+        spec.metrics["keywords"] = keywords
+        spec.metrics["keyword_seed_version"] = KEYWORD_SEED_VERSION
+        spec.metrics["keyword_corpus_version"] = corpus_version
+        spec.metrics["keyword_session_seed"] = session_seed
+    except Exception:                       # noqa: BLE001
+        pass
+
+    if bool((getattr(spec, "metrics", None) or {}).get("interrupted")):
+        return None, "interrupted"
+    if spec is None or not getattr(spec, "puzzle", ""):
+        return None, "gen_fail"
+    return spec, ""

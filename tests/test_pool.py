@@ -642,8 +642,12 @@ def test_director_serves_from_pool_end_to_end():
             _D.threading.Thread = real_thread
 
         check("题已上屏(来自池子)", dr.engine.phase == Phase.QA, dr.engine.phase)
-        check("engine 记下来源是 pool",
-              dr.engine._spec_source == "pool", dr.engine._spec_source)
+        # G4-2 §八: `pool` 这个模糊标签换成了 `keyword2_pool` ——
+        # 复盘时要能一眼分出"这道来自后台补的 keyword2 池", 而不是
+        # 一个笼统的 "pool"。见 `_submit_spec` 的 source 取值表。
+        check("engine 记下来源是 keyword2_pool",
+              dr.engine._spec_source == "keyword2_pool",
+              dr.engine._spec_source)
         # 池子标记为已用
         check("池子已把它记为已用", dr.pool.pending_count() == 0,
               dr.pool.pending_count())
@@ -654,18 +658,31 @@ def test_director_serves_from_pool_end_to_end():
         dr._archive_reveal(rev.payload, "谜底")
         rec = json.loads(open(cfg.puzzle_out_path, encoding="utf-8")
                          .read().strip())
-        check("archive 记 source=pool", rec.get("source") == "pool",
-              rec.get("source"))
+        check("archive 记 source=keyword2_pool",
+              rec.get("source") == "keyword2_pool", rec.get("source"))
         check("archive 带 metrics(不丢溯源)",
               isinstance(rec.get("metrics"), dict), rec.get("metrics"))
 
 
 def test_director_falls_back_when_pool_empty():
-    """池空 -> 回落现场生成(不能因为池子空就不出题)。"""
-    print("\n[6b] 池空时回落现场生成")
+    """池空 -> 现场生成。
+
+    ## ⚠️ G4-2 §四 改了**用什么**现场生成
+
+    原来这条断言的是"调 `gen_spec`(classic Blueprint 链)"。G4-2 起
+    默认走 **keyword2**, 所以:
+
+        默认          -> keyword2_live(不碰 pick_blueprint/gen_spec)
+        --no-keyword-seed -> 回 classic, **与 prefetch 同时**
+
+    这里断言的是**默认那一半**(G4-2 的核心决定), 以及"确实没走
+    classic"这条反证。classic 那一半由下面
+    `test_live_generation_classic_when_keyword_disabled` 守。
+    """
+    print("\n[6b] 池空时回落现场生成(G4-2: 默认走 keyword2)")
     from director import Director
     with tmpdir() as d:
-        # no_llm=False: 要真的走到 gen_spec 那条路(no_llm=True 会走假题,
+        # no_llm=False: 要真的走到现场生成那条路(no_llm=True 会走假题,
         # 那是另一条分支, 验不到"池空 -> 现场生成")。
         cfg = mkcfg(d, no_llm=False)
         dr = Director(cfg)
@@ -680,6 +697,20 @@ def test_director_falls_back_when_pool_empty():
                 called["n"] += 1
                 s = good_spec()
                 return s
+
+            # ---- G4-2: keyword2 链要的另外两个方法 ----
+            #
+            # ⚠️ 它们**必须存在**, 否则 `keyword_spec` 会 AttributeError,
+            # 被 `_riddle` 的 except 兜成 failure -> 引擎兜底 —— 那时
+            # "来源不是 keyword2_live" 这条断言会红, 但红的原因是夹具
+            # 不全而不是行为不对。这里给最小实现: Stage A 返回 None
+            # (= 没成题), 于是走 failure 分支, 但路径确实经过了 keyword2。
+            def gen_keyword_idea(self, *a, **k):
+                called["kw"] = called.get("kw", 0) + 1
+                return None
+
+            def structure_original_idea(self, *a, **k):
+                raise AssertionError("Stage A 没成题, Stage B 不该被调")
 
             def hint(self, *a, **k):
                 return ("h", None)
@@ -703,9 +734,56 @@ def test_director_falls_back_when_pool_empty():
                         "recent_signatures": []})
         finally:
             _D.threading.Thread = real_thread
-        check("确实调了 gen_spec", called["n"] == 1, called["n"])
+        check("**G4-2: 没走 classic gen_spec**", called["n"] == 0, called["n"])
+        # ⚠️ 次数不是 1: 现场生成失败后**引擎自己**会重试(默认 4 次),
+        # 每次重试都重新走一遍 keyword2。所以断言的是">=1"而不是"==1"
+        # —— 钉住"确实进了这条链", 不钉引擎的重试预算(那是另一条测试
+        # 的地盘, 写死在这里会让调预算时误伤)。
+        check("**确实进了 keyword2 链(Stage A 被调过)**",
+              called.get("kw", 0) >= 1, called.get("kw"))
+
+
+def test_live_generation_classic_when_keyword_disabled():
+    """`--no-keyword-seed` -> 现场生成回 classic, 与 prefetch **同时**。
+
+    §四 的死要求: "不能出现 prefetch=classic 而 live=keyword2, 或反过来"。
+    两边读的是**同一个** config flag(`pool_keyword_seed_enabled`), 所以
+    半切换在结构上不可能 —— 这条测试把这个结构事实钉住。
+    """
+    print("\n[G4-2] --no-keyword-seed -> live 也回 classic")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, pool_keyword_seed_enabled=False)
+        dr = Director(cfg)
+        called = {"n": 0}
+
+        class _Gen:
+            class client:
+                class cfg:
+                    model = "fake"
+
+            def gen_spec(self, *a, **k):
+                called["n"] += 1
+                return good_spec()
+
+            def gen_keyword_idea(self, *a, **k):
+                raise AssertionError("--no-keyword-seed 时不该走 keyword2")
+
+            def hint(self, *a, **k):
+                return ("h", None)
+
+        dr.writer = _Gen()
+        dr.engine.start()
+        _inline_riddle(dr)
+        check("**回 classic: gen_spec 被调**", called["n"] == 1, called["n"])
         check("来源是 live_generate",
-              dr.engine._spec_source == "live_generate", dr.engine._spec_source)
+              dr.engine._spec_source == "live_generate",
+              dr.engine._spec_source)
+        # ---- 两边同时: prefetch 也必须是 classic ----
+        if dr._prefetcher is not None:
+            check("**prefetch 也回 classic(没有半切换)**",
+                  dr._prefetcher._keyword_enabled() is False,
+                  dr._prefetcher._bag)
 
 
 def test_director_with_pool_disabled_never_touches_pool():
@@ -837,8 +915,23 @@ def test_prefer_curated_false_skips_curated_entirely():
 
 
 def test_curated_served_before_ai_pool():
-    """**H2-G 的核心**: curated 排在 AI 池前面。"""
-    print("\n[H2-G] **curated 优先于 AI 池**")
+    """**G4-2 反转**: generated 排前, curated 是补充题源。
+
+    H2-G 原本断言"curated 排在 AI 池前面"。G4-2 的产品决定推翻了它:
+
+        默认直播的唯一主生成体系是 keyword2。
+        curated 是补充题源, 不是默认主产品。
+
+    所以**即使显式 `--curated` 开了**, 取题顺序也是
+    `generated -> curated -> 现场生成` —— 否则一开 curated 就立刻被
+    外部题淹没, 默认口径与 opt-in 口径的差别会大到不像同一个产品。
+
+    这条测试同时守住"curated 仍然**能**被用到": 这里证 generated 优先,
+    `test_falls_to_ai_pool_when_curated_empty` 的反面(下面那条)证
+    curated 在 generated 空时确实还有机会 —— 否则"把 curated 整个删掉"
+    也能让这条通过。
+    """
+    print("\n[G4-2] **generated 优先于 curated**")
     from director import Director
     with tmpdir() as d:
         cfg = mkcfg(d, prefer_curated=True)
@@ -870,13 +963,14 @@ def test_curated_served_before_ai_pool():
         dr.writer = _NoGen()
         dr.engine.start()
         _inline_riddle(dr)
-        check("**来源是 curated(不是 pool)**",
-              dr.engine._spec_source == "curated", dr.engine._spec_source)
-        check("**curated 池被消费了**",
-              dr.curated_pool.pending_count() == 0,
+        check("**G4-2: 来源是 generated 池(不是 curated)**",
+              dr.engine._spec_source == "keyword2_pool",
+              dr.engine._spec_source)
+        check("**generated 池被消费了**",
+              dr.pool.pending_count() == 0, dr.pool.pending_count())
+        check("**curated 池原封不动**",
+              dr.curated_pool.pending_count() == 1,
               dr.curated_pool.pending_count())
-        check("**AI 池没被动**", dr.pool.pending_count() == 1,
-              dr.pool.pending_count())
 
 
 def test_falls_to_ai_pool_when_curated_empty():
@@ -897,7 +991,8 @@ def test_falls_to_ai_pool_when_curated_empty():
         dr.writer = _NoGen()
         dr.engine.start()
         _inline_riddle(dr)
-        check("来源是 pool", dr.engine._spec_source == "pool",
+        check("来源是 keyword2_pool",
+              dr.engine._spec_source == "keyword2_pool",
               dr.engine._spec_source)
 
 
@@ -932,11 +1027,18 @@ def test_live_generation_disabled_goes_to_fallback():
 
 
 def test_live_generation_enabled_still_generates():
-    """默认配置(allow_live_generation=True)下, 池空仍现场生成 —— 旧行为不变。"""
-    print("\n[H2-G] 默认仍可现场生成")
+    """默认配置(allow_live_generation=True)下, 池空仍现场生成。
+
+    ⚠️ **G4-2**: "现场生成"默认指的是 **keyword2**。要验"classic 那条
+    分支还在", 得显式 `--no-keyword-seed` —— 见下面
+    `test_live_generation_classic_when_keyword_disabled`。这条只验
+    "池空**不会**开天窗", 与走哪条链无关。
+    """
+    print("\n[H2-G / G4-2] 池空仍会现场生成")
     from director import Director
     with tmpdir() as d:
-        cfg = mkcfg(d, no_llm=False, prefer_curated=True)
+        cfg = mkcfg(d, no_llm=False, prefer_curated=True,
+                    pool_keyword_seed_enabled=False)
         dr = Director(cfg)
         called = {"n": 0}
 
@@ -1171,7 +1273,12 @@ def test_only_pool_source_writes_used_ledger():
     import json as _json
     from director import Director
     with tmpdir() as d:
-        cfg = mkcfg(d, no_llm=False)
+        # ⚠️ G4-2: 这条测的是"**非 pool** 来源不写 used 账本"。默认现场
+        # 生成已经换成 keyword2, 而这条夹具只实现了 classic 的 `gen_spec`
+        # —— 所以要显式关掉 keyword2, 让它真的走到 `_Gen.gen_spec`。
+        # 这不是迁就夹具: 本测试关心的性质(来源不是 pool 时不动账本)
+        # 与走哪条生成链无关, 钉住一条链就够了。
+        cfg = mkcfg(d, no_llm=False, pool_keyword_seed_enabled=False)
         cfg.puzzle_out_path = os.path.join(d, "arch.jsonl")
 
         class _Gen:
@@ -2620,6 +2727,7 @@ def main():
         # ---- Q8c: 接线 ----
         test_director_serves_from_pool_end_to_end,
         test_director_falls_back_when_pool_empty,
+        test_live_generation_classic_when_keyword_disabled,
         test_director_with_pool_disabled_never_touches_pool,
         # ---- Batch H2-F/G: curated 池 ----
         test_curated_pool_created_with_separate_paths,
