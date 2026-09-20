@@ -1,0 +1,400 @@
+[
+  {
+    "arm": "A",
+    "info": "",
+    "index": 1,
+    "tone": "",
+    "keywords": [
+      "爱",
+      "故障"
+    ],
+    "puzzle_len": 101,
+    "answer_len": 170,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 2,
+    "tone": "",
+    "keywords": [
+      "梦",
+      "画家"
+    ],
+    "puzzle_len": 80,
+    "answer_len": 130,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 3,
+    "tone": "",
+    "keywords": [
+      "改变",
+      "红衣服"
+    ],
+    "puzzle_len": 120,
+    "answer_len": 130,
+    "first_person": false,
+    "closing_q": true,
+    "flags": []
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 4,
+    "tone": "",
+    "keywords": [
+      "转弯",
+      "录像"
+    ],
+    "puzzle_len": 125,
+    "answer_len": 107,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 5,
+    "tone": "",
+    "keywords": [
+      "人鱼公主",
+      "住院"
+    ],
+    "puzzle_len": 96,
+    "answer_len": 152,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 6,
+    "tone": "",
+    "keywords": [
+      "长椅",
+      "怀孕"
+    ],
+    "puzzle_len": 88,
+    "answer_len": 114,
+    "first_person": false,
+    "closing_q": true,
+    "flags": []
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 7,
+    "tone": "",
+    "keywords": [
+      "铁杆",
+      "冰淇淋"
+    ],
+    "puzzle_len": 103,
+    "answer_len": 119,
+    "first_person": false,
+    "closing_q": true,
+    "flags": []
+  },
+  {
+    "arm": "A",
+    "info": "",
+    "index": 8,
+    "tone": "",
+    "keywords": [
+      "跟踪",
+      "双胞胎"
+    ],
+    "puzzle_len": 125,
+    "answer_len": 167,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 1,
+    "tone": "red",
+    "keywords": [
+      "凶案",
+      "湖泊"
+    ],
+    "puzzle_len": 108,
+    "answer_len": 275,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 2,
+    "tone": "black",
+    "keywords": [
+      "房间",
+      "传销"
+    ],
+    "puzzle_len": 54,
+    "answer_len": 174,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 3,
+    "tone": "red",
+    "keywords": [
+      "画中人",
+      "灵感"
+    ],
+    "puzzle_len": 67,
+    "answer_len": 191,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 4,
+    "tone": "black",
+    "keywords": [
+      "丈夫",
+      "年轻"
+    ],
+    "puzzle_len": 84,
+    "answer_len": 182,
+    "first_person": true,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "谜面第一人称 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 5,
+    "tone": "red",
+    "keywords": [
+      "眼睛",
+      "陌生"
+    ],
+    "puzzle_len": 130,
+    "answer_len": 198,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 6,
+    "tone": "black",
+    "keywords": [
+      "漂浮",
+      "精灵"
+    ],
+    "puzzle_len": 53,
+    "answer_len": 191,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 7,
+    "tone": "red",
+    "keywords": [
+      "婚礼",
+      "旅馆"
+    ],
+    "puzzle_len": 66,
+    "answer_len": 160,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "B",
+    "info": "",
+    "index": 8,
+    "tone": "black",
+    "keywords": [
+      "回响",
+      "气压"
+    ],
+    "puzzle_len": 68,
+    "answer_len": 161,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C1",
+    "index": 1,
+    "tone": "red",
+    "keywords": [
+      "邪术",
+      "邮局"
+    ],
+    "puzzle_len": 173,
+    "answer_len": 240,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C1",
+    "index": 2,
+    "tone": "black",
+    "keywords": [
+      "熟悉",
+      "冻死"
+    ],
+    "puzzle_len": 92,
+    "answer_len": 168,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C1",
+    "index": 3,
+    "tone": "red",
+    "keywords": [
+      "昏暗",
+      "妻子"
+    ],
+    "puzzle_len": 151,
+    "answer_len": 209,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C1",
+    "index": 4,
+    "tone": "black",
+    "keywords": [
+      "小学",
+      "苏联"
+    ],
+    "puzzle_len": 184,
+    "answer_len": 310,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "汤底 310 字 > 300 -> **fail**"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C2",
+    "index": 5,
+    "tone": "red",
+    "keywords": [],
+    "puzzle_len": 129,
+    "answer_len": 316,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "汤底 316 字 > 300 -> **fail**"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C2",
+    "index": 6,
+    "tone": "black",
+    "keywords": [],
+    "puzzle_len": 255,
+    "answer_len": 303,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "谜面 255 字 > 220 -> **fail**",
+      "汤底 303 字 > 300 -> **fail**"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C2",
+    "index": 7,
+    "tone": "red",
+    "keywords": [],
+    "puzzle_len": 399,
+    "answer_len": 302,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "谜面 399 字 > 220 -> **fail**",
+      "汤底 302 字 > 300 -> **fail**"
+    ]
+  },
+  {
+    "arm": "C",
+    "info": "C2",
+    "index": 8,
+    "tone": "black",
+    "keywords": [],
+    "puzzle_len": 288,
+    "answer_len": 281,
+    "first_person": false,
+    "closing_q": false,
+    "flags": [
+      "谜面结尾不是问句 -> can_fix(实为硬改)",
+      "谜面 288 字 > 220 -> **fail**"
+    ]
+  }
+]
