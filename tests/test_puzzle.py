@@ -2257,17 +2257,23 @@ def test_g3_riddle_version_bumped_but_policy_unchanged():
     这一条特别重要: 若把 policy 一起 bump, 盘上所有 v8 库存会被池门
     隔离 —— 等于凭空清空题池。而 G3 改变的是"如何更少产出必死 draft",
     最终接受标准没变。
+
+    ⚠️ **G4-RB R1: 这条 G3 的判断在本轮被推翻了, 但测试保留下来当
+    对照。** R1 确实是"接受标准变了"(自由生成链的门 9 -> 7、
+    `discovery_beats` 下限 2 -> 1), 所以那一轮 policy **必须** bump 到
+    v9 —— 代价就是这里说的"盘上 v8 库存被池门隔离"。
+    两者不矛盾: 判据是"**接受标准有没有变**", 不是"哪一轮做的"。
     """
-    print("\n[G3-H] 版本: riddle-v9 / policy 仍 v8")
+    print("\n[G3-H] 版本: riddle-v9 / policy v9(R1 已 bump)")
     from story.llm import (RIDDLE_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            ANSWER_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
     check("RIDDLE_PROMPT_VERSION = riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("**QUALITY_POLICY_VERSION 仍是 quality-v8**",
-          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
-    check("CHECK_PROMPT_VERSION 不动",
-          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
+    check("**QUALITY_POLICY_VERSION 已是 quality-v9**",
+          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("CHECK_PROMPT_VERSION 跟着到 check-v9",
+          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION 不动",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
 

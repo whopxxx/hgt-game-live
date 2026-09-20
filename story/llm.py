@@ -1217,16 +1217,31 @@ class AnthropicMessagesClient:
 #: 这一步改变了 Generator **收到的动态约束**(饱和方向的硬约束段)。
 #: 所以 prompt 版本必须动, 否则复盘时分不清一稿成功率的变化是哪来的。
 #:
-#: ⚠️ `QUALITY_POLICY_VERSION` **保持 quality-v8**, `CHECK_PROMPT_VERSION`
-#: 也不动, `spec_version` 不动:
+#: ⚠️ `QUALITY_POLICY_VERSION` 的**当前值**与 `CHECK_PROMPT_VERSION` 是
+#: **两件事**, 不要写成"一起 bump"(见下面两条各自的段落):
 #:
-#:     最终接受标准没有改变。改的只是"如何更少地产出**必死**的 draft"。
+#:     QUALITY_POLICY_VERSION   "什么算合格"(acceptance)
+#:     CHECK_PROMPT_VERSION     "审稿人被要求做什么"(instructions)
 #:
-#: 因此**现有 quality-v8 池不 quarantine** —— 那些题仍然是合格的,
-#: 只是它们是被旧 prompt 生成出来的。若把 policy 版本一起 bump, 盘上
-#: 的 v8 库存会全部被池门隔离, 等于凭空清空题池。
+#: 它们可以独立变化: 一次只改审稿指令而不改接受标准也是合法的组合。
+#: 当前两者都在 G4-RB R1 动过 —— 但那是**两次独立的判断**, 不是捆绑。
 RIDDLE_PROMPT_VERSION = "riddle-v9"
-CHECK_PROMPT_VERSION = "check-v8"
+#: ---- G4-RB R1: check-v8 -> check-v9 ----
+#:
+#: `CHECK_SYSTEM` 的**可修清单**实质变了, 所以版本必须动:
+#:
+#:   - 删掉"第一人称叙事 -> 改成第三人称"与"只叙述、结尾没有问句 ->
+#:     末尾补一个问句" —— 这两条已不再是毛病(见 `validate_spec`,
+#:     它们不再是 fixable), 留着会让审稿人**主动**去做我们刚禁止的事;
+#:   - 新增"谜面混进了【谜底】/【提示】之类的元文本 -> 删掉它们"
+#:     —— 这是现在**唯一**需要动谜面的 fixable 规则;
+#:   - 明写"⚠ 第一人称与'结尾没有问句'都**不是**毛病, 不要改";
+#:   - 两处 `2~4 个 discovery_beats` -> `1~4`(单核题合法)。
+#:
+#: ⚠️ 与 `RIDDLE_PROMPT_VERSION` **保持分开**: 那是"怎么生成",
+#: 这是"怎么审"。两者改动的原因不同, 合并没有任何好处, 只会让复盘时分不清
+#: 一次通过率变化是生成侧还是审稿侧造成的。
+CHECK_PROMPT_VERSION = "check-v9"
 #: ---- G2-F: 审稿技术失败重试时的 max_tokens ----
 #:
 #: 实播里审稿的输出触顶 3500 导致工具调用没写完。成因就是预算不够 ——
@@ -1824,11 +1839,15 @@ _CURATED_HARD_CHECK_FIELDS = (
 #: `reasoning_beats_nonredundant=true` —— 若它还是硬门, 那种题就被
 #: 全灭, 与 §三/§十六 直接冲突。
 #:
-#: ⚠️ **G4-RB §五: 上面的"双标"已经取消。** 红黑实验(24 道真实样本)
-#: 证明同一条推理对自由生成链**同样成立** —— 于是自由生成链也把这四项
-#: 降为信号(见 `FREE_GEN_HARD_CHECKS` / `FREE_GEN_SIGNAL_CHECKS`)。
-#: 两条链在这一点上现在一致。这段历史保留下来是因为它记录了"为什么
-#: 该降级"的完整推理 —— 它先被 curated 验证, 再推广到自由生成。
+#: ⚠️ **G4-RB §五: 上面的"双标"收窄了。**
+#:
+#: 原先自由生成链把"好不好玩"四项一起降为信号。**R1 收口时按证据把范围
+#: 收回两项** —— 见 `FREE_GEN_SIGNAL_CHECKS` 那段对证据分级的说明。
+#: 现在两条链只在 `dramatic_payoff` / `reasoning_beats_nonredundant`
+#: 这两项上仍然"双标"(curated: 信号; 自由生成: 前者是门、后者是信号)。
+#:
+#: 这段历史保留下来是因为它记录了"为什么该降级"的完整推理 ——
+#: 它先被 curated 验证, 再**部分**推广到自由生成。
 _CURATED_SIGNAL_FIELDS = (
     "dramatic_payoff", "reasoning_beats_nonredundant",
     "story_reconstruction", "multi_step_deduction", "single_trick",
@@ -1862,46 +1881,69 @@ _CURATED_SIGNAL_FIELDS = (
 #: 一致。后两项的语义是错的 —— 详见 `_CURATED_HARD_CHECK_FIELDS`。
 #: 现在 curated 用**与编译侧同名**的六条, 没有映射表可画错。
 #:
-#: ⚠️ **G4-RB §五: 自由生成链的门从九项收窄到五项。**
+#: ⚠️ **G4-RB §五 / R1: 自由生成链的门从九项收窄到七项。**
 #:
-#: 红黑实验(24 道真实样本)确认: `concrete_anomaly` /
-#: `clue_recontextualized` / `dramatic_payoff` /
-#: `reasoning_beats_nonredundant` 这四项问的是"**够不够精彩**",
-#: 而一道单核强反转的经典汤(53~84 字的那些)结构上不可能全 true ——
-#: 把它们当硬门等于**全灭**这个形状。
+#: ## 证据分级(决定哪些降、哪些不降)
 #:
-#: 这不是新政策: curated 链在 H4-D1 已经对**同样四项**做过同样的推理
-#: 并降为信号(见上面 `_CURATED_SIGNAL_FIELDS` 那段), 只是当时只放开了
-#: curated。现在把**同一套推理**用到自由生成链 —— 两条链在这一点上
-#: 终于一致, 不再"双标"。
+#: 这一版的依据是 **PR #5**(`data/soup_constraint_experiment/`)。
+#: 那份实验的证据强弱**不是齐平的**, 必须分开对待:
 #:
-#: 留下的是**正确性 + 安全**五项, 一项都没放宽:
+#:   强证据(production trace 直接观察到):
+#:     `clue_recontextualized` —— S10 其余核心项**全 true**, 仅它 false
+#:       就导致 reject, 而该稿 RAW 盲评为"想玩"。足以支持降级。
+#:     `reasoning_beats_nonredundant` —— DB2 里单核题被 2~4 的低限
+#:       逼着拆成伪层次。足以支持降级(与 `discovery_beats` 放开单层同源)。
+#:
+#:   无证据 / 反向证据(因此**不降**):
+#:     `concrete_anomaly` —— 报告明确要求最低公平性保留
+#:       "**真实异常锚点** + QA 可达路径", 而它就是那个锚点; 也是直播
+#:       第一眼提问欲的基础。降它等于把报告要留的东西删掉。
+#:     `dramatic_payoff` —— 10 条真实 trace 里 **0 次** false,
+#:       实验没有提供任何降级依据。产品当前最大的问题恰恰是
+#:       "解释得通但揭晓没劲", 先继续当门。
+#:       它的降级应标成**待验证假设**, 不与 S10 的证据同级。
+#:
+#: ⚠️ 早先这里写的是"红黑实验(24 道真实样本)"并要求四项一起降。
+#: 那批实验没有可审计的 report/raw outputs, 且 PR #5 只支持其中两项 ——
+#: 所以措辞换成了上面这份可追溯的分级。
+#:
+#: 于是留下的是 **正确性 + 安全 + 两个锚点/兑现** 七项, 一项都没放宽
+#: 它们**本来**的意思:
 #:
 #:     narrator_truthful          谜底有没有推翻谜面的无归属事实
 #:     mechanism_consistent       物理/时间/方向/数量/因果成不成立
 #:     core_answer_direct         core_answer 有没有正面回答谜面
 #:     completion_contract_minimal 通关合同是不是最小语义拆分
+#:     concrete_anomaly           谜面有没有一个具体可感知的异常锚点
+#:     dramatic_payoff            揭晓有没有真的兑现开头那个异常
 #:     livestream_safe            能不能在直播间直接念出来
 #:
-#: 降级的那四项**仍然要 Reviewer 返回**(schema 里照旧), 只是 false
-#: 不再拒稿 —— 进 `_last_review_checks` / metrics, 供复盘看分布。
-#: 判据与 `check_value_ok(n, v)` 一起用: 两项都是"true = 好", 没有反向项。
+#: 降级的那两项**仍然要 Reviewer 返回**(schema 里照旧), 只是 false
+#: 不再拒稿 —— 进 `spec.metrics["quality_checks"]` / archive, 供复盘看
+#: 分布(见 `structure_original_idea` 成功路径上那一段搬运)。
+#: 判据与 `check_value_ok(n, v)` 一起用: 七项都是"true = 好", 没有反向项。
 FREE_GEN_HARD_CHECKS = (
     "narrator_truthful", "mechanism_consistent",
     "core_answer_direct", "completion_contract_minimal",
+    "concrete_anomaly",
+    "dramatic_payoff",
     "livestream_safe",
 )
 
-#: 自由生成链里**降为信号**的四项(仍然返回, 不再拒稿)。
+#: 自由生成链里**降为信号**的两项(仍然返回, 不再拒稿)。
 #:
-#: ⚠️ 与上面那五项**必须不相交** —— 两边都列会让"这道题为什么被拒"
+#: ⚠️ 与上面那七项**必须不相交** —— 两边都列会让"这道题为什么被拒"
 #: 变得无法回答(与 `_CURATED_SIGNAL_FIELDS` 的纪律同一条)。
+#:
+#: 为什么只有两项而不是四项: 见 `FREE_GEN_HARD_CHECKS` 上面的证据分级。
+#: `concrete_anomaly` 与 `dramatic_payoff` **留在门里** —— 前者是 PR #5
+#: 要保留的异常锚点, 后者没有降级的实证依据。
+#:
 #: `reasoning_beats_nonredundant` 的降级还附带一个重要效果:
 #: 它不再与 `discovery_beats` 的条数联动 (§六 允许单层题之后,
 #: "只有 1 个 beat" 不该同时引发两个门)。
 FREE_GEN_SIGNAL_CHECKS = (
-    "concrete_anomaly", "clue_recontextualized",
-    "dramatic_payoff", "reasoning_beats_nonredundant",
+    "clue_recontextualized", "reasoning_beats_nonredundant",
 )
 
 
@@ -1918,8 +1960,11 @@ def _quality_check_contract(spec: Any) -> tuple:
     原先这里写的是 `_QUALITY_CHECK_FIELDS[:9]`, 靠"第 9 项正好是
     `livestream_safe`"这个**位置**成立。那个写法很脆: 往
     `_QUALITY_CHECK_FIELDS` 里插一项就会静默取错(注释里也警告过)。
-    现在直接用 `FREE_GEN_HARD_CHECKS` 具名元组 —— 门是哪五项**写在
+    现在直接用 `FREE_GEN_HARD_CHECKS` 具名元组 —— 门是哪几项**写在
     名字里**, 不依赖任何下标。
+
+    ⚠️ R1 收口后它是**七项**(见 `FREE_GEN_HARD_CHECKS`), 但仍然
+    **不要**回到"数长度"的断言: 那就是 H4-D 第一版漏掉假映射的原因。
 
     `_QUALITY_CHECK_FIELDS` 仍然是**契约总表**(schema 的 required 用它,
     十五项都要 Reviewer 填)。改变的是"哪几项能拒稿", 不是"要填几项"。
@@ -2423,16 +2468,38 @@ def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
 #: 所以这里**只有创作顺序**, 没有任何 `check_core_truth()` /
 #: `check_clue_legitimacy()` 之类的审核。
 #:
-#: ## 为什么 `QUALITY_POLICY_VERSION` **不**跟着 bump
+#: ## 为什么 v4 时 `QUALITY_POLICY_VERSION` **不**跟着 bump
 #:
-#: 接受标准一个字都没改 —— 同一套 Reviewer / truth audit / validate_spec
-#: / 跨题门。改的只是**候选怎么产生**。bump policy 会把盘上现有库存全部
-#: 隔离掉, 而那批库存的隔离与"生成风格变了"无关。
+#: ⚠️ **这段理由在 G4-RB R1 已经不成立, 保留是为了对照。**
 #:
-#: ⚠️ 旧 `keyword2-v3` 库存因此**不会自动消失**(`PuzzlePool._validate_pool_spec`
-#: 不检查 keyword prompt version)。上线用**一次性 pool rotation** 处理,
-#: 不是新造 pool gate, 也不是 bump quality policy。
-KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v4"
+#: v4 时接受标准一个字都没改 —— 同一套 Reviewer / truth audit /
+#: validate_spec / 跨题门。改的只是**候选怎么产生**。bump policy 会把
+#: 盘上现有库存全部隔离掉, 而那批库存的隔离与"生成风格变了"无关。
+#:
+#: R1 收口时这两件事**同时**变了: 生成 prompt 变了(本条), **接受标准
+#: 也变了**(自由生成链的门 9 -> 7、`discovery_beats` 下限 2 -> 1)。
+#: 所以那一轮 policy **必须** bump —— 见 `story/quality.py` 的 v9 段落。
+#:
+#: ⚠️ 旧 `keyword2-v3` 库存不会自动消失(`PuzzlePool._validate_pool_spec`
+#: 不检查 keyword prompt version)。它由 quality policy 那扇门间接隔离:
+#: v3 题属于 quality-v8, 而当前政策是 v9。
+#:
+#: ## v4 -> v5(G4-RB R1): 删掉两条会**改变创作分布**的旧指令
+#:
+#: 实质变化有两处, 所以版本必须动 —— `structure_original_idea` 会把它
+#: 写进 `spec.prompt_version` 并归档, 不 bump 的话旧 v4 / 新 v4 无法区分:
+#:
+#:   1. `_keywords_prompt` 删掉了 v3 遗留的"直接给出谜面与谜底"。
+#:      那句与 v4 的六字段 schema **直接矛盾**(一边要求先想清真相, 一边
+#:      要求直接交答案), 是 prompt 层的一处自相矛盾。
+#:   2. `KEYWORD_IDEA_SYSTEM` 第 3 步删掉了"如果有一条关键步骤在谜面里
+#:      完全没有痕迹, 回到第 2 步补一条线索"。它在**创作 prompt** 里
+#:      复制了 `fair_clues` 那条"证据必须写进谜面"的逻辑 —— 同一个错误
+#:      的第三个副本, 会第二次把证据逼进谜面。
+#:
+#: ⚠️ 与 v3 -> v4 一样: 这两处改的只是**候选怎么想出来**, 没有新增任何
+#: 审核器, 也没有新增 keyword checker(任务书明确"不要要求字面命中")。
+KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v5"
 
 KEYWORD_IDEA_SYSTEM = """你是一个擅长设计中文海龟汤的悬疑谜题作者。
 
@@ -4797,6 +4864,17 @@ class PuzzleWriter:
                      attempts, _t.monotonic() - t0, spec.puzzle[:40])
             m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
             m["ok"] = True
+            # ---- R1: 把 Reviewer 的 quality_checks 搬进 metrics ----
+            #
+            # 与 `structure_original_idea` 成功路径上那一段**同一个理由、
+            # 同一套约定**: 降为 signal 的两项不再拒稿, 若不留痕,
+            # "这一场有多少道题在这两项上不理想"就永远没人能回答。
+            # 两条链都产 generated spec, 行为必须一致 —— 只有一条搬的话,
+            # 复盘时看到的是"半张表", 比没有更容易误判。
+            #
+            # ⚠️ 同样**原样整份 dict**、同样**缺省不写键**(见那边的说明)。
+            if isinstance(self._last_review_checks, dict):
+                m["quality_checks"] = dict(self._last_review_checks)
             spec.metrics = dict(m)
             # ---- G4-E: 现场一行, 只此一行 ----
             # 直播时人就在看滚屏, 想知道"这题花了几稿 / 省下几次重造"。
@@ -5262,6 +5340,32 @@ class PuzzleWriter:
                 return _bail("和已出过的题太像: " + dup[:30])
         m["ok"] = True
         m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+        # ---- R1: 把 Reviewer 的 quality_checks 搬进 metrics ----
+        #
+        # ## 为什么必须搬
+        #
+        # 降为 signal 的那两项(`clue_recontextualized` /
+        # `reasoning_beats_nonredundant`)**不再拒稿**, 于是"这道题在这两项
+        # 上表现如何"就只剩一个去处: 复盘时能看到分布。但在这之前它只停在
+        # `self._last_review_checks` —— 一个**实例侧信道**, 谁都不会把它
+        # 写进 archive。于是"降成 signal 供复盘"这句承诺是空的:
+        # 下一场直播结束, 没人能回答"这一场有多少道题的揭晓没重新定性"。
+        #
+        # `_round_metrics()` 只搬 `spec.metrics` 里的具名键, 不会搬整个
+        # metrics; 所以这一行是那条链的第一环, 缺了它后面两环都拿不到值。
+        #
+        # ⚠️ **原样存整份 dict**(十五项全要), 不裁剪成"只存两个 signal":
+        #    * 复盘时要看的是**联合分布** —— "揭晓没劲的题是不是也常常
+        #      重新定性失败"这种问题需要七项门 + 两项 signal 一起看;
+        #    * 只挑两项存, 等于把"schema 要求 Reviewer 全填"这件事在
+        #      落盘时又丢掉一半, 下一轮想加一项观察就得再改一次链。
+        #
+        # ⚠️ 缺省**不写**这个键(而不是写 `{}`): 让"这道题没跑过审稿"
+        # 与"审稿回了一份空的 quality_checks"在 archive 里可区分。
+        # `_round_metrics` 那边才做 `or {}` 的兜底 —— 那里下游要的是
+        # "取得到值", 这里上游要的是"如实记录有没有"。
+        if isinstance(self._last_review_checks, dict):
+            m["quality_checks"] = dict(self._last_review_checks)
         spec.metrics = dict(m)
         log.info("keyword2 成题(用时 %.1fs): %s",
                  _t.monotonic() - t0, spec.puzzle[:40])

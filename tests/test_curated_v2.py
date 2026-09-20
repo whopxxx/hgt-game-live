@@ -359,25 +359,50 @@ def test_reviewer_contract_matches_compiler_policy():
         check(f"**真实性硬门 {good} 仍在**", good in curated_fields)
     # ⑤ 自由生成链**没被顺手改**(§九: 只改 curated)
     #
-    # ⚠️ **G4-E 加了第 9 项**: `livestream_safe`。原断言是 `len == 8`,
-    # 现在必须是 9 —— 而且**多出来的必须是它**, 不能是题型字段(那才是
-    # H4-D 警告过的"从后门装回去")。
+    # ⚠️ **G4-E 加了 `livestream_safe`; R1 又把 `concrete_anomaly` 与
+    # `dramatic_payoff` 放回门里** —— 所以这里不再断言"第 N 项是什么"。
+    #
+    # 早先写的是 `len(free_fields) == 9` + `free_fields[-1] ==
+    # "livestream_safe"`, 靠**位置**成立。那正是 H4-D 第一版栽过的坑
+    # (见上面 326-334 行那段): 用项数/位置断言, 完全错误的字段映射也能
+    # 绿。所以这里改成**逐字段断言** —— 名字对不对, 而不是数对不对。
     free_fields = _llm._quality_check_contract(
         type("S", (), {"source_type": ""})())
-    check("**自由生成链是 9 项**(G4-E 加了 livestream_safe)",
-          len(free_fields) == 9, free_fields)
-    check("**第 9 项就是 livestream_safe**",
-          free_fields[-1] == "livestream_safe", free_fields[-1])
+    check("**自由生成链的门与 FREE_GEN_HARD_CHECKS 逐字同序**",
+          tuple(free_fields) == tuple(_llm.FREE_GEN_HARD_CHECKS),
+          (tuple(free_fields), tuple(_llm.FREE_GEN_HARD_CHECKS)))
+    check("**自由生成链是 7 项**(R1: 加回 concrete_anomaly/dramatic_payoff)",
+          len(free_fields) == 7, free_fields)
     check("**livestream_safe 也在 curated 门里**(两边都查 safety)",
           "livestream_safe" in curated_fields)
     check("自由生成链**不含**题型字段",
           not (set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)),
           sorted(set(CC.CURATED_SOFT_SIGNALS) & set(free_fields)))
-    # ⑤b **双标是刻意的**: `dramatic_payoff` 对自由生成是门, 对 curated 是信号
-    check("**dramatic_payoff 对 AI 原创仍是硬门**",
-          "dramatic_payoff" in free_fields)
-    check("**reasoning_beats_nonredundant 对 AI 原创仍是硬门**",
-          "reasoning_beats_nonredundant" in free_fields)
+    # ⑤b **门 / signal 的划分是 R1 按证据定的**, 逐条钉住:
+    #
+    #   * `concrete_anomaly` 是 PR #5 明确要保留的"真实异常锚点" -> **门**
+    #   * `dramatic_payoff` 在 10 条真实 trace 里 0 次 false, 无降级依据
+    #     -> **门**(它的降级只是待验证假设)
+    #   * `clue_recontextualized` 有 S10 的干净反例 -> **signal**
+    #   * `reasoning_beats_nonredundant` 有 DB2 的伪层次证据 -> **signal**
+    for keep in ("concrete_anomaly", "dramatic_payoff"):
+        check(f"**{keep} 对 AI 原创仍是硬门**", keep in free_fields)
+    for soft in ("clue_recontextualized", "reasoning_beats_nonredundant"):
+        check(f"**{soft} 已降为 signal(不在门里)**",
+              soft not in free_fields, free_fields)
+        check(f"**{soft} 在 FREE_GEN_SIGNAL_CHECKS 里**",
+              soft in _llm.FREE_GEN_SIGNAL_CHECKS)
+    # 门与信号**必须不相交** —— 两边都列会让"为什么被拒"无法回答。
+    check("**FREE_GEN 门与 signal 不相交**",
+          not (set(_llm.FREE_GEN_HARD_CHECKS)
+               & set(_llm.FREE_GEN_SIGNAL_CHECKS)),
+          sorted(set(_llm.FREE_GEN_HARD_CHECKS)
+                 & set(_llm.FREE_GEN_SIGNAL_CHECKS)))
+    check("**FREE_GEN 门+signal 恰好覆盖 9 项**(7+2)",
+          len(_llm.FREE_GEN_HARD_CHECKS) + len(_llm.FREE_GEN_SIGNAL_CHECKS)
+          == 9,
+          (len(_llm.FREE_GEN_HARD_CHECKS),
+           len(_llm.FREE_GEN_SIGNAL_CHECKS)))
 
 
 def test_soft_signals_never_reject():

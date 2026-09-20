@@ -1459,8 +1459,8 @@ def test_v4_prompt_versions_bumped():
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
     check("RIDDLE_PROMPT_VERSION == riddle-v7",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v7",
-          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v9",
+          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1623,8 +1623,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v8",
-          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v9",
+          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -2005,29 +2005,38 @@ def test_g4rb_single_beat_is_legal():
     check("0 条 -> 仍拒", not rz.ok, rz.why()[:120])
 
 
-def test_g4rb_fun_four_are_soft_signals():
-    """G4-RB §五: "好不好玩"四项 false **不再拒稿**。
+def test_g4rb_signal_checks_are_soft_but_anchors_stay_hard():
+    """R1 收口: 两个 signal false **不再拒稿**; 两个锚点 false **仍然拒**。
 
-    自由生成链的硬门收窄到五项(正确性 + 安全); 四项质量信号仍然要
-    Reviewer 返回, 但 false 只进 metrics。
+    门是 7 项(`FREE_GEN_HARD_CHECKS`), 降为 signal 的只有两项:
+    `clue_recontextualized` / `reasoning_beats_nonredundant`。
+
+    ⚠️ 早先这条叫 `test_g4rb_fun_four_are_soft_signals`, 断言的是
+    "四项全 false 也通过、门恰好五项"。**R1 按 PR #5 的证据把范围收窄了**:
+    `concrete_anomaly`(真实异常锚点)与 `dramatic_payoff`(揭晓兑现)
+    回到门里 —— 前者的降级等于删掉报告要保留的东西, 后者在 10 条真实
+    trace 里 0 次 false, 没有任何降级依据。所以这条测试也跟着改。
     """
     from story.llm import (FREE_GEN_HARD_CHECKS, FREE_GEN_SIGNAL_CHECKS,
                            _quality_check_contract)
-    check("硬门恰好五项",
+    check("硬门恰好七项",
           set(FREE_GEN_HARD_CHECKS) == {
               "narrator_truthful", "mechanism_consistent",
               "core_answer_direct", "completion_contract_minimal",
+              "concrete_anomaly", "dramatic_payoff",
               "livestream_safe"}, FREE_GEN_HARD_CHECKS)
-    check("信号恰好四项",
+    check("信号恰好两项",
           set(FREE_GEN_SIGNAL_CHECKS) == {
-              "concrete_anomaly", "clue_recontextualized",
-              "dramatic_payoff", "reasoning_beats_nonredundant"},
+              "clue_recontextualized", "reasoning_beats_nonredundant"},
           FREE_GEN_SIGNAL_CHECKS)
     check("**门与信号不相交**",
           not (set(FREE_GEN_HARD_CHECKS) & set(FREE_GEN_SIGNAL_CHECKS)),
           (FREE_GEN_HARD_CHECKS, FREE_GEN_SIGNAL_CHECKS))
+    check("**两个 signal 都不在门里**",
+          not (set(FREE_GEN_SIGNAL_CHECKS) & set(FREE_GEN_HARD_CHECKS)),
+          FREE_GEN_HARD_CHECKS)
 
-    # 端到端: 四项全 false + 五项全 true -> 采用(不再因为"不好玩"被拒)
+    # 端到端: 两个 signal 全 false + 七项门全 true -> 采用
     from story.llm import _spec_from_tool
     spec = _spec_from_tool(riddle(), blueprint=bp_for())
     qc = dict(qc_ok())
@@ -2037,11 +2046,12 @@ def test_g4rb_fun_four_are_soft_signals():
         spec.puzzle, quality_checks=qc))])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     reviewed, why, rewrite, technical = w._review_spec(spec, bp_for())
-    check("**四项质量信号全 false 仍然通过**", reviewed is not None, why)
+    check("**两个质量信号全 false 仍然通过**", reviewed is not None, why)
     check("不是 rewrite(是语义通过)", not rewrite, rewrite)
 
-    # 反向: 五项硬门里任一项 false -> **仍然拒**
-    for k in ("livestream_safe", "narrator_truthful"):
+    # 反向: 七项硬门里任一项 false -> **仍然拒**
+    for k in ("livestream_safe", "narrator_truthful",
+              "concrete_anomaly", "dramatic_payoff"):
         bad = dict(qc_ok())
         bad[k] = False
         fc2 = FakeClient([LLMResult(tool_input=review_ok(
@@ -3160,7 +3170,7 @@ def test_truth5_v6_pool_quarantined_but_v7_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v8", QUALITY_POLICY_VERSION == "quality-v8",
+    check("当前政策是 v9", QUALITY_POLICY_VERSION == "quality-v9",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q1pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -3239,18 +3249,25 @@ def test_q2_discovery_beats_schema_and_prompts():
           "reasoning_beats_nonredundant" in CHECK_SYSTEM)
 
 
-def test_q2_v7_pool_quarantined_but_v8_eligible():
-    """**Q2-K**: 旧 quality-v7 库存被隔离; v8 正常 eligible。
+def test_q2_v8_pool_quarantined_but_v9_eligible():
+    """**Q2-K / R1**: 旧 quality-v8 库存被隔离; v9 正常 eligible。
 
-    实播冒烟的日志里能看到这一条真的在生产路径上生效:
+    实播冒烟的日志里能看到这一条真的在生产路径上生效(当时的数字是 v7/v8,
+    本条把当前版本换成 R1 之后的 v8/v9 —— **隔离机制一个字没改**,
+    变的只是"哪个版本算当前"):
 
         题池 8 道候选全部被挡(回落现场生成): …
-        quality policy 不兼容(spec='quality-v7', current='quality-v8')
+        quality policy 不兼容(spec='quality-v8', current='quality-v9')
 
     隔离靠 `_validate_pool_spec` 既有那一扇门自动生效 —— **不迁移 /
     不伪装 / 不删旧行**。
+
+    ⚠️ **R1 的 v9 bump 是有意的**, 不是事故: 自由生成链的门从 9 项收到
+    7 项、`discovery_beats` 下限 2 -> 1, 接受标准真的变了。旧 v8 题是在
+    9-hard 标准下被接受的, 与新题不可比较, 所以必须隔离(见
+    `story/quality.QUALITY_POLICY_VERSION` 的 v9 段)。
     """
-    print("\n[Q2-K] v7 quarantine / v8 eligible")
+    print("\n[Q2-K] v8 quarantine / v9 eligible")
     import os
     import json
     import tempfile
@@ -3264,38 +3281,38 @@ def test_q2_v7_pool_quarantined_but_v8_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v8", QUALITY_POLICY_VERSION == "quality-v8",
+    check("当前政策是 v9", QUALITY_POLICY_VERSION == "quality-v9",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q2pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
                  pool_path=os.path.join(d, "p.jsonl"),
                  pool_used_path=os.path.join(d, "u.jsonl"))
-    # 盘上放一条 v7 —— 它**必须**留在盘上但被一致地挡住。
+    # 盘上放一条 v8 —— 它**必须**留在盘上但被一致地挡住。
     old = _pool_good_spec()
-    old.quality_policy_version = "quality-v7"
+    old.quality_policy_version = "quality-v8"
     with open(cfg.pool_path, "w", encoding="utf-8") as f:
         f.write(json.dumps({"pool_version": 1, "pool_key": spec_key(old),
                             "added_at": 0.0, "added_by": "legacy",
                             "spec": old.to_archive()},
                            ensure_ascii=False) + "\n")
     pool = PuzzlePool.open(cfg)
-    check("**v7: stock_count 不算它**", pool.stock_count() == 0,
+    check("**v8: stock_count 不算它**", pool.stock_count() == 0,
           pool.stock_count())
-    check("**v7: pop_next 不返回**",
+    check("**v8: pop_next 不返回**",
           pool.pop_next(recent_signatures=[]) is None)
-    check("**v7: playable_count 也不算**", pool.playable_count([]) == 0,
+    check("**v8: playable_count 也不算**", pool.playable_count([]) == 0,
           pool.playable_count([]))
     check("**旧行仍在盘上(没删)**",
           sum(1 for _ in open(cfg.pool_path, encoding="utf-8")) == 1)
-    # v8 新题正常 eligible(换谜面, 免得撞内容哈希去重)
+    # v9 新题正常 eligible(换谜面, 免得撞内容哈希去重)
     new = _pool_good_spec(
         puzzle="钟楼的守夜人每晚敲钟, 但只在涨潮的那几个小时敲。为什么?",
         fair_clues=[_mod.FairClue(quote="只在涨潮的那几个小时敲",
                                   supports_atoms=["a1"]),
                     _mod.FairClue(quote="每晚敲钟", supports_atoms=["a2"])])
-    check("**v8: 正常 eligible**", pool.add(new) is True)
-    check("v8 入池后 stock=1", pool.stock_count() == 1, pool.stock_count())
-    check("v8 能 pop 出来", pool.pop_next(recent_signatures=[]) is not None)
+    check("**v9: 正常 eligible**", pool.add(new) is True)
+    check("v9 入池后 stock=1", pool.stock_count() == 1, pool.stock_count())
+    check("v9 能 pop 出来", pool.pop_next(recent_signatures=[]) is not None)
 
 
 def test_q2_reviewer_all_four_new_fields_required():
@@ -3391,12 +3408,12 @@ def test_q2_versions_bumped():
                            ANSWER_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
     from story.puzzle import PuzzleSpec
-    check("QUALITY_POLICY_VERSION = quality-v8",
-          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
-    check("RIDDLE_PROMPT_VERSION = riddle-v8",
+    check("QUALITY_POLICY_VERSION = quality-v9",
+          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("RIDDLE_PROMPT_VERSION = riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION = check-v8",
-          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v9",
+          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
     # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
     check("ANSWER_PROMPT_VERSION 仍是 C0 升的 answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
@@ -3952,8 +3969,8 @@ def test_g2_keyword_provenance_and_generated():
     spec = w.structure_original_idea(title=idea["title"],
                                      puzzle=idea["puzzle"],
                                      answer=idea["answer"])
-    check("**prompt_version == keyword2-v4(G4-CF Case-first)**",
-          spec.prompt_version == "keyword2-v4", spec.prompt_version)
+    check("**prompt_version == keyword2-v5(R1: 旧 prompt 已改)**",
+          spec.prompt_version == "keyword2-v5", spec.prompt_version)
     check("**与 classic 的 riddle-v9 不同**",
           spec.prompt_version != RIDDLE_PROMPT_VERSION, spec.prompt_version)
     check("metrics 有 generation_mode=keyword2",
@@ -5317,7 +5334,7 @@ def main():
               test_g4rb_puzzle_shape_is_not_fixable,
               test_g4rb_unfixed_shape_is_no_longer_rejected,
               test_g4rb_single_beat_is_legal,
-              test_g4rb_fun_four_are_soft_signals,
+              test_g4rb_signal_checks_are_soft_but_anchors_stay_hard,
               test_writer_reads_temperature_from_runtime_cfg,
               test_client_cfg_is_not_used_for_temperature,
               test_quotas_read_from_runtime_cfg,
@@ -5451,7 +5468,7 @@ def main():
               test_g4_fix_reasons_never_guesses,
               test_u3e_archive_reveal_keeps_composed_compat,
               test_q2_discovery_beats_schema_and_prompts,
-              test_q2_v7_pool_quarantined_but_v8_eligible,
+              test_q2_v8_pool_quarantined_but_v9_eligible,
               test_q2_reviewer_all_four_new_fields_required,
               test_q2_beats_never_reach_frontend,
               test_q2_beats_have_no_victory_power,

@@ -1263,6 +1263,31 @@ class Director:
                 str(gen.get("keyword_corpus_version") or ""),
             "keyword_session_seed": gen.get("keyword_session_seed", ""),
         })
+        # ---- R1: Reviewer 的 quality_checks 必须进 puzzle.jsonl ----
+        #
+        # 降为 signal 的两项(`clue_recontextualized` /
+        # `reasoning_beats_nonredundant`)**不再拒稿**, 所以它们的价值
+        # 全部落在"复盘时能不能看到分布"上。
+        #
+        # 链路是三环, 缺一环整条断掉:
+        #
+        #     writer._review_spec      算出 quality_checks (侧信道)
+        #       -> spec.metrics        成功路径搬进 metrics (story/llm.py)
+        #       -> _round_metrics      搬进本题落盘 dict  ← 这里
+        #       -> puzzle.jsonl        `_archive_reveal` 把 metrics 整块写走
+        #
+        # 早先只有第一环, 后两环都没有 —— 于是"降成 signal 供复盘"是一句
+        # 无法兑现的承诺。**注意 `_archive_reveal()` 只挑本函数返回的键**,
+        # 不搬整个 `spec.metrics`; 所以少这一行, archive 里就是没有。
+        #
+        # ⚠️ 缺省 `{}`(不是 `None`): 与上面几个 provenance 键同一个约定 ——
+        # 老题 / 兜底题 / `--no-llm` 的假题都没有这个键, 而"没有"与"空"
+        # 在复盘里是同一个结论, 不该逼下游做 `None` 判断。
+        # ⚠️ **只搬不改**: 值原样来自 `spec.metrics`, 一个字节都不加工 ——
+        # 裁剪或改名都会让 archive 与当场的判定不一致。
+        out.update({
+            "quality_checks": dict(gen.get("quality_checks") or {}),
+        })
         return out
 
     # ---- 离线(--no-llm)用的固定内容 ----

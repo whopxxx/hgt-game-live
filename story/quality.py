@@ -84,7 +84,33 @@ log = logging.getLogger(__name__)
 #: 为什么必须 bump 政策版本而不是兼容 v5: 盘上已经存在按 quality-v5
 #: Reviewer 生成的题, 它们正是这次真实故障的来源。不 bump 的话修完
 #: prompt 旧题仍然能进直播 —— 所以 v5 一律 quarantine, 不迁移、不猜。
-QUALITY_POLICY_VERSION = "quality-v8"
+#:
+#: v9(G4-RB R1): **这次是真的接受标准变了, 所以必须 bump。**
+#:
+#: 与 G3 那次"policy 保持 v8"的判断**正好相反**, 值得把差别写清楚,
+#: 免得下次有人拿这个先例当依据:
+#:
+#:     G3 改的是 riddle prompt 的**动态约束段** —— 目标是"更少产出必死
+#:     draft"。最终**接受标准一个字没改**(同一套 Reviewer / truth audit
+#:     / validate_spec / 跨题门)。所以 policy 不动是对的。
+#:
+#:     本轮改的是**接受标准本身**:
+#:       - 自由生成链的 fail-closed 门从 9 项收窄到 7 项
+#:         (`clue_recontextualized` / `reasoning_beats_nonredundant`
+#:         降为 signal; 见 `story/llm.FREE_GEN_HARD_CHECKS`);
+#:       - `discovery_beats` 下限 2 -> 1(单核题不再被判不合格);
+#:       - 第一人称 / 无结尾问号不再触发 repair。
+#:
+#: 这三条改了"什么算合格"。旧 v8 库存是**在 9-hard 标准下**被接受的,
+#: 拿它和新题混进同一个配额窗口比较, 等于把两版不可比较的 signature
+#: 放在一起 —— `PuzzlePool` 正是靠这个版本做 live eligibility
+#: (`story/pool.py` 的严格相等那扇门), 所以要靠它隔离。
+#:
+#: ⚠️ **代价是有意的, 不要偷偷发生**: bump 之后盘上 v8 库存**自动**
+#: 失去 live eligibility(不迁移、**不删除**, 行仍留在 `pool.jsonl` 里)。
+#: 上线前需要一次 prewarm 重新补池 —— 与 G4-CF 记的那次 pool rotation
+#: 是同一个动作, 不是新造 pool gate。
+QUALITY_POLICY_VERSION = "quality-v9"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -104,10 +130,22 @@ class ValidationResult:
         而且它很可能"改"出一个更不一致的版本。
 
     `fixable` —— **格式问题, 审稿人能就地改好**。
-        第一人称叙述 -> 改成第三人称; 结尾没有问句 -> 补一个;
-        谜面混进 meta 文本 -> 删掉。这三样都是"改一句话"的事,
-        整题重出是浪费(实测: 一稿只差一个人称就被丢掉)。
+        谜面混进【谜底】/【提示】之类的 meta 文本 -> 删掉。
+        这是"改一句话"的事, 整题重出是浪费。
         这些会被**转成 `must_fix` 交给审稿人**, 而不是直接毙。
+
+        ⚠️ **G4-RB: 这一档现在只剩 meta 文本一条。**
+        早先它还有"第一人称叙述 -> 改成第三人称"与"结尾没有问句 ->
+        补一个"两条 —— 它们已被**删除**, 不再是毛病:
+
+            * 第一人称本来就是海龟汤非常自然的形式;
+            * 一个自明其问的异常场景本身就是完整的问题, 不需要再补
+              "为什么?"。
+
+        所以 `has_closing_question` / `is_first_person` 这两个判定函数
+        **保留为分析信号**(`story/puzzle.py`), 但不再进 `fixable` ——
+        带着它们把题判成"要改"会把好题修坏, 甚至整稿丢掉
+        (实测: 24 道候选里 21 道被"没有收束问题"杀掉)。
     """
 
     ok: bool = True
@@ -134,11 +172,11 @@ class ValidationResult:
         return "; ".join(self.fixable)
 
     def puzzle_touching_fix(self) -> list:
-        """**必须改动谜面**才能修好的 fixable 问题(人称/问句/meta)。
+        """**必须改动谜面**才能修好的 fixable 问题(**现在只有 meta**)。
 
         为什么要把这一类单独分出来: 审稿人的 `fix` 分支要求"给出改后的
-        谜面" —— 那是它证明自己**真的改过东西**的方式, 对"谜面是第一
-        人称"这类毛病完全正确。
+        谜面" —— 那是它证明自己**真的改过东西**的方式, 对"谜面里混进了
+        【谜底】"这类毛病完全正确。
 
         但大多数 fixable 问题**根本不在谜面上**: 压缩 core_answer、
         从谜面重新摘一个 quote、缩短 hint、补一根 atom 连线。对着这些
@@ -153,7 +191,10 @@ class ValidationResult:
         反过来若用"不涉及"标记, 忘了标的后果是"它被当成不需要动谜面"
         (放任一次真的没改). 保守的那个方向才是对的。
 
-        标记写在那三条 `can_fix()` 的文案里(`_PUZZLE_TOUCH_MARK`)。
+        ⚠️ **G4-RB: 名单现在只剩一条。** 它曾经是三条(人称 / 问句 /
+        meta) —— 前两条已经被删除, 因为它们不再是毛病(见
+        `ValidationResult` 的 `fixable` 说明)。所以现在只有 meta 文本
+        的 `can_fix()` 文案里带 `_PUZZLE_TOUCH_MARK`。
         """
         return [f for f in self.fixable if _PUZZLE_TOUCH_MARK in f]
 

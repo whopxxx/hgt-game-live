@@ -2450,6 +2450,82 @@ def test_reveal_contributors_reach_archive():
            for r in qa])
 
 
+def test_r1_quality_checks_reach_archive():
+    """**R1**: Reviewer 的 quality_checks 必须一路走到 puzzle.jsonl。
+
+    为什么专门测这一条: R1 把两个质量项
+    (`clue_recontextualized` / `reasoning_beats_nonredundant`)降成了
+    signal —— **不再拒稿**。于是它们的价值全部落在"复盘时能不能看到
+    分布"上。而这条链有三环, 缺一环就整条断掉:
+
+        writer._review_spec     算出 quality_checks (实例侧信道)
+          -> spec.metrics       成功路径搬进 metrics
+          -> _round_metrics     搬进本题落盘 dict
+          -> puzzle.jsonl       `_archive_reveal` 把 metrics 整块写走
+
+    早先只有第一环 —— `_last_review_checks` 谁也读不到, 所以
+    "降成 signal 供复盘"是一句无法兑现的承诺。这条用例钉住后两环:
+    用一个带 quality_checks 的 spec 走到**真实落盘**, 再读回 json。
+    """
+    import io as _io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.llm import FREE_GEN_SIGNAL_CHECKS, _QUALITY_CHECK_FIELDS
+    from story.puzzle import PuzzleFact, PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_r1_qc.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+    _pl = os.path.join(tempfile.gettempdir(), "_hgt_r1_qc_played.jsonl")
+    if os.path.exists(_pl):
+        os.remove(_pl)
+    cfg.played_path = _pl
+
+    # 两个 signal 都 false —— 它们**不再**拒稿, 所以这道题是合法的
+    qc = {k: True for k in _QUALITY_CHECK_FIELDS}
+    for k in FREE_GEN_SIGNAL_CHECKS:
+        qc[k] = False
+
+    d = Director(cfg)
+    clk = FakeClock()
+    d.engine = RoundEngine(cfg, clock=clk)
+    d.engine.start()
+    sp = PuzzleSpec(
+        id="r1-qc", title="质量信号落盘",
+        puzzle="她每天都把闹钟拨快十分钟, 却从不迟到。为什么?",
+        answer="她想比丈夫早起十分钟, 独自吃完早饭。",
+        core_answer="她想比丈夫早起十分钟。",
+        completion_fact_ids=["f1"],
+        prompt_version="keyword2-v5", quality_policy_version="quality-v9",
+        facts=[PuzzleFact(id="f1", text="她想比丈夫早起", kind="core",
+                          visibility="hidden")])
+    # 模拟成功生成路径: writer 把 quality_checks 搬进了 spec.metrics
+    sp.metrics = dict(sp.metrics or {})
+    sp.metrics["quality_checks"] = dict(qc)
+    sp.metrics["generation_mode"] = "keyword2"
+
+    d.engine.submit_riddle(sp.puzzle, sp.answer, ["a"], spec=sp, source="pool")
+    rev = [a for a in d.engine._enter_revealing_locked(0.0, "giveup", "")
+           if a.kind == ActionKind.REVEAL]
+    check("产出 REVEAL", len(rev) == 1, kinds(rev))
+    payload = rev[0].payload if rev else {}
+    d._archive_reveal(payload, "揭晓文案")
+    check("落盘成功", os.path.exists(out), out)
+    rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
+    m = rec.get("metrics") or {}
+    check("**metrics 里有 quality_checks**", "quality_checks" in m,
+          sorted(m.keys()))
+    got = m.get("quality_checks") or {}
+    check("**整份 dict 都搬过来了(不是只挑两项)**",
+          set(got.keys()) == set(_QUALITY_CHECK_FIELDS), sorted(got.keys()))
+    for k in FREE_GEN_SIGNAL_CHECKS:
+        check(f"**signal {k}=False 如实落盘**", got.get(k) is False, got)
+
+
 def test_spec_source_is_recorded_and_reaches_reveal():
     """Q8: 来源要一路进 REVEAL payload —— archive 靠它区分 pool/现场。"""
     clk = FakeClock()
@@ -3880,6 +3956,7 @@ def main():
              test_spec_source_is_recorded_and_reaches_reveal,
              # ---- R2: 揭晓贡献链 ----
              test_reveal_contributors_reach_archive,
+             test_r1_quality_checks_reach_archive,
              test_fallback_marks_source_as_fallback,
              test_spec_source_resets_between_puzzles,
              test_archive_records_source,

@@ -1271,7 +1271,15 @@ def test_stage_a_prompt_carries_answer_length():
           "念" in KEYWORD_IDEA_SYSTEM, "缺少理由说明")
     _d = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]["answer"]["description"]
     check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
-    check("**版本号 bump 了**", KEYWORD_IDEA_PROMPT_VERSION == "keyword2-v4",
+    # ⚠️ R1 收口后 prompt 又改过一次(_keywords_prompt 删掉 v3 遗留的
+    # "直接给出谜面与谜底"; KEYWORD_IDEA_SYSTEM 删掉"没痕迹就补线索"),
+    # 所以版本从 keyword2-v4 走到 v5 —— 这条断言只要求"**不是最初的
+    # 那一版**", 不钉死具体数字, 否则每改一次 prompt 都要改测试。
+    check("**版本号已 bump(不再是 keyword2-v1)**",
+          KEYWORD_IDEA_PROMPT_VERSION != "keyword2-v1",
+          KEYWORD_IDEA_PROMPT_VERSION)
+    check("**版本号是 keyword2 系**",
+          KEYWORD_IDEA_PROMPT_VERSION.startswith("keyword2-v"),
           KEYWORD_IDEA_PROMPT_VERSION)
     # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
     for banned, why in (("第一人称", "v1 人称硬限制"),
