@@ -217,6 +217,26 @@ jobs:
       - name: 离线套件 red_black_core
         run: uv run tests/test_experiment_red_black_core.py
 
+      # 全链路观测实验: 守的是「**不改 production prompt**」这条底线。
+      #
+      # 这个实验的全部价值在于"看**当前代码**会产出什么"。一旦有人顺手在
+      # 实验脚本里改一句 Stage A/B 的提示词、或 monkeypatch 掉生产常量,
+      # 结论就不再描述生产 —— 而产物**看上去仍然正常**(题照样生成)。
+      # 所以静态钉住四件事:
+      #   (a) 不得重新赋值任何生产 SYSTEM 常量 / 不得 monkeypatch;
+      #   (b) 那唯一的一行 lane 信息**只能**贴在 Stage A 的调用上 ——
+      #       用真 KEYWORD_IDEA_SYSTEM 构造假 client 逐字节断言 Stage B /
+      #       Reviewer 的 user 一字未动(贴错会静默改掉审稿人看到的文本);
+      #   (c) Stage B 拒了**不重抽** —— 按 AST 结构查 Stage A/B 调用不得
+      #       位于任何循环内;
+      #   (d) 不入池、不写生产账本。
+      #
+      # ⚠️ 与另一个实验套件同源: 所有断言都从**源码现读现 parse**, 绝不
+      # `import` 取常量 —— `.pyc` 新鲜度只按秒比对 mtime, 变异测试会假绿。
+      # 5 个变异向量实测全红(1/5/2/1/1)。
+      - name: 离线套件 full_chain
+        run: uv run tests/test_experiment_full_chain.py
+
       # 单元测试覆盖不到的**装配**问题(线程/端口/信号/落盘接线)。
       # director 是常驻进程, 没有"跑完就退出"的模式, 所以用 timeout 兜底:
       # 正常情况一定是被 timeout 杀掉的(退出码 124), 那时看日志判定。

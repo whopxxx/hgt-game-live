@@ -1,0 +1,33 @@
+00:58:55 INFO model=deepseek-v4.1-flash
+00:58:55 INFO 词袋: corpus=keyword2-vocab-v2 count=1134
+00:58:55 INFO 已抽定 10 组关键词:
+00:58:55 INFO   [red-01] 个人信息、下毒
+00:58:55 INFO   [red-02] 求生、洞穴
+00:58:55 INFO   [red-03] 牙齿、回忆
+00:58:55 INFO   [red-04] 死者、地下湖泊
+00:58:55 INFO   [red-05] 迷雾、1237
+00:58:55 INFO   [black-01] 救助、脚步
+00:58:55 INFO   [black-02] 手印、捐心脏
+00:58:55 INFO   [black-03] 潮声、水滴声
+00:58:55 INFO   [black-04] 车后、乘客
+00:58:55 INFO   [black-05] 满足、山顶
+00:59:00 INFO [red-01] ['个人信息', '下毒'] -> Stage A ok (puzzle 136 字, clues 4 条)
+00:59:16 WARNING [red-01] -> Stage B 拒/失败 reject=truth_reject decision=fix error=叙事真实性审计不过: conflicts 非空
+00:59:19 INFO [red-02] ['求生', '洞穴'] -> Stage A ok (puzzle 78 字, clues 3 条)
+00:59:31 WARNING [red-02] -> Stage B 拒/失败 reject=review_rewrite decision=fix error=审稿要求重出: 本次修复**未授权改第 1 条 fair_clue 的 supports_atoms** —— 重摘 quote 不许顺手改它指向哪条 atom, 拒绝这次修复
+00:59:35 INFO [red-03] ['牙齿', '回忆'] -> Stage A ok (puzzle 102 字, clues 4 条)
+00:59:48 WARNING [red-03] -> Stage B 拒/失败 reject=review_rewrite decision=fix error=审稿要求重出: 本次修复**未授权改 fact.hintable**(fact f1) —— 拒绝这次修复
+00:59:52 INFO [red-04] ['死者', '地下湖泊'] -> Stage A ok (puzzle 128 字, clues 4 条)
+01:00:06 INFO [red-04] -> Stage B ok (facts 8, clues 4, atoms 4, beats 3)
+01:00:11 INFO [red-05] ['迷雾', '1237'] -> Stage A ok (puzzle 121 字, clues 4 条)
+01:00:23 WARNING [red-05] -> Stage B 拒/失败 reject=structure_technical_fail decision=n/a error=工具调用返回空 input (stop=tool_use)
+01:00:28 INFO [black-01] ['救助', '脚步'] -> Stage A ok (puzzle 120 字, clues 4 条)
+01:00:44 INFO [black-01] -> Stage B ok (facts 8, clues 3, atoms 3, beats 4)
+01:00:48 INFO [black-02] ['手印', '捐心脏'] -> Stage A ok (puzzle 109 字, clues 4 条)
+01:01:05 INFO [black-02] -> Stage B ok (facts 9, clues 4, atoms 4, beats 3)
+01:01:10 INFO [black-03] ['潮声', '水滴声'] -> Stage A ok (puzzle 92 字, clues 4 条)
+01:01:23 WARNING [black-03] -> Stage B 拒/失败 reject=validation_reject decision=fix error=改稿后仍不合格: 第 3 条提示超过 30 字(39 字): 请**只**把它缩短到 30 字以内并保持提示意图, 不要改动谜面/谜底/核心答案/facts/completion_fact_ids/discovery_beats。
+01:01:26 INFO [black-04] ['车后', '乘客'] -> Stage A ok (puzzle 90 字, clues 4 条)
+01:01:33 WARNING [black-04] -> Stage B 拒/失败 reject=validation_reject decision=n/a error=结构不过: completion fact f4 的 kind='support', 只有 core 可以作为通关要求
+01:01:37 INFO [black-05] ['满足', '山顶'] -> Stage A ok (puzzle 116 字, clues 4 条)
+01:01:53 WARNING [black-05] -> Stage B 拒/失败 reject=truth_reject decision=pass error=叙事真实性审计不过: conflicts 非空

@@ -1,0 +1,203 @@
+{
+  "experiment": "full_chain_stageA_stageB",
+  "question": "当前生产 Case-first Stage A / Stage B, 前面加一行 red/black 方向后, 最终展示出来的题会不会更像真正的海龟汤, 还是会被 observed_clues / fair_clues 重新写成长案情简介。",
+  "base_sha": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
+  "branch": "experiment/red-black-core-stories",
+  "git_head_at_run": "HEAD",
+  "model_requested": "deepseek-v4.1-flash",
+  "model_returned": [
+    "keyword2-v4"
+  ],
+  "base_url": "",
+  "n_per_type": 5,
+  "seed_red": 20260923,
+  "seed_black": 20260924,
+  "keyword_mechanism": {
+    "source": "story.keyword_seed.KeywordBag (生产同款)",
+    "corpus_version": "keyword2-vocab-v2",
+    "keyword_count": 1134,
+    "keyword_seed_version": "keyword2-vocab-v2",
+    "per_candidate": [
+      {
+        "id": "red-01",
+        "keywords": [
+          "个人信息",
+          "下毒"
+        ],
+        "draw_index": 1
+      },
+      {
+        "id": "red-02",
+        "keywords": [
+          "求生",
+          "洞穴"
+        ],
+        "draw_index": 2
+      },
+      {
+        "id": "red-03",
+        "keywords": [
+          "牙齿",
+          "回忆"
+        ],
+        "draw_index": 3
+      },
+      {
+        "id": "red-04",
+        "keywords": [
+          "死者",
+          "地下湖泊"
+        ],
+        "draw_index": 4
+      },
+      {
+        "id": "red-05",
+        "keywords": [
+          "迷雾",
+          "1237"
+        ],
+        "draw_index": 5
+      },
+      {
+        "id": "black-01",
+        "keywords": [
+          "救助",
+          "脚步"
+        ],
+        "draw_index": 1
+      },
+      {
+        "id": "black-02",
+        "keywords": [
+          "手印",
+          "捐心脏"
+        ],
+        "draw_index": 2
+      },
+      {
+        "id": "black-03",
+        "keywords": [
+          "潮声",
+          "水滴声"
+        ],
+        "draw_index": 3
+      },
+      {
+        "id": "black-04",
+        "keywords": [
+          "车后",
+          "乘客"
+        ],
+        "draw_index": 4
+      },
+      {
+        "id": "black-05",
+        "keywords": [
+          "满足",
+          "山顶"
+        ],
+        "draw_index": 5
+      }
+    ]
+  },
+  "production_prompts_reused": {
+    "stage_a": [
+      "KEYWORD_IDEA_SYSTEM",
+      "_TOOL_KEYWORD_IDEA",
+      "_keywords_prompt()"
+    ],
+    "stage_b": [
+      "structure_original_idea",
+      "STRUCTURE_SYSTEM",
+      "_TOOL_STRUCTURE",
+      "Reviewer",
+      "truth audit",
+      "validate_spec"
+    ],
+    "note": "全部**原样调用** production 方法; story/llm.py 的常量一个都没改。唯一的增量是 Stage A user message 前的一行 lane。"
+  },
+  "lane_injection": {
+    "template": "类型：{lane}。",
+    "how": "_LaneClient 代理: 只在 system == KEYWORD_IDEA_SYSTEM 的那一次调用上把 lane 行贴到 user 前面; 其余调用(Stage B / Reviewer / truth audit)原样透传。",
+    "stage_a_rewritten": 10,
+    "other_passed_through": 24
+  },
+  "counts": {
+    "total": 10,
+    "stage_a_ok": 10,
+    "stage_b_ok": 3,
+    "stage_b_rejected": 7,
+    "by_type": {
+      "red": {
+        "stage_a_ok": 5,
+        "stage_b_ok": 1
+      },
+      "black": {
+        "stage_a_ok": 5,
+        "stage_b_ok": 2
+      }
+    }
+  },
+  "rejects": [
+    {
+      "id": "red-01",
+      "type": "red",
+      "reject": "truth_reject",
+      "review_decision": "fix",
+      "error": "叙事真实性审计不过: conflicts 非空"
+    },
+    {
+      "id": "red-02",
+      "type": "red",
+      "reject": "review_rewrite",
+      "review_decision": "fix",
+      "error": "审稿要求重出: 本次修复**未授权改第 1 条 fair_clue 的 supports_atoms** —— 重摘 quote 不许顺手改它指向哪条 atom, 拒绝这次修复"
+    },
+    {
+      "id": "red-03",
+      "type": "red",
+      "reject": "review_rewrite",
+      "review_decision": "fix",
+      "error": "审稿要求重出: 本次修复**未授权改 fact.hintable**(fact f1) —— 拒绝这次修复"
+    },
+    {
+      "id": "red-05",
+      "type": "red",
+      "reject": "structure_technical_fail",
+      "review_decision": "n/a",
+      "error": "工具调用返回空 input (stop=tool_use)"
+    },
+    {
+      "id": "black-03",
+      "type": "black",
+      "reject": "validation_reject",
+      "review_decision": "fix",
+      "error": "改稿后仍不合格: 第 3 条提示超过 30 字(39 字): 请**只**把它缩短到 30 字以内并保持提示意图, 不要改动谜面/谜底/核心答案/facts/completion_fact_ids/discovery_beats。"
+    },
+    {
+      "id": "black-04",
+      "type": "black",
+      "reject": "validation_reject",
+      "review_decision": "n/a",
+      "error": "结构不过: completion fact f4 的 kind='support', 只有 core 可以作为通关要求"
+    },
+    {
+      "id": "black-05",
+      "type": "black",
+      "reject": "truth_reject",
+      "review_decision": "pass",
+      "error": "叙事真实性审计不过: conflicts 非空"
+    }
+  ],
+  "no_resample_on_reject": "Stage B 拒绝的条目**保留 Stage A 原始结果**并原样记录, 不重抽到通过 —— 要看的是当前真实链会怎么处理它。",
+  "not_done": [
+    "自动评分 / 想玩不想玩 / 红黑判定器",
+    "新增 reviewer 或 gate",
+    "另写结构器",
+    "入池 / played / pool_used / archive"
+  ],
+  "outputs": {
+    "raw": "data/full_chain_experiment/raw.jsonl",
+    "report": "data/full_chain_experiment/report.md"
+  }
+}
