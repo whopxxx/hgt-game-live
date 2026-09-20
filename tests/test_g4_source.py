@@ -567,17 +567,20 @@ def test_banner_prints_source_mode():
     """
     print("\n[G4-2-banner] banner 打印题源模式")
     import director as _D
-    for kw, want_mode, want_cur in (
+    for idx, (kw, want_mode, want_cur) in enumerate((
             ({}, "keyword2 generated", "OFF"),
             ({"prefer_curated": True}, "keyword2 generated", "ON"),
             ({"pool_keyword_seed_enabled": False},
-             "classic Blueprint", "OFF")):
+             "classic Blueprint", "OFF"))):
         with tmpdir() as d:
             cfg = mkcfg(d, **kw)
             cfg.pool_prefetch_enabled = False
+            # ⚠️ 端口必须**每次不同**: `run()` 会真的起 `RenderServer`,
+            # 而 Linux 上连着 bind 同一个端口会因为 TIME_WAIT 失败
+            # (Windows 的 SO_REUSEADDR 语义更宽松, 所以本地看不出来)。
+            cfg.port = 18700 + idx
+            cfg.open_window = False
             # `run()` 会先 `cfg.validate()`, 而它要求**必须有输入源**。
-            # 给一个空的 sim 脚本 —— banner 在数据源真正被读之前就打完了
-            # (而且下面那个 `_build_source` 替身会在它之前截断)。
             sim = os.path.join(d, "empty.jsonl")
             with open(sim, "w", encoding="utf-8") as f:
                 f.write("")
@@ -588,8 +591,8 @@ def test_banner_prints_source_mode():
             _D._console = buf
 
             # 在 banner 之后的第一件事上截断。`_build_source` 是
-            # banner 段结束后的第一个动作, 所以到这里 banner 必然已经
-            # 全部写完。
+            # banner 段结束后的第一个动作(渲染服务之后), 所以到这里
+            # banner 必然已经全部写完。
             class _Stop(Exception):
                 pass
 
@@ -608,6 +611,13 @@ def test_banner_prints_source_mode():
             finally:
                 _D._console = old
                 dr._build_source = real_build
+                # 收尾: `run()` 在 `_boom` 之前已经把 RenderServer 起起来了,
+                # 不停掉它就会占着端口(CI 上连着跑三次 -> 后面几次 bind 失败)。
+                if dr.server is not None:
+                    try:
+                        dr.server.stop()
+                    except Exception:           # noqa: BLE001
+                        pass
             lines = buf.getvalue().splitlines()
         text = "\n".join(lines)
         check(f"**模式行: {want_mode}**", want_mode in text,
