@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.puzzle import (  # noqa: E402
     DiscoveryBeat, EMOTION_MODES, FairClue, PuzzleBlueprint, PuzzleFact,
     PuzzleSignature, PuzzleSpec, REVEAL_DEFAULT, REVEAL_MODES, SolveAtom,
-    has_closing_question, is_first_person, quote_in_puzzle,
+    is_first_person, quote_in_puzzle,
 )
 from story.quality import (  # noqa: E402
     QUALITY_POLICY_VERSION, Quotas, check_signature, choose_blueprint,
@@ -437,9 +437,12 @@ def test_hints_must_be_three_and_short():
 def test_puzzle_format_checks():
     """谜面格式问题归 `fixable` —— 由审稿人就地改, 不是直接毙。
 
-    这三样(人称/问句/meta)都是"改一句话"的事。早先当成结构性错误直接拒,
+    剩下两样(人称/meta)都是"改一句话"的事。早先当成结构性错误直接拒,
     结果是审稿人根本没机会改它, 一道只差一个人称的好题被丢掉 ——
     而且 gen_spec 会一直重出直到次数耗尽。
+
+    ⚠️ R4: "没有问句"**不再**属于这一类 —— 它现在是**合法**的(短汤面
+    本来就不自带收束提问)。下面同时断言它零 fixable, 防止被接回来。
     """
     print("[validate_spec: 谜面格式问题 -> fixable, 不是 error]")
     def with_puzzle(text, quote):
@@ -454,7 +457,8 @@ def test_puzzle_format_checks():
                     "他每天晚上都亮灯")
     r = validate_spec(s)
     check("没有问句: 结构仍算过", r.ok, r.errors)
-    check("没有问句: 记进 fixable", any("问句" in f for f in r.fixable), r.fixable)
+    check("**没有问句: 零 fixable(R4 起合法)**",
+          not any("问句" in f for f in r.fixable), r.fixable)
 
     s2 = with_puzzle("我每天晚上都亮灯, 从不间断。为什么?", "我每天晚上都亮灯")
     r2 = validate_spec(s2)
@@ -474,8 +478,8 @@ def test_puzzle_format_checks():
     r4 = validate_spec(s4)
     check("引用缺失的 fact 仍是 error", not r4.ok, r4.errors)
     # 低层 helper
-    check("has_closing_question 正例", has_closing_question("他为什么走了?"))
-    check("has_closing_question 反例", not has_closing_question("他走了。"))
+    # R4: has_closing_question **已删除** —— 无结尾问句现在是合法的,
+    # 见 `story/quality.py` 的 quality-v9 说明。
     check("is_first_person 引语里的我不算",
           not is_first_person('男人对酒保说：「请给我一杯水。」为什么?'))
 
@@ -2249,24 +2253,27 @@ def test_g3_gen_spec_actually_computes_and_injects_constraints():
 
 
 def test_g3_riddle_version_bumped_but_policy_unchanged():
-    """**G3**: riddle prompt 升 v9, 但 **quality policy 保持 v8**。
+    """**版本号现状**(G3 起, R4 更新)。
 
-    这一条特别重要: 若把 policy 一起 bump, 盘上所有 v8 库存会被池门
-    隔离 —— 等于凭空清空题池。而 G3 改变的是"如何更少产出必死 draft",
-    最终接受标准没变。
+    ⚠️ **R4 反转了 G3 的判断**: G3 那次 policy 不 bump 是对的(接受标准
+    一个字没改, 只是"更少产出必死 draft"); 而 R4 **真的改了接受标准**
+    —— "谜面必须有结尾问句"从缺陷变成合法 —— 所以 policy 必须跟着走。
+
+    代价是有意的: 盘上 `quality-v8` 库存会被池门隔离(不删除), 上线前
+    需要一次 prewarm 补池。见 `story/quality.py` 的 v9 说明。
     """
-    print("\n[G3-H] 版本: riddle-v9 / policy 仍 v8")
+    print("\n[G3-H] 版本: riddle-v9 / policy v9 / check v9")
     from story.llm import (RIDDLE_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            ANSWER_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
-    check("RIDDLE_PROMPT_VERSION = riddle-v9",
+    check("RIDDLE_PROMPT_VERSION = riddle-v9(未动)",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("**QUALITY_POLICY_VERSION 仍是 quality-v8**",
-          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
-    check("CHECK_PROMPT_VERSION 不动",
-          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
-    check("ANSWER_PROMPT_VERSION 不动",
+    check("ANSWER_PROMPT_VERSION = answer-v7(未动)",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
+    check("**QUALITY_POLICY_VERSION = quality-v9**",
+          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v9",
+          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
 
 
 def main():

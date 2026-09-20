@@ -132,7 +132,7 @@ def ident_spec(completion=("f1", "f2"), core="门外女人是父亲的亲生女�
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["注意她的身份", "注意昨晚发生了什么", "注意饭桌"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def flight_spec():
@@ -155,7 +155,7 @@ def flight_spec():
         ],
         fair_clues=[FairClue(quote="乘客却在鼓掌", supports_atoms=["a1"])],
         hints=["注意掌声", "注意民航流程", "注意考核"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def auction_spec():
@@ -193,7 +193,7 @@ def auction_spec():
         fair_clues=[FairClue(quote="每次都是他自己举牌买回来",
                              supports_atoms=["a1"])],
         hints=["注意谁在举牌", "想想成交记录有什么用", "注意他手里还有别的箱子"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def wardrobe_spec():
@@ -238,7 +238,7 @@ def wardrobe_spec():
         fair_clues=[FairClue(quote="却一直睡在衣柜前面",
                              supports_atoms=["a2"])],
         hints=["注意衣柜的位置", "注意床原本在哪", "想想那面墙原来是干什么的"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def plane_spec():
@@ -267,7 +267,7 @@ def plane_spec():
         fair_clues=[FairClue(quote="主动取消了本可正常起飞的航班",
                              supports_atoms=["a1"])],
         hints=["注意他看到了什么", "注意旗子是谁的"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def _completion_match(ids):
@@ -710,7 +710,7 @@ def test_closeout_b1_minimal_identity_puzzle_valid():
         fair_clues=[FairClue(quote="开门的人一见她就愣住了",
                              supports_atoms=["a1"])],
         hints=["a", "b", "c"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8")
+        prompt_version="riddle-v9", quality_policy_version="quality-v9")
     _stamp_beats(sp)
     vr = validate_spec(sp)
     check("validate_spec 通过", vr.ok, vr.why())
@@ -750,7 +750,7 @@ def test_closeout_b2_v5_must_have_contract():
     ]
     vr3 = validate_spec(sp3)
     check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
-    check("版本常量确实是 v7", _Q == "quality-v8", _Q)
+    check("版本常量确实是 v9", _Q == "quality-v9", _Q)
     # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
     check("has_completion_contract 仍是运行时判据",
           ident_spec().has_completion_contract())
@@ -1380,13 +1380,13 @@ def test_v6_versions_bumped():
     from story.llm import (ANSWER_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            RIDDLE_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
-    check("QUALITY_POLICY_VERSION == quality-v7",
-          QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
-    check("RIDDLE_PROMPT_VERSION == riddle-v7",
+    check("QUALITY_POLICY_VERSION == quality-v9",
+          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("RIDDLE_PROMPT_VERSION == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v7",
-          CHECK_PROMPT_VERSION == "check-v8", CHECK_PROMPT_VERSION)
-    check("ANSWER_PROMPT_VERSION == answer-v6",
+    check("CHECK_PROMPT_VERSION == check-v9",
+          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
+    check("ANSWER_PROMPT_VERSION == answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
     # v8 bump 到 4: discovery_beats 改了 PuzzleSpec 的 schema。
     from story.puzzle import PuzzleSpec
@@ -1421,8 +1421,8 @@ def test_v6_pool_quarantines_quality_v5():
     ok, why = PuzzlePool._validate_pool_spec(_full("quality-v6"))
     check("quality-v6(旧政策) -> 入池被拒", not ok, why)
     check("理由点名政策不兼容", "不兼容" in why, why)
-    ok2, why2 = PuzzlePool._validate_pool_spec(_full("quality-v8"))
-    check("quality-v7 完整题 -> 入池", ok2, why2)
+    ok2, why2 = PuzzlePool._validate_pool_spec(_full("quality-v9"))
+    check("quality-v9 完整题 -> 入池", ok2, why2)
 
     # 出池门: 盘上**残留**的 v5 题也绝不能 pop 出来 —— 只拦入池不够,
     # 因为故障现场就是升级前已经写进池子的那批。
@@ -2658,7 +2658,7 @@ def frame_spec():
         ],
         fair_clues=[FairClue(quote="画本身完好无损", supports_atoms=["a1"])],
         hints=["注意不是画本身", "想想画框"],
-        prompt_version="riddle-v8", quality_policy_version="quality-v8"))
+        prompt_version="riddle-v9", quality_policy_version="quality-v9"))
 
 
 def test_a1_r1_broad_question_cannot_complete():
@@ -2786,8 +2786,8 @@ def test_a1_non_candidate_verifier_cannot_widen():
         solve_atoms=[SolveAtom(id="a1", role="key", text="丙",
                                fact_ids=["f1", "f2"])],
         fair_clues=[FairClue(quote="同时发生", supports_atoms=["a1"])],
-        hints=["h"], prompt_version="riddle-v8",
-        quality_policy_version="quality-v8")
+        hints=["h"], prompt_version="riddle-v9",
+        quality_policy_version="quality-v9")
     # 复核回 f1(第一层自报的那条) + f2(观众**没**说过的那条)。
     fc = FakeClient([
         _verdict(established=["f1"], cand=False),

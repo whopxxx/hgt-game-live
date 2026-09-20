@@ -273,7 +273,10 @@ class _NoGen:
     def gen_spec(self, *a, **k):
         raise AssertionError("池里有题, 不该现场生成")
 
-    def gen_keyword_idea(self, *a, **k):
+    def gen_keyword_story(self, *a, **k):
+        raise AssertionError("池里有题, 不该现场生成")
+
+    def gen_surface(self, *a, **k):
         raise AssertionError("池里有题, 不该现场生成")
 
     def structure_original_idea(self, *a, **k):
@@ -354,7 +357,7 @@ def test_live_uses_keyword2_by_default():
                 called["classic"] += 1
                 return _good_gen_spec()
 
-            def gen_keyword_idea(self, *a, **k):
+            def gen_keyword_story(self, *a, **k):
                 called["stageA"] += 1
                 return None          # 不成题 -> 走 failure 分支
 
@@ -395,8 +398,8 @@ def test_no_keyword_seed_returns_both_to_classic():
                 called["classic"] += 1
                 return _good_gen_spec()
 
-            def gen_keyword_idea(self, *a, **k):
-                raise AssertionError("关掉 keyword2 后不该调 Stage A")
+            def gen_keyword_story(self, *a, **k):
+                raise AssertionError("关掉 keyword2 后不该调 Story")
 
             def hint(self, *a, **k):
                 return ("h", None)
@@ -1261,24 +1264,27 @@ def test_stage_b_retry_checks_should_continue():
 
 
 def test_stage_a_prompt_carries_answer_length():
-    """**§8-8**: Stage A prompt/schema 明确 answer <=260。"""
-    print("\n[G4-R2-8] Stage A 展示约束进了 prompt 与 schema")
-    from story.llm import (KEYWORD_IDEA_SYSTEM, _TOOL_KEYWORD_IDEA,
-                           KEYWORD_IDEA_PROMPT_VERSION)
-    check("**system prompt 写了 260**", "260" in KEYWORD_IDEA_SYSTEM,
-          "没找到")
+    """**§8-8**: Story prompt/schema 明确 answer <=260。
+
+    ⚠️ R4: 这一段从 `KEYWORD_IDEA_SYSTEM` 换成了 `STORY_SYSTEM` —— 旧的
+    Case-first Stage A 已经不在了。约束本身(260 / 给直播念)保持不变, 它
+    是前端画布的硬合同, 不是风格偏好。
+    """
+    print("\n[G4-R2-8] Story 展示约束进了 prompt 与 schema")
+    from story.llm import STORY_SYSTEM, _TOOL_STORY, STORY_PROMPT_VERSION
+    check("**system prompt 写了 260**", "260" in STORY_SYSTEM, "没找到")
     check("**说了这是给直播念的**",
-          "念" in KEYWORD_IDEA_SYSTEM, "缺少理由说明")
-    _d = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]["answer"]["description"]
+          "念" in STORY_SYSTEM, "缺少理由说明")
+    _d = _TOOL_STORY["input_schema"]["properties"]["answer"]["description"]
     check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
-    check("**版本号 bump 了**", KEYWORD_IDEA_PROMPT_VERSION == "keyword2-v4",
-          KEYWORD_IDEA_PROMPT_VERSION)
+    check("**版本号 bump 了**", STORY_PROMPT_VERSION == "keyword2-v5",
+          STORY_PROMPT_VERSION)
     # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
     for banned, why in (("第一人称", "v1 人称硬限制"),
                         ("职业", "v1 禁职业"),
                         ("Blueprint", "v1 多层结构配额"),
                         ("单机关", "v1 单机关限制")):
-        check(f"**没有恢复 {why}**", banned not in KEYWORD_IDEA_SYSTEM, banned)
+        check(f"**没有恢复 {why}**", banned not in STORY_SYSTEM, banned)
 
 
 def test_answer_over_300_still_hard_rejected():
@@ -1610,31 +1616,35 @@ def test_core_fix_only_kind_change_allowed():
 def test_core_fix_coexists_with_other_fixable():
     """**R1 §二**: core-count + 另一个合法 fixable 能同时修, 不误伤。
 
-    夹具: `core hidden=4` **且** 谜面缺结尾问句。Reviewer:
+    夹具: `core hidden=4` **且** 谜面是第一人称。Reviewer:
 
-        * 改谜面**只补问句**
+        * 改谜面**只把人称改成第三人称**
         * 把多余 core -> support
 
     必须**收下**。一刀切(有 core-count 就冻结谜面)会把这次合法修复判成
     越界 —— 那正是 R2 第一版的形状。
+
+    ⚠️ R4: 原来的第二个 fixable 是"谜面缺结尾问句", 那条契约已删。
+    换成人称 —— 它是**仅存**的 `[需改谜面]` 类 fixable, 所以这条用例
+    现在守的是"core-count 与人称修复共存"。
     """
-    print("\n[G4-R2-R1-3] core-count + 补问句 同时修")
+    print("\n[G4-R2-R1-3] core-count + 第一人称 同时修")
     from story.llm import PuzzleWriter
     from story.quality import validate_spec
     from story.puzzle import FairClue
     from tests.test_llm import FakeClient, clues_for, qc_ok
     s = _core4_spec()
-    # 让谜面**缺结尾问句**(另一种 fixable)。
-    s.puzzle = s.puzzle.rstrip("?？").rstrip()
+    # 让谜面变成**第一人称**(另一种 fixable)。
+    s.puzzle = "我" + s.puzzle
     s.fair_clues = [FairClue(quote=c["quote"],
                              supports_atoms=list(c["supports_atoms"]))
                     for c in clues_for(s.puzzle)]
     vr = validate_spec(s)
     check("**同时有两种 fixable**",
           any("core hidden" in f for f in vr.fixable)
-          and any("问句" in f for f in vr.fixable), vr.fixable)
-    # Reviewer: 补问句 + 重标 f4
-    new_puzzle = s.puzzle + " 为什么?"
+          and any("第一人称" in f for f in vr.fixable), vr.fixable)
+    # Reviewer: 改人称 + 重标 f4
+    new_puzzle = "他" + s.puzzle[1:]
     payload = _review_payload_retag(s, {"f4": "support"})
     payload["puzzle"] = new_puzzle
     payload["fair_clues"] = clues_for(new_puzzle)
@@ -1646,8 +1656,8 @@ def test_core_fix_coexists_with_other_fixable():
     check("**合法双重修复被收下(不误拒)**", new is not None,
           (why or "")[:80])
     if new is not None:
-        check("**问句补上了**", new.puzzle.rstrip().endswith("?"),
-              new.puzzle[-12:])
+        check("**人称改回第三人称**", not new.puzzle.startswith("我"),
+              new.puzzle[:12])
         check("**core 降到 <= 3**", len(new.core_hidden_facts()) <= 3,
               len(new.core_hidden_facts()))
         vr2 = validate_spec(new)
@@ -1662,7 +1672,7 @@ def test_core_fix_coexists_with_other_fixable():
     w2 = PuzzleWriter(FakeClient([LLMResult(tool_input=payload2)]))
     new2, why2, _r2, _t2 = w2._review_spec(s, must_fix=vr.must_fix(),
                                           own_fix_focus=list(vr.fixable))
-    check("**拒: 借补问句之名改谜底**", new2 is None, (why2 or "")[:70])
+    check("**拒: 借改人称之名改谜底**", new2 is None, (why2 or "")[:70])
 
 
 def test_core_fix_still_over_limit_rejected():
@@ -1782,15 +1792,18 @@ def test_core_guard_does_not_touch_wide_fixables():
     bad2 = _core_fix_scope_violation(s, new, {}, loose)
     check("**loose -> 不逐项冻结**", bad2 == "", bad2)
 
-    # ---- ③ 混合: core-count(strict) + 补问句(loose) -> **仍然冻结** ----
+    # ---- ③ 混合: core-count(strict) + 第一人称(loose) -> **仍然冻结** ----
     #
     # 这是 §二 的关键: 存在 strict 的那一位就够触发逐项冻结, 而谜面因为
     # 在并集域里所以可以改。少了这条, core-count 在混合修复里形同虚设。
-    mixed = focus + ["[需改谜面] 谜面结尾不是问句, 末尾补一句'为什么?'"]
+    #
+    # ⚠️ R4: 混合里的第二项从"补问句"换成了"第一人称" —— 前者已删。
+    # 换的是**文案**, 断言的机制(并集域 / strict 触发)一个字没改。
+    mixed = focus + ["[需改谜面] 谜面是第一人称叙事, 改成第三人称客观事实"]
     check("**混合里存在 strict -> 触发冻结**",
           any_strict_fixable(mixed) is True, fix_domains_for(mixed))
     mixed_ok = s.to_dict()
-    mixed_ok["puzzle"] = s.puzzle.rstrip("?？").rstrip() + " 为什么?"
+    mixed_ok["puzzle"] = "他" + s.puzzle[1:]
     mixed_ok["facts"] = [dict(f) for f in mixed_ok["facts"]]
     mixed_ok["facts"][3]["kind"] = "support"
     _PS2 = __import__("story.puzzle", fromlist=["PuzzleSpec"]).PuzzleSpec
@@ -1812,19 +1825,20 @@ def test_core_guard_does_not_touch_wide_fixables():
 def _clue_case(mutate, *, puzzle_fix=False):
     """跑一次带 `fair_clues` 变更的修复, 返回 `(new, why)`。
 
-    `puzzle_fix=True` 时同时授权"补问句" —— 那是混合修复的形状。
+    `puzzle_fix=True` 时同时授权**改人称** —— 那是混合修复的形状。
+    (R4 之前这里授权的是"补问句", 那条契约已删。)
     """
     from story.llm import PuzzleWriter
     from story.quality import validate_spec
     from tests.test_llm import FakeClient, clues_for, qc_ok
     s = _core4_spec()
     if puzzle_fix:
-        s.puzzle = s.puzzle.rstrip("?？").rstrip()
+        s.puzzle = "我" + s.puzzle
         s.fair_clues = [FairClue(quote=c["quote"],
                                  supports_atoms=list(c["supports_atoms"]))
                         for c in clues_for(s.puzzle)]
     vr = validate_spec(s)
-    new_puzzle = (s.puzzle + " 为什么?") if puzzle_fix else s.puzzle
+    new_puzzle = (("他" + s.puzzle[1:]) if puzzle_fix else s.puzzle)
     payload = _review_payload_retag(s, {"f4": "support"})
     payload["puzzle"] = new_puzzle
     payload["fair_clues"] = clues_for(new_puzzle)

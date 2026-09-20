@@ -2720,8 +2720,12 @@ class _KeywordWriter:
 
     def __init__(self, *, spec=None, stage_a=None, stage_a_interrupt=False,
                  stage_b_interrupt=False, stage_a_none=False):
-        self.keyword_calls = []       # 每次 gen_keyword_idea 的 keywords
-        self.structure_calls = []     # 每次 structure_original_idea 的参数
+        #: 每次 Story 的 `(keywords, lane)`。
+        self.keyword_calls = []
+        #: 每次 Surface 收到的 `answer`(R4: 汤面从这里截)。
+        self.surface_calls = []
+        #: 每次 `structure_original_idea` 的参数。
+        self.structure_calls = []
         self.gen_spec_calls = []      # 不应被调到 —— 用来证明走的是新链
         self._spec = spec
         _base = good_spec()
@@ -2732,37 +2736,41 @@ class _KeywordWriter:
         self._b_interrupt = stage_b_interrupt
         self._a_none = stage_a_none
 
-    def gen_keyword_idea(self, keywords, *, should_continue=None,
-                         max_attempts=None, temperature=None):
-        self.keyword_calls.append(list(keywords))
+    # ---- R4: Story / Surface 两段(取代旧的一段 Stage A) ----
+    def gen_keyword_story(self, keywords, lane, *, should_continue=None,
+                          max_attempts=None, temperature=None):
+        """Story 阶段替身: 只交 `{"answer": ...}`。
+
+        ⚠️ 让路语义与生产件同构, 见下面 `structure_original_idea` 那段
+        长注释(调用前/返回后各问一次谓词; 让路返回 `{"interrupted": True}`
+        而不是 None)。
+        """
+        self.keyword_calls.append((list(keywords), lane))
         if self._a_none:
             return None
         if self._a_interrupt:
             return {"interrupted": True}
-        # ---- G4-R1: 替身也必须**真的**调用谓词 ----
-        #
-        # ⚠️ 不调的话, "谓词被注入了没有"这件事在测试上**不可见** ——
-        # 而 G4-R1 的 P0 修的正是"注入"本身。第一版 `gen_spec` 只收
-        # `**kw` 就把它丢了, 于是"去掉注入"这个变异**不会变红**(测的是
-        # 空气)。这与 G4 的 M9 同型: 断言像在测那个机制, 执行路径根本
-        # 没走到。
-        #
-        # ⚠️ **调用次数必须与生产件同构**: 真的 `gen_keyword_idea` 在
-        # **调用前**与**返回后**各问一次(见 `story/llm.py`), 所以这里
-        # 也是两次。只问一次会让 `test_g2_*` 那些数谓词调用次数的用例
-        # 偏移一格 —— 那会变成"替身比生产件宽松"的另一种形式。
-        #
-        # ⚠️ 让路时返回的是 `{"interrupted": True}` 而**不是** None。
-        # 两者的分类**不同**(见 `keyword_spec`): None -> "gen_fail"
-        # (真的失败, 要退避), `{"interrupted": True}` -> "interrupted"
-        # (让路, 不计失败不退避)。替身返回 None 会把一次**故意的取消**
-        # 记成故障 —— 生产件不这么做。
         if should_continue is not None and not should_continue():
             return {"interrupted": True}
-        idea = dict(self._stage_a)
+        story = {"answer": self._stage_a.get("answer", "")}
         if should_continue is not None and not should_continue():
             return {"interrupted": True}
-        return idea
+        return story
+
+    def gen_surface(self, answer, *, should_continue=None, max_attempts=None,
+                    temperature=None):
+        """Surface 阶段替身: 从 answer 截出 `{"puzzle": ...}`。"""
+        self.surface_calls.append(answer)
+        if self._a_none:
+            return None
+        if self._a_interrupt:
+            return {"interrupted": True}
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        surf = {"puzzle": self._stage_a.get("puzzle", "")}
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        return surf
 
     def structure_original_idea(self, *, title, puzzle, answer, avoid=None,
                                 recent=None, should_continue=None,
@@ -2921,9 +2929,19 @@ def test_g2_keyword_provenance():
             check("generation_mode == keyword2",
                   (s.metrics or {}).get("generation_mode") == "keyword2",
                   s.metrics)
+            # ⚠️ R4: `keyword_calls` 现在记的是 `(keywords, lane)` 二元组
+            # (Story 阶段多收一个 lane), 而 metrics 里只放 keywords 列表。
+            _kws = list(w.keyword_calls[0][0])
             check("keywords 记进了 metrics",
-                  (s.metrics or {}).get("keywords") == w.keyword_calls[0],
+                  (s.metrics or {}).get("keywords") == _kws,
                   (s.metrics or {}).get("keywords"))
+            check("**lane 也记进了 metrics**",
+                  (s.metrics or {}).get("lane") in ("red", "black"),
+                  (s.metrics or {}).get("lane"))
+            check("**story/surface 两个 prompt version 都落盘**",
+                  (s.metrics or {}).get("story_prompt_version") == "keyword2-v5"
+                  and (s.metrics or {}).get("surface_prompt_version")
+                  == "surface-v1", s.metrics)
             check("**source_type 为空(是 generated, 不是 curated)**",
                   not getattr(s, "source_type", ""), repr(getattr(s, "source_type", "")))
             check("**没有 curated_policy_version**",
@@ -3125,13 +3143,14 @@ def test_g2_live_writer_never_calls_keyword():
     """
     print("\n[G2-12] live 路径零 keyword 调用")
     from story.llm import PuzzleWriter
-    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    from test_llm import (FakeClient, riddle, review_ok, runtime_cfg,
+                         _truth_tool)  # noqa
     # ---- (a) 行为层: 走一遍 live 的调用形状 ----
     fc = FakeClient([LLMResult(tool_input=riddle()),
                      LLMResult(tool_input=review_ok())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     calls = {"kw": 0, "st": 0}
-    real_kw, real_st = w.gen_keyword_idea, w.structure_original_idea
+    real_kw, real_st = w.gen_keyword_story, w.structure_original_idea
 
     def spy_kw(*a, **k):
         calls["kw"] += 1
@@ -3141,13 +3160,13 @@ def test_g2_live_writer_never_calls_keyword():
         calls["st"] += 1
         return real_st(*a, **k)
 
-    w.gen_keyword_idea = spy_kw
+    w.gen_keyword_story = spy_kw
     w.structure_original_idea = spy_st
     bp = fc.default_blueprint
     spec = w.gen_spec(avoid=None, blueprint=bp, recent=[],
                       enforce_blueprint=bp is not None)
     check("live 出了一道题", bool(spec.puzzle), spec.error)
-    check("**gen_keyword_idea 零调用**", calls["kw"] == 0, calls["kw"])
+    check("**gen_keyword_story 零调用**", calls["kw"] == 0, calls["kw"])
     check("**structure_original_idea 零调用**", calls["st"] == 0, calls["st"])
     check("live 用的还是 emit_riddle",
           "emit_riddle" in [c["tool"]["name"] for c in fc.calls
@@ -3156,10 +3175,10 @@ def test_g2_live_writer_never_calls_keyword():
     # ---- (b) 源码层: director.py 的 live 出题点 ----
     src = io.open(Path(__file__).resolve().parents[1] / "director.py",
                   encoding="utf-8").read()
-    check("**director.py 里没有 gen_keyword_idea**",
-          "gen_keyword_idea" not in src,
+    check("**director.py 里没有 gen_keyword_story / gen_surface**",
+          "gen_keyword_story" not in src and "gen_surface" not in src,
           [ln.strip() for ln in src.splitlines()
-           if "gen_keyword_idea" in ln][:3])
+           if "gen_keyword_story" in ln or "gen_surface" in ln][:3])
     check("**director.py 里没有 structure_original_idea**",
           "structure_original_idea" not in src,
           [ln.strip() for ln in src.splitlines()
@@ -3169,18 +3188,28 @@ def test_g2_live_writer_never_calls_keyword():
 
 
 def test_g2_stage_b_schema_has_no_puzzle_field():
-    """**Stage B schema 里没有 puzzle/answer/title** —— 结构性禁止改写。"""
+    """**Stage B schema 里没有 puzzle/answer/title** —— 结构性禁止改写。
+
+    ⚠️ R4: Story / Surface 是**分开**的两个 schema —— Story 只有
+    `answer`, Surface 只有 `puzzle`。所以"Stage A 的 schema 有这两样"
+    这条断言变成两条: 两段合起来才覆盖 puzzle + answer, 而**任何一段
+    都不该同时有两者**(那会让同一次调用又想起草又想起谜面)。
+    """
     print("\n[G2-13] Stage B schema 不含 puzzle/answer/title")
-    from story.llm import _TOOL_STRUCTURE, _TOOL_KEYWORD_IDEA
+    from story.llm import _TOOL_STRUCTURE, _TOOL_STORY, _TOOL_SURFACE
     props = set(_TOOL_STRUCTURE["input_schema"]["properties"])
     req = set(_TOOL_STRUCTURE["input_schema"]["required"])
     for k in ("puzzle", "answer", "title"):
         check(f"properties 里没有 {k}", k not in props, sorted(props))
         check(f"required 里没有 {k}", k not in req, sorted(req))
-    check("Stage A 的 schema 有这三样",
-          {"puzzle", "answer"} <= set(_TOOL_KEYWORD_IDEA["input_schema"]["properties"]))
-    check("Stage A 的 required 含 puzzle/answer",
-          {"puzzle", "answer"} <= set(_TOOL_KEYWORD_IDEA["input_schema"]["required"]))
+    story_props = set(_TOOL_STORY["input_schema"]["properties"])
+    surface_props = set(_TOOL_SURFACE["input_schema"]["properties"])
+    check("Story schema 有 answer", "answer" in story_props, sorted(story_props))
+    check("Surface schema 有 puzzle", "puzzle" in surface_props,
+          sorted(surface_props))
+    # ⚠️ 反过来: 任何一段都**不得**同时持有 puzzle 与 answer。
+    check("**Story 不含 puzzle**", "puzzle" not in story_props)
+    check("**Surface 不含 answer**", "answer" not in surface_props)
 
 
 def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
@@ -3207,25 +3236,24 @@ def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
        keyword2 仍是 AI-original 而不是 curated)。
     """
     print("\n[G2-14] G4-A: 配额墙只记录, 不再硬拒 keyword candidate")
-    from story.llm import PuzzleWriter, KEYWORD_IDEA_PROMPT_VERSION
-    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    from story.llm import PuzzleWriter, STORY_PROMPT_VERSION
+    from test_llm import (FakeClient, riddle, review_ok, runtime_cfg,
+                         _truth_tool)  # noqa
     st = dict(riddle())
     for k in ("puzzle", "answer", "title"):
         st.pop(k, None)
     pz = riddle()["puzzle"]
-    # ⚠️ G4-CF: Stage A 现在对 Case-first 脚手架 **fail-closed**
-    # (core_truth + 2~4 observed_clues + 2~3 event_chain)。这条用例测的是
-    # 配额墙, 脚手架要给齐 —— 否则 Stage A 返回 None, 后面 `i["title"]`
-    # 会 TypeError, 而那不是这条用例想验的东西。
-    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"],
-            "core_truth": "他亮灯是为了标出退潮时露出的礁石。",
-            "observed_clues": ["只在退潮的那几个小时亮灯",
-                               "涨潮时灯是灭的"],
-            "event_chain": ["退潮时礁石露出水面", "他用亮灯标出礁石位置"]}
-    fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
+    # ⚠️ R4: 现在是 Story / Surface 两段。Story 只要 answer, Surface 只要
+    # puzzle —— 旧的 Case-first 脚手架(core_truth / observed_clues /
+    # event_chain)已经不在链上了。
+    fc = FakeClient([LLMResult(tool_input={"answer": riddle()["answer"]}),
+                     LLMResult(tool_input={"puzzle": pz}),
+                     LLMResult(tool_input=st),
                      LLMResult(tool_input=review_ok())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    i = w.gen_keyword_idea(["图书馆", "上楼"])
+    story = w.gen_keyword_story(["图书馆", "上楼"], "red")
+    surf = w.gen_surface(story["answer"])
+    i = {"title": "", "puzzle": surf["puzzle"], "answer": story["answer"]}
     # 造一个 recent 窗口: 同一 (mechanism_family, solution_shape) 已满。
     from story.puzzle import PuzzleSignature
     sig = PuzzleSignature.from_dict({
@@ -3253,23 +3281,20 @@ def test_g2_too_similar_still_hard_rejects():
     """`avoid` 里已有近重复谜面 -> keyword candidate 仍被硬拒。"""
     print("\n[G2-15] too_similar / avoid 仍硬拒")
     from story.llm import PuzzleWriter
-    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    from test_llm import (FakeClient, riddle, review_ok, runtime_cfg,
+                         _truth_tool)  # noqa
     st = dict(riddle())
     for k in ("puzzle", "answer", "title"):
         st.pop(k, None)
     pz = riddle()["puzzle"]
-    # ⚠️ G4-CF: 同上 —— 脚手架要给齐, 否则 Stage A fail-closed。
-    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"],
-            "core_truth": "他亮灯是为了标出退潮时露出的礁石。",
-            "observed_clues": ["只在退潮的那几个小时亮灯",
-                               "涨潮时灯是灭的"],
-            "event_chain": ["退潮时礁石露出水面", "他用亮灯标出礁石位置"]}
-    fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
-                     LLMResult(tool_input=review_ok())])
+    # ⚠️ 这条用例**直接**调 `structure_original_idea`, 不经过 Story/Surface
+    # —— 所以队列第一条就是结构 payload。(R4 拆链不影响这里。)
+    fc = FakeClient([LLMResult(tool_input=st),
+                     LLMResult(tool_input=review_ok()),
+                     _truth_tool()])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    i = w.gen_keyword_idea(["图书馆", "上楼"])
-    spec = w.structure_original_idea(title=i["title"], puzzle=i["puzzle"],
-                                     answer=i["answer"], avoid=[pz])
+    spec = w.structure_original_idea(title="", puzzle=pz,
+                                     answer=riddle()["answer"], avoid=[pz])
     check("**被 avoid 硬拒**", not spec.puzzle, spec.puzzle[:40])
     check("拒因提到太像", "太像" in (spec.error or ""), spec.error)
 
@@ -3348,9 +3373,13 @@ def test_g4_vocab_missing_never_falls_back_to_bank():
             super().__init__()
             self.keyword_calls = []
 
-        def gen_keyword_idea(self, keywords, **kw):
-            self.keyword_calls.append(list(keywords))
-            raise AssertionError("**降级后不该调 gen_keyword_idea**")
+        def gen_keyword_story(self, keywords, lane, **kw):
+            self.keyword_calls.append((list(keywords), lane))
+            raise AssertionError("**降级后不该调 gen_keyword_story**")
+
+        def gen_surface(self, answer, **kw):
+            self.keyword_calls.append("surface")
+            raise AssertionError("**降级后不该调 gen_surface**")
 
         def structure_original_idea(self, **kw):
             self.keyword_calls.append("structure")
@@ -3428,7 +3457,7 @@ def test_g4_good_vocab_activates_bag():
         pf.on_tick()
         check("Stage A 被调了", len(w.keyword_calls) >= 1, w.keyword_calls)
         if w.keyword_calls:
-            got = set(w.keyword_calls[0])
+            got = set(w.keyword_calls[0][0])   # R4: (keywords, lane)
             check("**抽到的词来自词库**",
                   got <= {"山顶", "敲门", "台阶", "下雨", "棺材"}, got)
 

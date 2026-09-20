@@ -448,6 +448,44 @@ def combos(n: int) -> int:
     return n * (n - 1) // 2
 
 
+#: lane(红汤 / 黑汤)取值。顺序即 50/50 抽取的两个桶。
+LANES = ("red", "black")
+
+#: lane rng 的派生常量(SplitMix64 风格混合, 与 `derive_session_seed` 同源)。
+#: 换一个常量值就只有 lane 序列变, keyword 抽词序列不动 —— 两者必须隔离。
+_LANE_MIX = 0x2545F4914F6CDD1D
+
+
+def derive_lane_seed(session_seed: int) -> int:
+    """从 keyword session seed **确定性派生** lane 的 rng seed。
+
+    ## 为什么单独派生, 而不是复用 bag 的 rng
+
+    `KeywordBag` 内部那个 `random.Random` 是**抽词专用**的: 它每 draw 一次
+    就推进自己的状态。拿它去掷 lane, 会让"抽到哪些词"取决于"掷了几次
+    lane" —— 复盘时看到 `session_seed` 也重放不出同一组词。
+
+    所以 lane 走**另一把** rng, 由 session seed 混合出一个独立种子。
+    于是: 同一个 session seed => 同一个 `(keywords, lane)` 序列, 且
+    两者互不影响。
+
+    ⚠️ 与 `derive_session_seed` 一样**不用 `hash()`** —— str 的 `hash()`
+    带 PYTHONHASHSEED 随机化, 跨进程不可复现。
+    """
+    x = (int(session_seed) ^ _LANE_MIX) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 30)
+    x = (x * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 27)
+    x = (x * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 31)
+    return x
+
+
+def draw_lane(rng: random.Random) -> str:
+    """掷一个 lane(红/黑, 50/50)。`rng` **必须**由调用方提供。"""
+    return LANES[rng.randrange(len(LANES))]
+
+
 # ======================================================================
 # 四、兼容: G2 的 `draw_two_keywords`(人工词库)
 # ======================================================================
@@ -521,7 +559,8 @@ def draw_two_keywords(rng: random.Random,
 # G4-2 §四 要求 live 现场生成**也**走同一条链:
 #
 #     pool 空且必须现场生成
-#       -> draw 2 independent keywords -> Stage A -> Stage B
+#       -> draw 2 independent keywords + 掷 lane(红/黑)
+#       -> Story(完整汤底) -> Surface(截反常瞬间) -> Structure(PuzzleSpec)
 #       -> generated Reviewer -> truth audit -> validate -> safety/dup 硬门
 #
 # 而**不是**回到 classic Blueprint —— 否则观众会看到风格断层(池子里
@@ -531,22 +570,24 @@ def draw_two_keywords(rng: random.Random,
 # 哪里补 provenance"这些细节上漂, 而漂了以后 live 与 prefetch 出的题
 # 就不是同一种东西了 —— 那正是本轮要消灭的形状。所以骨架只写一次。
 #
-# ⚠️ 逻辑 0 改动(本轮只补这条注释): Stage A 从 `keyword2-v4` 起内部含
-# **Case-first 创作脚手架**(先想清 core_truth -> 现场 observed_clues ->
-# event_chain, 最后才写谜面谜底)。但下面这一行刻意**只**把
-# title/puzzle/answer 交给 Stage B:
+# ⚠️ R4 把旧 Stage A(`keyword2-v4` 的 Case-first: 先想 core_truth, 再
+# 反推 observed_clues, 再排 event_chain, **最后**才写谜面谜底)拆成了
+# Story + Surface 两段 —— 原因见 `story/llm.py` 的
+# `STORY_PROMPT_VERSION` 注释: 同一次调用里既想线索又想谜面, 会把本该
+# 靠 Yes/No 问出来的信息提前写进汤面。`observed_clues` / `event_chain`
+# 因此**退出创作链**(不是降级, 是删除)。
 #
-#     structure_original_idea(title=idea["title"], puzzle=idea["puzzle"],
-#                             answer=idea["answer"], ...)
+# Structure 仍然**只**拿最终 canonical 的谜面谜底:
 #
-# 三个脚手架字段是**一次性**的 —— 它们帮模型先想清楚, 然后在这里终止。
-# **不要**把它们也传进 Stage B: Stage B 已经从**最终** canonical 谜面谜底
-# 建了 core_answer / facts / completion / atoms / beats, 再传一份草稿
-# 结构进去就有了两个事实来源, 以后要解决"谁权威"。
+#     structure_original_idea(title="", puzzle=surface["puzzle"],
+#                             answer=story["answer"], ...)
+#
+# 它已经从这两样里建了 core_answer / facts / completion / atoms / beats。
+# 不要再把中间产物塞进去 —— 那会有两份事实来源, 以后要解决"谁权威"。
 def keyword_spec(writer, bag, session_seed: int, *,
                  avoid=None, recent=None, should_continue=None,
-                 corpus_version: str = ""):
-    """跑一遍 `抽词 -> Stage A -> Stage B + provenance`。
+                 corpus_version: str = "", lane_rng=None):
+    """跑一遍 `抽词 + 掷 lane -> Story -> Surface -> Structure + provenance`。
 
     返回 `(spec, reason)`:
 
@@ -556,7 +597,7 @@ def keyword_spec(writer, bag, session_seed: int, *,
     `reason` 的取值是**结构化**的, 调用方据此分流:
 
         "interrupted"  直播变忙, 让路 —— **不计失败不退避**(G1 语义)
-        "gen_fail"     Stage A 没成题 / Stage B 空谜面 —— 真的失败
+        "gen_fail"     Story/Surface 没成, 或 Structure 空谜面 —— 真的失败
 
     ⚠️ G4-R2 §六: `gen_fail` 只是"没成"这个**结果**, 而"**为什么**没成"
     写在 spec 的 `metrics["reject"]` 里(`structure_technical_fail` /
@@ -567,37 +608,87 @@ def keyword_spec(writer, bag, session_seed: int, *,
     ⚠️ 这里**不**做试玩、**不**入池、**不**上屏 —— 那些是调用方的
     契约(live 直接 submit, prefetch 走 pool.add)。骨架只负责"产出一
     个合格的 spec"。
+
+    ## R4: 三段式
+
+        Story     只写完整隐藏汤底            -> answer
+        Surface   从汤底单独截一个反常瞬间    -> puzzle
+        Structure 当前 PuzzleSpec 结构化      -> spec
+
+    旧版是"一次调用里同时想线索、想顺序、想谜面、想谜底"(Stage A 的
+    Case-first), 而 R1/R2/R3 实测证明那条链会把本该靠 Yes/No 问出来的
+    信息提前写进谜面。拆开之后汤面平均长度从 109.2 掉到 62.8 字。
+
+    ⚠️ `observed_clues` / `event_chain` **不在链上了** —— 它们不是
+    被降级, 是从创作里删掉了。
+
+    ## lane
+
+    `lane_rng` 由调用方给(见 `derive_lane_seed`)。**不给**时按 session
+    seed 派生一把局部的 —— 于是"同一个 session seed 重放出同一组词 +
+    同一条 lane 序列"仍然成立, 而且永远不会碰全局 `random`。
     """
-    # ---- 让路检查 ①: Stage A 之前 ----
+    # ---- 让路检查 ①: Story 之前 ----
     if should_continue is not None and not should_continue():
         return None, "interrupted"
+
+    # ⚠️ **延迟 import**: `story.llm` 是重模块(它 import parser / puzzle /
+    # quality), 而本模块在 import 期被 director/prefetch 拉起来。放模块
+    # 顶层会把这个重量加到每一条 import 路径上 —— 和本文件里
+    # `from .keyword_corpus import load_vocabulary` 同样的处理。
+    from .llm import STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION
 
     keys = bag.draw()
     keywords = list(keys["keywords"])
 
-    idea = writer.gen_keyword_idea(keywords, should_continue=should_continue)
-    if idea is None:
+    # ---- lane: 50/50, 用**独立**的 rng(不复用 bag 的抽词 rng) ----
+    if lane_rng is None:
+        lane_rng = random.Random(derive_lane_seed(session_seed))
+    lane = draw_lane(lane_rng)
+
+    story = writer.gen_keyword_story(keywords, lane,
+                                     should_continue=should_continue)
+    if story is None:
         return None, "gen_fail"
-    if idea.get("interrupted"):
+    if story.get("interrupted"):
         return None, "interrupted"
 
-    # ---- 让路检查 ②: Stage A 之后 / Stage B 之前(最容易漏的一处) ----
+    # ---- 让路检查 ②: Story 之后 / Surface 之前 ----
+    if should_continue is not None and not should_continue():
+        return None, "interrupted"
+
+    surface = writer.gen_surface(story["answer"],
+                                 should_continue=should_continue)
+    if surface is None:
+        return None, "gen_fail"
+    if surface.get("interrupted"):
+        return None, "interrupted"
+
+    # ---- 让路检查 ③: Surface 之后 / Structure 之前 ----
     if should_continue is not None and not should_continue():
         return None, "interrupted"
 
     spec = writer.structure_original_idea(
-        title=idea.get("title", ""), puzzle=idea["puzzle"],
-        answer=idea["answer"], avoid=avoid, recent=recent,
+        title="", puzzle=surface["puzzle"],
+        answer=story["answer"], avoid=avoid, recent=recent,
         should_continue=should_continue)
 
     # ---- provenance: 只进 metrics/archive/日志 ----
+    #
+    # ⚠️ 两个 prompt version 都落盘: `spec.prompt_version` 只放得下
+    # **Story** 那一个(它决定内容), Surface 的走 metrics。少写一个,
+    # 复盘时就分不清"这题变了"是因为故事变了还是截法变了。
     try:
         spec.metrics = dict(spec.metrics or {})
         spec.metrics["generation_mode"] = "keyword2"
+        spec.metrics["lane"] = lane
         spec.metrics["keywords"] = keywords
+        spec.metrics["story_prompt_version"] = STORY_PROMPT_VERSION
+        spec.metrics["surface_prompt_version"] = SURFACE_PROMPT_VERSION
         spec.metrics["keyword_seed_version"] = KEYWORD_SEED_VERSION
         spec.metrics["keyword_corpus_version"] = corpus_version
         spec.metrics["keyword_session_seed"] = session_seed
+        spec.metrics["keyword_draw_index"] = int(keys.get("index") or 0)
     except Exception:                       # noqa: BLE001
         pass
 
@@ -605,9 +696,9 @@ def keyword_spec(writer, bag, session_seed: int, *,
         return None, "interrupted"
     if spec is None or not getattr(spec, "puzzle", ""):
         # ---- G4-R2 §六: 把 Stage B 写下的原因标签**原样**带出去 ----
-        # 拿不到就是 Stage A 那一边没成(没走到结构调用), 记 "gen_fail"
-        # 之外的默认标签 "structure_technical_fail" 是不对的 —— 那是
-        # "结构调用失败", 而这里可能是"Stage A 没成题"。所以只在拿到
-        # 标签时才覆盖, 否则留空由调用方按 "gen_fail" 记账。
+        # 拿不到就是 Story/Surface 那一边没成(没走到结构调用), 记
+        # "gen_fail" 之外的默认标签 "structure_technical_fail" 是不对的
+        # —— 那是"结构调用失败"。所以只在拿到标签时才覆盖, 否则留空由
+        # 调用方按 "gen_fail" 记账。
         return None, "gen_fail"
     return spec, ""
