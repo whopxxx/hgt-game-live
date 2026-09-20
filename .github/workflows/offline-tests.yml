@@ -70,6 +70,15 @@ jobs:
       - name: 离线套件 pool
         run: uv run tests/test_pool.py
 
+      # G2: keyword2 两阶段起题的**零件** —— 抽词。它守三件事:
+      #   (a) 生产抽词与 G1 实验是**同一份实现**(否则 G1 的结论不再描述
+      #       生产行为), 且依赖方向只能是 `story/ <- tools/`;
+      #   (b) 抽取序列与 G1 基线**逐字节相同**(md5 钉死) —— 改词库/改抽取
+      #       方式会让两批历史数据无法对比;
+      #   (c) 本模块不碰 `random` 的全局状态(否则会污染 live 出题的序列)。
+      - name: 离线套件 keyword_seed
+        run: uv run tests/test_keyword_seed.py
+
       - name: 离线套件 prefetch
         run: uv run tests/test_prefetch.py
 

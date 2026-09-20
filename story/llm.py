@@ -1810,6 +1810,412 @@ _TOOL_RIDDLE = {
     },
 }
 
+STRUCTURE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用中文。
+
+用户会给你一道**已经写好**的谜题(谜面 + 谜底)。你的工作**不是**评价它
+好不好, 也**不是**重新创作 —— 而是把它**搬进**我们的结构化 schema:
+填出 facts / solve_atoms / completion_fact_ids / fair_clues /
+discovery_beats / hints / core_answer, 以及这道题**实际**是什么形状
+(observed signature)。
+
+## 铁律
+
+1. **谜面与谜底已经定了, 你改不了也不该改。** schema 里根本没有这两个
+   字段 —— 不要试图"顺手润色一下"。
+2. `core_answer` 必须**直接回答谜面最后那个问题**。一句话, <=60 字,
+   不换行。
+3. `fair_clues.quote` 必须**逐字**摘自**用户给出的那个谜面**(代码会做
+   包含检查)。一个字都不能改 —— 更不许改谜面去迁就 quote。
+4. `completion_fact_ids` 是**通关合同**(1~2 条), 不是"谜底要点"。指向
+   `kind=core` 且 `visibility=hidden` 的 fact。support / exclusion
+   **绝不能**填在这里。
+5. `signature` 是**观察结果**, 不是创作指令: 没有任何目标骨架要你迎合,
+   如实填写这道题**本来**是什么形状。
+6. 这道题**没有** target Blueprint。不要因为"它不是某个形状"就说它
+   不合格 —— 你要判的只有一件事: **它本身是不是一道合格的直播海龟汤**。
+
+按工具字段填: core_answer / facts / completion_fact_ids / solve_atoms /
+fair_clues / discovery_beats / hints / signature。"""
+
+
+def _unconstrained_blueprint():
+    """`make_unconstrained_blueprint()` 的**延迟**包装(见 `_TOOL_KEYWORD_IDEA`)。
+
+    ## 为什么要有这一层
+
+    那个哨兵住在 `tools/curated_compiler.py`。`story/llm.py` 顶层**不**
+    import `tools/*` —— 目前全部三处用到 `tools` 的地方(`CURATED_HARD_CHECKS`
+    / `check_value_ok` / 这里)都是**函数内** import, 保持 `story` 包对
+    `tools` 的零顶层依赖。这不是洁癖: `tools/` 是"离线工具"层, 让它出现在
+    直播进程的 import 图顶端会把下载器/编译器那一整串依赖带进来。
+
+    ## 为什么可以借它
+
+    `make_unconstrained_blueprint()` 是**纯函数**(构造一个带 `_unconstrained`
+    标记的 `PuzzleBlueprint`), 没有 curated policy 副作用。借它是因为
+    `_blueprint_block_for_review` 已经认识那个标记, 会给审稿人印"本题没有
+    target Blueprint"的**观察声明** —— 那正是 §七 要的语义。
+
+    ⚠️ 借的是**哨兵**, 不是 `CuratedCompiler`。任务书 §二 明确禁止在生产里
+    复用 curated 编译链(它带 curated-v5 准入账本与另一套 diversity policy)。
+    keyword 题必须落成普通的 **generated** spec。
+    """
+    from tools.curated_compiler import make_unconstrained_blueprint
+    return make_unconstrained_blueprint()
+
+
+def _keywords_prompt(keywords) -> str:
+    """Stage A 的 user message。
+
+    形状刻意与外部题库一致(`关键词：X，Y`) —— G1-A 就是照这个形状测的,
+    换掉它等于换掉被测变量。
+    """
+    words = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    return ("关键词：" + "，".join(words) + "\n\n"
+            "请围绕这几个关键词写一道中文海龟汤。\n"
+            "直接给出谜面与谜底。")
+
+
+def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
+                           avoid: Optional[list] = None,
+                           recent: Optional[list] = None) -> str:
+    """Stage B 的 user message。
+
+    ⚠️ 谜面与谜底放在**显眼位置**并明确标注 canonical —— 光靠 system
+    prompt 不够: 模型很容易滑回"编一道类似的题"。这一点与 curated 编译
+    链的 `build_user_prompt` 是同一条经验(那边也是显式声明"这是已有
+    题目, 不要重新创作")。
+
+    `avoid` / `recent` **不**在这里注入: 它们已经被
+    `cross_puzzle_gate` 事后硬判了, 写进 prompt 只会让模型为了"避开"
+    而改掉这道题的内容 —— 而谜面是冻结的。§七 的要求正是"不要为了过
+    quota 回头修改这道题"。
+    """
+    parts = ["下面是一道**已经写好**的谜题。请把它**搬进**我们的 schema。"]
+    if title:
+        parts.append(f"【原标题】{title}")
+    parts += [
+        "",
+        "═══ 谜面(canonical —— **不得改变其文字**)═══",
+        puzzle,
+        "",
+        "═══ 谜底(canonical —— **不得改变其真相**)═══",
+        answer,
+        "",
+        "请按 schema 输出。记住: 你是**编辑**, 不是出题人。",
+    ]
+    return "\n".join(parts)
+
+
+# ======================================================================
+# G2 —— keyword2 两阶段起题: Stage A(自由成题)/ Stage B(结构化)
+# ======================================================================
+#
+# ## 为什么要有 Stage A
+#
+# G1-A / G1-B 实验证明: 与其先派一份 Blueprint 让模型"命题作文", 不如
+# 给它 2 个**普通生活关键词**让它自己形成一个自然的海龟汤。后者出来的
+# 谜面短(median 33 字)、单机关、没有为了显得高级硬加的第二机关 ——
+# 更接近外部题库的语感, 而 Blueprint 链最容易丢掉的就是这个。
+#
+# ## 两个阶段各自只做一件事
+#
+#     Stage A(本节的 prompt)   输入: 2 个关键词
+#                              输出: **只有** title / puzzle / answer
+#     Stage B(下面的 _TOOL_STRUCTURE)
+#                              输入: 上面那三样(**冻结**)
+#                              输出: facts / atoms / completion / clues /
+#                                    beats / hints / observed signature
+#
+# Stage A 刻意**不**提 facts / atoms / completion / discovery_beats。
+# 任务书 §四 的原话是"暂时不要让它同时想着"那些 —— 一边构思自然的故事,
+# 一边填五张结构化表格, 模型会往"怎么把这五张表填满"上跑, 而那正好
+# 毁掉 Stage A 唯一的产出价值:**谜面的自然语感**。
+#
+# ## 生产接在哪
+#
+# **只有**普通 AI 后台补池(`PoolPrefetcher`)走这条链。live 现场出题
+# 仍然是一阶段 Blueprint 链 —— 那里观众在等, 两阶段会显著拉长等待时间。
+# curated 链更不相关(那是"搬运"链, 不是"发明"链)。
+
+#: Stage A prompt 的版本号。
+#:
+#: ⚠️ 与 `RIDDLE_PROMPT_VERSION` **并列**而不是替换它: 两条链同时存在于
+#: 生产里(live 走 classic, prefetch 走 keyword2), archive 必须能区分
+#: "这题是哪条链产的"。所以这是**新开的号**, 不是 bump 老号。
+#:
+#: 同理 `QUALITY_POLICY_VERSION` **不 bump** —— 接受标准一个字都没改
+#: (同一套 Reviewer / truth audit / validate_spec / 跨题门), 改的只是
+#: "候选怎么产生"。bump policy 会把盘上现有库存全部隔离掉。
+KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v1"
+
+KEYWORD_IDEA_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人。全程用中文。
+
+用户会给你 2 个**普通生活关键词**。请围绕这些关键词, 自己想一个
+自然的谜题, 直接给出:
+
+    title   —— 极短标题(可留空)
+    puzzle  —— 谜面, 1~3 句
+    answer  —— 谜底, 直接解释谜面里那个反常点
+
+## 硬要求
+
+1. 谜面要有一个**清楚的反常点**: 有一件事看起来不该发生 / 说不通,
+   读者会想问"为什么会这样"。
+2. 谜底必须**直接解释**那个反常点。读者看完谜底要能说"哦, 原来如此"。
+3. 谜面结尾要是一个问句。
+4. 用第三人称客观叙述, 不要"我"。
+5. 只用关键词和**普通生活常识**, 不要引入输入之外的冷门知识。
+
+## 以下都可以, 不要为了"显得高级"而回避
+
+* **简单也可以** —— 一句话能问明白的题是合格的题。
+* **单机关也可以** —— 不需要两个诡计叠在一起。
+* **普通生活常识即可** —— 柴米油盐、邻里日常都行。
+* 不要求多层反转, 不要求悲剧。
+* 不要求复杂人物背景, 不要求职业设定。
+* **不为显得高级增加第二机关** —— 一个干净的诡计胜过两个勉强的。
+
+## 不要做的事
+
+* 不要写提示、附注、谜底剧透在谜面里。
+* 不要把关键词生硬地塞进去 —— 让它们自然地出现在情境里。
+* 不要写需要看外部图片 / 听音频 / 上某个软件才能答的题。
+
+先在心里想一个**自然的**情境, 再写出来。不要套模板。
+"""
+
+#: Stage A 的工具 schema —— **只有三样**。
+#:
+#: ⚠️ 这里的字段集合是**刻意的**: 任何 facts / atoms / completion /
+#: signature 字段的出现都会把模型拉回"填表"模式(见上面代码块里的说明)。
+_TOOL_KEYWORD_IDEA = {
+    "name": "emit_keyword_idea",
+    "description": "围绕 2 个关键词输出一个海龟汤的谜面与谜底(只有这三样)",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "极短标题(可留空)"},
+            "puzzle": {"type": "string",
+                       "description": ("谜面: 1~3 句, 结尾是问句, "
+                                       "有一个清楚的反常点")},
+            "answer": {"type": "string",
+                       "description": "谜底: 直接解释谜面里的反常点"},
+        },
+        "required": ["puzzle", "answer"],
+    },
+}
+
+#: Stage B 的工具 schema —— 结构化的**全部**产出。
+#:
+#: ## ⚠️ 这里**没有** puzzle / answer / title, 而且这不是疏忽
+#:
+#: 任务书 §五: "Stage B schema **不要提供 puzzle / answer 可写字段**,
+#: 从结构上禁止它把自然谜面重新写成工程化谜面。"
+#:
+#: 这是**结构性**保证, 不是靠 prompt 里写"请不要改谜面"那种约定 ——
+#: 约定在长 prompt 里会被注意力稀释, 而 schema 里没有的字段模型填不出来。
+#: 组装 spec 时由**代码**把 Stage A 的 title/puzzle/answer 原样放回
+#: (见 `PuzzleWriter.structure_original_idea`)。
+#:
+#: 字段语义与 `_TOOL_RIDDLE` 的对应项**逐条一致** —— 两者都喂给同一套
+#: `validate_spec` / Reviewer / truth audit, 说法不一致会让模型按不同的
+#: 标准填, 然后被同一套门拒掉。
+_TOOL_STRUCTURE = {
+    "name": "emit_structure",
+    "description": ("把一道**已经写好**的谜题结构化(不是重新出题; "
+                    "谜面与谜底已定, 你只填分析字段)"),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "core_answer": {
+                "type": "string",
+                "description": (
+                    "**核心答案**: 普通观众一听就知道\"这题到底怎么回事\"的"
+                    "一句话。必须**直接回答谜面最后那个问题**, 不能依赖额外"
+                    "脑补。推荐 <=60 汉字, 硬上限 80。**不换行**。\n"
+                    "它是揭晓时**第一句**念给观众的话 —— 写得绕等于没写。"),
+            },
+            "completion_fact_ids": {
+                "type": "array", "minItems": 1, "maxItems": 2,
+                "items": {"type": "string"},
+                "description": (
+                    "**通关合同**: 观众房间必须真正建立的 1~2 条核心事实"
+                    "(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
+                    "房间已公开确认的事实会**累计**, 最后补齐缺口的观众立即"
+                    "触发揭晓 —— 不要求某一个人独自说全。\n"
+                    "所以这里要填的是\"解出这题最少必须知道什么\", "
+                    "**不是**\"完整谜底需要解释什么\"。\n"
+                    "support / exclusion **绝不能**填在这里。"),
+            },
+            "facts": {
+                "type": "array", "minItems": 4, "maxItems": 10,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string",
+                               "description": "如 f1, f2 … 唯一"},
+                        "text": {"type": "string",
+                                 "description": "一条确定的事实, 一句话"},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["core", "support", "exclusion"],
+                            "description": "core=解谜核心(≤3 条); "
+                                           "support=支撑/背景; "
+                                           "exclusion=用来排除常见错误路线",
+                        },
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["public", "hidden"],
+                            "description": "public=谜面已明说; hidden=要问出来",
+                        },
+                        "hintable": {
+                            "type": "boolean",
+                            "description": "是否允许提示围绕它引导。"
+                                           "核心 mechanism 建议 false",
+                        },
+                    },
+                    "required": ["id", "text", "kind"],
+                },
+                "description": (
+                    "主持人在整局游戏里判断「是/不是/无关」的**事实空间**。"
+                    "至少 1 条 kind=exclusion。"),
+            },
+            "solve_atoms": {
+                "type": "array", "minItems": 1, "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "如 a1, a2 …"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["key", "cause", "mechanism", "support"],
+                            "description": (
+                                "key       = 这道题的**核心翻转**本身"
+                                "(身份/时间/目标/物品被误认), **没有因果链"
+                                "的题就用它**; "
+                                "cause     = 那个反常结果的起因; "
+                                "mechanism = 这个起因**如何**导致反常行为; "
+                                "support   = 补充事实(可选)"),
+                        },
+                        "text": {"type": "string",
+                                 "description": "这条原子事实, 一句话"},
+                        "fact_ids": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "这条 atom 依据的 fact id(必须存在)",
+                        },
+                        "required": {
+                            "type": "boolean",
+                            "description": (
+                                "是否属于谜底的主要解释结构 / 提示优先结构。"
+                                "**不决定玩家是否通关**。"),
+                        },
+                    },
+                    "required": ["id", "role", "text", "fact_ids"],
+                },
+                "description": (
+                    "1~4 条对谜底的分析原子, 用于**提示 / 解释 / 复盘**。\n"
+                    "**不得为了满足 schema 凑第二条 atom。**"),
+            },
+            "fair_clues": {
+                "type": "array", "minItems": 1, "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "quote": {
+                            "type": "string",
+                            "description": "谜面里**逐字**摘录的一段原文"
+                                           "(代码会验证它真的在谜面里)",
+                        },
+                        "supports_atoms": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "这段原文指向哪条 atom 的 id",
+                        },
+                    },
+                    "required": ["quote", "supports_atoms"],
+                },
+                "description": (
+                    "谜面里**已经写着的**、知道答案后回看能指向谜底的具体"
+                    "事实。quote 必须逐字出自**上面给出的谜面**。"),
+            },
+            "discovery_beats": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string",
+                               "description": "如 b1, b2 … 唯一"},
+                        "text": {"type": "string",
+                                 "description": "观众在正常推理中应当发现的"
+                                                "**一层**, 一句话。"},
+                        "fact_ids": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "这一层涉及哪些 fact id(必须存在)",
+                        },
+                    },
+                    "required": ["id", "text"],
+                },
+                "description": (
+                    "2~4 个**发现阶段** —— 观众正常玩下来会一层层想通什么。"
+                    "⚠️ 它**不是**通关条件。每条必须是**不同的发现阶段**。"
+                    "至少一条要指向 completion 里的 fact。"),
+            },
+            "hints": {
+                "type": "array", "minItems": 3, "maxItems": 3,
+                "items": {"type": "string"},
+                "description": "3 条由浅入深的提示, 每条不超过 30 字, 不剧透",
+            },
+            "signature": {
+                "type": "object",
+                "properties": {
+                    "mechanism_family": {
+                        "type": "string",
+                        "enum": list(MECHANISM_FAMILIES),
+                    },
+                    "solution_shape": {
+                        "type": "string",
+                        "enum": list(SOLUTION_SHAPES),
+                    },
+                    "domain": {"type": "string", "enum": list(DOMAINS)},
+                    "emotion_mode": {"type": "string",
+                                     "enum": list(EMOTION_MODES)},
+                    "relation": {"type": "string", "enum": list(RELATIONS)},
+                    "time_shape": {"type": "string", "enum": list(TIME_SHAPES)},
+                    "death": {"type": "boolean"},
+                    "past_trauma": {"type": "boolean"},
+                    "long_term_profession": {"type": "boolean"},
+                    "repeated_ritual": {"type": "boolean"},
+                    "reveal_mode": {
+                        "type": "string", "enum": list(REVEAL_MODES),
+                        "description": (
+                            "揭晓结构: 揭晓那一刻观众**重新理解了什么**。"
+                            "与 emotion_mode **严格正交**。"),
+                    },
+                    "procedural_rule_dependency": {
+                        "type": "boolean",
+                        "description": (
+                            "这道题是否**主要靠**题面之外的制度性设定成立。"
+                            "普通的生活常识/物理规律**不算**。"),
+                    },
+                },
+                "required": ["mechanism_family", "solution_shape", "domain",
+                             "relation", "emotion_mode", "time_shape",
+                             "death", "past_trauma", "long_term_profession",
+                             "repeated_ritual", "reveal_mode",
+                             "procedural_rule_dependency"],
+                "description": (
+                    "这道题**实际**是什么形状 —— 这是**观察结果**, 不是"
+                    "创作指令: 没有任何 target Blueprint 要你迎合, 照实填。"
+                    "代码会拿它做跨题分布检查, 填假的会污染统计。"),
+            },
+        },
+        # ⚠️ 注意这里**没有** puzzle / answer / title —— 见上面的说明。
+        "required": ["core_answer", "hints", "facts",
+                     "completion_fact_ids", "solve_atoms",
+                     "fair_clues", "discovery_beats", "signature"],
+    },
+}
+
 _TOOL_ANSWER = {
     "name": "emit_verdict",
     "description": "输出对若干提问的裁决",
@@ -3725,6 +4131,294 @@ class PuzzleWriter:
             error=err, metrics=dict(m),
             usage=getattr(last, "usage", None),
             model=getattr(last, "model", None))
+
+    # ==================================================================
+    # G2 —— keyword2 两阶段链(只给普通 AI 后台补池用)
+    # ==================================================================
+    #
+    # 这两条方法**只有** `PoolPrefetcher` 会调。live 现场出题继续走
+    # `gen_spec`(一阶段 Blueprint 链), curated 走 `CuratedCompiler`。
+    #
+    # 生产**不**复用 `CuratedCompiler`: 它带着 external curated 的 policy
+    # 语义(curated-v5 准入账本 / provenance / 与 AI 原创链不同的 diversity
+    # policy —— 见 H4-F)。keyword 题仍然是 **AI 原创**题, 只是候选的产生
+    # 方式变了, 所以它必须走**这一条**链, 并落成普通的 generated PuzzleSpec。
+
+    def gen_keyword_idea(self, keywords, *, should_continue=None,
+                         max_attempts: int = 1,
+                         temperature: Optional[float] = None
+                         ) -> Optional[dict]:
+        """**Stage A**: 围绕 2 个关键词自由形成一个海龟汤。
+
+        返回 `{"title", "puzzle", "answer", "interrupted"}` 或 `None`。
+
+        ## 为什么它单独存在(而不是并进 gen_spec)
+
+        任务书 §四 的原话是"Stage A 决定题的**自然语感**"。把它塞进
+        `gen_spec` 的稿循环里会立刻变味: 那个循环的每一次迭代都在想
+        "上一稿为什么被拒", 而 Stage A 要的是**不想任何验收标准**地
+        先写一个自然的故事。两件事分开, 才有 G1-A 观测到的那个语感。
+
+        ## 预算: 1 attempt(§十)
+
+        `max_attempts` 默认 **1**。后台补池没有"下一拍", 但也**绝不**
+        在 Stage A 里加无限重试把一次 prefetch 拉成长链 —— 生产后台的
+        哲学是"小预算、失败下轮再来", 不是"这一次一定要成"。
+
+        ## 让路(§九)
+
+        `should_continue` 在**调用前**与**返回后**各问一次:
+
+            * 调用前 false -> 直接不发请求
+            * 返回后 false -> 丢弃这次结果(**不返回 idea**), 标 interrupted
+
+        第二条是新增 Stage A 之后**最容易被漏掉**的一处: 一次调用是
+        几十秒量级, 期间直播完全可能已经切进 SETTING 开始现场出题。
+        "已经飞出去的那次请求"只能等它回来, 但它**回来之后不能再往下走**。
+
+        ## 返回值里的 `interrupted`
+
+        让路时返回的 dict **只有** `{"interrupted": True}`, 没有 puzzle ——
+        调用方据此把它归到 `interrupted` 而不是 `gen_fail`。两者混起来会
+        让"补池失败率"退化成"直播活跃度"(那正是 G1 修掉的东西)。
+        """
+        if should_continue is not None and not should_continue():
+            log.info("Stage A 让路(调用前, 直播已忙)")
+            return {"interrupted": True}
+        text = _keywords_prompt(keywords)
+        last_err = ""
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            res = self.client.messages(
+                KEYWORD_IDEA_SYSTEM, text, max_tokens=1500,
+                tool=_TOOL_KEYWORD_IDEA,
+                temperature=(temperature if temperature is not None
+                             else self._temperature("generate_temperature")))
+            ti = res.tool_input
+            if ti:
+                d = _unwrap_tool_input(ti)
+                pz = str(d.get("puzzle", "") or "").strip()
+                an = str(d.get("answer", "") or "").strip()
+                if pz and an:
+                    # ---- 让路检查: 请求回来了, 但房间可能已经忙了 ----
+                    if (should_continue is not None
+                            and not should_continue()):
+                        log.info("Stage A 让路(返回后, 直播已忙; 本次结果丢弃)")
+                        return {"interrupted": True}
+                    return {"title": str(d.get("title", "") or "").strip(),
+                            "puzzle": pz, "answer": an}
+                last_err = "Stage A 返回的谜面或谜底为空"
+            else:
+                last_err = res.error or "Stage A 没有 tool_input"
+            log.warning("Stage A 第 %d 稿失败: %s", attempt, last_err[:100])
+        log.info("Stage A 未成题(不计 gen_fail, 由调用方决定): %s",
+                 last_err[:120])
+        return None
+
+    def structure_original_idea(self, *, title: str, puzzle: str, answer: str,
+                                avoid: Optional[list] = None,
+                                recent: Optional[list] = None,
+                                should_continue=None,
+                                max_attempts: int = 1) -> PuzzleSpec:
+        """**Stage B**: 把 Stage A 的三样**冻结**着结构化成 `PuzzleSpec`。
+
+        ## 铁律: `puzzle` / `answer` / `title` 一个字都不许变
+
+        任务书 §五: "Stage B 只结构化, 不改写题"、"Stage B schema **不要
+        提供 puzzle / answer 可写字段**, 从结构上禁止它把自然谜面重新
+        写成工程化谜面"。
+
+        所以:
+
+            1. 发给模型的 schema(`_TOOL_STRUCTURE`)里**根本没有**这三个
+               字段 —— 它填不出来, 不是"我们请它别填";
+            2. 组装 spec 之后由**代码**把 Stage A 的原值写回去(见下),
+               连"模型恰好生成了同名字段"的可能性都不留。
+
+        ## 没有 target Blueprint(§七)
+
+        `blueprint` 恒为 `make_unconstrained_blueprint()` —— curated 链
+        认识的那个"**没有**目标骨架"哨兵。于是:
+
+            * `_blueprint_block_for_review` 给审稿人印的是**观察声明**
+              (["本题没有 target Blueprint —— 不要按骨架判它"]) 而不是
+              硬约束 —— 审稿人不会因为"不是某个随机骨架"要求重出;
+            * `mechanism / solution_shape / domain / relation` 因此是
+              **生成后的分类结果**, 不是创作指令(§五的核心)。
+
+        ⚠️ 但 **hard quota 照旧**: 生成之后 `observed_signature` 必须过
+        现有 `cross_puzzle_gate`(§六: keyword AI 仍属 AI-original, 题型
+        分布对它**还是 hard**)。过不了就这一道候选失败, **不回头改题**。
+
+        ## 返回
+
+        成功 -> 一个 `source_type` **为空**的普通 generated spec
+                (即 AI 原创, **不是** curated)。
+        让路 -> `puzzle` 为空、`metrics["interrupted"]=True` 的 spec。
+        失败 -> `puzzle` 为空、`error` 非空的 spec。
+
+        ## 预算: 1 attempt(§十)
+
+        只**结构化一次**。Reviewer 自己的技术重试(`_review_spec_with_retry`
+        内部那一次)保留 —— 那是既有行为, 不是这次新加的重试。
+        """
+        # ---- 组装: 走 gen_spec 同一套门, 但输入是我们自己给的 ----
+        import time as _t
+        t0 = _t.monotonic()
+        m: dict = {"generation_attempts": 0, "review_calls": 0,
+                   "rewrite_count": 0, "review_issues": [],
+                   "review_decision": "", "generation_mode": "keyword2"}
+        interrupted = {"v": False}
+
+        def _stop() -> bool:
+            """该收手了吗? 谓词抛异常按"该收手"处理(fail closed)。"""
+            if should_continue is None:
+                return False
+            try:
+                ok = bool(should_continue())
+            except Exception:                   # noqa: BLE001
+                log.exception("should_continue 抛异常, 按收手处理")
+                ok = False
+            if not ok:
+                interrupted["v"] = True
+            return not ok
+
+        def _bail(err: str = "") -> PuzzleSpec:
+            """中断/失败的统一出口 —— **绝不**把半成品当结果返回。"""
+            m["ok"] = False
+            m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+            if interrupted["v"]:
+                m["interrupted"] = True
+                log.info("Stage B 让路(直播变忙), 放弃本次候选")
+                return PuzzleSpec(error="", metrics=dict(m))
+            log.info("Stage B 未成(%s)", (err or "无")[:120])
+            return PuzzleSpec(error=err or "结构化未成", metrics=dict(m))
+
+        # ---- 让路检查 ①: 调 LLM 之前 ----
+        if _stop():
+            return _bail()
+
+        bp = _unconstrained_blueprint()
+        user = _structure_user_prompt(puzzle, answer, title=title,
+                                      avoid=avoid, recent=recent)
+        spec: Optional[PuzzleSpec] = None
+        last_err = ""
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            m["generation_attempts"] = attempt
+            # ---- 让路检查 ②: 第 2 稿之前(默认 max_attempts=1, 走不到) ----
+            if attempt > 1 and _stop():
+                return _bail()
+            res = self.client.messages(
+                STRUCTURE_SYSTEM, user, max_tokens=4000, tool=_TOOL_STRUCTURE,
+                temperature=self._temperature("generate_temperature"))
+            if not res.tool_input:
+                last_err = res.error or "结构化没有 tool_input"
+                log.warning("Structurize 第 %d 稿没有 tool_input: %s",
+                            attempt, last_err[:100])
+                continue
+            d = _unwrap_tool_input(res.tool_input)
+            # ---- 组装: _spec_from_tool 填结构化字段, 代码回填 canonical ----
+            #
+            # ⚠️ 这里**必须**用 `_spec_from_tool` 而不是 curated 的
+            # `spec_from_tool`: 后者会写 source_type="curated" +
+            # curated_policy_version + curated_content_hash。那会让这道
+            # **AI 原创**题被 `_is_curated()` 判成 curated, 于是审稿人按
+            # 外部题库那套九条判据审它, 而且进池时会被 curated 账本门挡住
+            # —— 既是 policy 错误, 也是 provenance 谎言(任务书 §二)。
+            spec = _spec_from_tool(d, blueprint=bp)
+            spec.usage, spec.model = res.usage, res.model
+            # ---- 代码回填 canonical 三样(§五) ----
+            spec.title = str(title or "").strip()
+            spec.puzzle = _strip_puzzle_tail(str(puzzle or "").strip())
+            spec.answer = str(answer or "").strip()
+            # ---- provenance(§十一) ----
+            # `_spec_from_tool` 把 prompt_version 硬编码成 RIDDLE_PROMPT_VERSION
+            # 且**从不写 metrics** —— 这两样必须在这里补, 否则 archive 里
+            # 分不出这题是哪条链产的, 而且溯源("这题是怎么来的")整个丢失。
+            spec.prompt_version = KEYWORD_IDEA_PROMPT_VERSION
+            break
+        if spec is None:
+            return _bail(last_err or "结构化未成")
+
+        # ---- ① 结构硬门(与出题链同一套, 不放宽) ----
+        vr = validate_spec(spec)
+        if not vr.ok:
+            return _bail("结构不过: " + vr.why())
+        # ---- 让路检查 ③: 审稿之前 ----
+        if _stop():
+            return _bail()
+        reviewed, why, need_rewrite, technical = self._review_spec_with_retry(
+            spec, bp, must_fix=vr.must_fix(),
+            should_continue=should_continue,
+            own_fix_focus=list(vr.fixable))
+        m["review_calls"] = self._last_review_call_count
+        m["review_decision"] = (self._last_review_decision or "").lower()
+        if self._last_review_issues:
+            m["review_issues"] = list(self._last_review_issues)
+        if reviewed is None:
+            # ---- 技术失败与语义拒绝分开记账(与 gen_spec 同一口径) ----
+            if technical:
+                m["review_technical_fail"] = 1
+                return _bail("审稿技术失败: " + str(why)[:120])
+            # ---- §五: Reviewer 判 rewrite => **整道候选失败** ----
+            #
+            # 不去修它, 也不重出: 下一轮 prefetch 会**重新抽关键词**。
+            # 这里坚持"一次结构化只有一个 candidate"正是 §十 的预算哲学
+            # ——在 Stage B 里再生成一道, 就等于把两阶段悄悄变回多稿链。
+            m["rewrite_count"] = 1
+            return _bail("审稿要求重出: " + str(why)[:120])
+        spec = reviewed
+        # ---- ② 改完之后再走一遍硬校验(必须完全干净) ----
+        vr2 = validate_spec(spec)
+        if not vr2.ok or vr2.fixable:
+            return _bail("改稿后仍不合格: "
+                         + "; ".join(vr2.errors + vr2.fixable))
+        # ---- 让路检查 ④: truth audit 之前 ----
+        if _stop():
+            return _bail()
+        # ---- ③ truth audit(**复用**, 不放宽) ----
+        ta = self._audit_with_retry(spec, should_continue=should_continue)
+        if ta is not None:
+            m["truth_audit_calls"] = 1
+            ok = bool(ta.get("narrator_truthful")
+                      and ta.get("mechanism_consistent"))
+            m["truth_audit_ok"] = ok
+            if not ok:
+                if ta.get("technical"):
+                    m["truth_audit_technical"] = 1
+                    return _bail("叙事真实性审计技术失败: "
+                                 + str(ta.get("why") or "")[:120])
+                m["truth_audit_issues"] = list(ta.get("conflicts") or [])
+                return _bail("叙事真实性审计不过: "
+                             + str(ta.get("why") or "")[:120])
+        # ---- ④ 跨题门(**HARD, §六 不放宽**) ----
+        #
+        # keyword AI 仍属 AI-original, 所以题型分布对它**还是硬约束**。
+        # 与 curated 链(H4-F: 分布只记录不拒绝)是**相反**的口径 ——
+        # 这不是不一致, 是产品边界: 两条链的 diversity policy 本来就不同。
+        #
+        # ⚠️ blueprint 传 `bp`(unconstrained 哨兵)而不是 None:
+        # `cross_puzzle_gate` 在 signature 缺失时会退回 blueprint 的预期值,
+        # 传 None 会让它去读 spec.blueprint(也是同一个哨兵), 效果一样;
+        # 显式传是为了让"这里没有 target 骨架"这件事一眼可见。
+        rcfg = self._cfg()
+        xbad = cross_puzzle_gate(
+            spec, recent,
+            Quotas.from_config(rcfg) if rcfg is not None else None,
+            bp)
+        if xbad:
+            m["cross_gate"] = list(xbad)
+            return _bail("跨题重复: " + "; ".join(xbad))
+        # ---- ⑤ 跟已出过的题文本太像?(硬拒) ----
+        if avoid:
+            dup = _too_similar(spec.puzzle, avoid)
+            if dup:
+                return _bail("和已出过的题太像: " + dup[:30])
+        m["ok"] = True
+        m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
+        spec.metrics = dict(m)
+        log.info("keyword2 成题(用时 %.1fs): %s",
+                 _t.monotonic() - t0, spec.puzzle[:40])
+        return spec
 
     # ------------------------------------------------------------------
     #: 上一次 `_review_spec` 的决定与 issues(给 gen_spec 统计用)。

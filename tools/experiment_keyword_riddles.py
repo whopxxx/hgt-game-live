@@ -71,7 +71,6 @@ import io
 import json
 import logging
 import os
-import random
 import sys
 import threading
 import time
@@ -79,6 +78,13 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from story.config import Config  # noqa: E402
+#: G2: 抽词逻辑已经**搬进生产模块** `story/keyword_seed.py` —— 方向是
+#: `story/ <- tools/`, 绝不允许反过来。本脚本现在只是它的一个调用方,
+#: 所以"实验抽到的词"与"生产会抽到的词"永远是同一份实现, 不会漂。
+from story.keyword_seed import (  # noqa: E402
+    KEYWORD_BANK, KEYWORD_SEED_VERSION, _SLOTS, draw_keyword_groups,
+    keywords_line,
+)
 from story.llm import (  # noqa: E402
     AnthropicMessagesClient, PuzzleWriter, validate_spec,
 )
@@ -91,118 +97,25 @@ from tools.curated_compiler import (  # noqa: E402
 log = logging.getLogger("hgt.g1a")
 
 # ======================================================================
-# 一、关键词库(§二)
+# 一、关键词库(§二) —— **已搬进 `story/keyword_seed.py`**
 # ======================================================================
 #
-# 要求(§二):
-#   * 至少分 person / place / action / object / state
-#   * 使用**普通生活词**
-#   * **不要**专业术语、冷门设备、平台机制
+# 这一段原来是本脚本的本地副本。G2 把它搬进生产模块, 因为:
 #
-# 刻意写成"一眼就是日常场景"的短词。任何需要背景知识才能产生联想的
-# 词(器材型号 / 行业术语 / 网络平台功能)都不收 —— 它们会让模型往
-# "知识题"而不是"生活异常"上跑, 而那正是本实验要排除的变量。
+#   1. 生产(普通 AI `PoolPrefetcher`)现在真的要用它 —— 让生产去 import
+#      一个 `tools/` 下的实验脚本是荒唐的;
+#   2. 两份实现迟早会漂: 实验改一个词而生产没改, "实验结论"就不再描述
+#      生产行为了。
+#
+# 现在**唯一**的实现是 `story.keyword_seed`, 本脚本从它 import。
+# 下面的名字保持可用(报告代码与 `--draw-only` 都还在用), 但不再有副本:
+#
+#     KEYWORD_BANK / _SLOTS / _dedupe / draw_keyword_groups / keywords_line
+#
+# ⚠️ 抽词序列**逐位不变** —— `--draw-only` 的输出 md5 仍必须是
+#    `049c7073412f906f962e32f4ff20e3fe`(G1-A/G1-B 的基线)。改词库或改
+#    抽取方式都会让 G1 两批数据无法对比, 那正是本实验最不该引入的变量。
 
-KEYWORD_BANK: dict[str, list[str]] = {
-    "person": [
-        "老人", "小孩", "司机", "护士", "老师", "邻居", "新娘", "保安",
-        "快递员", "房东", "乘客", "服务员", "父亲", "女儿", "兄弟",
-        "同事", "陌生人", "理发师", "售货员", "同学",
-    ],
-    "place": [
-        "出租车", "屋子", "电梯", "图书馆", "医院", "楼道", "阳台",
-        "超市", "车站", "厨房", "教室", "地下室", "酒店", "天台",
-        "公园", "浴室", "车库", "餐厅", "桥", "车站",
-    ],
-    "action": [
-        "借书", "搬家", "拍照", "敲门", "排队", "结账", "打扫", "等人",
-        "打电话", "开车", "回家", "睡觉", "洗澡", "吃饭", "寄信",
-        "换衣服", "上楼", "退票", "点菜", "锁门",
-    ],
-    "object": [
-        "钥匙", "雨伞", "行李箱", "信封", "钟表", "镜子", "梯子",
-        "账单", "药瓶", "相册", "杯子", "剪刀", "手电筒", "毛巾",
-        "绳子", "盒子", "日记本", "校服", "饭盒", "车票",
-    ],
-    "state": [
-        "停电", "下雨", "发烧", "迟到", "失眠", "迷路", "停水",
-        "搬家", "离婚", "失业", "怀孕", "喝醉", "打喷嚏", "忘带",
-        "掉牙", "烫伤", "吵架", "迷路", "超重", "失眠",
-    ],
-}
-
-#: 槽位顺序固定 —— 抽到什么槽位不影响"程序抽取"这件事, 但固定顺序
-#: 让同一 seed 在任何机器上得到同一组词。
-_SLOTS = ("person", "place", "action", "object", "state")
-
-
-def _dedupe(bank: dict) -> dict:
-    """槽位内去重并**保序**(语料里有重复词, 重复会抬高被抽中的概率)。"""
-    out = {}
-    for slot in _SLOTS:
-        seen, keep = set(), []
-        for w in bank[slot]:
-            if w and w not in seen:
-                seen.add(w)
-                keep.append(w)
-        out[slot] = keep
-    return out
-
-
-def draw_keyword_groups(seed: int, key_count: int = 0) -> list:
-    """按 seed 抽 20 组(§二: 10 组 x 2 + 10 组 x 3)。
-
-    返回 `[{index, group, keywords, slots, seed, seed_used}, ...]` ——
-    `keywords` 原样保留, 报告直接写它。
-
-    ## 抽取方式
-
-    `random.Random(seed)` 一个实例顺序抽: 先用**不重复**抽样的方式
-    为 2 词组各取 2 个不同槽位, 再为 3 词组各取 3 个不同槽位。
-    槽位不重复 -> 不会出现"老人 + 小孩"这种同槽位堆叠(那更像人工
-    挑词, 不像自然的关键词提示)。
-
-    `seed_used` 逐组记录(基 seed + 组号), 便于复现任何**单组**。
-
-    ## `key_count`(G1-B)
-
-    `0` = 两组都返回(默认, 与 G1-A 行为逐位一致)。
-    `2` / `3` = **只**返回那一组。
-
-    ⚠️ 这是**过滤**, 不是重新抽词。20 组的抽取序列**完全不变** ——
-    所以 3-key 的第 11~15 组与 G1-A 里"如果跑下去会拿到的"那几组
-    一模一样。重新设计抽取方式会让两批数据无法对比, 那正是本实验
-    最不该引入的变量。
-    """
-    if key_count not in (0, 2, 3):
-        raise ValueError("key_count 只能是 0 / 2 / 3, 收到 %r" % (key_count,))
-    bank = _dedupe(KEYWORD_BANK)
-    groups: list = []
-    idx = 0
-    for n_keys in (2, 3):
-        for _ in range(10):
-            idx += 1
-            seed_used = seed + idx
-            rng = random.Random(seed_used)
-            slots = rng.sample(_SLOTS, n_keys)
-            words = [rng.choice(bank[s]) for s in slots]
-            groups.append({
-                "index": idx,
-                "group": "2key" if n_keys == 2 else "3key",
-                "n_keys": n_keys,
-                "keywords": words,
-                "slots": list(slots),
-                "seed": seed,
-                "seed_used": seed_used,
-            })
-    if key_count:
-        groups = [g for g in groups if g["n_keys"] == key_count]
-    return groups
-
-
-def keywords_line(g: dict) -> str:
-    """`关键词: X，Y，Z`(全角逗号, 与外部题库的观感一致)。"""
-    return "关键词：" + "，".join(g["keywords"])
 
 
 # ----------------------------------------------------------------------

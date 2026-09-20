@@ -16,6 +16,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import replace
 
+import io
 import json
 import os
 import sys
@@ -23,8 +24,10 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # G2: 复用 test_llm 的夹具
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
+from story.llm import LLMResult  # noqa: E402
 from story.puzzle import (  # noqa: E402
     DiscoveryBeat, FairClue, PuzzleBlueprint, PuzzleFact, PuzzleSignature,
     PuzzleSpec, SolveAtom,
@@ -152,6 +155,10 @@ def mkcfg(tmp, **kw):
     kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
     kw.setdefault("pool_used_path", os.path.join(tmp, "used.jsonl"))
     kw.setdefault("no_llm", True)
+    #: G2: 本文件的 config 默认**关掉** keyword2 —— 见 `mkpf` 的说明。
+    #: 放在这里而不是 `mkpf` 里, 是因为有 5 处用例**绕过 `mkpf` 直接**
+    #: 构造 `PoolPrefetcher`, 它们也用 `mkcfg`。改一处覆盖全部。
+    kw.setdefault("pool_keyword_seed_enabled", False)
     return Config(sim_path="x", **kw)
 
 
@@ -480,10 +487,26 @@ class _Clock:
 
 def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
          probe_inputs=None, **cfgkw):
-    """建一个 PoolPrefetcher, 协作者默认都是"最宽松"的假件。"""
+    """建一个 PoolPrefetcher, 协作者默认都是"最宽松"的假件。
+
+    ## G2: 默认走 **classic** 链(`pool_keyword_seed_enabled=False`)
+
+    这是**刻意**的, 不是漏配。理由:
+
+      * 本文件里绝大多数用例测的是 **latch / 单飞 / 退避 / 让路 / 试玩**
+        —— 那些机制与"候选怎么产生"**完全无关**。让它们默认跑 keyword2
+        只会给每个用例多挂两个假方法, 却一条新断言都不加;
+      * `_FakeWriter` 只实现了 `gen_spec`。默认走 classic 意味着**所有既有
+        用例的替身依然有效**, 不必为一个与它们无关的改动集体改写。
+
+    keyword2 的用例在 `mkpf(d, pool_keyword_seed_enabled=True, writer=...)`
+    上**显式打开**, 并传一个实现了两条新方法的 writer(`_KeywordWriter`)。
+    这样"哪条链被测到"在调用点一眼可见, 而不是靠默认值猜。
+    """
     from story.prefetch import PoolPrefetcher
     cfgkw.setdefault("pool_min_size", 2)
     cfgkw.setdefault("pool_target_size", 5)
+    cfgkw.setdefault("pool_keyword_seed_enabled", False)
     cfg = mkcfg(tmp, **cfgkw)
     if pool is None:
         pool = PuzzlePool.open(cfg)
@@ -2645,6 +2668,481 @@ def test_g4c_playtest_still_runs_when_live_is_idle():
               pf.interrupted_count)
 
 
+# ======================================================================
+# G2 —— keyword2 两阶段链的回归
+# ======================================================================
+#
+# 这些用例**显式**打开 `pool_keyword_seed_enabled=True`(其余用例默认关,
+# 见 `mkcfg` 的说明), 并传一个实现了两条新方法的 `_KeywordWriter`。
+
+class _KeywordWriter:
+    """实现了 G2 两条新方法的假 writer。记录调用, 可编程地让路/失败。
+
+    为什么不扩 `_FakeWriter`: 那个替身被 30+ 个既有用例共用, 给它加两条
+    方法会让"这个替身到底实现了哪条链"变得含糊。新类只服务 G2 用例,
+    意图更清楚。
+
+    `stage_a_interrupt` / `stage_b_interrupt` 让用例在**中途某个阶段**
+    模拟"直播变忙" —— 那正是 §九 要求覆盖的四类窗口。
+
+    ## ⚠️ Stage A 的谜面**就是** `good_spec()` 那道题的谜面
+
+    这不是偷懒, 是**夹具正确性**要求: `good_spec()` 的 `fair_clues` 逐字
+    引用它自己的谜面, 而 `validate_spec` 会硬查这件事。若 Stage A 返回
+    一个**别的**谜面, 那么"用 Stage A 的谜面 + fixture 的 clues"造出来的
+    spec 必然被 validate 判 fixable(quote 不在谜面里), 于是池门拒收 ——
+    那时用例失败的原因是**夹具自相矛盾**, 而不是被测代码有问题(第一版
+    就是这么挂的)。
+
+    所以 Stage A 的返回值从 fixture 自己派生; "冻结生效"那条断言靠
+    `structure_calls[0]["puzzle"] == stage_a["puzzle"]` 来验(见 G2-1),
+    不需要靠换一个谜面。
+    """
+
+    def __init__(self, *, spec=None, stage_a=None, stage_a_interrupt=False,
+                 stage_b_interrupt=False, stage_a_none=False):
+        self.keyword_calls = []       # 每次 gen_keyword_idea 的 keywords
+        self.structure_calls = []     # 每次 structure_original_idea 的参数
+        self.gen_spec_calls = []      # 不应被调到 —— 用来证明走的是新链
+        self._spec = spec
+        _base = good_spec()
+        self._stage_a = stage_a or {
+            "title": _base.title, "puzzle": _base.puzzle,
+            "answer": _base.answer}
+        self._a_interrupt = stage_a_interrupt
+        self._b_interrupt = stage_b_interrupt
+        self._a_none = stage_a_none
+
+    def gen_keyword_idea(self, keywords, *, should_continue=None,
+                         max_attempts=None, temperature=None):
+        self.keyword_calls.append(list(keywords))
+        if self._a_none:
+            return None
+        if self._a_interrupt:
+            return {"interrupted": True}
+        return dict(self._stage_a)
+
+    def structure_original_idea(self, *, title, puzzle, answer, avoid=None,
+                                recent=None, should_continue=None,
+                                max_attempts=None):
+        self.structure_calls.append({
+            "title": title, "puzzle": puzzle, "answer": answer,
+            "avoid": avoid, "recent": recent,
+            "max_attempts": max_attempts})
+        if self._b_interrupt:
+            s = good_spec()
+            s.puzzle = ""
+            s.error = ""
+            s.metrics = {"interrupted": True, "ok": False,
+                         "generation_mode": "keyword2"}
+            return s
+        if self._spec is not None:
+            return self._spec
+        # 默认: 造一道合格题, 但**谜面用 Stage A 的**(证明冻结生效)。
+        return good_spec(puzzle=puzzle, answer=answer, title=title,
+                         metrics={"generation_mode": "keyword2", "ok": True})
+
+    def gen_spec(self, **kw):
+        """keyword2 模式下**不该**被调用。记下来供断言。"""
+        self.gen_spec_calls.append(kw)
+        return variant(len(self.gen_spec_calls))
+
+
+def _mkpf_keyword(d, writer=None, **cfgkw):
+    """建一个 keyword2 模式的 prefetcher。"""
+    cfgkw.setdefault("pool_keyword_seed_enabled", True)
+    w = writer or _KeywordWriter()
+    pf = mkpf(d, writer=w, **cfgkw)
+    return pf, w
+
+
+def test_g2_keyword_path_draws_two_keys_and_adds():
+    """happy path: 抽 2 词 -> Stage A -> Stage B -> 入池。
+
+    ⚠️ 断言**不**假设"只跑一轮": `fill(pool, 1)` 之后 stock=1 < min=2,
+    补到 2 仍 < target=5, 于是 latch 保持 active —— 第二拍会再补一道。
+    这是 Q9 的滞回语义(不是 bug), 所以下面所有计数都写成 `>= 1` 或
+    "每一次都满足", 而不是 `== 1`。
+    """
+    print("\n[G2-1] keyword2 主路径: 2-key -> A -> B -> 入池")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d)
+        fill(pf.pool, 1)                      # stock=1 < min=2 -> 启动
+        pf.on_tick()                          # 提交 + 同步执行
+        pf.on_tick()                          # 应用结果(+ 可能再提交一次)
+        check("调了 Stage A", len(w.keyword_calls) >= 1, w.keyword_calls)
+        check("**每次恰好 2 个关键词**",
+              all(len(k) == 2 for k in w.keyword_calls), w.keyword_calls)
+        check("调了 Stage B", len(w.structure_calls) >= 1, w.structure_calls)
+        check("**Stage B 每次都收到 Stage A 的原文**",
+              all(c["puzzle"] == w._stage_a["puzzle"]
+                  for c in w.structure_calls), w.structure_calls)
+        check("**没有走 classic 链**(gen_spec 零调用)",
+              w.gen_spec_calls == [], w.gen_spec_calls)
+        check("题进池了", pf.pool.stock_count() >= 2, pf.pool.stock_count())
+        check("added_count >= 1", pf.added_count >= 1, pf.added_count)
+        # ⚠️ 只看**本次补进来的**那些: `fill(pool, 1)` 预先灌的那道是
+        # `variant()`(经典链的形状, 没有 generation_mode), 它不该被算进来。
+        added = [s for s in pf.pool._items
+                 if (s.metrics or {}).get("generation_mode") == "keyword2"]
+        check("**本次补进来的每一道都是 keyword2**",
+              len(added) == pf.added_count, (len(added), pf.added_count))
+
+
+def test_g2_keyword_does_not_call_pick_blueprint():
+    """keyword 模式**不**发 target Blueprint(§七)。"""
+    print("\n[G2-2] keyword 模式不发 target Blueprint")
+    with tmpdir() as d:
+        calls = {"n": 0}
+
+        def pick(recent, rng=None):
+            calls["n"] += 1
+            return None
+
+        pf = mkpf(d, writer=_KeywordWriter(), pool_keyword_seed_enabled=True)
+        pf._pick_blueprint = pick
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("**_pick_blueprint 零调用**", calls["n"] == 0, calls["n"])
+        check("题进池了(证明流程真的走完了)",
+              pf.pool.stock_count() >= 2, pf.pool.stock_count())
+
+def test_g2_keyword_provenance():
+    """最终 spec 必须带 keyword2 provenance, 且**仍是 generated**。"""
+    print("\n[G2-3] keyword2 provenance + 仍是 generated")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d)
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        items = list(pf.pool._items)
+        new = [s for s in items if s.puzzle == w._stage_a["puzzle"]]
+        check("池里有 Stage A 那道题", len(new) == 1, len(new))
+        if new:
+            s = new[0]
+            check("generation_mode == keyword2",
+                  (s.metrics or {}).get("generation_mode") == "keyword2",
+                  s.metrics)
+            check("keywords 记进了 metrics",
+                  (s.metrics or {}).get("keywords") == w.keyword_calls[0],
+                  (s.metrics or {}).get("keywords"))
+            check("**source_type 为空(是 generated, 不是 curated)**",
+                  not getattr(s, "source_type", ""), repr(getattr(s, "source_type", "")))
+            check("**没有 curated_policy_version**",
+                  not getattr(s, "curated_policy_version", ""),
+                  repr(getattr(s, "curated_policy_version", "")))
+            check("**没有 curated_content_hash**",
+                  not getattr(s, "curated_content_hash", ""),
+                  repr(getattr(s, "curated_content_hash", "")))
+            # 落盘往返后 provenance 仍在(§十一 要求"必须能从日志/archive 区分")
+            d2 = s.to_archive()
+            check("archive 里 metrics 带着 generation_mode",
+                  (d2.get("metrics") or {}).get("generation_mode") == "keyword2",
+                  d2.get("metrics"))
+            rt = PuzzleSpec.from_dict(d2)
+            check("往返后 still keyword2",
+                  (rt.metrics or {}).get("generation_mode") == "keyword2",
+                  rt.metrics)
+
+
+def test_g2_stage_a_none_is_gen_fail():
+    """Stage A 出不来题 -> gen_fail(不是 interrupted)。"""
+    print("\n[G2-4] Stage A 未成题 -> gen_fail")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_a_none=True))
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("generation_fail_count == 1",
+              pf.generation_fail_count == 1, pf.generation_fail_count)
+        check("interrupted_count == 0", pf.interrupted_count == 0,
+              pf.interrupted_count)
+        check("**没进过 Stage B**", w.structure_calls == [], w.structure_calls)
+        check("没进池", pf.added_count == 0, pf.added_count)
+
+
+def test_g2_stage_a_interrupt_is_not_failure():
+    """Stage A 让路 -> interrupted, **不计失败不退避**。"""
+    print("\n[G2-5] Stage A 让路 -> interrupted(不是失败)")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_a_interrupt=True))
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("**interrupted_count == 1**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("**generation_fail_count == 0**", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+        check("**不退避**", pf._retry_at == 0.0, pf._retry_at)
+        check("**不加失败链**", pf._fail_streak == 0, pf._fail_streak)
+        check("**没进过 Stage B**", w.structure_calls == [], w.structure_calls)
+
+
+def test_g2_stage_b_interrupt_is_not_failure():
+    """Stage B 让路 -> interrupted, 不入池, 不计失败。"""
+    print("\n[G2-6] Stage B 让路 -> interrupted(不是失败)")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_b_interrupt=True))
+        fill(pf.pool, 1)
+        before = pf.pool.stock_count()
+        pf.on_tick()
+        pf.on_tick()
+        check("interrupted_count == 1", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("generation_fail_count == 0", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+        check("不退避", pf._retry_at == 0.0, pf._retry_at)
+        check("**池子里没有多出题**", pf.pool.stock_count() == before,
+              pf.pool.stock_count())
+
+
+def test_g2_should_continue_blocks_before_stage_a():
+    """检查点 ①: Stage A **之前**就让路 -> 连 A 都不发。"""
+    print("\n[G2-7] 让路检查点 ①: Stage A 之前")
+    with tmpdir() as d:
+        pf, w = _mkpf_keyword(d)
+        pf._should_continue = lambda: False
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("**Stage A 零调用**", w.keyword_calls == [], w.keyword_calls)
+        check("Stage B 零调用", w.structure_calls == [], w.structure_calls)
+        check("interrupted_count == 1", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("generation_fail_count == 0", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+
+
+def test_g2_should_continue_blocks_after_stage_a_before_stage_b():
+    """检查点 ②: Stage A 之后变忙 -> **Stage B 不调用**。
+
+    这是新增 stage 之后最容易漏的一处: A 是一次几十秒的调用, 期间直播
+    完全可能已经切进 SETTING。
+    """
+    print("\n[G2-8] 让路检查点 ②: A 之后 / B 之前")
+    with tmpdir() as d:
+        w = _KeywordWriter()
+        pf, _ = _mkpf_keyword(d, writer=w)
+        # 谓词: 第一次(A 之前)放行, 之后一律让路。
+        state = {"n": 0}
+
+        def gate():
+            state["n"] += 1
+            return state["n"] <= 1
+
+        pf._should_continue = gate
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("Stage A 调了 1 次", len(w.keyword_calls) == 1, w.keyword_calls)
+        check("**Stage B 零调用**", w.structure_calls == [], w.structure_calls)
+        check("interrupted_count == 1", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("没进池", pf.added_count == 0, pf.added_count)
+
+
+def test_g2_rewrite_does_not_enter_pool():
+    """Reviewer 判 rewrite -> 整道候选失败, 不入池。
+
+    writer 侧的 rewrite 判定发生在 `structure_original_idea` **内部**
+    (那里接的是真 Reviewer)。这里用"Stage B 返回一道 puzzle 为空的 spec"
+    模拟同一个外部效果: 候选被丢弃, 且**不重试**。
+    """
+    print("\n[G2-9] 候选失败(Stage B 没产出) -> 不入池、不重试")
+    with tmpdir() as d:
+        bad = good_spec()
+        bad.puzzle = ""
+        bad.error = "审稿要求重出: 没有公平推理路径"
+        bad.metrics = {"generation_mode": "keyword2", "rewrite_count": 1}
+        pf, w = _mkpf_keyword(d, writer=_KeywordWriter(spec=bad))
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("generation_fail_count == 1", pf.generation_fail_count == 1,
+              pf.generation_fail_count)
+        check("**没进池**", pf.added_count == 0, pf.added_count)
+        check("**只跑了一次候选**(Stage A 只调 1 次)", len(w.keyword_calls) == 1,
+              w.keyword_calls)
+
+
+def test_g2_keyword_disabled_uses_classic_path():
+    """kill-switch: `pool_keyword_seed_enabled=False` -> 完整回到旧链。"""
+    print("\n[G2-10] kill-switch: 关掉 keyword2 -> 旧 Blueprint 链")
+    with tmpdir() as d:
+        kw = _KeywordWriter()
+        pf = mkpf(d, writer=_FakeWriter(), pool_keyword_seed_enabled=False)
+        # 把一个 keyword 替身挂在旁边, 用来证明"关掉时**绝不会**碰它"。
+        pf._kw_spy = kw
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        check("**没有调 Stage A**", kw.keyword_calls == [], kw.keyword_calls)
+        check("题进池了", pf.added_count >= 1, pf.added_count)
+        check("走的是 gen_spec", len(pf.writer.calls) >= 1,
+              len(pf.writer.calls))
+        check("gen_spec 收到了 blueprint 参数",
+              "blueprint" in pf.writer.calls[0], pf.writer.calls[0])
+
+
+def test_g2_disabled_behavior_is_bit_identical_to_pre_g2():
+    """关掉时, 每条关键行为与 G2 之前逐位一致。
+
+    这条是 §八 "设为 False 必须**完整**回到现有 pick_blueprint -> gen_spec"
+    的直接落地: 用一个记录型 writer 跑一遍, 断言参数形状与旧路径相同。
+    """
+    print("\n[G2-11] 关掉时行为与旧路径逐位一致")
+    with tmpdir() as d:
+        fw = _FakeWriter()
+        pf = mkpf(d, writer=fw, pool_keyword_seed_enabled=False)
+        fill(pf.pool, 1)
+        pf.on_tick()
+        pf.on_tick()
+        c = fw.calls[0]
+        check("gen_spec 的 4 个参数名齐备",
+              set(c) == {"avoid", "recent", "blueprint", "enforce_blueprint"}, c)
+        check("enforce_blueprint 跟着 blueprint 走(None -> False)",
+              c["enforce_blueprint"] is (c["blueprint"] is not None), c)
+        check("added_count == 1", pf.added_count == 1, pf.added_count)
+        check("没有 interrupted", pf.interrupted_count == 0, pf.interrupted_count)
+        check("没有 gen_fail", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+
+
+def test_g2_live_writer_never_calls_keyword():
+    """**live 生成路径完全不调用 keyword Stage A**。
+
+    分两层验, 因为**单靠任何一层都不够**:
+
+      (a) **行为层** —— 用真 `PuzzleWriter` 走一遍 live 的调用形状
+          (`director.py` 里那条 `gen_spec(avoid=..., blueprint=...,
+          recent=..., enforce_blueprint=...)`), 断言两个 keyword 方法
+          **零调用**。
+      (b) **源码层** —— 断言 `director.py` 的 live 出题点仍然只有
+          `gen_spec`, **没有** `gen_keyword_idea` / `structure_original_idea`。
+
+    ⚠️ 为什么必须有 (b): (a) 只证明"这条调用形状不碰 keyword", 它**挡不住**
+    有人在 `director.py` 的那一行**前面**插一次 `gen_keyword_idea(...)` ——
+    那正是 M7 变异做的事, 而当时只有 (a) 时它**没有变红**(测试留了缺口)。
+    (b) 直接把"live 只调 gen_spec"钉在源码上, 那条变异立刻红。
+    """
+    print("\n[G2-12] live 路径零 keyword 调用")
+    from story.llm import PuzzleWriter
+    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    # ---- (a) 行为层: 走一遍 live 的调用形状 ----
+    fc = FakeClient([LLMResult(tool_input=riddle()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    calls = {"kw": 0, "st": 0}
+    real_kw, real_st = w.gen_keyword_idea, w.structure_original_idea
+
+    def spy_kw(*a, **k):
+        calls["kw"] += 1
+        return real_kw(*a, **k)
+
+    def spy_st(*a, **k):
+        calls["st"] += 1
+        return real_st(*a, **k)
+
+    w.gen_keyword_idea = spy_kw
+    w.structure_original_idea = spy_st
+    bp = fc.default_blueprint
+    spec = w.gen_spec(avoid=None, blueprint=bp, recent=[],
+                      enforce_blueprint=bp is not None)
+    check("live 出了一道题", bool(spec.puzzle), spec.error)
+    check("**gen_keyword_idea 零调用**", calls["kw"] == 0, calls["kw"])
+    check("**structure_original_idea 零调用**", calls["st"] == 0, calls["st"])
+    check("live 用的还是 emit_riddle",
+          "emit_riddle" in [c["tool"]["name"] for c in fc.calls
+                            if c.get("tool")],
+          [c["tool"]["name"] for c in fc.calls if c.get("tool")])
+    # ---- (b) 源码层: director.py 的 live 出题点 ----
+    src = io.open(Path(__file__).resolve().parents[1] / "director.py",
+                  encoding="utf-8").read()
+    check("**director.py 里没有 gen_keyword_idea**",
+          "gen_keyword_idea" not in src,
+          [ln.strip() for ln in src.splitlines()
+           if "gen_keyword_idea" in ln][:3])
+    check("**director.py 里没有 structure_original_idea**",
+          "structure_original_idea" not in src,
+          [ln.strip() for ln in src.splitlines()
+           if "structure_original_idea" in ln][:3])
+    check("director.py 的 live 出题仍是 gen_spec",
+          "self.writer.gen_spec(" in src)
+
+
+def test_g2_stage_b_schema_has_no_puzzle_field():
+    """**Stage B schema 里没有 puzzle/answer/title** —— 结构性禁止改写。"""
+    print("\n[G2-13] Stage B schema 不含 puzzle/answer/title")
+    from story.llm import _TOOL_STRUCTURE, _TOOL_KEYWORD_IDEA
+    props = set(_TOOL_STRUCTURE["input_schema"]["properties"])
+    req = set(_TOOL_STRUCTURE["input_schema"]["required"])
+    for k in ("puzzle", "answer", "title"):
+        check(f"properties 里没有 {k}", k not in props, sorted(props))
+        check(f"required 里没有 {k}", k not in req, sorted(req))
+    check("Stage A 的 schema 有这三样",
+          {"puzzle", "answer"} <= set(_TOOL_KEYWORD_IDEA["input_schema"]["properties"]))
+    check("Stage A 的 required 含 puzzle/answer",
+          {"puzzle", "answer"} <= set(_TOOL_KEYWORD_IDEA["input_schema"]["required"]))
+
+
+def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
+    """题型配额满 -> keyword candidate 仍被 **HARD 拒**(§六 不放宽)。
+
+    这条守住"keyword AI 仍属 AI-original, 分布对它还是硬约束"。用真
+    `structure_original_idea` + 一个 `recent` 已占满的窗口跑一遍。
+    """
+    print("\n[G2-14] 配额墙仍硬拒 keyword candidate")
+    from story.llm import PuzzleWriter, KEYWORD_IDEA_PROMPT_VERSION
+    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    st = dict(riddle())
+    for k in ("puzzle", "answer", "title"):
+        st.pop(k, None)
+    pz = riddle()["puzzle"]
+    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"]}
+    fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    i = w.gen_keyword_idea(["图书馆", "上楼"])
+    # 造一个 recent 窗口: 同一 (mechanism_family, solution_shape) 已满。
+    from story.puzzle import PuzzleSignature
+    sig = PuzzleSignature.from_dict({
+        "mechanism_family": "hidden_function",
+        "solution_shape": "hidden_function_explains_behavior",
+        "domain": "maritime", "emotion_mode": "neutral",
+        "relation": "stranger", "time_shape": "habitual",
+        "reveal_mode": "meaning_flip"})
+    recent = [sig, sig, sig]           # 远超 same_mechanism/same_shape 上限
+    spec = w.structure_original_idea(title=i["title"], puzzle=i["puzzle"],
+                                     answer=i["answer"], recent=recent)
+    check("**被跨题门硬拒**(puzzle 为空)", not spec.puzzle, spec.puzzle[:40])
+    check("拒因是跨题重复", "跨题" in (spec.error or ""), spec.error)
+    check("cross_gate 记进了 metrics",
+          bool((spec.metrics or {}).get("cross_gate")), spec.metrics)
+    check("**错误不来自 curated 门**",
+          "curated" not in (spec.error or "").lower(), spec.error)
+
+
+def test_g2_too_similar_still_hard_rejects():
+    """`avoid` 里已有近重复谜面 -> keyword candidate 仍被硬拒。"""
+    print("\n[G2-15] too_similar / avoid 仍硬拒")
+    from story.llm import PuzzleWriter
+    from test_llm import FakeClient, riddle, review_ok, runtime_cfg  # noqa
+    st = dict(riddle())
+    for k in ("puzzle", "answer", "title"):
+        st.pop(k, None)
+    pz = riddle()["puzzle"]
+    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"]}
+    fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    i = w.gen_keyword_idea(["图书馆", "上楼"])
+    spec = w.structure_original_idea(title=i["title"], puzzle=i["puzzle"],
+                                     answer=i["answer"], avoid=[pz])
+    check("**被 avoid 硬拒**", not spec.puzzle, spec.puzzle[:40])
+    check("拒因提到太像", "太像" in (spec.error or ""), spec.error)
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -2730,6 +3228,22 @@ def main():
         test_g1_scene_change_resets_long_backoff_once,
         test_g1_effective_guard_covers_budget,
         test_g1_interrupted_probe_fails_closed,
+        # ---- G2: keyword2 两阶段链 ----
+        test_g2_keyword_path_draws_two_keys_and_adds,
+        test_g2_keyword_does_not_call_pick_blueprint,
+        test_g2_keyword_provenance,
+        test_g2_stage_a_none_is_gen_fail,
+        test_g2_stage_a_interrupt_is_not_failure,
+        test_g2_stage_b_interrupt_is_not_failure,
+        test_g2_should_continue_blocks_before_stage_a,
+        test_g2_should_continue_blocks_after_stage_a_before_stage_b,
+        test_g2_rewrite_does_not_enter_pool,
+        test_g2_keyword_disabled_uses_classic_path,
+        test_g2_disabled_behavior_is_bit_identical_to_pre_g2,
+        test_g2_live_writer_never_calls_keyword,
+        test_g2_stage_b_schema_has_no_puzzle_field,
+        test_g2_quota_wall_still_hard_rejects_keyword_candidate,
+        test_g2_too_similar_still_hard_rejects,
     ]
     for t in tests:
         t()

@@ -345,6 +345,30 @@ class Config:
     # 两稿都不合格就放弃, 等下一轮, 而不是一路打到第 4 稿。
     pool_prefetch_max_attempts: int = 2
     pool_prefetch_budget_seconds: float = 25.0
+    # ---- G2: keyword2 两阶段起题(只影响普通 AI 后台补池) ----
+    #
+    # 打开时, 后台补池换一条候选产生方式:
+    #
+    #     程序随机抽 2 个普通生活关键词
+    #       -> Stage A: 只生成 title / puzzle / answer(自由成题)
+    #       -> Stage B: 冻结谜面谜底, 只结构化成 PuzzleSpec
+    #       -> 现有 Reviewer / truth audit / validate_spec / 跨题门
+    #
+    # 依据 G1-A / G1-B: 这样出来的题**谜面更短、单机关、没有硬塞的第二
+    # 机关**, 更接近外部题库的语感; 而 Blueprint 链最容易丢的就是这个。
+    #
+    # ⚠️ **只影响普通 AI prefetch**:
+    #     * live 现场出题 **不动** —— 那里观众在等, 两阶段会显著拉长
+    #       等待时间, 所以继续走一阶段 Blueprint 链;
+    #     * curated 链 **不动** —— 那是"搬运"链, 不是"发明"链。
+    #
+    # 设为 False 必须**完整**回到旧行为(`pick_blueprint -> gen_spec`),
+    # 所以旧路径**保留**在代码里作为 kill-switch, 不是删掉。
+    #
+    # ⚠️ 质量策略**一条都不放宽**: keyword 题仍然走同一套 Reviewer /
+    # truth audit / validate_spec / cross_puzzle_gate HARD / too_similar /
+    # recent-10 quota。它仍是 **AI 原创**题(不是 curated)。
+    pool_keyword_seed_enabled: bool = True
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -605,6 +629,19 @@ class Config:
                 f"pool_prefetch_max_attempts({self.pool_prefetch_max_attempts}) "
                 f"< 1: 后台补池连一稿都不会出, 池子永远补不上。"
             )
+        # ---- G2: keyword2 开了但补池整个关着 ----
+        # 这不是错误(两个开关各自都合法), 但组合起来的结果是"配了个寂寞"
+        # —— 唯一会读 keyword2 的消费者是 prefetcher, 而它根本不在跑。
+        # 说一句免得运维以为"开了 keyword2 却没生效"是代码 bug。
+        if self.pool_keyword_seed_enabled and not self.pool_prefetch_enabled:
+            warns.append(
+                f"pool_keyword_seed_enabled("
+                f"{self.pool_keyword_seed_enabled}) 为真但 "
+                f"pool_prefetch_enabled("
+                f"{self.pool_prefetch_enabled}) 为假: 后台补池整个没在跑, "
+                f"keyword2 不会被用到。要测 keyword2 就两个都开; "
+                f"要关后台生成就两个都关。"
+            )
         if self.pool_prefetch_budget_seconds <= 0:
             warns.append(
                 f"pool_prefetch_budget_seconds("
@@ -762,6 +799,14 @@ def build_parser() -> argparse.ArgumentParser:
                     action="store_false",
                     help="不后台补池(只用已有/手工灌的题; 默认开启)。"
                          "网关故障时用它停掉后台生成, 池子里的存量题照常播")
+    # ---- G2: keyword2 两阶段起题(kill-switch) ----
+    ap.add_argument("--no-keyword-seed", dest="pool_keyword_seed_enabled",
+                    action="store_false",
+                    help="后台补池回到旧的一阶段 Blueprint 链"
+                         "(`pick_blueprint -> gen_spec`)。默认**开启** "
+                         "keyword2: 随机抽 2 个普通生活关键词 -> 自由成题 "
+                         "-> 再结构化。只影响普通 AI 后台补池; live 现场"
+                         "出题与 curated 链本来就不走它")
     # ---- Batch H2-F/G: curated 池 ----
     ap.add_argument("--no-curated", dest="prefer_curated",
                     action="store_false",
@@ -858,6 +903,7 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
                            or Config.curated_pool_path),
         pool_prefetch_max_attempts=a.prefetch_max_attempts,
         pool_prefetch_budget_seconds=a.prefetch_budget,
+        pool_keyword_seed_enabled=a.pool_keyword_seed_enabled,
         pool_reveal_start_guard_seconds=a.pool_reveal_guard,
         playtest_enabled=a.playtest_enabled,
         playtest_max_turns=a.playtest_max_turns,

@@ -11,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.llm import (  # noqa: E402
     RIDDLE_PROMPT_VERSION, LLMResult, PuzzleWriter,
+    # G2-keyword2: Stage A/B 的 prompt、schema 与审稿契约
+    KEYWORD_IDEA_SYSTEM, _TOOL_STRUCTURE, check_tool,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.puzzle import FairClue  # noqa: E402
@@ -3431,6 +3433,281 @@ def test_g1_budget_and_attempts_are_honored():
 
 
 # ======================================================================
+# G2-keyword2 —— Stage A / Stage B(writer 级)
+# ======================================================================
+#
+# ⚠️ 注意与下面那个 "G2 —— 可修问题不再整题重造" 的**区别**: 那一批是
+# 早先的修复链工作, 与本批的 keyword2 两阶段起题无关。命名上带
+# `keyword` 以免混。
+
+def _kw_idea():
+    """Stage A 的产出(与 `riddle()` 同一道题, 保证 clues 对得上)。"""
+    r = riddle()
+    return {"title": r.get("title", "灯塔"), "puzzle": r["puzzle"],
+            "answer": r["answer"]}
+
+
+def _kw_structure_payload():
+    """Stage B 的 tool_input: `riddle()` **删掉** puzzle/answer/title。
+
+    这正好模拟真实 schema —— 模型**给不出**那三样。
+    """
+    d = dict(riddle())
+    for k in ("puzzle", "answer", "title"):
+        d.pop(k, None)
+    return d
+
+
+def test_g2_keyword_stage_a_returns_idea():
+    """Stage A 只返回三样, 且用的是 keyword 专用 prompt/tool。"""
+    print("\n[G2-K1] Stage A: 只有 title/puzzle/answer")
+    fc = FakeClient([LLMResult(tool_input=_kw_idea())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = w.gen_keyword_idea(["图书馆", "上楼"])
+    check("返回了三样", set(idea) >= {"title", "puzzle", "answer"}, idea)
+    check("puzzle 非空", bool(idea["puzzle"]))
+    check("用的是 emit_keyword_idea",
+          fc.calls[0]["tool"]["name"] == "emit_keyword_idea",
+          fc.calls[0]["tool"]["name"])
+    check("**system 是 keyword idea prompt, 不是 RIDDLE_SYSTEM**",
+          fc.calls[0]["system"] == KEYWORD_IDEA_SYSTEM)
+    # ⚠️ §四: Stage A 不得同时想 facts / atoms / completion / beats。
+    low = KEYWORD_IDEA_SYSTEM
+    for bad in ("facts", "solve_atoms", "completion_fact_ids",
+                "discovery_beats", "signature"):
+        check(f"Stage A prompt 不提 {bad}", bad not in low)
+
+
+def test_g2_keyword_stage_a_one_attempt():
+    """§十: Stage A 默认**只发一次**。"""
+    print("\n[G2-K2] Stage A: 1 attempt")
+    fc = FakeClient([LLMResult(error="网关抖了")])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = w.gen_keyword_idea(["图书馆", "上楼"])
+    check("失败返回 None", idea is None, idea)
+    check("**只发了 1 次**", len(fc.calls) == 1, len(fc.calls))
+
+
+def test_g2_keyword_stage_b_freezes_puzzle():
+    """**Stage B 不得改题**: 谜面/谜底/标题由**代码**回填。"""
+    print("\n[G2-K3] Stage B: canonical 三样被冻结")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("puzzle 就是 Stage A 那个",
+          spec.puzzle == idea["puzzle"], spec.puzzle[:40])
+    check("answer 就是 Stage A 那个",
+          spec.answer == idea["answer"], spec.answer[:40])
+    check("title 就是 Stage A 那个", spec.title == idea["title"], spec.title)
+    check("结构化字段确实填上了", bool(spec.facts) and bool(spec.core_answer),
+          (len(spec.facts), spec.core_answer[:20]))
+
+
+def test_g2_keyword_stage_b_ignores_model_puzzle():
+    """⚠️ **最要紧的一条**: 模型硬塞 puzzle 也无效。
+
+    schema 里没有这个字段(结构性禁止, 见 G2-K5), 但万一模型自作主张
+    塞了一个同名字段, 代码回填必须**覆盖**它 —— 这是 §五 "从结构上禁止
+    把自然谜面重新写成工程化谜面"的第二道保险。
+    """
+    print("\n[G2-K4] 模型塞 puzzle 也无效")
+    payload = _kw_structure_payload()
+    payload["puzzle"] = "这是模型偷偷改写过的工程化谜面。为什么?"
+    payload["answer"] = "模型偷偷改写的谜底。"
+    fc = FakeClient([LLMResult(tool_input=payload),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("**puzzle 仍是 Stage A 的**(模型那次被丢弃)",
+          spec.puzzle == idea["puzzle"], spec.puzzle[:50])
+    check("**answer 仍是 Stage A 的**",
+          spec.answer == idea["answer"], spec.answer[:50])
+    check("模型塞的那个谜面没出现在 spec 里",
+          "工程化谜面" not in (spec.puzzle or ""), spec.puzzle[:50])
+
+
+def test_g2_keyword_stage_b_schema_is_structural():
+    """schema 里**根本没有** puzzle/answer/title —— 结构性禁止。"""
+    print("\n[G2-K5] Stage B schema 是结构性的")
+    props = set(_TOOL_STRUCTURE["input_schema"]["properties"])
+    req = set(_TOOL_STRUCTURE["input_schema"]["required"])
+    for k in ("puzzle", "answer", "title"):
+        check(f"properties 无 {k}", k not in props, sorted(props))
+        check(f"required 无 {k}", k not in req, sorted(req))
+    check("它要的是分析字段",
+          {"core_answer", "facts", "solve_atoms", "fair_clues",
+           "discovery_beats", "hints", "signature",
+           "completion_fact_ids"} <= props, sorted(props))
+    check("工具名是 emit_structure",
+          _TOOL_STRUCTURE["name"] == "emit_structure", _TOOL_STRUCTURE["name"])
+
+
+def test_g2_keyword_provenance_and_generated():
+    """§十一: prompt_version / generation_mode, 且**仍是 generated**。"""
+    print("\n[G2-K6] provenance + 仍是 generated")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("**prompt_version == keyword2-v1**",
+          spec.prompt_version == "keyword2-v1", spec.prompt_version)
+    check("**与 classic 的 riddle-v9 不同**",
+          spec.prompt_version != RIDDLE_PROMPT_VERSION, spec.prompt_version)
+    check("metrics 有 generation_mode=keyword2",
+          (spec.metrics or {}).get("generation_mode") == "keyword2", spec.metrics)
+    check("metrics 不是空的(溯源没丢)", bool(spec.metrics), spec.metrics)
+    check("**source_type 为空(不是 curated)**",
+          not getattr(spec, "source_type", ""), repr(getattr(spec, "source_type", "")))
+    check("**没有 curated_policy_version**",
+          not getattr(spec, "curated_policy_version", ""),
+          repr(getattr(spec, "curated_policy_version", "")))
+    check("**没有 curated_content_hash**",
+          not getattr(spec, "curated_content_hash", ""),
+          repr(getattr(spec, "curated_content_hash", "")))
+    check("quality_policy_version 仍是当前政策(没 bump)",
+          spec.quality_policy_version == QUALITY_POLICY_VERSION,
+          spec.quality_policy_version)
+
+
+def test_g2_keyword_uses_generated_quality_contract():
+    """`source_type` 为空 => `check_tool` 发的是 **generated 八项**。
+
+    ⚠️ 这条是 §二 "keyword 题仍是 AI-original, 不得被标成 curated" 的
+    **可执行判据**: 一旦有人让 Stage B 走 curated 的组装函数(写
+    `source_type="curated"`), `check_tool` 会改发外部题库那九项, 这里立刻红。
+    """
+    print("\n[G2-K7] keyword spec 走 generated 的审稿契约")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    tool = check_tool(spec)
+    req = set(tool["input_schema"]["properties"]["quality_checks"]["required"])
+    from story.llm import _CURATED_HARD_CHECK_FIELDS, _QUALITY_CHECK_FIELDS
+    check("**发的是 generated 那八项**",
+          req == set(_QUALITY_CHECK_FIELDS), sorted(req))
+    check("**不是 curated 那套**",
+          not (req & set(_CURATED_HARD_CHECK_FIELDS)) or
+          req == set(_QUALITY_CHECK_FIELDS), sorted(req))
+    # 反证: 一旦标成 curated, 契约就变了 —— 证明上面那条不是恒真。
+    spec.source_type = "curated"
+    tool2 = check_tool(spec)
+    req2 = set(tool2["input_schema"]["properties"]["quality_checks"]["required"])
+    check("**标成 curated 后契约确实变了**(反证)",
+          req2 != req, (sorted(req)[:3], sorted(req2)[:3]))
+
+
+def test_g2_keyword_stage_b_blueprint_is_unconstrained():
+    """§七: Stage B 发的是"无 target Blueprint"哨兵。"""
+    print("\n[G2-K8] Stage B: 无 target Blueprint")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("spec.blueprint 是 unconstrained 哨兵",
+          getattr(spec.blueprint, "_unconstrained", False) is True, spec.blueprint)
+    # 审稿 prompt 必须印"没有 target Blueprint"的**观察声明**,
+    # 而不是硬约束 —— 否则 Stage B 会因为"不是某个随机骨架"被要求重出。
+    rev = [c for c in fc.calls if c.get("tool") and
+           c["tool"]["name"] == "emit_review"]
+    check("审过稿", len(rev) == 1, len(rev))
+    if rev:
+        check("**审稿 prompt 印的是观察声明**",
+              "没有** target Blueprint" in rev[0]["user"]
+              or "没有" in rev[0]["user"] and "target Blueprint" in rev[0]["user"],
+              rev[0]["user"][:200])
+
+
+def test_g2_keyword_should_continue_checkpoints():
+    """让路: Stage B 内部的两个检查点(审稿前 / audit 前)。"""
+    print("\n[G2-K9] Stage B 内部让路")
+    # ① 一进门就让路 -> 一次调用都不发
+    fc = FakeClient([])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"], puzzle=idea["puzzle"],
+                                     answer=idea["answer"],
+                                     should_continue=lambda: False)
+    check("**零调用**", len(fc.calls) == 0, len(fc.calls))
+    check("metrics 标 interrupted",
+          (spec.metrics or {}).get("interrupted") is True, spec.metrics)
+    check("error 为空(让路不是失败)", not spec.error, spec.error)
+    check("puzzle 为空(半成品不当结果)", not spec.puzzle, spec.puzzle)
+
+
+def test_g2_keyword_stage_a_interrupt_checkpoint():
+    """让路: Stage A 的**返回后**检查点。"""
+    print("\n[G2-K10] Stage A 返回后让路")
+    fc = FakeClient([LLMResult(tool_input=_kw_idea())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    n = {"i": 0}
+
+    def gate():
+        n["i"] += 1
+        return n["i"] <= 1          # 调用前放行, 返回后让路
+
+    out = w.gen_keyword_idea(["图书馆", "上楼"], should_continue=gate)
+    check("发了 1 次调用", len(fc.calls) == 1, len(fc.calls))
+    check("**返回的是 interrupted, 不是 idea**",
+          out == {"interrupted": True}, out)
+
+
+def test_g2_keyword_rewrite_fails_candidate():
+    """Reviewer rewrite -> **整道候选失败**(不重出、不修)。"""
+    print("\n[G2-K11] Reviewer rewrite -> 候选失败")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_rewrite("没有公平推理路径"))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("**puzzle 为空**(候选被丢)", not spec.puzzle, spec.puzzle[:30])
+    check("error 非空", bool(spec.error), spec.error)
+    check("error 提到重出", "重出" in spec.error, spec.error)
+    check("metrics 记了 rewrite_count",
+          (spec.metrics or {}).get("rewrite_count") == 1, spec.metrics)
+    check("**只跑了一次结构化**(没有为失败再生成一稿)",
+          [c["tool"]["name"] for c in fc.calls].count("emit_structure") == 1,
+          [c["tool"]["name"] for c in fc.calls])
+
+
+def test_g2_keyword_truth_audit_fail_rejects():
+    """truth audit fail -> 候选失败。"""
+    print("\n[G2-K12] truth audit fail -> 候选失败")
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok()),
+                     LLMResult(tool_input=_truth_tool(
+                         truthful=False, consistent=True,
+                         conflicts=["谜面说 A, 谜底说不是 A"]))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("**puzzle 为空**", not spec.puzzle, spec.puzzle[:30])
+    check("error 提到审计", "审计" in (spec.error or ""), spec.error)
+    check("metrics 记 truth_audit_ok=False",
+          (spec.metrics or {}).get("truth_audit_ok") is False, spec.metrics)
+
+
+# ======================================================================
 # G2 —— 可修问题不再整题重造
 # ======================================================================
 def _qip(quote, puzzle):
@@ -4282,6 +4559,19 @@ def main():
               test_g1_gen_spec_stops_before_truth_audit,
               test_g1_probe_exception_is_fail_closed,
               test_g1_budget_and_attempts_are_honored,
+              # ---- G2-keyword2: Stage A / Stage B(writer 级) ----
+              test_g2_keyword_stage_a_returns_idea,
+              test_g2_keyword_stage_a_one_attempt,
+              test_g2_keyword_stage_b_freezes_puzzle,
+              test_g2_keyword_stage_b_ignores_model_puzzle,
+              test_g2_keyword_stage_b_schema_is_structural,
+              test_g2_keyword_provenance_and_generated,
+              test_g2_keyword_uses_generated_quality_contract,
+              test_g2_keyword_stage_b_blueprint_is_unconstrained,
+              test_g2_keyword_should_continue_checkpoints,
+              test_g2_keyword_stage_a_interrupt_checkpoint,
+              test_g2_keyword_rewrite_fails_candidate,
+              test_g2_keyword_truth_audit_fail_rejects,
               test_closeout_observed_signature_schema_is_complete,
               test_closeout_incomplete_observed_signature_is_rejected,
               test_closeout_incomplete_obs_never_lands_in_signature,

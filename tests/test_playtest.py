@@ -664,7 +664,9 @@ def test_prefetch_playtest_disabled_by_default():
         cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
                      pool_path=_os.path.join(d, "p.jsonl"),
                      pool_used_path=_os.path.join(d, "u.jsonl"),
-                     pool_min_size=2, pool_target_size=5)
+                     pool_min_size=2, pool_target_size=5,
+                     #: G2: 走 classic 链(见 `_mkpf_with_pt` 的说明)。
+                     pool_keyword_seed_enabled=False)
         pool = PuzzlePool.open(cfg)
         w = _W()
         # 默认: 不注入 playtester
@@ -913,6 +915,11 @@ def _mkpf_with_pt(playtester, **cfgkw):
     d = tempfile.mkdtemp()
     cfgkw.setdefault("pool_min_size", 2)
     cfgkw.setdefault("pool_target_size", 5)
+    #: G2: 本文件的用例测的是**试玩**(Q10/G4-C), 与"候选怎么产生"无关。
+    #: 默认关掉 keyword2 -> 走 classic 链, 于是 `_W` 只需要实现 `gen_spec`
+    #: (与 `test_prefetch.mkcfg` 同一条约定)。测 keyword2 的用例在
+    #: `test_prefetch.py` 里, 不在这里重复。
+    cfgkw.setdefault("pool_keyword_seed_enabled", False)
     # 注入了 playtester 就得同时把开关打开 —— 两者缺一都不会跑试玩。
     # G6 专门测这道双闸门。
     if playtester is not None:
