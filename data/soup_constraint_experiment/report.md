@@ -25,11 +25,12 @@ validator 和 Reviewer，不改写任何 production 默认值。
 > Stage A 的普通现实先验 + Reviewer/validator 的选择压力，使容易结构化和容易审计的
 > 题更容易幸存；好题则会因与题感无关的结构修复失败退出。
 
-同样重要的反证是：shadow `CURRENT SURFACE` 并没有整体变差。盲评中 V0 RAW 为
-5 想玩 / 3 可以玩 / 2 不想玩，V2 CURRENT SURFACE 为 7 / 1 / 2。也就是说，
-“把任何明确线索从汤面删掉”不是答案；完全关闭 fair clue 的 6 个版本有 5 个“不想玩”。
-最小必要约束应保留真实异常锚点和可问答路径，同时去掉人称、问号、多层 beat 和
-`fair_clue.quote` 必须直接支撑 required atom 等形式绑定。
+shadow `CURRENT SURFACE` 的探索性盲评为 7 想玩 / 1 可以玩 / 2 不想玩，RAW 为
+5 / 3 / 2；但这**不是干净 A/B**：surface 生成器没有稳定只改变目标变量，V2 只有
+4/10 同时满足“第三人称+句末问号”，且 fair-clue adherence 无法在 Stage B 前验证。
+因此它只能说明“当前约束未在这份 snapshot 中表现出统一的逐字压平”，不能证明这些
+约束有益或无害。fair-clue binding 是否应移除、LOW 与 MEDIUM 谁更好，都需要重新做
+确定性或严格 adherence 的实验；本 PR 不据此建议直接改 production。
 
 ## 方法与样本
 
@@ -40,8 +41,20 @@ validator 和 Reviewer，不改写任何 production 默认值。
 - 108 个有标签的 surface 实例；按“汤面+汤底”去重后 99 个候选进入盲评。
 - 盲评只看到随机号 P001~P099、汤面和汤底，不看到实验标签。
 - 盲评与生成使用同一模型供应侧，但使用独立、无状态请求，不携带生成上下文。
-- 盲评结果：36 想玩、43 可以玩、20 不想玩。它是小样本定性证据，不是精确评分。
-- Stage A 仅 1 次技术重试；shape error 为 0。所有失败输出均保留。
+- 盲评结果：36 想玩、43 可以玩、20 不想玩。每次请求含最多 10 个候选，近似稿可能
+  在同一上下文被直接比较，因此这些是 exploratory qualitative counts，不是 candidate-
+  level 独立样本或规则 A/B。
+- Stage A 仅 1 次技术重试；shape error 为 0。固定 seed 只固定关键词抽取与 shuffle，
+  不固定远端 LLM 采样；全量输出使本次运行成为**固定输入、可审计 snapshot**，不是可
+  精确重跑复现的实验。所有失败输出均保留。
+
+### 证据等级
+
+- **Production trace evidence（强）**：代码路径、10 个固定 RAW 的真实 Stage B /
+  validator / Reviewer / truth-audit 轨迹，以及明确的 reject reason。
+- **Exploratory synthetic evidence（弱）**：surface/person/question/fair-clue/exposure、
+  reality 与 few-shot 的 LLM 生成对照和批量盲评。只有 manipulation adherence 合格的
+  candidate 才能用于局部观察；本报告不再把组级计数解释为因果效果。
 
 完整数据见同目录的 `raw_results.jsonl`、`ablation_results.jsonl`、
 `surface_exposure_results.jsonl`、`style_results.jsonl`、`blind_manifest.jsonl`、
@@ -93,6 +106,16 @@ past_trauma、repeated_ritual 等跨题饱和从 hard reject 改为 soft signal�
 
 `*` S05 的盲评原因主要是候选在盲评集内重复；V2 的去重版本为“想玩”。
 
+V0→V1/V2 的 surface shadow 同样不是严格操纵：
+
+| surface variant | manipulation adherence |
+|---|---|
+| V1 FORMAT ONLY | 6/10 近似只做格式/压缩；S05/S06 增加线索卡或疑点清单，S08 换故事，S10 输出编辑摘要 |
+| V2 CURRENT SURFACE | 4/10 满足第三人称+句末问号；Stage B 前无法验证 quote→required-atom path，故 0/10 可确认完整 adherence |
+
+因此 V1/V2 的组级盲评只保留为 exploratory snapshot，不参与“哪条 surface 规则造成
+因果变化”的强结论。
+
 V3 不改汤面，故不能观察到“Stage B 把汤面越写越长”；它能造成的是结构字段膨胀和
 失败概率。DB 对照显示，天然单核的 S01 在强制 2~4 beats 时，被拆成“来电—空摊—
 误读—接女儿”四段解释，基本是同一原因的重述。S03 的 beats 更像对谜面逐句复述。
@@ -111,16 +134,16 @@ puzzle/answer/core_answer/completion/facts/atoms/fair_clues/discovery_beats 全�
 
 6 个固定 hidden story，各生成 LOW/MEDIUM/HIGH，共 18 个 surface。
 
-| 暴露量 | 想玩 | 可以玩 | 不想玩 | 定性结论 |
+| 标签 | 想玩 | 可以玩 | 不想玩 | manipulation adherence |
 |---|---:|---:|---:|---|
-| LOW | 2 | 4 | 0 | 问题欲强，但部分答案空间过大，只能靠主持人漫游 |
-| MEDIUM | 4 | 2 | 0 | 最稳：核心异常+一个锚点，既有方向又未提前解释 |
-| HIGH | 3 | 2 | 1 | 5/6 被独立评估为高泄露，6/6 呈阅读理解倾向 |
+| LOW | 2 | 4 | 0 | 2/6 清楚符合，1/6 部分符合；其余仍给了多条线索 |
+| MEDIUM | 4 | 2 | 0 | 2/6 清楚符合；S01/S03/S06 泄露关键真相，S02 附疑点清单 |
+| HIGH | 3 | 2 | 1 | 5/6 符合高暴露；S04 与 LOW/MEDIUM 几乎同信息量 |
 
-独立定性评估中，HIGH 有 5/6 为高答案泄露，且所有 HIGH 都被标为阅读理解倾向；
-LOW 全部被预估为需要 8~20 问，但其中一些只能通过宽泛枚举逼近。结合盲评，推荐的
-默认形状是 MEDIUM：一个反常场景 + 一个不撒谎的具体锚点。LOW 可作为少数强主持题，
-不能成为普遍合同；HIGH 不应由 validator 强迫。
+这一组唯一稳健方向是：**成功操纵成 HIGH 的样本明显过曝**。独立评估把 5/6 HIGH
+标为高泄露；S01、S02、S03、S05、S06 都直接给出关键真相或完整解释。LOW 与 MEDIUM
+之间因 adherence 太低不能排序，更不能下“MEDIUM 最稳”的因果结论。下一轮应固定同一
+字符串，用人工预定义的事实 mask 或确定性句段选择构造 LOW/MEDIUM/HIGH，再做独立盲评。
 
 ## 实验 3：现实主义约束
 
@@ -133,10 +156,9 @@ LOW 全部被预估为需要 8~20 问，但其中一些只能通过宽泛枚举�
 | R3 Strange Allowed | 5 现实 | 普通现实2、心理关系2、其他1 | 3 想玩 / 2 可以玩 |
 
 “鼓励异常世界”并没有自动产生真正超自然，R3 反而 5/5 被匿名分类为现实；R1 也没有
-完全服从“现实优先”。这说明抽象许可的控制力弱。R2 和 R3 都消除了本批的“不想玩”
-低谷，R2 的机制自洽与可玩性下限最好。建议 production 不再偏好现实，但也不要设
-“必须超自然”硬配额；把 strange-world 当软采样方向，并用自洽世界规则的 few-shot
-表达题感。
+完全服从“现实优先”。这份 snapshot 支持“抽象许可控制力弱”的观察。R2/R3 本批没有
+“不想玩”只是每组 5 题的探索信号，不足以证明可玩性下限或建议 production 立刻换策略；
+下一轮应把 world-type adherence 纳入生成后分层，再比较同类候选。
 
 ## 实验 4：Abstract vs structural few-shot
 
@@ -145,32 +167,34 @@ F1 Abstract Only：1 想玩 / 4 可以玩。F2 Structural Few-shot：1 想玩 / 
 
 质性差异更有价值：F2 产生了一个冲击更强的心理黑汤，也产生了 P038 的“双重幽灵”
 堆料和 P033 的字谜退化。F1 全部被匿名分类为现实；F2 有 1/5 超自然，冲击强的数量
-从 0 提到 2，但方差也变大。结论是：few-shot 比“诡异、红汤、黑汤”更能改变分布，
-但当前 4 个结构示例还不够约束“海龟汤而不是散文谜/字谜”。适合继续作为 soft style
-anchor，并同时放反例；不应写成固定反转模板或 hard validator。
+从 0 提到 2，但方差也变大。它提示 few-shot **可能**改变分布，同时暴露“海龟汤退化
+为散文谜/字谜”的风险；本轮不证明 few-shot 更有效。若继续实验，应保留反例并增加
+确定性形式过滤，不写成固定反转模板或 hard validator。
 
 ## 实验 5：人称与问号
 
-| 形式 | 想玩 | 可以玩 | 不想玩 |
-|---|---:|---:|---:|
-| P1 第三人称+问号 | 1 | 4 | 1 |
-| P2 第一人称/自然叙述 | 1 | 4 | 1 |
-| P3 无显式问号 | 1 | 3 | 2 |
+| 形式 | 想玩 | 可以玩 | 不想玩 | manipulation adherence |
+|---|---:|---:|---:|---|
+| P1 第三人称+问号 | 1 | 4 | 1 | 1/6 干净；S05 是第二人称，S06 仍是第一人称，其余改了信息量 |
+| P2 第一人称/自然叙述 | 1 | 4 | 1 | 2/6 干净；S02/S03 仍是第三人称，S06 是第二人称 |
+| P3 无显式问号 | 1 | 3 | 2 | 2/6 近似只去问号；S02/S03/S04 直接写入汤底 |
 
-第一人称与第三人称完全同档，没有证据支持第一人称为内容缺陷。无问号版本下限略低，
-但失败主要来自生成器输出质量，不是缺少 `？` 本身。句末问号最多是 UI/主持提示，
-可在展示层统一加“请找出真相”，不应触发一次全 schema LLM repair。
+这张分布**不能**证明第一人称与第三人称表现相同，也不能比较有无问号。支持放宽的强
+证据来自规则性质和 production trace：第一人称是叙事形式而非正确性，S04 因它触发全
+bundle repair 后丢题；补句末问号同样不值得调用 LLM 重写正文。下一轮问号实验应对同一
+字符串确定性 add/remove suffix；人称实验则使用人工配对、逐事实 diff 证明只改代词和
+必要语法。
 
 ## 实验 6：fair clue
 
-FC-ON 为 1 想玩 / 2 可以玩 / 3 不想玩；FC-OFF 为 0 / 1 / 5。这里不能得出“删掉
-fair clue 更好”。FC-OFF 的模型多次直接输出编辑说明，且即使格式正常，也容易让核心
-机制成为汤底里的随机隐藏背景。
+FC-ON 的探索计数为 1 想玩 / 2 可以玩 / 3 不想玩，FC-OFF 为 0 / 1 / 5；但两组
+manipulation adherence 都是 **0/6**。模型输出的是“公平线索开启/关闭后的编辑说明或
+清单”，不是只改变 clue 暴露量的汤面。P003/P014 正是操纵失败样本。
 
-需要改的是定义：公平性应该意味着“汤面有一个真实异常锚点，canonical QA 中存在能
-逐步确认关键事实的路径”，而不是“至少一段 `fair_clue.quote` 逐字出现在 puzzle，且
-直接支持 required atom”。后者会把可通过问答获得的事实误当成必须预先揭露的信息，
-并让 `clue_recontextualized` 被错误绑定到某一条 quote。
+因此这组不能证明关闭 fair clue 会随机，也不能支持现在移除 quote/required-atom
+binding。production 当前 binding 在本 PR 中应继续冻结。可保留为下一轮假设的是：公平
+性的产品目标可能更适合表述为“真实异常锚点 + canonical QA 可达路径”；是否能替换逐字
+quote 合同，必须另做干净实验验证正确性、秒解风险和主持可判定性。
 
 ## 实验 7：discovery beats
 
@@ -188,8 +212,9 @@ DB1（允许 1~4）最能忠实标注自然层次；DB2（强制 2~4）在 S01�
 - 不想玩：20
 
 局限：生成与盲评虽然是独立无状态上下文，但仍是同一个 `deepseek-v4.1-flash` 模型；
-没有真人直播玩家，也没有估计真实提问轮数。模型会把近似候选互相比较，并对重复项
-降级，这符合完整盲评集的现实，但会影响单 variant 的绝对分布。所有结论都应作为下一轮
+没有真人直播玩家，也没有估计真实提问轮数。每次盲评请求包含最多 10 题，近似 variant
+有时在同一 batch 被直接互相比较，故 candidate-level 不独立；模型还会对重复项降级。
+这些计数只能帮助定位 case，不能支撑 6 题小表的规则优劣检验。所有结论都应作为下一轮
 人工盲评和线上 shadow eval 的假设，而不是直接上线依据。
 
 ## 逐项审计 production 规则
@@ -201,14 +226,14 @@ DB1（允许 1~4）最能忠实标注自然层次；DB2（强制 2~4）在 S01�
 3. **`PUZZLE_HARD_MAX_LEN=220`**：保留 hard。固定大屏 puzzle viewport、overflow 与
    实际滚动回归构成真实 UI 合同；它与创作风格无关。
 4. **`ANSWER_HARD_MAX_LEN=300`**：同样保留 hard，属于揭晓展示/runtime 合同。
-5. **`fair_clues`**：保留“真实锚点+QA 可达”的 hard 目标；移除“quote 必须直接支撑
-   required atom”的硬绑定。quote 可作回看高亮 metadata。
+5. **`fair_clues`**：本轮操纵失败，当前 quote/required-atom binding **继续冻结**。
+   “真实锚点+QA 可达”作为替代定义仅是待验证假设，不在本 PR 建议直接上线。
 6. **`MIN_DISCOVERY_BEATS=2`**：改为允许 1~4；对天然单核题 beats 可 optional。
 7. **`reasoning_beats_nonredundant`**：AI-original 目前仍是 hard，降为 soft/offline eval。
 8. **`clue_recontextualized`**：从“某条 fair clue 意义必须变化”改为“整个 surface/scene
    至少一个元素在揭晓后被重新理解”，且单独作为 soft taste signal，不替代真实性。
-9. **`dramatic_payoff`**：降为 soft/offline eval。它是审美判断，模型方差大；保留 hard
-   会把温和但漂亮的机制题和单核题一起丢掉。
+9. **`dramatic_payoff`**：本批 production trace 没有任何一题因它为 false 被拒。
+   “降为 soft/offline eval”是产品假设，需单独采样验证，不能与 S10 的实证同级。
 10. **`core_answer_direct`**：保留 hard。它约束主持人通关落点和 reveal，不要求汤面
     提前泄露答案，属于 runtime 合同。
 11. **`completion_contract_minimal`**：保留 hard。1~2 个最小完成事实防止永不通关；
@@ -216,13 +241,15 @@ DB1（允许 1~4）最能忠实标注自然层次；DB2（强制 2~4）在 S01�
 12. **death/grief/past_trauma quotas**：latest main 已将 cross-puzzle 饱和降为 soft，方向
     正确。继续限制的是 `past_trauma + repeated_ritual + grief/memorial` 的模板重复，
     不是 death 本身。红汤/黑汤允许死亡；死亡不能单独充当 reveal。
+13. **`concrete_anomaly`**：继续 hard。它的 production 定义正是汤面中具体、可感知的
+    异常锚点，是第一眼提问欲和后续 QA 的起点；本实验没有证据支持把它一并软化。
 
 ## Top 5 最该放宽规则
 
 1. 规则：第一人称自动修复
    文件：`story/quality.py`、`story/puzzle.py`
    当前行为：第一人称为 fixable，Reviewer 要改第三人称。
-   为什么伤害题感：P2 与 P1 盲评分布相同；S04 因此触发全 schema repair 并丢题。
+   为什么伤害题感：它是叙事形式而非正确性；S04 因此触发全 schema repair 并丢题。
    建议：第一人称合法，只审计说话者知识边界和字面真实性。
    风险：角色信念可能被误读成全知事实；由归属明确的 truth audit 控制。
 
@@ -240,22 +267,23 @@ DB1（允许 1~4）最能忠实标注自然层次；DB2（强制 2~4）在 S01�
    建议：允许 1~4；beats optional metadata；nonredundant 只作 soft signal。
    风险：过薄候选增加；由 QA 可达性和 blind playability 控制。
 
-4. 规则：fair clue quote 必须逐字出现并直接支撑 required atom
-   文件：`story/quality.py`、`story/llm.py`
-   当前行为：缺 quote、quote 不在 puzzle、无 required-atom path 都是 hard。
-   为什么伤害题感：混淆“能通过 QA 获得”与“必须提前给出”，提高 HIGH 暴露压力。
-   建议：hard 只保留真实异常锚点和 canonical QA 可达；quote/atom link 作 metadata。
-   风险：完全关闭会随机；FC-OFF 5/6 不想玩证明不能把公平性一起删掉。
-
-5. 规则：`dramatic_payoff` / `clue_recontextualized` 作为 AI-original hard gate
+4. 规则：`clue_recontextualized` 绑定单条 fair clue 的 hard gate
    文件：`story/llm.py`
-   当前行为：任一 false 都可拒稿；后者还绑定 fair clue。
+   当前行为：至少一条 fair clue 必须在揭晓后改变意义，否则可拒稿。
    为什么伤害题感：S10 整体场景有清晰重读，却因单条 clue 未重释被拒。
-   建议：payoff 降 offline/soft；recontextualization 改看整体 scene element。
+   建议：改看整体 scene element，并降为不替代正确性门的 taste signal。
    风险：普通说明题会增加；应用盲评/池偏好排序，而非正确性 hard gate。
 
-另一个应单独修的工程问题是 Reviewer repair 粒度：surface-only format fix 不应要求模型
-重吐整套 facts/atoms/clues/beats。它不是创作规则，但在本批造成了两个明确损失。
+5. 规则：任何局部 fix 都要求 Reviewer 重吐全 bundle
+   文件：`story/llm.py`
+   当前行为：surface-only 或 metadata-only 修复也必须回传完整 facts/atoms/clues/beats，
+   且任一漏项或未授权细节改动都会丢弃整题。
+   为什么伤害题感：S04、S08 是两例明确的非内容损失。
+   建议：确定性格式修复不调用 LLM；metadata 分类修复只允许最小字段 patch。
+   风险：局部 patch 可能产生结构漂移；修后继续跑完整 validator/truth audit。
+
+`fair_clue` binding remove 与 `dramatic_payoff` hard→soft 不进入这份 Top 5；它们是下一轮
+待验证假设。
 
 ## Top 5 绝对不能放宽
 
@@ -263,15 +291,23 @@ DB1（允许 1~4）最能忠实标注自然层次；DB2（强制 2~4）在 S01�
    S02 的复刻旧宅冲突证明该门必要。
 2. **Canonical facts / answer 一致且 QA 可判定**：主持人的“是/否/无关”必须有稳定
    canonical world；开放答案空间不等于事实自相矛盾。
-3. **`core_answer_direct` + `completion_contract_minimal`**：保持可通关和明确 reveal；
+3. **`concrete_anomaly`**：谜面必须存在具体、可感知、可调查的异常锚点；PR #5 没有
+   支持把它与审美信号一起降级。
+4. **`core_answer_direct` + `completion_contract_minimal`**：保持可通关和明确 reveal；
    这是 runtime 合同，不是要求汤面提前给答案。
-4. **No external media + livestream safety**：必须纯文字可玩，并保留内容安全、超时和
-   fail-closed 边界；超自然许可不等于放宽伤害细节。
-5. **220/300 UI hard max**：保留真实大屏展示上限。若未来 UI 合同改变，应先以几何测试
-   证明，而不是由 prompt 任意突破。
+5. **No external media + livestream safety + 220/300 UI limits**：必须纯文字可玩，并保留
+   真实大屏展示、内容安全、超时和 fail-closed 边界；超自然许可不等于放宽伤害细节。
 
 此外，“完全依赖冷门知识”和“关键事实无法通过任何提问确认”仍应 hard reject；它们与
 本轮放宽形式约束无冲突。
+
+### 与 PR #4 的证据边界
+
+本报告不支持把 `concrete_anomaly + clue_recontextualized + dramatic_payoff +
+reasoning_beats_nonredundant` 四项一次性全部降 soft。production trace 直接支持的是：
+S10 暴露 `clue_recontextualized` 误杀；DB 对照支持单核题不应因 beats 不够多被拒。
+`dramatic_payoff` 本批没有 false 实例；`concrete_anomaly` 则应继续 hard，因为它就是本
+报告要求保留的真实异常锚点。
 
 ## 五个明显值得保留、却被 production 损失的 case
 
@@ -347,7 +383,7 @@ current 处理：Reviewer 只补问号，truth audit 却用“靠窗/铁门哪�
 如何通知”等未在 canonical facts 中定义的制度常识判冲突。题底本身“死亡+纪念”偏弱，
 应由 taste signal 降级，而不是伪装成真实性冲突。RAW P015 为“想玩”。
 
-## 五个放太松或生成本身失败的 case
+## 五个失败 case（含操纵失败，不都代表“放太松”）
 
 ### FAIL-01 / S02：误导变成撒谎
 
@@ -364,6 +400,7 @@ current 处理：Reviewer 只补问号，truth audit 却用“靠窗/铁门哪�
 
 汤面直接写“汤面缺少每月、四年、三小时车程……关键遗言被略去”，不再是故事，而是
 对自己缺线索的检讨。盲评“不想玩”。完全关闭 fair clue 既不等于留白，也不等于公平。
+这是 **manipulation failure**，不能用来证明 FC-OFF 的真实效果。
 
 ### FAIL-04 / P038：超自然堆料但无规则
 
@@ -389,39 +426,40 @@ Stage B 技术失败、1 个 validator 合同失败、2 个 truth audit 拒绝�
 **B. Stage A 本身是否平庸？** 部分是。S01/S07/S09 已平；S04/S06/S08/S10 的 RAW
 很好，说明后处理也确实会损失好题。两种原因同时存在。
 
-**C. 哪种暴露量最像海龟汤？** MEDIUM 最稳；LOW 可用于少数强主持题；HIGH 最易变
-阅读理解。
+**C. 哪种暴露量最像海龟汤？** 只确认成功操纵的 HIGH 明显过曝；LOW 与 MEDIUM 的
+adherence 不足，当前不能排序。
 
 **D. 两个关键词有帮助吗？** 10 题全部至少使用一个，6/10 在汤面+汤底中逐字使用两个。
 S02/S06 的组合提供了高价值钩子，S01/S09 也会把普通联想固定下来。没有单关键词对照，
 不能声称因果优势。
 
-**E. reality/neutral/strange？** Neutral 与 Strange 的可玩性下限相同且优于 Reality
-Preferred；但 Strange 抽象指令没有真的增加超自然。推荐 neutral hard boundary + strange
-soft sampling。
+**E. reality/neutral/strange？** 探索性 snapshot 中 Neutral 与 Strange 没有“不想玩”，
+但每组仅 5 题且 prompt adherence 弱；强结论只有 Strange 抽象指令没有稳定增加超自然。
 
-**F. few-shot 更有效吗？** 能提高强冲击样本和超自然出现率，但没有提高本批总盲评，
-且增加字谜/堆料方差。方向有效，示例仍需加入形式反例。
+**F. few-shot 更有效吗？** 本批不能证明。它改变了分布，同时产生强样本、字谜和堆料；
+值得在严格形式过滤后再测，不应作为已验证生成方案。
 
-**G. 第一人称合法吗？** 应合法。
+**G. 第一人称合法吗？** 产品/工程建议是合法；依据是它不属于正确性合同及 S04 的
+production failure，不是污染的人称 A/B 表。
 
-**H. 末尾问号继续 hard？** 不应。改 UI/soft。
+**H. 末尾问号继续 hard？** 建议不 hard，改 UI/soft；质量效果仍需确定性 suffix A/B。
 
-**I. fair clue 在泄露吗？** 直接 required-atom quote 会产生 HIGH 压力；但完全关闭更差。
-重定义而非删除。
+**I. fair clue 在泄露吗？** 本轮 FC 操纵失败，无法回答；当前 binding 冻结，另做实验。
 
 **J. discovery beats 制造伪复杂吗？** 会，尤其单核题；允许 1~4/optional。
 
-**K. 哪些 Reviewer hard gate 降 soft？** `dramatic_payoff`、
-`reasoning_beats_nonredundant` 降 soft/offline；`clue_recontextualized` 改整体场景定义后作
-soft taste signal。`narrator_truthful`、`mechanism_consistent`、`core_answer_direct`、
-`completion_contract_minimal`、`livestream_safe` 保持 hard。
+**K. 哪些 Reviewer hard gate 降 soft？** 强支持：`clue_recontextualized` 改整体场景
+定义后降 taste signal；`reasoning_beats_nonredundant` 不应因单核直接拒绝。待验证：
+`dramatic_payoff`。明确保持 hard：`concrete_anomaly`、`narrator_truthful`、
+`mechanism_consistent`、`core_answer_direct`、`completion_contract_minimal`、
+`livestream_safe`。
 
 ## 建议的最小必要约束集
 
 ```text
 继续 hard：
   字面真实 / 机制自洽 / canonical facts 一致
+  具体、可感知的异常锚点(concrete_anomaly)
   QA 可判定且有可达路径
   core answer 直接、completion 最小
   纯文字、直播安全、220/300 UI 合同
@@ -429,10 +467,13 @@ soft taste signal。`narrator_truthful`、`mechanism_consistent`、`core_answer_
 
 改 soft 或 metadata：
   第一/第三人称、句末问号
-  clue 数量、逐字 quote、beat 数量
+  beat 数量、是否必须多层
   多层反转、dramatic payoff
   现实/超自然偏好、死亡/悲情跨题饱和
   整体 recontextualization 的审美强度
+
+本轮冻结、待干净实验：
+  fair_clue quote / required-atom binding
 ```
 
 这套边界允许题目一开始高度开放，但要求主持人的 canonical world 明确，并能通过
