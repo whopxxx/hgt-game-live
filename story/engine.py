@@ -239,6 +239,18 @@ class RoundEngine:
         self._dup_ids = 0                   # 因 msg_id 重复而丢弃的条数
         self._viewers: set[str] = set()
 
+        # ---- P0: 全局已播账本(任意来源, 跨重启) ----
+        #
+        # 覆盖 pool / live_generate / fallback / curated **四条**来源 ——
+        # `pool_used.jsonl` 只管池题, 另外两条完全看不见。
+        # 由 Director 装配时注入(拿得到 cfg 与路径); 测试可以直接构造。
+        # None = 不启用(老调用方 / 纯单测), 此时 `_admit_unplayed` 放行
+        # 一切 —— 与"这条链原来没有它"逐位相同。
+        self.played_ledger = None
+        #: 因"已经播过"被拒的交付次数。这是本轮最该被监控的数字:
+        #: 它 >0 就说明有来源在尝试重播。
+        self.no_repeat_reject_count = 0
+
         # ---- 统计 ----
         self.round_index = 0                 # 兼容: == 已出题数
         self._questions_total = 0
@@ -735,6 +747,24 @@ class RoundEngine:
                 return []                      # 迟到/重复的回调忽略
             if not puzzle:
                 return self._riddle_failed_locked(now, error or "空谜面")
+            # ---- P0: 已经上屏过的题**绝不允许**再次进入 QA ----
+            #
+            # 这是本轮唯一的硬门, 覆盖**任意来源**(pool / live_generate /
+            # fallback / curated)—— 它挂在 `submit_riddle` 上, 而那是
+            # **所有**交付路径的唯一收口。
+            #
+            # 为什么必须在**这里**而不是各调用方:
+            #   * 兜底题不走池子, `pool_used` 完全看不见它;
+            #   * 现场生成的题同样不进池账本;
+            #   * 于是"固定 4 题兜底"按 `index % 4` 必然重播 —— 这一层
+            #     就是那个缺口的封堵点。
+            #
+            # 判据用 `spec_key(spec)`, 与题池**同一个哈希**, 所以池题在
+            # 两个账本里的身份一致。**先落盘再上屏**(`remember`), 记不下来
+            # 就拒播 —— 与 `pop_next` 里 used 写失败就不交付同一条纪律。
+            if spec is not None and not self._admit_unplayed(spec):
+                return self._riddle_failed_locked(
+                    now, "这道题已经播过(no-repeat)")
             self._setting_deadline = None
             self._setting_attempts = 0
             self._puzzle = puzzle
@@ -1568,19 +1598,81 @@ class RoundEngine:
             "transcript": public["transcript"],
         })]
 
+    def _admit_unplayed(self, spec) -> bool:
+        """P0: 这道题**可以**上屏吗? 顺便把它记进已播账本。
+
+        返回 False = 拒播(已经播过, 或者账本记不下来)。
+
+        ## 契约
+
+            没有账本(None)      -> 放行(老调用方 / 纯单测逐位不变)
+            已播过              -> 拒
+            账本不可信          -> 拒(fail closed: "不知道"当成"播过")
+            没播过              -> **先落盘再放行**(记不下来也拒)
+
+        最后一条与 `PuzzlePool.pop_next` 里 used 写失败就不交付是**同一条
+        纪律**: 宁可不播这一道, 也不冒"重启后它再播一次"的风险。
+        """
+        led = self.played_ledger
+        if led is None:
+            return True
+        if led.has_played(spec):
+            self.no_repeat_reject_count += 1
+            log.warning("拒播: 这道题已经播过(no-repeat; 来源=%s): %s",
+                        getattr(spec, "source_type", "") or "?",
+                        (getattr(spec, "puzzle", "") or "")[:40])
+            return False
+        if not led.remember(spec):
+            self.no_repeat_reject_count += 1
+            return False
+        return True
+
     def _riddle_failed_locked(self, now: float, why: str) -> list[EngineAction]:
         self._setting_attempts += 1
         self.last_error = why
         if self._setting_attempts >= self.cfg.riddle_max_attempts:
-            # 用兜底谜题, 保证永不开天窗
-            log.warning("出题连续失败(%s), 使用兜底谜题", why)
-            # 轮换兜底题 —— 总用同一道, 观众一看就知道出题挂了。
+            # ==========================================================
+            # P0: **固定 4 题兜底退出生产 live path**
+            # ==========================================================
             #
+            # 这里原来是:
+            #
+            #     spec = P.fallback_spec(self._puzzle_index)
+            #     return self.submit_riddle(..., source="fallback")
+            #
+            # 而 `fallback_spec` 是 `index % 4` —— 四道硬编码题按题号
+            # 轮换。两个后果:
+            #
+            #   ① 第 5 次出题失败必然重播第 1 道(**观众看过同一道题**);
+            #   ② 它完全不走题池, 于是 `pool_used` 那条"已播不复活"的
+            #      纪律对这条路径**根本不适用**。
+            #
+            # 现在两者都堵上了:
+            #
+            #   * `submit_riddle` 的全局已播门会拦住任何重播(即使将来
+            #     有人重新接上兜底, 它也只会播**没播过的那几道**);
+            #   * 四道都播过之后, 这里**不再交付**, 保持 SETTING 并让
+            #     下一拍继续尝试(现场生成 / 补池), 而不是拿旧题填时间。
+            #
+            # ⚠️ 代价是极端情况下可能短暂没有新题(开天窗)。这是**刻意**
+            # 的取舍: 复播一道观众已经看过、且答案已经在弹幕里刷过的题,
+            # 比空场更伤 —— 后者只是没内容, 前者是内容错了。
+            spec = P.fallback_spec(self._puzzle_index)
+            if self.played_ledger is not None and \
+                    self.played_ledger.has_played(spec):
+                self.no_repeat_reject_count += 1
+                log.warning("出题连续失败且兜底题**已播过** —— 不再复播, "
+                            "保持 SETTING 继续尝试(第 %d 题): %s",
+                            self._puzzle_index, why)
+                # 回到"等题"状态, 下一拍重新走生成/补池。
+                self._setting_attempts = 0
+                return []
+            log.warning("出题连续失败(%s), 使用兜底谜题(4 题轮换, 未播过的)",
+                        why)
             # **兜底也必须结构化**(第二轮 review P1): 它同样要经过正式
             # Q&A, 只给 puzzle/answer 的话 facts 为空 -> 主持人退回"只看
             # 文学谜底", Final Judge 也没有 atom gate —— 质量系统在这条
             # 路径上等于不存在。
-            spec = P.fallback_spec(self._puzzle_index)
             return self.submit_riddle(
                 spec.puzzle, spec.answer, list(spec.hints), title=spec.title,
                 now=now, solve_atoms=spec.solve_atoms,

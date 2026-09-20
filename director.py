@@ -47,6 +47,7 @@ from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
                        _spec_to_riddle)
 from story.pool import PuzzlePool                   # noqa: E402
+from story.played import PlayedLedger               # noqa: E402
 from story.public_player import PublicPlayerCore    # noqa: E402
 from story.server import RenderServer, StateHub     # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
@@ -156,6 +157,20 @@ class Director:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.engine = RoundEngine(cfg)
+        # ---- P0: 全局已播账本(任意来源, 跨重启) ----
+        #
+        # 挂在 engine 上而不是各处调用方上: `submit_riddle` 是**所有**
+        # 交付路径(pool / live_generate / fallback / curated)的唯一收口,
+        # 一处接线就覆盖四条链。见 `PlayedLedger` 的模块说明。
+        self.played_ledger = PlayedLedger(
+            path=getattr(cfg, "played_path", "") or "",
+            # ⚠️ **只有生产装配显式打开它**。`PlayedLedger` 自己默认是
+            # 关的 —— 几百个既有用例直接 `Config(sim_path="x")` 起引擎
+            # (没有 tmpdir), 默认开会把它们的交付互相挡掉。见那个类的
+            # `__init__` 说明。
+            enabled=True)
+        self.played_ledger.load()
+        self.engine.played_ledger = self.played_ledger
         self.hub = StateHub()
         self.inbox: "queue.Queue[ChatEvent]" = queue.Queue(maxsize=20000)
         self.source = None

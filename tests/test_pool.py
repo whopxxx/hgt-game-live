@@ -144,6 +144,10 @@ def mkcfg(tmp, **kw):
     kw.setdefault("pool_enabled", True)
     kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
     kw.setdefault("pool_used_path", os.path.join(tmp, "used.jsonl"))
+    # P0 已播账本 —— 与上面 curated 同理: 不覆盖就会写到仓库真实的
+    # `data/played.jsonl`, 于是用例之间**互相污染**(上一例播过的题把
+    # 下一例的交付挡掉)。那会让"同一份代码两种结果"重演。
+    kw.setdefault("played_path", os.path.join(tmp, "played.jsonl"))
     kw.setdefault("no_llm", True)
     # ---- Batch H2-F: curated 池必须在临时目录里, 且默认关掉 ----
     #

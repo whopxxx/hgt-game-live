@@ -1952,6 +1952,13 @@ def test_full_fallback_chain_reaches_archive():
     if os.path.exists(out):
         os.remove(out)
     cfg.puzzle_out_path = out
+    # P0: 这条用例走**真 Director**, 于是已播账本是开的 —— 不指向临时
+    # 文件的话, 第二次跑这条用例时兜底题已经被上一次记成"播过", 交付
+    # 会被拒, 断言就红了。那是**测试隔离**问题, 不是产品行为问题。
+    _pl = os.path.join(tempfile.gettempdir(), "_hgt_fallback_played.jsonl")
+    if os.path.exists(_pl):
+        os.remove(_pl)
+    cfg.played_path = _pl
 
     d = Director(cfg)
     d.engine.start()
@@ -2511,6 +2518,11 @@ def test_archive_records_source():
         os.remove(out)
     cfg = mkcfg()
     cfg.puzzle_out_path = out
+    # P0: 真 Director => 已播账本开着, 必须指向临时文件(见另一处同款说明)。
+    _pl = os.path.join(tempfile.gettempdir(), "_hgt_src_arch_played.jsonl")
+    if os.path.exists(_pl):
+        os.remove(_pl)
+    cfg.played_path = _pl
     d = Director(cfg)
     d.pool = None                      # 这条用例只验 archive 本身
     d.engine.start()

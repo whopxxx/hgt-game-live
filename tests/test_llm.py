@@ -4059,14 +4059,26 @@ def test_u4_livestream_text_length_bounds():
 
 
 def test_g2b_clue_quote_repaired_in_place():
-    """**G2-B**: quote 不在谜面 -> 就地改 quote, **不换稿**。"""
-    print("\n[G2-B] clue quote 不在谜面 -> 就地修")
+    """**G2-B**: quote 不在谜面 -> 就地改 quote, **不换稿**。
+
+    ⚠️ G4-R2-R2: 审稿人的答复必须**保持 clue 数量不变** —— 现在
+    `_core_fix_scope_violation` 的逐 clue 守卫要求"只重摘 quote,
+    数量/顺序/supports_atoms 全冻结"。第一版这里用的是 `review_fix(P)`
+    (它从 `riddle()` 重新生成**两条** clue), 于是"修 quote"变成了
+    "换一整套线索" —— 那正是守卫要拦的越界, 用例却把它当成合法修复。
+    真实的重摘就是**同一条 clue 换个 quote**, 所以夹具照这个形状写。
+    """
+    print("\n[G2-B] clue quote 不在谜面里 -> 就地修")
     P = _GOOD_PUZ
     bad_clues = [{"quote": "这句话谜面里根本没有", "supports_atoms": ["a1"]}]
+    # 合法修复: **同一条** clue, quote 换成谜面里真有的那一句。
+    good_q = clues_for(P)[0]["quote"]
+    fixed = review_fix(P)
+    fixed["fair_clues"] = [{"quote": good_q, "supports_atoms": ["a1"]}]
     fc = FakeClient([
         LLMResult(tool_input=riddle(fair_clues=bad_clues), model="m"),
         # 审稿: fix —— 从当前谜面重新逐字摘
-        LLMResult(tool_input=review_fix(P), model="m"),
+        LLMResult(tool_input=fixed, model="m"),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     spec = w.gen_spec(blueprint=fc.default_blueprint)

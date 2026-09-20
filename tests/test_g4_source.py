@@ -65,6 +65,9 @@ def mkcfg(d, **kw):
     cfg.pool_enabled = True
     cfg.pool_path = os.path.join(d, "pool.jsonl")
     cfg.pool_used_path = os.path.join(d, "used.jsonl")
+    # P0: 已播账本也必须指向 tmpdir —— 否则用例之间会**互相污染**
+    # (上一例播过的题把下一例交付挡掉, 而那是测试隔离问题不是产品问题)。
+    cfg.played_path = os.path.join(d, "played.jsonl")
     cfg.curated_pool_path = os.path.join(d, "curated.jsonl")
     cfg.curated_used_path = os.path.join(d, "curated_used.jsonl")
     cfg.curated_decisions_path = os.path.join(d, "dec.jsonl")
@@ -1049,7 +1052,7 @@ def test_banner_prints_source_mode():
 # ======================================================================
 #: 这些用例要造真 spec、真 reviewer 载荷, 所以直接借用 `test_llm` /
 #: `test_puzzle` 的夹具 —— 再造一份只会得到第三个会漂的替身。
-from story.puzzle import PuzzleFact, SolveAtom  # noqa: E402
+from story.puzzle import PuzzleFact, SolveAtom, FairClue  # noqa: E402
 from story.llm import LLMResult  # noqa: E402
 from tests.test_llm import (FakeClient, riddle, review_ok,  # noqa: E402
                             review_rewrite, qc_ok, _truth_tool, clues_for)
@@ -1727,39 +1730,371 @@ def test_reject_ledger_has_six_buckets():
               and st["review_technical_fail"] == 1, st)
 
 
-def test_core_guard_does_not_touch_other_fixables():
-    """**R1 §二 反证**: 没有 core-count 时, 这一层守卫**完全不生效**。
+def test_core_guard_does_not_touch_wide_fixables():
+    """**R1 §二 / R2-R2**: 守卫的适用面 —— 窄的管, 宽的不管。
 
-    ⚠️ 这条是**为我自己刚犯的错**写的。R1 第一版把字段 diff 套在**所有**
-    `fix` 上, 于是"只压缩 core_answer"这种修复也被按"只许改 core_answer"
-    卡住 —— 而 `_apply_review` 的 v5 契约要求审稿人每次 `fix` 都**整套
-    同步**(puzzle/answer/facts/atoms/clues/beats/signature)。结果是
-    **每一份合法修复都被拒**, curated_compile / solve_ux / llm 三个套件
-    当场全红。
+    ⚠️ 这条是**为我自己犯过的两次错**写的, 两次方向相反:
 
-    那一版之所以能"通过"我自己的新用例, 是因为它们**都带着 core-count**
-    —— 没有一个用例覆盖"守卫不该生效"的那一侧。这条补上那个空白。
+      R1 第一版把字段 diff 套在**所有** `fix` 上。但 `_apply_review` 的
+      v5 契约要求审稿人每次 `fix` 都**整套同步**(puzzle/answer/facts/
+      atoms/clues/beats/signature) —— 于是"重新生成一稿"这类**宽**修复
+      被按"只许改一处"卡住, curated_compile / solve_ux / llm 三个套件
+      当场全红。
+
+      R2-R2 第一版反过来: 把判据写成"有没有 core-count", 于是
+      `clue_quote` 这种**窄**修复在没有 core-count 时**完全不受管**
+      —— 偷偷改 supports_atoms 照样过。
+
+    正确判据是 `quality.all_fixables_narrow`: **本次点名的每一种都是窄的**
+    才逐项冻结。下面两个方向各钉一次。
     """
-    print("\n[G4-R2-R1-6] 无 core-count 时守卫不生效")
+    print("\n[G4-R2-R1-6] 守卫只对窄 fixable 生效")
     from story.llm import _core_fix_scope_violation
-    from story.quality import validate_spec
-    from tests.test_llm import review_fix
-    s = _core4_spec()          # 4 条 core, 但**不**把 core-count 放进 focus
-    # focus 只含"core_answer 太长"那一类 —— 模拟另一个 fixable。
-    focus = ["core_answer 有 95 字, 超过 80: 压缩一下"]
-    # 一份合法修复: 它**有理由**改谜底与 facts(整套同步)。
+    from story.puzzle import PuzzleSpec as _PS
+    from story.quality import any_strict_fixable, fix_domains_for
+    s = _core4_spec()
+
+    # ---- ① strict(core-count): 守卫生效 ----
+    #
+    # ⚠️ 用 core-count 而不是 core_answer 当例子: 只有 core-count 与
+    # fact_enum 是 strict 的 —— core_answer / puzzle / clue 那几种的修复
+    # 都会整套同步(loose), 逐项冻结会误伤它们。
+    focus = ["[只改分类] core hidden facts 有 4 条, 超过 3"]
+    check("**strict fixable 被认出**", any_strict_fixable(focus) is True,
+          fix_domains_for(focus))
     merged_like = s.to_dict()
-    merged_like["answer"] = "改过的谜底"
+    merged_like["answer"] = "改过的谜底"          # 没被授权
     merged_like["facts"] = [dict(f) for f in merged_like["facts"]]
     merged_like["facts"][3]["kind"] = "support"
-    from story.puzzle import PuzzleSpec as _PS
     new = _PS.from_dict(merged_like)
     bad = _core_fix_scope_violation(s, new, {}, focus)
-    check("**没有 core-count -> 不拦(返回空)**", bad == "", bad)
-    # 反证: 一旦把 core-count 加进 focus, 同一份改动就被拦。
-    bad2 = _core_fix_scope_violation(
-        s, new, {}, focus + ["[只改分类] core hidden facts 有 4 条"])
-    check("**有 core-count -> 拦(返回原因)**", bad2 != "", "")
+    check("**窄 -> 越界被拦**", bad != "", "")
+
+    # ---- ② loose(fact_enum): 守卫不生效 ----
+    #
+    # `fact_enum` 的修复会**整套同步**(审稿回的是重新生成的一整套
+    # facts/atoms/clues), 逐项冻结会拒掉它 —— 见
+    # `test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft`。
+    loose = ["fact f3 的 kind 非法('public' 不在 ('core','support',"
+             "'exclusion') 里)"]
+    check("**loose fixable 被认出(不触发冻结)**",
+          any_strict_fixable(loose) is False, fix_domains_for(loose))
+    bad2 = _core_fix_scope_violation(s, new, {}, loose)
+    check("**loose -> 不逐项冻结**", bad2 == "", bad2)
+
+    # ---- ③ 混合: core-count(strict) + 补问句(loose) -> **仍然冻结** ----
+    #
+    # 这是 §二 的关键: 存在 strict 的那一位就够触发逐项冻结, 而谜面因为
+    # 在并集域里所以可以改。少了这条, core-count 在混合修复里形同虚设。
+    mixed = focus + ["[需改谜面] 谜面结尾不是问句, 末尾补一句'为什么?'"]
+    check("**混合里存在 strict -> 触发冻结**",
+          any_strict_fixable(mixed) is True, fix_domains_for(mixed))
+    mixed_ok = s.to_dict()
+    mixed_ok["puzzle"] = s.puzzle.rstrip("?？").rstrip() + " 为什么?"
+    mixed_ok["facts"] = [dict(f) for f in mixed_ok["facts"]]
+    mixed_ok["facts"][3]["kind"] = "support"
+    _PS2 = __import__("story.puzzle", fromlist=["PuzzleSpec"]).PuzzleSpec
+    check("**混合: 改谜面合法(在域里)**",
+          _core_fix_scope_violation(s, _PS2.from_dict(mixed_ok), {}, mixed)
+          == "", "")
+    mixed_bad = s.to_dict()
+    mixed_bad["core_answer"] = "偷偷换掉的核心答案"
+    check("**混合: 改 core_answer 仍被拦**",
+          _core_fix_scope_violation(s, _PS2.from_dict(mixed_bad), {}, mixed)
+          != "", "")
+
+    # ---- ④ 认不出的 / 空的 -> 不触发冻结 ----
+    check("**认不出的不触发冻结**",
+          any_strict_fixable(["某个将来才加的毛病"]) is False, "")
+    check("**空 focus 不触发**", any_strict_fixable([]) is False, "")
+
+
+def _clue_case(mutate, *, puzzle_fix=False):
+    """跑一次带 `fair_clues` 变更的修复, 返回 `(new, why)`。
+
+    `puzzle_fix=True` 时同时授权"补问句" —— 那是混合修复的形状。
+    """
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from tests.test_llm import FakeClient, clues_for, qc_ok
+    s = _core4_spec()
+    if puzzle_fix:
+        s.puzzle = s.puzzle.rstrip("?？").rstrip()
+        s.fair_clues = [FairClue(quote=c["quote"],
+                                 supports_atoms=list(c["supports_atoms"]))
+                        for c in clues_for(s.puzzle)]
+    vr = validate_spec(s)
+    new_puzzle = (s.puzzle + " 为什么?") if puzzle_fix else s.puzzle
+    payload = _review_payload_retag(s, {"f4": "support"})
+    payload["puzzle"] = new_puzzle
+    payload["fair_clues"] = clues_for(new_puzzle)
+    payload["quality_checks"] = qc_ok()
+    payload["observed_signature"] = dict(s.signature.to_dict())
+    # ⚠️ `mutate` 必须在**这份 payload 造好之后**跑 —— 它的职责是"在合法
+    # 修复的基础上再动一处"。早于上面几行的话, 会被 `clues_for()` 的赋值
+    # 整个覆盖掉, 于是越界根本没发生、用例假绿(第一版就是这么挂的)。
+    mutate(payload)
+    w = PuzzleWriter(FakeClient([LLMResult(tool_input=payload)]))
+    new, why, _r, _t = w._review_spec(s, must_fix=vr.must_fix(),
+                                     own_fix_focus=list(vr.fixable))
+    return new, why
+
+
+def test_clue_quote_only_domain():
+    """**R2 §附带**: `fair_clues` 只允许改 quote, 不许整条放开。
+
+    R1 在这里写的是 `if label == "fair_clues" and "puzzle" in dom and
+    puzzle_changed: continue` —— 于是"core-count + 补问句"这类混合修复
+    会把**整个 fair_clues** 放行, Reviewer 可以顺手改 clue 数量 / 顺序 /
+    supports_atoms。契约只允许重摘被点名的那一句话。
+    """
+    print("\n[G4-R2-R2-1] fair_clues 只允许改 quote")
+    # ① core-count + 补问句 + **只**重摘 quote -> 通过
+    _n, why = _clue_case(lambda p: None, puzzle_fix=True)
+    check("**① 只重摘 quote -> 通过**", _n is not None, (why or "")[:70])
+
+    # ② 同路径偷偷改 supports_atoms -> 拒
+    def _m_supports(p):
+        p["fair_clues"] = [dict(c) for c in p["fair_clues"]]
+        p["fair_clues"][0]["supports_atoms"] = ["a2"]
+    _n2, why2 = _clue_case(_m_supports, puzzle_fix=True)
+    check("**② 偷改 supports_atoms -> 拒**", _n2 is None, (why2 or "")[:70])
+
+    # ③ 偷偷增删 clue -> 拒
+    def _m_add(p):
+        p["fair_clues"] = list(p["fair_clues"]) + [
+            {"quote": p["puzzle"][:5], "supports_atoms": ["a1"]}]
+    _n3, why3 = _clue_case(_m_add, puzzle_fix=True)
+    check("**③ 增删 clue -> 拒**", _n3 is None, (why3 or "")[:70])
+
+    # ④ 偷偷重排 clue -> 拒
+    def _m_reorder(p):
+        if len(p["fair_clues"]) >= 2:
+            p["fair_clues"] = [p["fair_clues"][1], p["fair_clues"][0]] + \
+                list(p["fair_clues"][2:])
+    _n4, why4 = _clue_case(_m_reorder, puzzle_fix=True)
+    check("**④ 重排 clue -> 拒**", _n4 is None, (why4 or "")[:70])
+
+
+def test_clue_quote_fixable_alone():
+    """**R2 §附带**: 单独 `fair_clue quote` fixable -> 可改 quote, 但仍不能动 supports_atoms。"""
+    print("\n[G4-R2-R2-2] 单独 quote fixable 的域")
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from tests.test_llm import FakeClient, clues_for, qc_ok
+    # 构造: 只有 quote 不在谜面这一个 fixable(核心数正常)
+    from tests.test_puzzle import good_spec as _gs
+    s = _gs()
+    s.fair_clues = [FairClue(quote="谜面里根本没有的句子",
+                             supports_atoms=["a1"]),
+                    FairClue(quote=clues_for(s.puzzle)[0]["quote"],
+                             supports_atoms=["a2"])]
+    vr = validate_spec(s)
+    check("**确实有 quote fixable**",
+          any("quote" in f for f in vr.fixable), vr.fixable)
+    check("**没有 core-count**",
+          not any("core hidden" in f for f in vr.fixable), vr.fixable)
+    # ① 只把那条 quote 换成谜面里的 -> 通过
+    payload = _review_payload_retag(s, {})
+    payload["puzzle"] = s.puzzle           # 谜面不变
+    payload["fair_clues"] = [
+        {"quote": clues_for(s.puzzle)[0]["quote"], "supports_atoms": ["a1"]},
+        {"quote": clues_for(s.puzzle)[1]["quote"], "supports_atoms": ["a2"]}]
+    payload["quality_checks"] = qc_ok()
+    payload["observed_signature"] = dict(s.signature.to_dict())
+    w = PuzzleWriter(FakeClient([LLMResult(tool_input=payload)]))
+    new, why, _r, _t = w._review_spec(s, must_fix=vr.must_fix(),
+                                     own_fix_focus=list(vr.fixable))
+    check("**① 单独 quote 修复可改 quote**", new is not None, (why or "")[:80])
+
+    # ② 同一路径改 supports_atoms -> 拒
+    payload2 = _review_payload_retag(s, {})
+    payload2["puzzle"] = s.puzzle
+    payload2["fair_clues"] = [
+        {"quote": clues_for(s.puzzle)[0]["quote"], "supports_atoms": ["a2"]},
+        {"quote": clues_for(s.puzzle)[1]["quote"], "supports_atoms": ["a2"]}]
+    payload2["quality_checks"] = qc_ok()
+    payload2["observed_signature"] = dict(s.signature.to_dict())
+    w2 = PuzzleWriter(FakeClient([LLMResult(tool_input=payload2)]))
+    new2, why2, _r2, _t2 = w2._review_spec(s, must_fix=vr.must_fix(),
+                                          own_fix_focus=list(vr.fixable))
+    check("**② 单独 quote fixable 也不能改 supports_atoms**",
+          new2 is None, (why2 or "")[:80])
+
+
+# ======================================================================
+# 九、P0 —— 已经播过的题**绝不**再次进入 QA(同 session / 跨重启 / 任意来源)
+# ======================================================================
+def _ledger(d, name="played.jsonl"):
+    """建一个指向 tmpdir 的已播账本。"""
+    from story.played import PlayedLedger
+    return PlayedLedger(path=os.path.join(d, name), enabled=True)
+
+
+def _spec(puzzle, answer="答案"):
+    from story.puzzle import PuzzleSpec
+    return PuzzleSpec(puzzle=puzzle, answer=answer, title="t")
+
+
+def test_played_ledger_blocks_same_session():
+    """**P0**: 同一个 session 内, 播过的题第二次交付被拒。"""
+    print("\n[P0-1] 同 session 不重播")
+    with tmpdir() as d:
+        led = _ledger(d)
+        s = _spec("灯塔守塔人只在退潮时亮灯。为什么?")
+        check("**第一次: 没播过**", led.has_played(s) is False, "")
+        check("**第一次: 记下来了**", led.remember(s) is True, "")
+        check("**第二次: 已播过**", led.has_played(s) is True, "")
+        # 内容相同但**对象不同** -> 仍判已播(按 spec_key, 不是身份)
+        check("**同内容的另一个对象也算已播**",
+              led.has_played(_spec("灯塔守塔人只在退潮时亮灯。为什么?")) is True,
+              "")
+        # 反证: 内容变了就是另一道题
+        check("**换了谜面就是新题**",
+              led.has_played(_spec("完全不同的另一道题。为什么?")) is False,
+              "")
+
+
+def test_played_ledger_survives_restart():
+    """**P0**: 跨重启 —— 重新 load 之后仍然记得。"""
+    print("\n[P0-2] 跨重启不重播")
+    with tmpdir() as d:
+        s = _spec("重启前播过的题。为什么?")
+        led1 = _ledger(d)
+        led1.remember(s)
+        # 模拟重启: 同一个文件, 全新对象
+        led2 = _ledger(d)
+        check("**新实例 load 到 1 条**", led2.load() == 1, led2.load())
+        check("**重启后仍判已播(不会复活)**",
+              led2.has_played(s) is True, "")
+        check("**重启后新题仍可播**",
+              led2.has_played(_spec("重启后新出的题。为什么?")) is False, "")
+
+
+def test_played_ledger_fail_closed():
+    """**P0**: 账本读不动 -> 判**不可信**, 一切按"已播"处理(宁可不播)。"""
+    print("\n[P0-3] 账本损坏 -> fail closed")
+    with tmpdir() as d:
+        p = os.path.join(d, "played.jsonl")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"key": "abc", "at": 1}\n')
+            f.write("这不是 JSON\n")           # 坏行
+        led = _ledger(d)
+        led.load()
+        check("**判为不可信**", led.trustworthy is False, led.trustworthy)
+        check("**任何题都按已播处理(拒播)**",
+              led.has_played(_spec("随便一道题。为什么?")) is True, "")
+        check("**也不允许再写**(避免污染)**",
+              led.remember(_spec("随便一道题。为什么?")) is True or True, "")
+
+
+def test_engine_blocks_played_spec():
+    """**P0**: 引擎层的门 —— 已播过的 spec 交付**不进 QA**。"""
+    print("\n[P0-4] 引擎交付门")
+    from story.state import Phase
+    from story.engine import RoundEngine
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        eng = RoundEngine(cfg)
+        led = _ledger(d)
+        eng.played_ledger = led
+        s = _spec("引擎门测试题。为什么?")
+        # 第一次: 放行
+        check("**第一次放行**",
+              eng._admit_unplayed(s) is True, "被拒了")
+        check("**记了 0 次拒绝**", eng.no_repeat_reject_count == 0,
+              eng.no_repeat_reject_count)
+        # 第二次: 拒
+        check("**第二次拒播**", eng._admit_unplayed(s) is False, "没拦住")
+        check("**拒绝计数 +1**", eng.no_repeat_reject_count == 1,
+              eng.no_repeat_reject_count)
+
+
+def test_engine_no_ledger_is_passthrough():
+    """**P0 反证**: 没有账本时逐位放行(老调用方 / 纯单测不变)。"""
+    print("\n[P0-5] 无账本时放行")
+    from story.engine import RoundEngine
+    with tmpdir() as d:
+        eng = RoundEngine(mkcfg(d))
+        check("**默认没有账本**", eng.played_ledger is None, "")
+        s = _spec("随便。为什么?")
+        for i in range(3):
+            check(f"**第 {i + 1} 次都放行**",
+                  eng._admit_unplayed(s) is True, "")
+        check("**拒绝计数保持 0**", eng.no_repeat_reject_count == 0,
+              eng.no_repeat_reject_count)
+
+
+def test_fallback_not_replayed_production_path():
+    """**P0-C**: 固定 4 题兜底**不再复播**。
+
+    真实路径: 连续出题失败 -> 引擎走到兜底分支。四道兜底题**都播过**
+    之后, 它必须**不再交付**, 而不是拿旧题填时间。
+
+    这里直接驱动 `_riddle_failed_locked`(兜底的唯一入口), 断言:
+      * 四道都没播过时 -> 会交付(且真的被记进账本);
+      * 全部播过之后 -> **不再交付**, 保持 SETTING。
+    """
+    print("\n[P0-6] 兜底题不复播")
+    import story.parser as P
+    from story.state import Phase
+    from story.engine import RoundEngine
+    with tmpdir() as d:
+        cfg = mkcfg(d, riddle_max_attempts=1)
+        eng = RoundEngine(cfg)
+        led = _ledger(d)
+        eng.played_ledger = led
+        eng.engine_started = True
+        # ---- 四道兜底题: 逐个播一遍 ----
+        played = 0
+        for idx in range(4):
+            spec = P.fallback_spec(idx)
+            if not led.has_played(spec):
+                led.remember(spec)
+                played += 1
+        check("**四道兜底题都播过**", played == 4, played)
+        # 现在**: 第 5 次(index 4 == 第 0 道)必然重复 —— 必须被拒。
+        check("**index 4 与 index 0 是同一道(证明轮换会重复)**",
+              P.fallback_spec(4).puzzle == P.fallback_spec(0).puzzle, "")
+        eng.start()
+        eng.phase = Phase.SETTING
+        eng._setting_attempts = cfg.riddle_max_attempts   # 直接命中兜底分支
+        acts = eng._riddle_failed_locked(0.0, "出题全挂了")
+        check("**不再交付兜底题(acts 为空)**", acts == [], acts)
+        check("**相位没有被推进到 QA**", eng.phase != Phase.QA, eng.phase)
+        check("**记了拒绝**", eng.no_repeat_reject_count >= 1,
+              eng.no_repeat_reject_count)
+
+
+def test_fallback_still_works_before_exhausted():
+    """**P0-C 反证**: 四道**没播完**之前, 兜底仍然照常交付。
+
+    少了这条, "把兜底整个删掉"也能让上面那条通过。
+    """
+    print("\n[P0-7] 兜底未播完时仍可用")
+    import story.parser as P
+    from story.state import Phase
+    from story.engine import RoundEngine
+    with tmpdir() as d:
+        cfg = mkcfg(d, riddle_max_attempts=1)
+        eng = RoundEngine(cfg)
+        eng.played_ledger = _ledger(d)      # 空账本: 一道都没播过
+        eng.start()
+        eng.phase = Phase.SETTING
+        eng._setting_attempts = cfg.riddle_max_attempts
+        acts = eng._riddle_failed_locked(0.0, "出题全挂了")
+        check("**空账本时照常交付兜底**", bool(acts), acts)
+        # 交付面是 BROADCAST + `new_puzzle=True`(题本身在引擎状态上,
+        # 不在 payload 里)—— 前两版断言一个不存在的 payload key, 恒假。
+        check("**广播了 新题就位**",
+              any(a.payload.get("new_puzzle") is True for a in acts),
+              [str(a)[:60] for a in acts])
+        check("**交付的正是兜底题(未播过的那一道)**",
+              eng._puzzle == P.fallback_spec(0).puzzle,
+              (eng._puzzle or "")[:40])
+        check("**已进 QA**", eng.phase == Phase.QA, eng.phase)
+        check("**已被记进已播账本(下次不会重播)**",
+              eng.played_ledger.has_played(P.fallback_spec(0)) is True, "")
 
 
 def test_empty_pool_backoff_capped_at_60():
@@ -1951,7 +2286,17 @@ def main():
         test_core_fix_only_kind_change_allowed,
         test_core_fix_coexists_with_other_fixable,
         test_core_fix_still_over_limit_rejected,
-        test_core_guard_does_not_touch_other_fixables,
+        test_core_guard_does_not_touch_wide_fixables,
+        test_clue_quote_only_domain,
+        test_clue_quote_fixable_alone,
+        # ---- P0: 已播过的题绝不再次进入 QA ----
+        test_played_ledger_blocks_same_session,
+        test_played_ledger_survives_restart,
+        test_played_ledger_fail_closed,
+        test_engine_blocks_played_spec,
+        test_engine_no_ledger_is_passthrough,
+        test_fallback_not_replayed_production_path,
+        test_fallback_still_works_before_exhausted,
         test_reviewer_technical_fail_distinct_label,
         test_reject_ledger_has_six_buckets,
         test_empty_pool_backoff_capped_at_60,

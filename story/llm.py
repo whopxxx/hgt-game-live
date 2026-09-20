@@ -47,6 +47,9 @@ from .quality import (
     #: G4-R2-R1 §二: 每种 fixable 各自允许改哪些字段。守卫取**并集**,
     #: 所以"core-count + 补问句"能同时成立而单一种仍然逐项冻结。
     fix_domains_for,
+    #: G4-R2-R2: 本次点名的 fixable 里有没有 **strict** 的 —— 决定
+    #: 要不要逐项冻结(见 `_core_fix_scope_violation`)。
+    any_strict_fixable,
     describe_constraints,
     saturated_constraints,
 )
@@ -637,22 +640,65 @@ def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
     """
     if new is None:
         return ""
-    # ---- ⚠️ 只对"core 数量"这一类修复生效 ----
+    # ==================================================================
+    # 第一层: `fair_clues` 的**逐 clue** 守卫
+    # ==================================================================
     #
-    # 这一层是 R2-R1 新加的**窄**守卫, 它的存在理由是: core-count 修复的
-    # 唯一合法动作是"把多余 core 重标 support", 所以除 `facts[*].kind`
-    # 之外的一切变化都值得怀疑。
+    # ⚠️ 这一层**不**受下面 strict/loose 闸门管, 因为用户 §6 明确要求
+    # "单独 fair_clue quote fixable 也不能改 supports_atoms"。而那一条
+    # 恰恰是 loose 的(修复时整套同步, 连带改 core_answer 等), 走全局
+    # 闸门就会把它的 clue 守卫一起关掉。
+    #
+    # ## 什么时候**才**该跑这一层(这里踩过一次)
+    #
+    # 两种情形:
+    #
+    #   ① 本次要修的就是那条 quote   (`_quote_fix`) —— §6 单独用例
+    #   ② 本次有 **strict** 修复在册  —— strict 的契约是"除被授权的那几个
+    #      字段外逐项冻结", 而 `fair_clues` 正属于"逐项"之一。少了这条,
+    #      "core-count 修复"就又可以把 clue 数量/顺序/supports_atoms
+    #      一起改掉(§一 明确禁止)。
+    #
+    # ⚠️ 判据**不是**"谜面变了"。第一版写成那个, 于是任何改了谜面的修复
+    # 都被要求"clue 数量/顺序一字不动" —— 实测打红 `test_solve_ux`
+    # (0 -> 1 条 clue 的**合法**修复)与
+    # `test_llm::test_review_decision_fix_syncs_facts`。
+    # "谜面变了"只应该**放开 quote**(旧 quote 可能不再逐字出自新谜面),
+    # 不该顺手把整个 clue 列表冻住 —— 那是两件事。
+    _focus_txt = " ".join(str(f) for f in (own_fix_focus or []))
+    _quote_fix = any(n in _focus_txt for n in
+                     ("fair_clue 缺 quote", "的 quote 不在谜面里"))
+    if _quote_fix or any_strict_fixable(own_fix_focus):
+        _bad_clue = _clues_diff(old, new, allow_quote=True)
+        if _bad_clue:
+            return _bad_clue
+
+    # ==================================================================
+    # 第二层: 其余字段的逐项冻结 —— 只在有 **strict** 修复时生效
+    # ==================================================================
+    #
+    # 这一层是 R2-R1 加的门, 存在理由是: core-count 修复的唯一合法动作是
+    # "把多余 core 重标 support", 所以除 `facts[*].kind` 之外的一切变化都
+    # 值得怀疑。
     #
     # 但**其余** fixable 不是这样: `_apply_review` 的 v5 契约要求审稿人
     # 每次 `fix` 都**整套同步**(puzzle/answer/core_answer/completion/
     # facts/atoms/clues/beats/signature) —— 那是它证明"我真的改过"的方式,
-    # 把一个只压缩 core_answer 的修复也按"只许改 core_answer"去卡, 会拒掉
-    # **每一份合法修复**(实测: 一次误伤 4 个套件 —— curated_compile /
-    # solve_ux / llm 全红)。那不是"更严", 那是把 Reviewer 弄坏。
+    # 把那些也按"只许改一处"去卡, 会拒掉**每一份合法修复**(实测: 误伤
+    # curated_compile / solve_ux / llm 共 8 条)。
     #
-    # 所以判据是"**这一次**点名要修的东西里有没有 core-count", 而不是
-    # "有没有 fixable"。
-    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):
+    #   core-count(strict)   -> 触发逐项冻结, 只放 kind
+    #   补问句(loose)        -> 不触发(重写谜面必然连带改 clues/atoms)
+    #   core-count + 补问句  -> **仍触发**(存在 strict), 域并集含 puzzle
+    #
+    # 二者合起来才同时满足 §一(strict 逐项冻结)与 §二(混合不误伤)。
+    #   "谜面是第一人称"(宽)        -> 审稿要重写谜面, 整套同步是正当的
+    #
+    # ⚠️ **混合**时按**最宽**处理: 只要有一种是宽的, 就不逐项冻结。理由与
+    # §二 一致 —— 宽的那种本来就允许整套同步, 冻结它等于拒掉合法修复。
+    # 而"core-count + 补问句"里的补问句虽然是谜面类, 但它**窄**(只改
+    # 谜面), 所以两者相加仍是窄的, 逐项冻结照常生效。
+    if not any_strict_fixable(own_fix_focus):
         return ""
     dom = fix_domains_for(own_fix_focus)
 
@@ -697,13 +743,26 @@ def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
             if bool(of.hintable) != bool(nf.hintable):
                 return (f"本次修复**未授权改 fact.hintable**(fact {fid}) —— "
                         f"拒绝这次修复")
+    # ---- `facts_kind` 的域: 两种 fixable 共用它, 但规则不同 ----
+    #
+    # ⚠️ **这里必须看"是哪种 fixable 授的这个域"**, 不能只看域里有没有
+    # `facts_kind`。两种 fixable 都开 `facts_kind`:
+    #
+    #     core-count   -> 唯一允许 core -> support(多余的 core 降级)
+    #     fact_enum    -> 把**非法**的 kind 改成合法值, 方向由错在哪决定
+    #
+    # R2-R2 第一版没区分, 于是 `fact_enum` 的合法修复(`public -> support`)
+    # 被判成"只允许 core -> support"整个拒掉 —— 打红 `test_g4a_...`
+    # (`tests/test_llm.py`)。那是把一条**本来合法**的修复拦了。
+    _core_count_here = any(_CORE_COUNT_MARK in str(f)
+                           for f in (own_fix_focus or []))
     if "facts_kind" not in dom:
         for fid, of in _old.items():
             if of.kind != _new[fid].kind:
                 return (f"本次修复**未授权改 fact.kind**(fact {fid}) —— "
                         f"拒绝这次修复")
-    else:
-        # ---- `core -> support` 是唯一被授权的 kind 变化方向 ----
+    elif _core_count_here:
+        # ---- core-count 专属: `core -> support` 是唯一授权方向 ----
         #
         # `support/exclusion -> core` 是**反向**的: 它会把一道本来合格的
         # 题"换一个核心"(合同指向的那条被挤掉, 观众要建的东西变了)。
@@ -722,33 +781,64 @@ def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
                 return (f"本次修复**不得把通关合同指向的 fact({fid}) 降级** "
                         f"—— 那样观众再也建不出合同, 拒绝这次修复")
     # ---- 其余结构字段: 逐项冻结 ----
+    #
+    # ⚠️ `fair_clues` **不在**这张表里: 它由上面的第一层逐 clue 守卫负责,
+    # 那一层是独立生效的(见那里的说明)。放进这里会变成"有 strict 修复时
+    # 才管 clue", 而 §6 要求单独 quote fixable 也受管。
     for field, label in (("solve_atoms", "solve_atoms"),
-                         ("fair_clues", "fair_clues"),
                          ("discovery_beats", "discovery_beats"),
                          ("signature", "signature")):
         if label in dom:
             continue
         if not _same_struct(getattr(old, field, None),
                             getattr(new, field, None)):
-            # ---- G4-R2-R1 §二: 改谜面**必然**要重摘 quote ----
-            #
-            # `fair_clues` 的每个 quote 必须逐字出自谜面(硬校验会查)。
-            # 所以只要这次修复被授权改谜面(补问句 / 改人称 / 删 meta),
-            # 重算 quote 就是那个授权的**必然结果**, 不是额外的越界。
-            #
-            # 判据用"谜面**确实**变了 且 puzzle 在域里", 而不是"谜面可能
-            # 会变": 前者是这次调用里真实发生的事, 后者会让"授权改谜面"
-            # 变成一张可随手改 clues 的空白支票。
-            if (label == "fair_clues" and "puzzle" in dom
-                    and (old.puzzle or "").strip()
-                    != (new.puzzle or "").strip()):
-                continue
             return (f"本次修复**未授权改 {label}** —— 只许改被点名的那一项, "
                     f"拒绝这次修复")
     if "hints" not in dom and \
             [str(h) for h in (old.hints or [])] != \
             [str(h) for h in (new.hints or [])]:
         return "本次修复**未授权改提示**, 拒绝这次修复"
+    return ""
+
+
+def _clues_diff(old: "PuzzleSpec", new: "PuzzleSpec",
+                allow_quote: bool) -> str:
+    """G4-R2-R2: `fair_clues` 的**逐 clue** diff。返回 `""` 表示没有越界。
+
+    授权只有一种: **重摘 quote**(谜面变了, 旧 quote 可能不再逐字出自
+    新谜面)。除此之外:
+
+        clue 数量    必须相同   (增删 clue = 改推理结构)
+        clue 顺序    必须相同   (顺序变了 supports_atoms 的对应关系就错位)
+        supports_atoms 必须相同 (它指向哪条 atom 是**设计**, 不是摘录)
+        其它字段     必须相同
+
+    ⚠️ 为什么顺序也要管: `_apply_review` 是把审稿人的列表**整体**收下的,
+    位置就是它的身份。允许重排等于允许"把 clue A 的 supports_atoms 挪给
+    clue B" —— 而那正好可以用 quote 重摘来掩护。
+    """
+    _o = list(getattr(old, "fair_clues", None) or [])
+    _n = list(getattr(new, "fair_clues", None) or [])
+    if len(_o) != len(_n):
+        return (f"本次修复**未授权增删 fair_clue**"
+                f"({len(_o)} 条 -> {len(_n)} 条) —— 只允许重摘 quote, "
+                f"拒绝这次修复")
+    for i, (oc, nc) in enumerate(zip(_o, _n)):
+        # ---- quote: 唯一可能被授权的字段 ----
+        #
+        # ⚠️ 这里**绝不能**用 `continue` 放行 —— 那样会跳过下面
+        # `supports_atoms` 的检查, 于是"重摘 quote 的同时改指向"变成
+        # 合法(实测: 一条 `continue` 让这条守卫整个失效)。
+        # quote 变了就继续往下查其余字段, 而不是结束这一轮。
+        if (oc.quote or "") != (nc.quote or ""):
+            if not allow_quote:
+                return (f"本次修复**未授权改第 {i + 1} 条 fair_clue 的 "
+                        f"quote** —— 拒绝这次修复")
+        # ---- 其余字段: 无论 quote 改没改, 都必须逐一相同 ----
+        if list(oc.supports_atoms or []) != list(nc.supports_atoms or []):
+            return (f"本次修复**未授权改第 {i + 1} 条 fair_clue 的 "
+                    f"supports_atoms** —— 重摘 quote 不许顺手改它指向哪条"
+                    f" atom, 拒绝这次修复")
     return ""
 
 

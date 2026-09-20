@@ -413,6 +413,18 @@ class Config:
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
     pool_path: str = os.path.join("data", "pool.jsonl")
     pool_used_path: str = os.path.join("data", "pool_used.jsonl")
+    # ---- P0: 全局已播账本(任意来源, 跨重启) ----
+    #
+    # ⚠️ 与上面那个 `pool_used_path` **不是**一回事, 别合并:
+    #
+    #     pool_used.jsonl   题池交付过哪些题(只覆盖池题)
+    #     played.jsonl      **任何来源真的上屏过**哪些题
+    #                       (pool / live_generate / fallback / curated)
+    #
+    # 前者是题池的内部账本(它靠这个决定"池里还剩哪些没用过"); 后者是
+    # 播出的**事实**记录, 服务的是"已经播过的题不得再次进入 QA"。
+    # 现场生成与兜底题根本不在池子里, 所以只有后者能拦住它们。
+    played_path: str = os.path.join("data", "played.jsonl")
 
     # ---- Batch H2-F/G: curated(外部题库)池 ----
     #

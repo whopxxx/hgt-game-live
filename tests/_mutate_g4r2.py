@@ -126,7 +126,7 @@ MUTATIONS = [
     # ================= G4-R2-R1 =================
     ("M-R1-1", "core 守卫的字段 diff 整个去掉(改什么都收下)",
      "story/llm.py",
-     "    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):\n"
+     "    if not any_strict_fixable(own_fix_focus):\n"
      "        return \"\"\n"
      "    dom = fix_domains_for(own_fix_focus)",
      "    if True:\n"
@@ -149,7 +149,7 @@ MUTATIONS = [
 
     ("M-R1-4", "守卫**误伤**其它 fixable(不判有没有 core-count)",
      "story/llm.py",
-     "    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):\n"
+     "    if not any_strict_fixable(own_fix_focus):\n"
      "        return \"\"\n"
      "    dom = fix_domains_for(own_fix_focus)",
      "    dom = {\"facts_kind\"}",
@@ -166,11 +166,54 @@ MUTATIONS = [
 
     ("M-R1-6", "core-count 与别的 fixable 并存时把域锁死(误伤)",
      "story/quality.py",
-     "    ((\"core hidden facts 有\",), (\"facts_kind\",)),",
-     "    ((\"core hidden facts 有\",), (\"facts_kind\",)),\n"
-     "    ((\"谜面结尾不是问句\",), ()),\n"
-     "    ((\"core_answer 有\",), ()),\n"
-     "    ((\"的 quote 不在谜面里\",), ()),",
+     "    ((\"core hidden facts 有\",), (\"facts_kind\",), False),",
+     "    ((\"core hidden facts 有\",), (\"facts_kind\",), False),\n"
+     "    ((\"谜面结尾不是问句\",), (), False),\n"
+     "    ((\"core_answer 有\",), (), False),\n"
+     "    ((\"的 quote 不在谜面里\",), (), False),",
+     ["tests/test_g4_source.py"]),
+    # ================= P0: 已播过的题绝不再次进入 QA =================
+    ("M-P0-1", "交付时不查已播账本(重播放行)",
+     "story/engine.py",
+     "        if led.has_played(spec):",
+     "        if False:",
+     ["tests/test_g4_source.py"]),
+
+    ("M-P0-2", "账本不落盘(重启就忘)",
+     "story/played.py",
+     "        ok = _append_line(self.path, {",
+     "        ok = True\n        _unused = {",
+     ["tests/test_g4_source.py"]),
+
+    ("M-P0-3", "账本损坏时不当已播处理(不 fail closed)",
+     "story/played.py",
+     "        if not self.trustworthy:\n            return True",
+     "        if not self.trustworthy:\n            return False",
+     ["tests/test_g4_source.py"]),
+
+    ("M-P0-4", "兜底不查账本(四题无限轮播)",
+     "story/engine.py",
+     "                    self.played_ledger.has_played(spec):",
+     "                    False:",
+     ["tests/test_g4_source.py"]),
+
+    # ================= P1: fair_clues 只允许改 quote =================
+    ("M-P1-1", "clue 守卫整条去掉",
+     "story/llm.py",
+     "    if _quote_fix or any_strict_fixable(own_fix_focus):",
+     "    if False:",
+     ["tests/test_g4_source.py"]),
+
+    ("M-P1-2", "_clues_diff 不查 supports_atoms",
+     "story/llm.py",
+     "        if list(oc.supports_atoms or []) != list(nc.supports_atoms or []):",
+     "        if False:",
+     ["tests/test_g4_source.py"]),
+
+    ("M-P1-3", "未授权的 quote 改动不拦(quote 域整个放开)",
+     "story/llm.py",
+     "            if not allow_quote:",
+     "            if False:",
      ["tests/test_g4_source.py"]),
 ]
 

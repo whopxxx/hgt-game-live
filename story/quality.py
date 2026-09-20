@@ -251,7 +251,25 @@ _CORE_COUNT_MARK = "[只改分类]"
 #:   `facts_kind`                `facts[*].kind`(**只有它**是 core-count 的域)
 #:   `facts_other`               `facts[*]` 的其它属性(visibility / hintable /
 #:                               文本 / 集合)—— 没有任何一种 fixable 开放它
-#:   `core_answer` / `completion` / `atoms` / `clues` / `beats` / `signature`
+#:   `core_answer` / `completion` / `atoms` / `clue_quote` / `beats` / `signature`
+#:
+#: ⚠️ `clue_quote` 是**逐 clue 的 quote 字段**, 不是整个 `fair_clues`。
+#: 放行整条 clue 就等于允许改它指向哪条 atom —— 那是改题, 不是重摘。
+#: 没有 `clues` 这个词 —— 要放开整个 fair_clues 必须显式新增它, 而不是
+#: 靠一个粗粒度名字顺带获得。
+#:
+#: ## `loose` 是什么(G4-R2-R2)
+#:
+#: `loose=True` 表示"**这一种 fixable 的修复会连带改动整套结构**"。
+#: `story.llm._core_fix_scope_violation` 只在本次点名的 fixable 里
+#: **有 loose=False 的**时候才逐项冻结(见 `any_strict_fixable`)。
+#:
+#: 为什么需要这个区分: `_apply_review` 的 v5 契约要求审稿人每次 `fix`
+#: 都**整套同步**(puzzle/answer/facts/atoms/clues/beats/signature) ——
+#: 那是它证明"我真的改过"的方式。所以除了 core-count 那种"只动一个标签"
+#: 的修复, 别的 fixable 都会连带重发整套 bundle。对它们逐项冻结 = 拒掉
+#: 合法修复。实测踩过两次: 谜面类(6 条)与 clue quote / fact enum
+#: (各 1 条)都当场打红过。
 #:
 #: ⚠️ **认不出的 fixable 一律按最严处理**(不开放任何域)。这与
 #: `_FIX_REASON_PATTERNS` 的"认不出归 other"是**相反**的方向, 而这里
@@ -260,24 +278,55 @@ _CORE_COUNT_MARK = "[只改分类]"
 #:
 #: ⚠️ 新增一条 `can_fix()` 时若它有正当的改内容理由, **必须**在这里加一
 #: 行 —— 忘了加不会漏放(仍然按最严), 但会把合法修复判成越界。
+#: 每种 fixable 的 `(匹配子串, 允许改的字段, 是否"窄")`。
+#:
+#: ## `narrow` 是什么(以及为什么它必须是**声明**而不是推断)
+#:
+#: "窄" = 这一种 fixable 只授权改**一个具体字段**, 审稿人没有任何理由
+#: 顺带重写别的。`story.llm._core_fix_scope_violation` 靠它决定要不要
+#: 逐项冻结:
+#:
+#:   全部窄  -> 逐项 diff(改没被点名的地方 = 越界)
+#:   有任一宽 -> 不逐项冻结(**宽的那种本来就需要整套同步**)
+#:
+#: 为什么不用"域有几个字段"来推断: `puzzle` 类的域只有 1 个字段, 但它
+#: 授权的是"重写整段谜面", 而重写谜面**必然**要连带改 fair_clues / facts /
+#: atoms(它们都引用谜面文本)。用字段数推断会把这种**正当**的连带改动判成
+#: 越界 —— R1 第一版就是这么误伤四个套件的。所以这件事必须由**人**声明。
 FIX_DOMAINS = (
-    # 谜面类(puzzle 自身): 补问句 / 改第三人称 / 删 meta 文本。
-    (("谜面结尾不是问句", "谜面是第一人称叙事", "谜面混进了"), ("puzzle",)),
-    # 枚举填错 -> 只改那一个字段本身。
-    (("的 kind 非法",), ("facts_kind",)),
-    (("的 visibility 非法",), ("facts_other",)),
-    # core_answer 太长 -> 只压缩 core_answer(不动谜面, 见 G2-A)。
-    (("core_answer 有",), ("core_answer",)),
-    # G4-R2 §三: core 太多 -> **只**把多余 core 重标 support。
+    # 谜面类: **loose** —— 重写谜面必然连带改 facts / atoms / fair_clues
+    # (它们都引用谜面文本), 而那是正当的连带改动。
+    # ⚠️ R2-R2 第一版把它标成 strict, 于是"第一人称 -> 第三人称"这类修复
+    # 被逐项冻结整个拒掉 —— 实测打红 `test_llm` 里 6 条真实回归。
+    (("谜面结尾不是问句", "谜面是第一人称叙事", "谜面混进了"),
+     ("puzzle",), True),
+    # 枚举填错 -> **loose**: 这类修复同样会整套同步(`review_ok()` 回的是
+    # 重新生成的一整套 facts/atoms/clues)。实测逐项冻结会把它判成越界,
+    # 打红 `test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft`。
+    (("的 kind 非法",), ("facts_kind", "facts_other"), True),
+    (("的 visibility 非法",), ("facts_other",), True),
+    # core_answer 太长 -> loose(整套同步)。
+    (("core_answer 有",), ("core_answer",), True),
+    # G4-R2 §三: core 太多 -> **strict**: 唯一合法动作是把多余 core 重标
+    # support, 别的字段一个字都不许动。
     # ⚠️ 刻意**不含** `facts_other`: 改 visibility / hintable / 文本都不在
     # 授权范围内, 尽管它们也是 "facts" 上的字段。
-    (("core hidden facts 有",), ("facts_kind",)),
-    # 连线漏了 -> 要动 atoms。
-    (("没有被任何 solve_atom 引用", "指向通关事实的推理路径"), ("atoms",)),
-    # quote 要重摘 -> 只动 fair_clues(且不得改谜面)。
-    (("fair_clue 缺 quote", "的 quote 不在谜面里"), ("clues",)),
-    # hint 超长 -> 只动 hints(不在上面的词表里, 也不该动别的)。
-    (("条提示超过",), ("hints",)),
+    (("core hidden facts 有",), ("facts_kind",), False),
+    # 连线漏了 -> loose(整套同步)。
+    (("没有被任何 solve_atom 引用", "指向通关事实的推理路径"),
+     ("atoms",), True),
+    # quote 要重摘 -> **loose**(li 的整套同步会连带改 core_answer 等,
+    # 逐项冻结会误伤 —— 实测打红 `test_g2b_...`), 但 `fair_clues` 那一项
+    # 本身**单独**受 `_clues_diff` 管: 只放 quote, 数量/顺序/supports_atoms
+    # 全部冻结。这条守卫**独立于** strict/loose, 所以"单独 quote fixable
+    # 也不能改 supports_atoms"(用户 §6)照样成立。
+    #
+    # ⚠️ G4-R2-R2: 这里以前写的是粗粒度的 `clues`, 于是"core-count + 补问句"
+    # 这类混合修复会把**整个 fair_clues** 放行 —— Reviewers 可以顺手改
+    # clue 数量 / 顺序 / supports_atoms, 而契约只允许重摘被点名的那一句话。
+    (("fair_clue 缺 quote", "的 quote 不在谜面里"), ("clue_quote",), True),
+    # hint 超长 -> loose(整套同步)。
+    (("条提示超过",), ("hints",), True),
 )
 
 
@@ -288,11 +337,44 @@ def fix_domains_for(fixable) -> set:
     """
     out: set = set()
     for f in (fixable or []):
-        for needles, fields in FIX_DOMAINS:
+        for needles, fields, _narrow in FIX_DOMAINS:
             if any(n in f for n in needles):
                 out.update(fields)
                 break
     return out
+
+
+def any_strict_fixable(fixable) -> bool:
+    """本次点名要修的 fixable 里**有没有至少一个 strict 的**(G4-R2-R2)。
+
+    ## 这条判据的**唯一**作用: 决定要不要跑逐项字段 diff
+
+    历史上这里错过三次, 值得写清楚, 因为边界很窄:
+
+        R1      对**所有** fix 无脑跑 diff   -> 误伤宽修复(4 个套件全红)
+        R2      "有没有 core-count"         -> `clue_quote` 单独出现时漏管
+        R2-R2a  "全部都是 strict 才行"       -> 误伤"core-count + 补问句"混合
+
+    ⚠️ **不是"全部 strict"**: `core-count + 补问句` 里后者是 loose 的
+    (重写谜面必然连带改 clues/atoms), 但前者是 strict 的 —— 用户 §二
+    明确要求**这一种混合仍要逐项冻结**, 否则 core-count 那条形同虚设。
+    所以判据是"**存在** strict 的", 而各个字段要不要冻结由
+    `fix_domains_for` 的**并集**决定:
+
+        域里有 puzzle       -> 谜面可以改(loose 的那位授权了)
+        域里没有 core_answer -> core_answer 一个字都不许动
+
+    两者合起来才同时满足 §一(严格的逐项冻结)与 §二(多 fixable 不误伤)。
+
+    ⚠️ 一个都没有(空 focus) -> False: 没有修复任务时这一层不该凭空拦人。
+    """
+    for f in (fixable or []):
+        for needles, _fields, loose in FIX_DOMAINS:
+            if any(n in f for n in needles):
+                if not loose:
+                    return True
+                break
+    return False
 
 
 # ======================================================================
