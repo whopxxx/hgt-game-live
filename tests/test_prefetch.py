@@ -2750,21 +2750,21 @@ class _KeywordWriter:
         return variant(len(self.gen_spec_calls))
 
 
-#: G3: 假 bag 用的固定 pair 表 —— **不读盘**, 于是用例不依赖
-#: `data/keyword2_seed_pairs.json` 是否存在。
+#: G4: 假 bag 用的固定**词表** —— **不读盘**, 于是用例不依赖
+#: `data/keyword2_vocabulary.json` 是否存在。
 #:
-#: 但形状与真 corpus 一致(2-key 的字符串对), 而且**刻意放了一对
-#: 同语义场的词**(`下雨/棺材`), 因为 G3 取消了"必须来自不同 slot"那条
-#: 人为约束 —— 若哪天有人把那条约束加回生产, 这对词会让测试红。
-_FAKE_PAIRS = [
-    ("山顶", "敲门"), ("电话", "老师"), ("下雨", "棺材"),
-    ("高跟鞋", "死亡"), ("图书馆", "一百元"), ("三兄弟", "杀人"),
+#: ⚠️ 刻意放了几组**同语义场**的词(`下雨` / `棺材` / `死亡`), 因为 G4
+#: 取消了"必须来自不同 slot"那条人为约束 —— 若哪天有人把那条约束加回
+#: 生产, 这些词会让测试红。
+_FAKE_WORDS = [
+    "山顶", "敲门", "电话", "老师", "下雨", "棺材",
+    "高跟鞋", "死亡", "图书馆", "一百元", "三兄弟", "杀人",
 ]
 
 
 def _fake_bag(seed=20260920):
     from story.keyword_seed import KeywordBag
-    return KeywordBag(list(_FAKE_PAIRS), seed)
+    return KeywordBag(list(_FAKE_WORDS), seed)
 
 
 def _mkpf_keyword(d, writer=None, **cfgkw):
@@ -2785,7 +2785,7 @@ def _mkpf_keyword(d, writer=None, **cfgkw):
     if cfgkw.get("pool_keyword_seed_enabled"):
         pf._bag = _fake_bag()
         pf._bag_meta = {"corpus_version": "test-fixture",
-                        "pair_count": len(_FAKE_PAIRS), "source": "test"}
+                        "keyword_count": len(_FAKE_WORDS), "source": "test"}
         pf._keyword_session_seed = 20260920
     return pf, w
 
@@ -3179,28 +3179,28 @@ def test_g2_too_similar_still_hard_rejects():
 
 
 # ======================================================================
-# G3 —— corpus 降级链 + bag 接线
+# G4 —— 词库降级链 + bag 接线
 # ======================================================================
 #
 # G2 那批用例把 bag **注入**进去(见 `_mkpf_keyword`), 测的是 keyword2
 # 链本身。这一批相反: 用**真实**的 `_init_keyword_bag` 路径, 专门测
-# "corpus 不可用时到底发生什么" —— 任务书 §五 的落点。
+# "词库不可用时到底发生什么"。
 
 def _mkpf_raw_corpus(d, corpus_path, writer=None, **cfgkw):
-    """不注入 bag, 让 `_init_keyword_bag` 真的去读 corpus。"""
+    """不注入 bag, 让 `_init_keyword_bag` 真的去读词库。"""
     cfgkw.setdefault("pool_keyword_seed_enabled", True)
     cfgkw["keyword_corpus_path"] = corpus_path
     w = writer or _KeywordWriter()
     return mkpf(d, writer=w, **cfgkw), w
 
 
-def test_g3_corpus_missing_degrades_to_classic():
-    """§五: corpus 缺失 -> **显式**降级到 classic, 不回退人工词库。
+def test_g4_vocab_missing_degrades_to_classic():
+    """§八-9: 词库缺失 -> **显式**降级到 classic, 不回退人工词库。
 
-    这条测的是**行为**: 文件不在时, 补池仍然工作(题照样进池), 但走的是
-    `gen_spec` 而不是 `gen_keyword_idea`, 并且**没有**任何 keyword 调用。
+    测的是**行为**: 文件不在时, 补池仍然工作(题照样进池), 但走的是
+    `gen_spec` 而不是 `gen_keyword_idea`, 且**没有**任何 keyword 调用。
     """
-    print("\n[G3-1] corpus 缺失 -> 显式降级到 classic")
+    print("\n[G4-1] 词库缺失 -> 显式降级到 classic")
     with tmpdir() as d:
         fw = _FakeWriter()
         pf, w = _mkpf_raw_corpus(d, os.path.join(d, "nope.json"), writer=fw)
@@ -3217,26 +3217,16 @@ def test_g3_corpus_missing_degrades_to_classic():
               "blueprint" in fw.calls[0], sorted(fw.calls[0]))
 
 
-def test_g3_corpus_missing_never_falls_back_to_bank():
-    """§五 的核心: 降级**不得**触碰 `KEYWORD_BANK`。
-
-    三层证据:
-      (a) 行为: corpus 缺失时 keyword 路径零调用(上一条已证);
-      (b) 结构: `_keyword_enabled()` 只看 bag, 不看"有没有词库";
-      (c) **源码**: `story/prefetch.py` 里根本不出现 `KEYWORD_BANK`.
-
-    (c) 是最要紧的一层 —— 它挡的是"有人在降级分支里补一句
-    `draw_two_keywords` 兜底", 那种改动在行为测试里**看不出来**
-    (题照样进池, 只是词的来源偷偷变了)。
-    """
-    print("\n[G3-2] 降级不碰人工词库(源码级)")
+def test_g4_vocab_missing_never_falls_back_to_bank():
+    """§八-9 的核心: 降级**不得**触碰 `KEYWORD_BANK`。"""
+    print("\n[G4-2] 降级不碰人工词库(源码级)")
     import ast as _ast
     root = Path(__file__).resolve().parents[1]
     src = io.open(root / "story" / "prefetch.py", encoding="utf-8").read()
-    # ⚠️ **按 AST 查引用, 不是 grep 文本**。`prefetch.py` 的注释里明确写着
-    # "**绝不**回退 `KEYWORD_BANK`" 和 "不再用 `draw_two_keywords`" ——
+    # ⚠️ **按 AST 查引用, 不是 grep 文本** —— `prefetch.py` 的注释里明确
+    # 写着"**绝不**回退 `KEYWORD_BANK`"和"不再用 `draw_two_keywords`",
     # 那两句是在**说明这条规则**, 朴素 grep 会把说明当成违规, 于是断言
-    # 永远红, 然后被"修"掉(那正是 K10 与 K22 踩过的同一个坑)。
+    # 永远红, 然后被"修"掉(那正是 K10 与 K39 踩过的同一个坑)。
     names = set()
     for node in _ast.walk(_ast.parse(src)):
         if isinstance(node, _ast.Name):
@@ -3245,20 +3235,18 @@ def test_g3_corpus_missing_never_falls_back_to_bank():
             names.add(node.attr)
         elif isinstance(node, _ast.alias):
             names.add(node.asname or node.name.split(".")[-1])
-    check("**prefetch.py 里没有 KEYWORD_BANK(按 AST 查)**",
+    check("**prefetch.py 里没有 KEYWORD_BANK(AST)**",
           "KEYWORD_BANK" not in names, sorted(n for n in names
                                               if "KEYWORD" in n))
-    check("**prefetch.py 里没有 draw_two_keywords(按 AST 查)**",
+    check("**prefetch.py 里没有 draw_two_keywords(AST)**",
           "draw_two_keywords" not in names, sorted(n for n in names
                                                    if "draw" in n))
-    check("prefetch.py 用的是 KeywordBag 路径",
+    check("prefetch.py 用的是独立词库路径",
           "load_bag" in src or "_bag" in src)
-    # (b) 结构层: 把 bag 手动设成 None, 即使词库完好也必须走 classic。
+    # 结构层: 把 bag 手动设成 None, 即使词库完好也必须走 classic。
     #
-    # 这里必须**两个 writer 分工**: classic 链需要 `gen_spec`, 而
-    # "有没有偷偷调 keyword"要用 `_KeywordWriter` 的 `keyword_calls` 观察。
-    # 用一个 `_KeywordSpyWriter` 同时满足两边 —— 它继承 classic 的
-    # `_FakeWriter`, 再挂上 keyword 的两个方法当**探针**(被调到就记一笔)。
+    # 两个 writer 分工: classic 链需要 `gen_spec`, 而"有没有偷偷调 keyword"
+    # 要用 `keyword_calls` 观察 —— 所以用一个两者兼有的探针。
     class _Spy(_FakeWriter):
         def __init__(self):
             super().__init__()
@@ -3287,14 +3275,14 @@ def test_g3_corpus_missing_never_falls_back_to_bank():
         check("题照样进池", pf.added_count >= 1, pf.added_count)
 
 
-def test_g3_corpus_empty_or_corrupt_also_degrades():
-    """空 / 损坏 / 全无效的 corpus 与"缺失"走同一条降级。"""
-    print("\n[G3-3] 空/损坏 corpus 同样降级")
+def test_g4_vocab_empty_or_corrupt_also_degrades():
+    """空 / 损坏 / 全无效的词库与"缺失"走同一条降级。"""
+    print("\n[G4-3] 空/损坏词库同样降级")
     bad = {
-        "empty.json": {"pairs": []},
-        "null.json": {"pairs": None},
-        "notlist.json": {"pairs": "x"},
-        "allbad.json": {"pairs": [[], ["a"], [None, None]]},
+        "empty.json": {"keywords": []},
+        "null.json": {"keywords": None},
+        "notlist.json": {"keywords": "x"},
+        "allbad.json": {"keywords": [None, 123, "", "我杀了他"]},
     }
     with tmpdir() as d:
         for name, obj in bad.items():
@@ -3304,66 +3292,67 @@ def test_g3_corpus_empty_or_corrupt_also_degrades():
             fw = _FakeWriter()
             pf, w = _mkpf_raw_corpus(d, p, writer=fw)
             check(f"{name}: bag 为 None", pf._bag is None)
-            check(f"{name}: 降级到 classic",
-                  pf._keyword_enabled() is False)
-        # 二进制垃圾
+            check(f"{name}: 降级到 classic", pf._keyword_enabled() is False)
         p = os.path.join(d, "garbage.json")
         with io.open(p, "wb") as f:
             f.write(b"\x00\x01\x02 not json at all")
         fw = _FakeWriter()
         pf, w = _mkpf_raw_corpus(d, p, writer=fw)
         check("二进制垃圾: bag 为 None", pf._bag is None)
-        check("二进制垃圾: 仍能建起 prefetcher(不抛)",
-              pf is not None)
+        check("二进制垃圾: 仍能建起 prefetcher(不抛)", pf is not None)
 
 
-def test_g3_good_corpus_activates_bag():
-    """反向: corpus 可用时 bag 真的建起来, 且日志行含 §四 的三个字段。"""
-    print("\n[G3-4] corpus 可用 -> bag 就绪 + 日志行")
-    from story.keyword_seed import load_bag as _lb
-    from story.keyword_corpus import build_corpus
+def test_g4_good_vocab_activates_bag():
+    """反向: 词库可用时 bag 真的建起来, 且日志行含 §六 的三个字段。
+
+    ⚠️ 这条是**必须**有的反向用例。`_init_keyword_bag` 第一版用
+    `if not self._keyword_enabled(): return` 短路, 而那个谓词**包含
+    "bag 已存在"** —— 于是 bag 永远是 None, 生产静默退回 classic, 连
+    `_bag_error` 都是空的。只有"注入一份完好词库就该建起来"这种**正向**
+    断言才能抓到它(失败路径的用例全都照样绿)。
+    """
+    print("\n[G4-4] 词库可用 -> bag 就绪 + 日志行")
+    from story.keyword_corpus import build_vocabulary
     with tmpdir() as d:
-        rows = [{"input": "关键词：山顶，敲门"},
+        rows = [{"input": "关键词：山顶，敲门，台阶"},
                 {"input": "关键词：下雨、棺材"}]
-        p = os.path.join(d, "c.json")
+        p = os.path.join(d, "v.json")
         with io.open(p, "w", encoding="utf-8") as f:
-            json.dump(build_corpus(rows), f, ensure_ascii=False)
+            json.dump(build_vocabulary(rows), f, ensure_ascii=False)
         pf, w = _mkpf_raw_corpus(d, p)
-        check("bag 建起来了", pf._bag is not None)
+        check("**bag 建起来了**", pf._bag is not None)
         check("`_keyword_enabled()` 为真", pf._keyword_enabled() is True)
         check("session seed 被记下", pf._keyword_session_seed is not None,
               pf._keyword_session_seed)
         line = pf._bag_meta_line()
-        for token in ("session_seed=", "corpus_version=", "pair_count="):
+        for token in ("session_seed=", "corpus_version=", "keyword_count="):
             check(f"日志行含 {token}", token in line, line)
-        # 抽出来的词必须来自 corpus(不是人工词库)
         fill(pf.pool, 1)
         pf.on_tick()
         pf.on_tick()
         check("Stage A 被调了", len(w.keyword_calls) >= 1, w.keyword_calls)
         if w.keyword_calls:
             got = set(w.keyword_calls[0])
-            check("**抽到的词来自 corpus**",
-                  got <= {"山顶", "敲门", "下雨", "棺材"}, got)
+            check("**抽到的词来自词库**",
+                  got <= {"山顶", "敲门", "台阶", "下雨", "棺材"}, got)
 
 
-def test_g3_session_seed_reproducible_end_to_end():
-    """§四: 同 corpus + 同 session_seed -> 同一个 pair 顺序(端到端)。"""
-    print("\n[G3-5] session seed 端到端可复现")
-    from story.keyword_corpus import build_corpus
+def test_g4_session_seed_reproducible_end_to_end():
+    """§六: 同词库 + 同 session_seed -> 同一个 pair 序列(端到端)。"""
+    print("\n[G4-5] session seed 端到端可复现")
+    from story.keyword_corpus import build_vocabulary
     rows = [{"input": "关键词：山顶，敲门"},
             {"input": "关键词：下雨、棺材"},
-            {"input": "关键词：电话，老师"}]
+            {"input": "关键词：电话，老师，火车"}]
     seqs = []
-    # ⚠️ **每次跑都要一个新的 tmpdir**。共用一个目录会让第二次跑的
-    # pool 文件里已经有第一次补进去的题 —— 于是 `fill(pf.pool, 1)` 之后
-    # stock 已经够, 补池根本不启动, `keyword_calls` 是空的。第一版就是
-    # 这么写的, 第二次拿到 `[]`, 而失败原因与"可复现"毫无关系。
+    # ⚠️ **每次跑都要一个新的 tmpdir**。共用一个目录会让第二次跑的 pool
+    # 文件里已经有第一次补进去的题 —— 于是 stock 已经够, 补池根本不启动,
+    # `keyword_calls` 是空的, 而失败原因与"可复现"毫无关系。
     for _ in range(2):
         with tmpdir() as d:
-            p = os.path.join(d, "c.json")
+            p = os.path.join(d, "v.json")
             with io.open(p, "w", encoding="utf-8") as f:
-                json.dump(build_corpus(rows), f, ensure_ascii=False)
+                json.dump(build_vocabulary(rows), f, ensure_ascii=False)
             pf, w = _mkpf_raw_corpus(d, p, keyword_session_seed=4242)
             fill(pf.pool, 1)
             pf.on_tick()
@@ -3373,9 +3362,9 @@ def test_g3_session_seed_reproducible_end_to_end():
     check("确实抽到了词", len(seqs[0]) >= 1, seqs[0])
 
 
-def test_g3_provenance_records_corpus_and_seed():
-    """§八: metrics 里要有 pair / seed / corpus version 供追溯。"""
-    print("\n[G3-6] provenance 记录 keyword pair + seed/corpus 版本")
+def test_g4_provenance_records_vocab_and_seed():
+    """§六: metrics 里要有 pair / seed / 词库版本供追溯。"""
+    print("\n[G4-6] provenance 记录 keyword pair + seed/词库版本")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d)
         fill(pf.pool, 1)
@@ -3499,13 +3488,13 @@ def main():
         test_g2_stage_b_schema_has_no_puzzle_field,
         test_g2_quota_wall_still_hard_rejects_keyword_candidate,
         test_g2_too_similar_still_hard_rejects,
-        # ---- G3 ----
-        test_g3_corpus_missing_degrades_to_classic,
-        test_g3_corpus_missing_never_falls_back_to_bank,
-        test_g3_corpus_empty_or_corrupt_also_degrades,
-        test_g3_good_corpus_activates_bag,
-        test_g3_session_seed_reproducible_end_to_end,
-        test_g3_provenance_records_corpus_and_seed,
+        # ---- G4 ----
+        test_g4_vocab_missing_degrades_to_classic,
+        test_g4_vocab_missing_never_falls_back_to_bank,
+        test_g4_vocab_empty_or_corrupt_also_degrades,
+        test_g4_good_vocab_activates_bag,
+        test_g4_session_seed_reproducible_end_to_end,
+        test_g4_provenance_records_vocab_and_seed,
     ]
     for t in tests:
         t()

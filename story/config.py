@@ -370,16 +370,18 @@ class Config:
     # recent-10 quota。它仍是 **AI 原创**题(不是 curated)。
     pool_keyword_seed_enabled: bool = True
 
-    # ---- G3: keyword2 的 seed 来源(真实 haiguitang corpus) ----
+    # ---- G4: keyword2 的 seed 来源(独立词库) ----
     #
     # 关键词不再来自人工 `KEYWORD_BANK`, 而是 `neurostellar/haiguitang` 的
-    # 原始 `input` 字段 —— 由 `tools/build_keyword_seed_corpus.py` **离线**
-    # 构建成这个文件(见 `story/keyword_corpus.py`)。
+    # 原始 `input` 字段**展开成的独立词库** —— 由
+    # `tools/build_keyword_seed_corpus.py` **离线**构建成这个文件
+    # (见 `story/keyword_corpus.py`)。
     #
+    # ⚠️ 运行时抽的是**两个独立的词**(随机重新组合), 不是原始 pair。
     # ⚠️ 文件缺失 / 空 / 解析失败时**显式降级**: 打一条 ERROR 日志, 整条
     # keyword2 链让位给 classic Blueprint 链。**不会**回退人工词库 ——
     # "看起来在跑 keyword2, 其实偷偷用人工词"是要防的形状。
-    keyword_corpus_path: str = ""      # 空 = data/keyword2_seed_pairs.json
+    keyword_corpus_path: str = ""      # 空 = data/keyword2_vocabulary.json
 
     # keyword bag 的 session seed。
     #
@@ -842,8 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "出题与 curated 链本来就不走它")
     # ---- G3: keyword2 的 seed 来源 ----
     ap.add_argument("--keyword-corpus", dest="keyword_corpus_path", default="",
-                    help="keyword2 的 seed corpus 路径(默认 "
-                         "data/keyword2_seed_pairs.json)。文件不可用时"
+                    help="keyword2 的 seed 词库路径(默认 "
+                         "data/keyword2_vocabulary.json)。文件不可用时"
                          "**显式降级**到 classic Blueprint 链, 不会回退"
                          "人工词库。构建: tools/build_keyword_seed_corpus.py")
     ap.add_argument("--keyword-session-seed", dest="keyword_session_seed",

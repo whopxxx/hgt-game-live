@@ -899,8 +899,7 @@ def main(argv=None) -> int:
         print("seed=%s" % a.seed)
         for _ in range(int(a.draw_corpus)):
             d = bag.draw()
-            print("  [%02d] round %d  %s"
-                  % (d["index"], d["round"], "，".join(d["keywords"])))
+            print("  [%02d] %s" % (d["index"], "，".join(d["keywords"])))
         return 0
 
     if a.limit and a.limit > 0:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""关键词种子(G2)—— 从普通生活词库里抽 2 个词, 给 AI-original 起题用。
+"""关键词种子(G4)—— 从**独立词库**里随机抽 2 个词重新组合, 给起题用。
 
 ## 这份代码从哪来
 
@@ -32,10 +32,9 @@ G1-A / G1-B 实验(`tools/experiment_keyword_riddles.py`)已经验证过:
 
 ## 两个入口, 别搞混
 
-    draw_keyword_groups(seed, key_count)   实验用: 一个 seed 抽出 20 组,
-                                           序列**完全可复现**(报告要原样列)
-    draw_two_keywords(rng, ...)            生产用: 用调用方给的 rng 抽一组
-                                           2-key, 可供同一场直播连续调用
+    draw_keyword_groups(seed, key_count)   实验用(人工词库): 一个 seed 抽 20 组
+    load_bag(path, seed) -> KeywordBag     生产用(G4): 从**独立词库**里
+                                           随机抽两个词**重新组合**
 
 **生产的 rng 由调用方给**(`PoolPrefetcher` 自己那个独立 rng) —— 本模块
 **不持有任何全局随机状态**。这条是硬要求: prefetch 的抽词绝不能让 live
@@ -51,9 +50,12 @@ import random
 #: 换 seed 来源与换 prompt 是两件事, 合成一个号会让复盘时分不清
 #: "这题风格变了" 是因为换了词, 还是因为换了 prompt。
 #:
-#: `keyword2-v1` = G1/G2 的人工 5x20 词库 `KEYWORD_BANK`。
-#: `keyword2-seeds-v2` = G3 起改用的**真实 haiguitang input** corpus。
-KEYWORD_SEED_VERSION = "keyword2-seeds-v2"
+#: `keyword2-v1`      = G1/G2 的人工 5x20 词库 `KEYWORD_BANK`。
+#: `keyword2-seeds-v2` = G3: 真实 haiguitang input, 但以**原始 pair** 为
+#:                       采样单位(已废弃 —— 那样会继承外部题库的搭配先验)。
+#: `keyword2-vocab-v1` = G4: 真实 haiguitang input 提取**独立词库**, 运行
+#:                       时随机抽两个词**重新组合**, 原始 pair 关系不保留。
+KEYWORD_SEED_VERSION = "keyword2-vocab-v1"
 
 #: v1 的人工词库**版本号**(不再是生产默认来源)。保留它是因为
 #: `tools/experiment_keyword_riddles.py`(G1 实验)仍然按它抽词 ——
@@ -235,100 +237,209 @@ def derive_session_seed(base_seed, session: int = 0) -> int:
 
 
 class KeywordBag:
-    """从 corpus 的 unique pair 表里**不放回**地发 pair。一个 bag 发完再洗。
+    """从**独立词库**里随机抽两个词**重新组合**(§四)。
 
-    ## 为什么是类而不是一个函数
+    ## 这一轮改了什么(G3 -> G4)
 
-    "不放回"是一种**状态**。G2 的 `draw_two_keywords(rng, used_pairs=...)`
-    把状态交给调用方维护, 结果是: 调用方忘了传 `used_pairs` 就静默退化成
-    有放回(那个 bug 真发生过, 见 `_dedupe` 上面那段注释)。把状态收进对象,
-    调用方就没有"忘了传"这个失败模式。
+    G3 是"从 pair 表里不放回地发 pair" —— 抽到的两个词**永远**在原始数据
+    里一起出现过。那等于把外部题库的**搭配先验**继承了下来, 只是打乱了
+    顺序: `三兄弟/杀人` 会一直被一起抽到, 而 `三兄弟/高跟鞋` 永远抽不到。
 
-    ## 可复现(§四)
+    G4 改成:
 
-    同一个 corpus + 同一个 session seed => **同一个 pair 顺序**。这由
-    `random.Random(seed)` 在同一个 `pairs` 列表上 shuffle 保证 —— 所以
-    `pairs` 的顺序必须确定(corpus 构建时已排序, 见 `pairs_from_rows`)。
+        word1 = vocabulary 随机抽
+        word2 = vocabulary 随机抽
+        要求 word1 != word2
+        **不保留**它们在原始数据里的搭配关系
+
+    任务书 §四 原话: "不要保留它们在原始数据中的搭配关系。不要要求:
+    不同 slot / 原来是同一 pair / 语义相关 / 人工 compatibility。
+    **随机碰撞就是这个生成器的核心。** Stage A 负责把两个看似无关的词
+    变成一道自然海龟汤。"
+
+    1147 个词 -> 657,231 种 unordered pair, 而原始数据只覆盖其中 301 种。
+    绝大多数抽到的是**从未一起出现过**的组合。
+
+    ## 短期重复控制(§五)
+
+    产品要求不是"不放回"(那会退化成另一种确定性), 而是:
+
+      * 同一个 keyword 不要**连续高频**出现
+      * 同一个 unordered pair 在**合理窗口**内不重复
+
+    做法: 维护 `recent_keywords` / `recent_pairs` 两个滑动窗口, 抽样时避开。
+    **不能陷入无限重抽** —— 达到 `max_tries` 后放宽 keyword cooldown
+    (但仍尽量避开 pair), 因为抽词函数不允许有"抽不出来"的失败态。
+
+    ## 可复现(§六)
+
+    同一个词库 + 同一个 session seed => **同一个 pair 序列**。由
+    `random.Random(seed)` + 确定的词表顺序保证(词表在构建时已排序)。
 
     ## 与全局 random 无关
 
     本类**只**用自己 new 出来的 `random.Random(seed)`, 从不碰 `random`
-    模块的全局状态。这条是硬要求: 否则补池的抽词会改变 live 出题的序列。
+    模块的全局状态。否则补池的抽词会改变 live 出题的序列。
     """
 
-    def __init__(self, pairs, session_seed: int):
-        if not pairs:
-            raise ValueError("KeywordBag 需要非空 pairs")
-        self.pairs = [(str(a), str(b)) for a, b in pairs]
+    #: keyword cooldown 窗口 —— 最近多少个词不重复抽。
+    #:
+    #: 1147 个词的库里, 窗口 40 意味着"一个词平均每 29 道题才轮到一次";
+    #: 撞上的概率很低, 但**偶尔撞上也完全正常**(随机碰撞的核心), 所以
+    #: 这里只是个软约束, 不是硬保证。
+    KEYWORD_COOLDOWN = 40
+
+    #: pair cooldown 窗口 —— 最近多少道题的对子不重复。
+    #:
+    #: 657,231 种组合下一个 pair 每 657k 道题才该轮到一次, 所以窗口
+    #: 取 200 已经远超"合理"的定义, 且不会造成重抽压力。
+    PAIR_COOLDOWN = 200
+
+    #: 单次抽样最多重试几次。达到上限就**放宽 keyword cooldown**
+    #: (pair 仍尽量避开) —— 见模块文档"不能陷入无限重抽"。
+    MAX_TRIES = 24
+
+    def __init__(self, keywords, session_seed: int,
+                 keyword_cooldown: "int | None" = None,
+                 pair_cooldown: "int | None" = None):
+        if not keywords:
+            raise ValueError("KeywordBag 需要非空词表")
+        # 去重 + 排序: 词表顺序**必须确定**, 否则同 seed 复现不了。
+        self.keywords = sorted({str(w) for w in keywords if str(w).strip()})
+        if len(self.keywords) < 2:
+            raise ValueError("KeywordBag 至少需要 2 个词才能组合")
         self.session_seed = int(session_seed)
         self._rng = random.Random(self.session_seed)
-        self._bag: list = []
-        self._round = 0
+        self._kc = (self.KEYWORD_COOLDOWN if keyword_cooldown is None
+                    else max(0, int(keyword_cooldown)))
+        self._pc = (self.PAIR_COOLDOWN if pair_cooldown is None
+                    else max(0, int(pair_cooldown)))
+        self._recent_kw: list = []
+        self._recent_pair: list = []
         self.served = 0
+        #: 诊断计数 —— 报告与日志要能看到重试真的发生在什么水平。
+        self.retries_total = 0
+        self.relaxed_total = 0
 
     # ---- 内部 ----
-    def _refill(self):
-        """洗一轮新的。**刻意不避开上一轮的末尾**。
-
-        "洗牌时把上一轮最后一个 pair 挪到首位"听起来能防"跨轮重复", 但它
-        会让分布**不再均匀**(那个 pair 的本轮位置被强制了), 而 §三 要的是
-        "运行时默认在 unique pair 上**近似均匀**采样"。301 对的表里, 跨轮
-        撞同一个 pair 的概率是 1/301 —— 不值得用破坏均匀性去换。
-        """
-        self._bag = list(self.pairs)
-        self._rng.shuffle(self._bag)
-        self._round += 1
+    def _pair_key(self, a: str, b: str) -> tuple:
+        """unordered pair 的键 —— **排序**, 于是 (A,B) 与 (B,A) 同键。"""
+        return (a, b) if a <= b else (b, a)
 
     # ---- 公开 ----
     def draw(self) -> dict:
-        """取下一个 pair。返回 `{keywords, slots, round, index}`。
+        """抽**两个不同**的词并返回。返回 `{keywords, slots, index, relaxed}`。
 
-        `slots` 恒为 `[]` —— 真实 source pair 没有槽位概念(§三: "不要再
-        要求两个词必须来自不同 slot")。留着这个 key 是为了调用方与日志的
-        形状不变, 而不是暗示它还有意义。
+        ## 重试与放宽的顺序(§五)
+
+            1. 抽 word1 / word2(都避开 `recent_keywords`)
+            2. `word1 == word2` -> 重抽
+            3. pair 在 `recent_pairs` 里 -> 重抽
+            4. 试满 `MAX_TRIES` -> **放宽 keyword cooldown**(只避 pair)
+            5. 再试满 `MAX_TRIES` -> 完全放宽(只保证 `word1 != word2`)
+
+        第 4/5 步是**必须有**的: 词库小(比如测试里的 3 个词)或窗口相对
+        词库过大时, 严格规则会抽不出来。抽词函数没有"失败"这个返回态,
+        所以必须能放宽。
+
+        `slots` 恒为 `[]` —— 独立词库没有槽位概念(§四: "不要要求不同
+        slot")。留着这个 key 只为调用方与日志的形状不变。
         """
-        if not self._bag:
-            self._refill()
-        a, b = self._bag.pop()
+        n = len(self.keywords)
+        kc = min(self._kc, max(0, n - 1))
+        pc = min(self._pc, max(0, n * (n - 1) // 2 - 1))
+        kset = set(self._recent_kw[-kc:]) if kc else set()
+        pset = set(self._recent_pair[-pc:]) if pc else set()
+
+        relaxed = 0
+        chosen = None
+        for attempt in range(self.MAX_TRIES * 2):
+            # 第二段(试满一轮之后)放宽 keyword cooldown。
+            if attempt >= self.MAX_TRIES:
+                relaxed = 1
+                kset = set()
+            a = self.keywords[self._rng.randrange(n)]
+            if a in kset:
+                self.retries_total += 1
+                continue
+            b = self.keywords[self._rng.randrange(n)]
+            if b == a or (relaxed == 0 and b in kset):
+                self.retries_total += 1
+                continue
+            if self._pair_key(a, b) in pset:
+                self.retries_total += 1
+                continue
+            chosen = (a, b)
+            break
+        if chosen is None:
+            # ---- 最后兜底: 只保证两个词不同 ----
+            #
+            # 走到这里说明窗口相对词库太大(极小词库的构造下会发生)。
+            # **绝不能**返回空 —— 调用方没有处理"抽不出来"的地方。
+            relaxed = 2
+            a = self.keywords[self._rng.randrange(n)]
+            b = a
+            while b == a and n > 1:
+                b = self.keywords[self._rng.randrange(n)]
+            chosen = (a, b)
+
+        a, b = chosen
+        if relaxed:
+            self.relaxed_total += 1
         self.served += 1
+        self._recent_kw.append(a)
+        self._recent_kw.append(b)
+        self._recent_pair.append(self._pair_key(a, b))
         return {
             "keywords": [a, b],
             "slots": [],
-            "round": self._round,
             "index": self.served,
+            "relaxed": relaxed,
         }
 
 
-def load_bag(corpus_path: str, session_seed: int) -> tuple:
-    """读 corpus 并建 bag。返回 `(bag, corpus_meta)`。
 
-    `corpus_meta` 只带日志/溯源要用的字段(`corpus_version` / `pairs` 数),
-    不含整张 pair 表 —— 那 300 多条不该进日志。
+def load_bag(corpus_path: str, session_seed: int,
+             keyword_cooldown: "int | None" = None,
+             pair_cooldown: "int | None" = None) -> tuple:
+    """读**词库**并建 bag。返回 `(bag, corpus_meta)`。
 
-    ⚠️ corpus 不可用时**抛 `CorpusError`**(从 `keyword_corpus` 透传)。
-    调用方必须显式降级到 classic 链, **不得**回退 `KEYWORD_BANK`(§五)。
+    `corpus_meta` 只带日志/溯源要用的字段, **不含**整张词表 —— 一千多个
+    词不该进日志。
+
+    ⚠️ 词库不可用时**抛 `CorpusError`**(从 `keyword_corpus` 透传)。
+    调用方必须显式降级到 classic 链, **不得**回退 `KEYWORD_BANK`。
     """
-    from .keyword_corpus import load_corpus
-    d = load_corpus(corpus_path)
-    pairs = d["pairs"]
+    from .keyword_corpus import load_vocabulary
+    d = load_vocabulary(corpus_path)
+    words = d["keywords"]
     meta = {
         "corpus_version": str(d.get("corpus_version") or ""),
-        "pair_count": len(pairs),
+        "keyword_count": len(words),
         "source": str(d.get("source") or ""),
+        "raw_token_count": int(d.get("raw_token_count") or 0),
+        "valid_token_count": int(d.get("valid_token_count") or 0),
     }
-    return KeywordBag(pairs, session_seed), meta
+    return (KeywordBag(words, session_seed, keyword_cooldown, pair_cooldown),
+            meta)
 
 
 def describe_bag(meta: dict, session_seed: int) -> str:
-    """§四 要求的那行 INFO 日志的正文。
+    """§六 要求的那行 INFO 日志的正文。
 
-    形如: `keyword2 session_seed=123 corpus_version=keyword2-seeds-v2
-    pair_count=301`。单独一个函数是为了让**测试直接断言这行日志**,
+    形如: `keyword2 session_seed=123 corpus_version=keyword2-vocab-v1
+    keyword_count=1147`。单独一个函数是为了让**测试直接断言这行日志**,
     而不是去正则匹配一段拼在别处的字符串。
     """
-    return ("keyword2 session_seed=%s corpus_version=%s pair_count=%s"
+    return ("keyword2 session_seed=%s corpus_version=%s keyword_count=%s"
             % (session_seed, meta.get("corpus_version", ""),
-               meta.get("pair_count", 0)))
+               meta.get("keyword_count", 0)))
+
+
+def combos(n: int) -> int:
+    """`n` 个词的 unordered 2-key 组合数 = N*(N-1)/2(§七 报告要用)。"""
+    n = max(0, int(n))
+    return n * (n - 1) // 2
 
 
 # ======================================================================

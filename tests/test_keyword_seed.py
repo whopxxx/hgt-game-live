@@ -280,59 +280,69 @@ def test_version_constant():
     # G3: 生产词源从人工词库换成真实 haiguitang corpus, 所以**种子版本**
     # 前进到 v2。人工词库那个号(retired)单独留在 `KEYWORD_BANK_VERSION`,
     # 因为 G1 实验的历史数据仍按它抽。
-    check("KEYWORD_SEED_VERSION == keyword2-seeds-v2",
-          KEYWORD_SEED_VERSION == "keyword2-seeds-v2", KEYWORD_SEED_VERSION)
+    check("KEYWORD_SEED_VERSION == keyword2-vocab-v1",
+          KEYWORD_SEED_VERSION == "keyword2-vocab-v1", KEYWORD_SEED_VERSION)
     check("KEYWORD_BANK_VERSION == keyword2-v1(人工词库的历史号)",
           KEYWORD_BANK_VERSION == "keyword2-v1", KEYWORD_BANK_VERSION)
     check("两个号不相等", KEYWORD_SEED_VERSION != KEYWORD_BANK_VERSION)
 
 
 # ======================================================================
-# G3 —— corpus / bag / 降级(§十 的回归)
+# G4 —— 独立词库 / 随机重新组合 / 降级(§八 的回归)
 # ======================================================================
 #
-# 这一批**不读真实 corpus 文件**(那 3729 行不在版本库里), 用内联的小
-# 行集跑同一条解析路径。唯一碰真文件的是 K12, 它只验证**产物形状**,
-# 文件不在时跳过(而不是假装通过)。
+# 这一批**不读真实词库文件**(那 3729 行不在版本库里), 用内联的小行集跑
+# 同一条解析路径。唯一碰真文件的是 K36 / K37。
 
 from story.keyword_corpus import (  # noqa: E402
-    CORPUS_VERSION, CorpusError, build_corpus, is_valid_keyword, load_corpus,
-    normalize_pair, pairs_from_rows, split_input,
+    CORPUS_VERSION, CorpusError, build_vocabulary, is_valid_keyword,
+    load_vocabulary, split_input,
 )
-from story.keyword_seed import KeywordBag, describe_bag, load_bag  # noqa: E402
+from story.keyword_seed import (  # noqa: E402
+    KeywordBag, combos, describe_bag, load_bag,
+)
 
 #: 假原始行 —— **形状照抄真实 turtle.json**: 每条只有 instruction/input/
 #: output/system 四个键, `input` 形如 `关键词：X，Y`。
+#:
+#: ⚠️ 刻意包含了 **1-key / 2-key / 3-key / 4-key** 四种行 —— §一 要求
+#: **所有** input 都展开成词, 不是只读恰好 2-key 的那批。G3 的夹具只有
+#: 2-key, 所以挡不住"只读 2-key"这个回归; G4 的夹具把它挡住了。
 _FAKE_ROWS = [
-    {"instruction": "请根据给定的关键词…", "input": "关键词：山顶，敲门",
-     "output": "故事情节：…\n真相：…", "system": "…"},
-    {"instruction": "…", "input": "关键词：电话,老师",
-     "output": "A", "system": "…"},
-    # 全角顿号分隔(原数据里有 348 处)
-    {"instruction": "…", "input": "关键词：下雨、棺材", "output": "B",
+    # 1-key 行 -> 贡献 1 个词
+    {"instruction": "…", "input": "关键词：山地", "output": "A", "system": "…"},
+    # 2-key 行 -> 2 个词(全角逗号)
+    {"instruction": "…", "input": "关键词：山顶，敲门", "output": "B",
      "system": "…"},
-    # 只有 1 个词 -> 不是 2-key, 必须被丢掉
-    {"instruction": "…", "input": "关键词：水", "output": "C", "system": "…"},
-    # 3 个词 -> 也要丢(不能"取前两个")
-    {"instruction": "…", "input": "关键词：a，b，c", "output": "D",
+    # 3-key 行 -> **3 个词**(不能只取前两个!)
+    {"instruction": "…", "input": "关键词：电话，老师，火车", "output": "C",
+     "system": "…"},
+    # 4-key 行 -> 4 个词(半角逗号 + 顿号混用)
+    {"instruction": "…", "input": "关键词：水,a、谢谢,桥", "output": "D",
+     "system": "…"},
+    # 全角顿号
+    {"instruction": "…", "input": "关键词：下雨、棺材", "output": "E",
      "system": "…"},
     # 0 个词
-    {"instruction": "…", "input": "关键词：", "output": "E", "system": "…"},
-    # 超长句(整段谜面误填) -> 丢
-    {"instruction": "…", "input": "关键词：一位女士去鞋店里买了一双红色高跟鞋，"
-                                   "这双高跟鞋预示了她今晚的死亡",
-     "output": "F", "system": "…"},
-    # 夹标点的损坏文本 -> 丢
-    {"instruction": "…", "input": "关键词：他为什么死了？，??",
-     "output": "G", "system": "…"},
-    # 与第 3 条**同一对**, 只是顺序反过来 -> 去重
-    {"instruction": "…", "input": "关键词：棺材，下雨", "output": "H",
+    {"instruction": "…", "input": "关键词：", "output": "F", "system": "…"},
+    # ---- 必须被丢掉的: 完整句子 / 事件描述 ----
+    {"instruction": "…",
+     "input": "关键词：一姐妹母亲去世，回家后却把姐姐杀了", "output": "G",
      "system": "…"},
-    # 与第 1 条**同一对**(把全角逗号换成半角 + 加空格)-> 去重
-    {"instruction": "…", "input": "关键词：  山顶 , 敲门 ", "output": "I",
+    {"instruction": "…",
+     "input": "关键词：不久后我把大哥也杀了，我有两个哥哥", "output": "H",
      "system": "…"},
-    # 直播不适宜的 seed -> 确定性过滤
-    {"instruction": "…", "input": "关键词：自杀，药瓶", "output": "J",
+    {"instruction": "…",
+     "input": "关键词：五人同时到达目的地。加快脚步的四人被淋成了落汤鸡",
+     "output": "I", "system": "…"},
+    # 带标点/疑问
+    {"instruction": "…", "input": "关键词：他为什么死了？，??", "output": "J",
+     "system": "…"},
+    # 直播不适宜
+    {"instruction": "…", "input": "关键词：自杀，药瓶", "output": "K",
+     "system": "…"},
+    # 同词重复(跨行) -> 去重
+    {"instruction": "…", "input": "关键词：山顶，桥", "output": "L",
      "system": "…"},
 ]
 
@@ -344,151 +354,308 @@ def _tmp_json(d, name, obj):
     return p
 
 
-def test_g3_corpus_extracts_only_input():
-    """§一: 关键词**只**从 `input` 来 —— 换掉 puzzle/answer 不得影响结果。
+def _vocab_words(rows=None):
+    return build_vocabulary(rows if rows is not None else _FAKE_ROWS)["keywords"]
 
-    这条是任务书里"不读取对应谜题来决定'这个 seed 好不好'"的**可执行**
-    版本。做法: 把同一批行的 `output` 全部换成垃圾, 重跑解析, pair 表
-    必须**逐位相同**。
+
+def test_g4_vocab_expands_every_row():
+    """§一: **所有** input 都拆成独立词 —— 1-key / 3-key / 4-key 全都要。
+
+    这是 G4 与 G3 最本质的差别。G3 只读恰好 2 个关键词的行, 于是
+    `电话/老师/火车` 这一行**整行被丢掉**, 三个词都进不了词库。
     """
-    print("\n[K12] corpus 只从 input 提关键词")
-    a = pairs_from_rows(_FAKE_ROWS)
-    mutated = [dict(r, output="完全不同的谜面与谜底 " + str(i))
-               for i, r in enumerate(_FAKE_ROWS)]
-    b = pairs_from_rows(mutated)
-    check("改掉全部 output 后 pair 表逐位不变", a["pairs"] == b["pairs"],
-          (a["pairs"], b["pairs"]))
-    # 连 instruction / system 一起换掉也必须不变。
-    mutated2 = [dict(r, instruction="别的 prompt", system="别的 system")
-                for r in _FAKE_ROWS]
-    check("改掉 instruction/system 也不变",
-          pairs_from_rows(mutated2)["pairs"] == a["pairs"])
-    # `output` 里出现关键词也不得被采到(反向: 若实现偷偷扫 output 就会多)
-    poisoned = [dict(r, output="关键词：额外的，词") for r in _FAKE_ROWS]
-    check("output 里塞关键词不会被采到",
-          pairs_from_rows(poisoned)["pairs"] == a["pairs"])
+    print("\n[K23] 每一行的每个词都进词库")
+    words = set(_vocab_words())
+    check("**1-key 行贡献了词(山地)**", "山地" in words, sorted(words))
+    for w in ("电话", "老师", "火车"):
+        check(f"**3-key 行的词进了词库: {w}**", w in words, sorted(words))
+    for w in ("水", "a", "谢谢", "桥"):
+        check(f"**4-key 行的词进了词库: {w}**", w in words, sorted(words))
+    for w in ("山顶", "敲门"):
+        check(f"2-key 行的词进了词库: {w}", w in words)
 
 
-def test_g3_corpus_only_two_key_rows():
-    """§一: **只保留恰好 2 个有效关键词**的记录。"""
-    print("\n[K13] 只保留合法 2-key")
-    st = pairs_from_rows(_FAKE_ROWS)
-    pairs = [tuple(p) for p in st["pairs"]]
-    check("每个 pair 都是 2 个词", all(len(p) == 2 for p in pairs), pairs)
-    # 1 个词的记录(水)、3 个词的(a,b,c)、0 个词的必须都不在。
-    flat = [w for p in pairs for w in p]
-    check("1-key 记录被丢掉", "水" not in flat, flat)
-    check("**3-key 不被截成前两个**", "a" not in flat and "c" not in flat, flat)
-    check("空 input 被丢掉", "" not in flat)
-    # 3 个词的记录若被"取前两个"就会产生 (a,b); 那条必须不存在。
-    check("没有产生 (a,b) 这种截断 pair",
-          ("a", "b") not in pairs and ("b", "a") not in pairs, pairs)
+def test_g4_vocab_is_words_not_pairs():
+    """§三: **原始 pair 不被当作采样单位**。
+
+    词库里存的是**词**, 不是 `[A,B]`。这条查三件事:
+      (a) `keywords` 的每个元素都是**字符串**, 不是 list/tuple;
+      (b) 产物里**没有** `pairs` 字段(那是 G3 的形状);
+      (c) 原本成对的词现在各自独立可抽。
+    """
+    print("\n[K24] 词库是词, 不是 pair")
+    v = build_vocabulary(_FAKE_ROWS)
+    kws = v["keywords"]
+    check("**每个元素都是 str, 不是 pair**",
+          all(isinstance(w, str) for w in kws),
+          [type(w).__name__ for w in kws[:5]])
+    check("没有任何元素是 list/tuple",
+          not any(isinstance(w, (list, tuple)) for w in kws))
+    check("**产物里没有 pairs 字段**", "pairs" not in v, sorted(v))
+    for k in ("raw_rows", "raw_token_count", "valid_token_count",
+              "unique_token_count", "keywords", "corpus_version", "source"):
+        check(f"产物有 {k}", k in v, sorted(v))
+    check("原本成对的 山顶 / 桥 都在库里(各自独立)",
+          {"山顶", "桥"} <= set(kws))
 
 
-def test_g3_corpus_dedupes_pairs():
-    """§二: 相同 pair 去重; **不按原数据出现频率重复存**。"""
-    print("\n[K14] pair 去重 + 不带频率")
-    st = pairs_from_rows(_FAKE_ROWS)
-    pairs = [tuple(p) for p in st["pairs"]]
-    check("unique_pairs == len(pairs)",
-          st["unique_pairs"] == len(pairs), (st["unique_pairs"], len(pairs)))
-    check("没有重复 pair", len(set(pairs)) == len(pairs), pairs)
-    # 顺序反过来的同一对(棺材/下雨 vs 下雨/棺材)只留一份。
-    n_rain = sum(1 for p in pairs if set(p) == {"下雨", "棺材"})
-    check("**顺序反过来的同一对只留一份**", n_rain == 1, n_rain)
-    # 全角/半角 + 空白差异不算不同 pair。
-    n_hill = sum(1 for p in pairs if set(p) == {"山顶", "敲门"})
-    check("**纯格式差异不算不同 pair**", n_hill == 1, n_hill)
-    # two_key_rows > unique_pairs 是**信息**(说明真有重复), 两个都记。
-    check("two_key_rows 记的是去重前的条数",
-          st["two_key_rows"] > st["unique_pairs"],
-          (st["two_key_rows"], st["unique_pairs"]))
-    # 产物里**不得**有频率字段。
-    d = build_corpus(_FAKE_ROWS)
-    check("产物没有频率/权重字段",
-          not any(k in d for k in ("freq", "frequency", "weights", "count")),
-          sorted(d))
+def test_g4_vocab_counts_and_dedupe():
+    """§一: 三个计数各司其职; 同词只存一次; **不带频率**。"""
+    print("\n[K25] 计数 / 去重 / 不带频率")
+    v = build_vocabulary(_FAKE_ROWS)
+    check("raw_token_count >= valid_token_count",
+          v["raw_token_count"] >= v["valid_token_count"],
+          (v["raw_token_count"], v["valid_token_count"]))
+    check("valid_token_count >= unique_token_count",
+          v["valid_token_count"] >= v["unique_token_count"],
+          (v["valid_token_count"], v["unique_token_count"]))
+    check("unique_token_count == len(keywords)",
+          v["unique_token_count"] == len(v["keywords"]),
+          (v["unique_token_count"], len(v["keywords"])))
+    check("raw_rows == 输入行数", v["raw_rows"] == len(_FAKE_ROWS))
+    check("没有重复词", len(set(v["keywords"])) == len(v["keywords"]))
+    check("keywords 已排序(顺序确定)",
+          list(v["keywords"]) == sorted(v["keywords"]))
+    # `山顶` 在第 2 行与第 12 行都出现 -> valid 里两次, unique 里一次
+    check("**重复词被去重(valid > unique)**",
+          v["valid_token_count"] > v["unique_token_count"],
+          (v["valid_token_count"], v["unique_token_count"]))
+    check("**产物没有频率/权重字段**",
+          not any(k in v for k in ("freq", "frequency", "weights",
+                                   "counts", "tf")),
+          sorted(v))
 
 
-def test_g3_corpus_filters_broken_and_unsuitable():
-    """确定性清洗: 超长句 / 标点垃圾 / 不适宜 seed 全部丢掉。"""
-    print("\n[K15] 确定性清洗(无 LLM)")
-    flat = [w for p in pairs_from_rows(_FAKE_ROWS)["pairs"] for w in p]
-    check("超长句被丢", not any(len(w) > 12 for w in flat), flat)
-    check("夹标点的损坏文本被丢",
-          not any("？" in w or "?" in w for w in flat), flat)
-    check("不适宜的 seed 被丢",
-          not any("自杀" in w for w in flat), flat)
-    # 判据本身: 白名单是**字符**级的, 不是黑名单。
-    check("纯汉字/字母/数字 -> 合法", is_valid_keyword("山顶"))
+def test_g4_vocab_rejects_sentence_fragments():
+    """§二: 完整句子 / 事件描述**不得**进词库。不要只靠长度。"""
+    print("\n[K26] 句子碎片被丢掉")
+    flat = set(_vocab_words())
+    for frag in ("一姐妹母亲去世", "回家后却把姐姐杀了",
+                 "不久后我把大哥也杀了", "我有两个哥哥",
+                 "五人同时到达目的地。加快脚步的四人被淋成了落汤鸡"):
+        check(f"**整句被丢: {frag[:12]}…**", frag not in flat)
+    # 判据本身
+    check("普通名词 -> 合法", is_valid_keyword("山顶"))
+    check("人物称谓 -> 合法", is_valid_keyword("司机"))
+    check("地点 -> 合法", is_valid_keyword("图书馆"))
+    check("普通动作 -> 合法", is_valid_keyword("敲门"))
+    check("**含'我' -> 不合法(代词)**", not is_valid_keyword("我杀了人"))
+    check("**含'了' -> 不合法(虚词)**", not is_valid_keyword("他死了"))
+    check("**含'的' -> 不合法(虚词)**", not is_valid_keyword("我的书"))
+    check("**含'为什么' -> 不合法**", not is_valid_keyword("为什么哭"))
+    check("**含'一个' -> 不合法(量词短语)**", not is_valid_keyword("一个男人"))
+    check("**含'很' -> 不合法(程度副词)**", not is_valid_keyword("光线很暗"))
     check("带句号 -> 不合法", not is_valid_keyword("他死了。"))
     check("带问号 -> 不合法", not is_valid_keyword("为什么?"))
+    check("带顿号 -> 不合法", not is_valid_keyword("a、b"))
     check("空 -> 不合法", not is_valid_keyword("   "))
-    check("超长 -> 不合法", not is_valid_keyword("一" * 13))
-    check("**1 个字也合法**(原数据里有 `110`/`b` 这种)",
-          is_valid_keyword("b") and is_valid_keyword("110"))
-    # 分隔符: 三种都认。
+    check("**超过 6 字 -> 不合法**", not is_valid_keyword("一" * 7))
+    check("**1 个字也合法**(原数据里有 110 / b)", is_valid_keyword("b")
+          and is_valid_keyword("110"))
+    # 分隔符: 三种都认
     check("全角逗号", split_input("关键词：a，b") == ["a", "b"])
     check("半角逗号", split_input("关键词：a,b") == ["a", "b"])
     check("顿号", split_input("关键词：a、b") == ["a", "b"])
     check("全角空格也算分隔", split_input("关键词：a　b") == ["a", "b"])
     check("没有前缀也认", split_input("a，b") == ["a", "b"])
-    check("归一: 空白折叠", normalize_pair(" a  b ", "c") == ("a b", "c"))
-    check("归一: 顺序无关", normalize_pair("a", "b") == normalize_pair("b", "a"))
 
 
-def test_g3_bag_reproducible_and_no_repeat():
-    """§三 / §四: 同 session seed 可复现; 一个 bag 内不重复; 耗尽重洗。"""
-    print("\n[K16] bag: 可复现 + 不放回")
-    pairs = [("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")]
-    b1 = KeywordBag(pairs, 12345)
-    b2 = KeywordBag(pairs, 12345)
-    s1 = [b1.draw()["keywords"] for _ in range(4)]
-    s2 = [b2.draw()["keywords"] for _ in range(4)]
-    check("**同 session seed 顺序完全可复现**", s1 == s2, (s1, s2))
-    check("**一个 bag 内不重复**",
-          len({tuple(x) for x in s1}) == 4, s1)
-    check("四条正好是那四对(只是顺序不同)",
-          sorted(tuple(x) for x in s1) == sorted(pairs), s1)
-    # 耗尽 -> 重洗下一轮, 不会"抽不出来"
-    r5 = b1.draw()
-    check("第 5 次仍能抽到(自动重洗)", bool(r5["keywords"]), r5)
-    check("round 前进到 2", r5["round"] == 2, r5["round"])
-    check("index 连续累加", r5["index"] == 5, r5["index"])
-    # 换 seed 会变
-    b3 = KeywordBag(pairs, 999)
+def test_g4_vocab_extracts_only_input():
+    """§一: 词**只**从 `input` 来 —— 换掉 puzzle/answer 不得影响结果。"""
+    print("\n[K27] 词库只从 input 提词")
+    a = build_vocabulary(_FAKE_ROWS)
+    mutated = [dict(r, output="完全不同的谜面与谜底 " + str(i))
+               for i, r in enumerate(_FAKE_ROWS)]
+    b = build_vocabulary(mutated)
+    check("**改掉全部 output 后词表逐位不变**",
+          a["keywords"] == b["keywords"])
+    mutated2 = [dict(r, instruction="别的 prompt", system="别的 system")
+                for r in _FAKE_ROWS]
+    check("改掉 instruction/system 也不变",
+          build_vocabulary(mutated2)["keywords"] == a["keywords"])
+    poisoned = [dict(r, output="关键词：额外的，词") for r in _FAKE_ROWS]
+    check("output 里塞关键词不会被采到",
+          build_vocabulary(poisoned)["keywords"] == a["keywords"])
+
+
+def test_g4_vocab_unsuitable_filtered():
+    """§三: 不适宜词确定性过滤(无 LLM)。"""
+    print("\n[K28] 直播不适宜词被过滤")
+    words = set(_vocab_words())
+    check("**自杀被丢**", "自杀" not in words, sorted(words))
+    check("药瓶**在**(普通物品, 不该被连坐)", "药瓶" in words)
+    for bad in ("性交", "强奸", "毒品", "自杀"):
+        check(f"{bad} -> 不合法", not is_valid_keyword(bad))
+
+
+def test_g4_bag_recombines_independently():
+    """§四: 两个词由**独立词库**抽出, 是**重新组合**, 不是原始 pair。"""
+    print("\n[K29] bag 重新组合两个独立词")
+    words = ["甲", "乙", "丙", "丁"]
+    bag = KeywordBag(words, 12345, keyword_cooldown=0, pair_cooldown=0)
+    seen = set()
+    # ⚠️ 抽 4 倍次数而不是"恰好 6 次" —— cooldown=0 时这是**有放回**的
+    # 独立抽样, 6 次里拿满 6 种组合的概率不接近 1(那是 coupon collector)。
+    # 断言"跑够次数后每种组合都出得来"才是这条测试要证明的性质:
+    # **组合是自由生成的, 不受原始 pair 限制**。
+    for _ in range(48):
+        d = bag.draw()
+        check("**word1 != word2**", d["keywords"][0] != d["keywords"][1], d)
+        check("两个词都在词库里", set(d["keywords"]) <= set(words), d)
+        check("**slots 恒为空(没有槽位概念)**", d["slots"] == [], d)
+        seen.add(tuple(sorted(d["keywords"])))
+        if len(seen) == 6:
+            break
+    check("**4 个词的全部 6 种 unordered 组合都出得来**",
+          len(seen) == 6, sorted(seen))
+    check("未触发放宽", bag.relaxed_total == 0, bag.relaxed_total)
+
+
+def test_g4_bag_reproducible_and_no_short_repeat():
+    """§五 / §六: 固定 seed 可复现; 短期不重复; 不会无限重抽。"""
+    print("\n[K30] bag: 可复现 + 短期不重复")
+    words = ["w%02d" % i for i in range(60)]
+    b1 = KeywordBag(words, 4242)
+    b2 = KeywordBag(words, 4242)
+    s1 = [tuple(b1.draw()["keywords"]) for _ in range(30)]
+    s2 = [tuple(b2.draw()["keywords"]) for _ in range(30)]
+    check("**同 session seed 顺序完全可复现**", s1 == s2)
+    check("每次都 word1 != word2", all(p[0] != p[1] for p in s1))
+    # ⚠️ keyword cooldown 是**软约束**, 不是"40 个词必须全不同"。
+    #
+    # 实现是"抽到落在窗口里的词就重抽" —— 所以**单次 draw 内部**两个词
+    # 一定不在窗口里, 但窗口是**滚动**的。因此"前 20 组 40 个词互不相同"
+    # **过强**(实测 38/40), 会假红。
+    #
+    # 真正要证明的是**短期重复率被压住了**: 无 cooldown 的独立抽样下
+    # 40 次抽 60 个词期望约 13 个重复 —— 差一个数量级。
+    first40 = [w for p in s1[:20] for w in p]
+    dups = len(first40) - len(set(first40))
+    check("**前 20 组的词重复数 <= 4(cooldown 生效)**",
+          dups <= 4, (dups, len(first40)))
+    # ⚠️ **不**断言"零放宽"。60 个词 + 40 词窗口时可选词会变稀, 24 次
+    # 重试偶尔真的会失败 -> 放宽是**设计行为**(见 `MAX_TRIES`), 不是回归。
+    check("**放宽是少数(<= 1/3 的组)**",
+          b1.relaxed_total <= len(s1) // 3,
+          (b1.relaxed_total, len(s1)))
+    b3 = KeywordBag(words, 999)
     check("换 session seed 顺序会变",
-          [b3.draw()["keywords"] for _ in range(4)] != s1)
-    # 空表必须响亮失败, 不能静默给空
-    try:
-        KeywordBag([], 1)
-        check("空 pair 表抛 ValueError", False, "没有抛")
-    except ValueError:
-        check("空 pair 表抛 ValueError", True)
+          [tuple(b3.draw()["keywords"]) for _ in range(5)] != s1[:5])
+
+    # ---- pair cooldown: 用一个**小**词库才测得到 ----
+    #
+    # ⚠️ 60 个词抽 30 次时, pair 撞车的概率本来就接近 0 —— 在那种规模下
+    # **删掉 pair cooldown 这条测试也不会红**(变异实测: 0 条失败)。
+    # 要真正验证这个机制, 必须把词库压到"随机撞车几乎必然发生"的规模:
+    # 10 个词 = 45 种组合, 抽 40 次。
+    small = ["s%02d" % i for i in range(10)]
+    sb = KeywordBag(small, 31337, keyword_cooldown=0, pair_cooldown=45)
+    ps = [tuple(sorted(sb.draw()["keywords"])) for _ in range(40)]
+    check("**小词库里 40 组的 pair 仍严格不重复**",
+          len(set(ps)) == len(ps),
+          (len(set(ps)), len(ps)))
+    # 反证: 把 pair 窗口关掉, 同样规模下**必然**出现重复 —— 证明上面那条
+    # 不是"规模太小所以碰巧没撞"。
+    nb = KeywordBag(small, 31337, keyword_cooldown=0, pair_cooldown=0)
+    nps = [tuple(sorted(nb.draw()["keywords"])) for _ in range(40)]
+    check("**(反证)关掉 pair 窗口后同样规模下确实会重复**",
+          len(set(nps)) < len(nps), (len(set(nps)), len(nps)))
 
 
-def test_g3_bag_does_not_touch_global_random():
-    """bag 只能用自己的 Random —— 否则会改 live 出题的序列。"""
-    print("\n[K17] bag 不碰全局 random")
+def test_g4_bag_relaxes_instead_of_hanging():
+    """§五: 不能陷入无限重抽 —— 窗口相对词库过大时必须**放宽**而不是卡死。"""
+    print("\n[K31] 窗口过大时放宽而不是卡死")
+    bag = KeywordBag(["甲", "乙", "丙"], 7, keyword_cooldown=999,
+                     pair_cooldown=999)
+    got = [bag.draw() for _ in range(10)]
+    check("**10 次全部返回(没有卡死)**", len(got) == 10, len(got))
+    check("每次都 word1 != word2", all(g["keywords"][0] != g["keywords"][1]
+                                    for g in got))
+    check("**确实触发了放宽**(否则说明窗口没生效)",
+          bag.relaxed_total > 0, bag.relaxed_total)
+    for bad in ([], ["只有一个"]):
+        try:
+            KeywordBag(bad, 1)
+            check(f"词表 {bad!r} 抛 ValueError", False, "没有抛")
+        except ValueError:
+            check(f"词表 {bad!r} 抛 ValueError", True)
+
+    # ---- 更强的一条: 窗口真的耗尽, 两层放宽都必须走到 ----
+    #
+    # ⚠️ 上面"3 个词 / 窗口 999"那条**不够强**, 而且我第一版写的
+    # "40 个词 / 窗口 40 / 抽 60 次"也**不够强** —— 在那些规模下第二层
+    # (完全放宽)其实到不了, 于是把第二层的兜底改成"返回空"**测试也不红**
+    # (变异实测: 0 条失败)。那说明我测的是**死路径**。
+    #
+    # 真能走到第二层的配置是**小词库 + 中等 cooldown**: 3 个词、窗口 2/5
+    # 时, 两层各 24 次重试都可能被窗口挡掉, 兜底必然被触发(实测 200 次
+    # 抽取里 `relaxed==2` 出现)。这才是"不能陷入无限重抽"的**真正边界**。
+    tiny = KeywordBag(["甲", "乙", "丙"], 3, keyword_cooldown=2,
+                      pair_cooldown=5)
+    got = [tiny.draw() for _ in range(200)]
+    check("**200 次全部返回(没有卡死/抛异常)**",
+          len(got) == 200, len(got))
+    check("**没有一次返回空 keywords**",
+          all(g["keywords"] for g in got),
+          [g for g in got if not g["keywords"]][:2])
+    check("每次都 word1 != word2",
+          all(g["keywords"][0] != g["keywords"][1] for g in got),
+          [g for g in got if g["keywords"][0] == g["keywords"][1]][:2])
+    check("**两层都走到了(第二层兜底可达)**",
+          any(g["relaxed"] == 2 for g in got),
+          sorted({g["relaxed"] for g in got}))
+    check("**触发过放宽**", tiny.relaxed_total > 0, tiny.relaxed_total)
+
+
+def test_g4_keyword_order_is_deterministic_bytes():
+    """§六: 词表顺序**必须确定** —— 否则同 seed 跨进程复现不了。
+
+    ⚠️ 这条**必须**在**独立进程**里跑。同进程内建两个 bag, `list(set(...))`
+    得到的顺序是一样的(PYTHONHASHSEED 相同), 所以**在进程内比较永远绿**
+    —— 删掉 `sorted()` 也不会红(变异实测: 0 条失败)。跨进程 `set` 的迭代
+    顺序不同, 这才是 `sorted()` 真正在挡的东西。
+    """
+    print("\n[K40] 词表顺序跨进程确定")
+    words = ["山顶", "敲门", "电话", "老师", "下雨", "棺材",
+             "高跟鞋", "死亡", "图书馆", "一百元", "三兄弟", "杀人"]
+    code = (
+        "import sys,json; sys.path.insert(0, %r);"
+        "from story.keyword_seed import KeywordBag;"
+        "b=KeywordBag(%r, 4242);"
+        "print(json.dumps([b.draw()['keywords'] for _ in range(4)],"
+        " ensure_ascii=False))" % (str(REPO), words))
+    outs = []
+    for _ in range(3):
+        r = subprocess.run([sys.executable, "-X", "utf8", "-c", code],
+                           cwd=str(REPO), capture_output=True)
+        outs.append(r.stdout.decode("utf-8").replace("\r\n", "\n").strip())
+    check("**3 个独立进程拿到同一序列**",
+          len(set(outs)) == 1, outs)
+    check("确实抽到了 4 组", outs[0].count("，") >= 3 or len(outs[0]) > 20,
+          outs[0][:80])
+
+
+def test_g4_bag_does_not_touch_global_random():
+    """§六: bag 只能用自己的 Random —— 否则会改 live 出题的序列。"""
+    print("\n[K32] bag 不碰全局 random")
     random.seed(4242)
     want = [random.random() for _ in range(6)]
     random.seed(4242)
-    b = KeywordBag([("a", "b"), ("c", "d"), ("e", "f")], 7)
-    for _ in range(9):
+    b = KeywordBag(["a", "b", "c", "d", "e"], 7)
+    for _ in range(20):
         b.draw()
     got = [random.random() for _ in range(6)]
-    check("**抽 9 次后全局 random 序列逐位不变**", got == want, (got, want))
+    check("**抽 20 次后全局 random 序列逐位不变**", got == want, (got, want))
 
 
-def test_g3_session_seed_derivation():
-    """§四: 从 quality_seed 派生; 同输入同输出, 且与输入/其它用途不撞。"""
-    print("\n[K18] session seed 派生")
+def test_g4_session_seed_derivation():
+    """§六: 从 quality_seed 派生; 同输入同输出, 且与其它用途不撞。"""
+    print("\n[K33] session seed 派生")
     check("确定性", derive_session_seed(20260920) == derive_session_seed(20260920))
     check("换 quality_seed 会变",
           derive_session_seed(20260920) != derive_session_seed(20260921))
     check("换 session 会变",
           derive_session_seed(20260920, 0) != derive_session_seed(20260920, 1))
-    # 与 director.py 给补池 rng 那个派生**不是**同一个数(否则三条链会撞)
     q = 20260920
     check("**不等于 director 的 pf_seed**",
           derive_session_seed(q) != (q ^ 0x9E3779B9), derive_session_seed(q))
@@ -501,170 +668,178 @@ def test_g3_session_seed_derivation():
         check("None 抛 ValueError", True)
 
 
-def test_g3_corpus_missing_is_explicit_not_bank():
-    """§五: corpus 缺失/空/损坏 -> 抛错(由调用方显式降级), **不回退词库**。"""
-    print("\n[K19] corpus 不可用必须显式")
+def test_g4_vocab_unavailable_is_explicit_not_bank():
+    """§八-9: 词库缺失/空/损坏 -> 抛错(由调用方显式降级), **不回退词库**。"""
+    print("\n[K34] 词库不可用必须显式")
     with tempfile.TemporaryDirectory() as d:
         for name, obj in (("missing.json", None),
-                          ("empty.json", {"pairs": []}),
-                          ("null.json", {"pairs": None}),
-                          ("bad.json", {"pairs": "不是列表"}),
-                          ("nokeys.json", {"foo": 1})):
+                          ("empty.json", {"keywords": []}),
+                          ("null.json", {"keywords": None}),
+                          ("bad.json", {"keywords": "不是列表"}),
+                          ("nokeys.json", {"foo": 1}),
+                          ("allbad.json", {"keywords": [None, 123, "", "   ",
+                                                        "我杀了他"]})):
             p = os.path.join(d, name)
             if obj is not None:
                 _tmp_json(d, name, obj)
             try:
-                load_corpus(p)
+                load_vocabulary(p)
                 check(f"{name}: 抛 CorpusError", False, "没有抛")
             except CorpusError:
                 check(f"{name}: 抛 CorpusError", True)
-        # 路径不存在(不是上面造的)
         try:
-            load_corpus(os.path.join(d, "nope-not-here.json"))
+            load_vocabulary(os.path.join(d, "nope-not-here.json"))
             check("路径不存在: 抛 CorpusError", False, "没有抛")
         except CorpusError:
             check("路径不存在: 抛 CorpusError", True)
-        # 全是无效 pair 的表
-        _tmp_json(d, "allbad.json", {"pairs": [[], ["a"], [None, None], ""]})
         try:
-            load_corpus(os.path.join(d, "allbad.json"))
-            check("pair 全无效: 抛 CorpusError", False, "没有抛")
-        except CorpusError:
-            check("pair 全无效: 抛 CorpusError", True)
-        # 空字符串路径
-        try:
-            load_corpus("")
+            load_vocabulary("")
             check("路径为空: 抛 CorpusError", False, "没有抛")
         except CorpusError:
             check("路径为空: 抛 CorpusError", True)
-        # ⚠️ 最要紧的一条: 降级路径**不得**碰 KEYWORD_BANK。
-        #
-        # 用 AST 查**真正的引用**, 不是 grep 文本 —— `keyword_corpus.py`
-        # 的 **docstring 里就写着** "G1 / G2 的关键词来自 `KEYWORD_BANK`"
-        # (那是在说明"为什么不再用它")。朴素 grep 会把这段散文当成引用,
-        # 于是这条断言永远红, 然后被人为"修"掉 —— 那正是 K10 踩过的坑。
+        # ⚠️ 最要紧的一条: 降级路径**不得**碰 KEYWORD_BANK。按 AST 查引用。
         names = set()
-        tree = ast.parse(io.open(
-            os.path.join(Path(__file__).resolve().parents[1], "story",
-                         "keyword_corpus.py"), encoding="utf-8").read())
-        for node in ast.walk(tree):
+        for node in ast.walk(ast.parse(io.open(
+                os.path.join(Path(__file__).resolve().parents[1], "story",
+                             "keyword_corpus.py"), encoding="utf-8").read())):
             if isinstance(node, ast.Name):
                 names.add(node.id)
             elif isinstance(node, ast.Attribute):
                 names.add(node.attr)
             elif isinstance(node, ast.alias):
                 names.add(node.asname or node.name.split(".")[-1])
-        check("**keyword_corpus.py 不引用 KEYWORD_BANK(按 AST 查)**",
-              "KEYWORD_BANK" not in names, sorted(n for n in names
-                                                  if "KEYWORD" in n))
+        check("**keyword_corpus.py 不引用 KEYWORD_BANK(AST)**",
+              "KEYWORD_BANK" not in names,
+              sorted(n for n in names if "KEYWORD" in n))
 
 
-def test_g3_bag_load_from_file():
-    """`load_bag` 读产物建 bag, 并给出 §四 要的日志元数据。"""
-    print("\n[K20] load_bag + 日志行")
+def test_g4_load_bag_from_file():
+    """`load_bag` 读产物建 bag, 并给出 §六 要的日志元数据。"""
+    print("\n[K35] load_bag + 日志行")
     with tempfile.TemporaryDirectory() as d:
-        p = _tmp_json(d, "c.json", build_corpus(_FAKE_ROWS))
+        p = _tmp_json(d, "v.json", build_vocabulary(_FAKE_ROWS))
         bag, meta = load_bag(p, 20260920)
         check("meta 有 corpus_version",
               meta["corpus_version"] == CORPUS_VERSION, meta)
-        check("meta 的 pair_count 与表一致",
-              meta["pair_count"] == bag.served + len(bag.pairs) - bag.served
-              or meta["pair_count"] == len(bag.pairs), meta)
+        check("meta 的 keyword_count 与词表一致",
+              meta["keyword_count"] == len(bag.keywords), meta)
         check("meta 有 source", meta["source"] == "neurostellar/haiguitang",
               meta)
+        check("meta 有 raw/valid 计数",
+              "raw_token_count" in meta and "valid_token_count" in meta, meta)
         line = describe_bag(meta, 20260920)
         for token in ("session_seed=20260920",
                       "corpus_version=" + CORPUS_VERSION,
-                      "pair_count="):
+                      "keyword_count="):
             check(f"日志含 {token}", token in line, line)
-        # meta **不含**整张 pair 表(300 多条不该进日志)
-        check("meta 里没有 pairs", "pairs" not in meta, sorted(meta))
+        check("**meta 里没有 keywords**(上千个词不该进日志)",
+              "keywords" not in meta, sorted(meta))
 
 
-def test_g3_real_corpus_shape():
+def test_g4_real_vocab_shape():
     """真产物的**形状**(若在)。文件不在时跳过 —— 不假装通过。"""
-    print("\n[K21] 真 corpus 产物形状")
+    print("\n[K36] 真词库产物形状")
     p = os.path.join(Path(__file__).resolve().parents[1],
-                     "data", "keyword2_seed_pairs.json")
+                     "data", "keyword2_vocabulary.json")
     if not os.path.exists(p):
-        print("  skip 真 corpus 不在(未构建), 跳过形状检查")
+        print("  skip 真词库不在(未构建), 跳过形状检查")
         return
-    d = load_corpus(p)
+    d = load_vocabulary(p)
     check("corpus_version == " + CORPUS_VERSION,
           d["corpus_version"] == CORPUS_VERSION, d["corpus_version"])
     check("source == neurostellar/haiguitang",
           d["source"] == "neurostellar/haiguitang", d["source"])
-    check("有 pairs", len(d["pairs"]) > 0, len(d["pairs"]))
-    check("unique_pairs 与表长一致",
-          d["unique_pairs"] == len(d["pairs"]),
-          (d["unique_pairs"], len(d["pairs"])))
-    check("raw_rows >= two_key_rows >= unique_pairs",
-          d["raw_rows"] >= d["two_key_rows"] >= d["unique_pairs"],
-          (d["raw_rows"], d["two_key_rows"], d["unique_pairs"]))
-    # ⚠️ 真产物的关键性质: pair 里**没有**槽位、没有人工词库的痕迹。
-    flat = [w for pr in d["pairs"] for w in pr]
-    check("每个 pair 都是 2 个非空词", all(len(pr) == 2 and pr[0] and pr[1]
-                                        for pr in d["pairs"]))
-    check("**没有重复 pair**",
-          len({tuple(sorted(pr)) for pr in d["pairs"]}) == len(d["pairs"]))
-    # ⚠️ 真产物与人工词库的重叠 —— 这条断言有讲究。
-    #
-    # 人工词库当初就是照着"普通生活词"挑的(柴米油盐、邻里日常), 所以
-    # 真 corpus 里**必然**有一批常见词与它撞上(实测 462 个 unique 词里
-    # 有 28 个重合, 约 6%)。撞上不是污染, 反而是"人工词库的语感没跑偏"
-    # 的证据。所以**不能**断言"零重叠" —— 那会永远红。
-    #
-    # 真正要钉的是**来源已经变了**: 绝大多数词**只可能**来自真 corpus,
-    # 人工词库里根本没有它们。反过来, 若哪天有人把生产接回人工词库, 这个
-    # 比例会立刻倒过来(→ 100%)。
+    kws = d["keywords"]
+    check("有词", len(kws) > 0, len(kws))
+    check("每个都是 str", all(isinstance(w, str) for w in kws))
+    check("没有重复词", len(set(kws)) == len(kws))
+    check("**unique_token_count 与词表一致**",
+          d["unique_token_count"] == len(kws),
+          (d["unique_token_count"], len(kws)))
+    check("raw >= valid >= unique",
+          d["raw_token_count"] >= d["valid_token_count"]
+          >= d["unique_token_count"],
+          (d["raw_token_count"], d["valid_token_count"],
+           d["unique_token_count"]))
+    check("**没有任何词超过 6 字**",
+          max(len(w) for w in kws) <= 6, max(len(w) for w in kws))
+    check("产物里没有 pairs 字段", "pairs" not in d)
     bank_words = {w for ws in KEYWORD_BANK.values() for w in ws}
-    uniq = set(flat)
-    only_bank = sum(1 for w in uniq if w in bank_words)
-    check("**绝大多数 unique 词不在人工词库里**(证明确实换了来源)",
-          only_bank < len(uniq) * 0.15, (only_bank, len(uniq)))
-    # ⚠️ 硬证据: 真 corpus 里有**人工词库产不出来**的 pair。
-    #
-    # 人工词库只有 5 个槽、每槽 20 词, 所以它的 pair 空间是
-    # C(5,2) x 20 x 20 = 4000 种, 且**每个词都必须是那 100 个之一**。
-    # 真 corpus 的 pair 里只要存在"两个词都**不在**人工词库"的组合
-    # (实测大量存在, 如 `广场舞/吵架` 里的 `广场舞`), 就证明词源换了。
-    # 这条**不是**在数重叠比例 —— 它查的是一个**只有真 corpus 能满足**
-    # 的存在性条件, 所以人工词库若被接回生产, 它必然红。
-    pure_corpus = [pr for pr in d["pairs"]
-                   if pr[0] not in bank_words and pr[1] not in bank_words]
-    check("**存在两个词都不在人工词库里的 pair**",
-          len(pure_corpus) > 0, (len(pure_corpus), len(d["pairs"])))
+    only_bank = sum(1 for w in kws if w in bank_words)
+    check("**绝大多数词不在人工词库里**",
+          only_bank < len(kws) * 0.15, (only_bank, len(kws)))
 
 
-def test_g3_experiment_has_no_own_keyword_logic():
-    """§九: 实验脚本不得维护第二份 corpus / 词库。"""
-    print("\n[K22] 实验脚本不再有第二份关键词逻辑")
+def test_g4_real_vocab_gives_fresh_combinations():
+    """**本轮验收核心**: 固定 seed 下抽的 pair, 绝大多数**从未在原始
+    input 里作为同一组出现过**。
+
+    ⚠️ 需要原始文件(`data_external/.../turtle.json`)才算得了比例。它不在时
+    **跳过**(而不是假装通过) —— 本地构建机上有, CI 上没有。
+    """
+    print("\n[K37] 重新组合的比例(验收核心)")
+    root = Path(__file__).resolve().parents[1]
+    vp = os.path.join(root, "data", "keyword2_vocabulary.json")
+    rp = os.path.join(root, "data_external", "haiguitang", "raw",
+                      "turtle.json")
+    if not (os.path.exists(vp) and os.path.exists(rp)):
+        print("  skip 缺真词库或原始件, 跳过比例统计")
+        return
+    rows = json.load(io.open(rp, encoding="utf-8"))
+    orig = set()
+    for row in rows:
+        toks = [t for t in split_input(row.get("input")) if t]
+        for i in range(len(toks)):
+            for j in range(i + 1, len(toks)):
+                a, b = toks[i], toks[j]
+                orig.add((a, b) if a <= b else (b, a))
+    ss = derive_session_seed(20260920)
+    bag, _ = load_bag(vp, ss)
+    drawn = {tuple(sorted(bag.draw()["keywords"])) for _ in range(50)}
+    fresh = [p for p in drawn if p not in orig]
+    ratio = len(fresh) / len(drawn)
+    print("    原始 input 出现过的 unordered pair: %d" % len(orig))
+    print("    抽 50 组, 其中从未出现过的: %d (%.1f%%)"
+          % (len(fresh), 100 * ratio))
+    # 组合空间 65 万, 原始只覆盖 2165 种 —— 期望几乎 100% 是新的。
+    # 门槛放 90% 而不是 100%: 偶发撞上一个真实组合是**正常**的(那些词
+    # 本来就在同一个自然语义场里), 不构成回归。
+    check("**>= 90% 的 pair 从未在原始 input 里出现过**",
+          ratio >= 0.90, "%.1f%%" % (100 * ratio))
+
+
+def test_g4_combos_helper():
+    """§七 的组合数公式 N*(N-1)/2。"""
+    print("\n[K38] 组合空间公式")
+    check("combos(2) == 1", combos(2) == 1)
+    check("combos(3) == 3", combos(3) == 3)
+    check("combos(4) == 6", combos(4) == 6)
+    check("combos(1144) == 653796", combos(1144) == 653796, combos(1144))
+    check("combos(0) == 0", combos(0) == 0)
+
+
+def test_g4_experiment_has_no_own_keyword_logic():
+    """§九: 实验脚本不得维护第二份词库。"""
+    print("\n[K39] 实验脚本不再有第二份关键词逻辑")
     root = Path(__file__).resolve().parents[1]
     src = io.open(root / "tools" / "experiment_keyword_riddles.py",
                   encoding="utf-8").read()
     check("不定义自己的 KEYWORD_BANK", "KEYWORD_BANK = {" not in src)
-    check("不定义自己的 _FAKE / 内联词表",
-          not re.search(r"^\s*KEYWORD_BANK\s*[:=]\s*\{", src, re.M))
     check("从生产 import 词库/抽取", "from story.keyword_seed import" in src)
-    check("**能从生产 corpus 抽词**(--draw-corpus)",
+    check("**能从生产词库抽词**(--draw-corpus)",
           "--draw-corpus" in src and "load_bag" in src)
-    # 反向: 生产不得 import 实验脚本。
-    #
-    # ⚠️ 同样用 AST 而不是 grep —— 这几个模块的 **docstring 里都写着**
-    # "绝不允许 import tools/experiment_keyword_riddles"(那正是这条规则
-    # 的说明)。朴素 grep 会把说明文字当成违规。
     for f in ("story/keyword_seed.py", "story/keyword_corpus.py",
               "story/prefetch.py"):
-        tree = ast.parse(io.open(root / f, encoding="utf-8").read())
         mods = []
-        for node in ast.walk(tree):
+        for node in ast.walk(ast.parse(io.open(root / f,
+                                               encoding="utf-8").read())):
             if isinstance(node, ast.Import):
                 mods.extend(al.name for al in node.names)
             elif isinstance(node, ast.ImportFrom):
                 mods.append(node.module or "")
-        check(f"{f} 不 import 实验脚本(按 AST 查)",
+        check(f"{f} 不 import 实验脚本(AST)",
               not any("experiment_keyword_riddles" in m for m in mods), mods)
-        check(f"{f} 不 import tools.*(顶层)",
+        check(f"{f} 不顶层 import tools.*(AST)",
               not any(m == "tools" or m.startswith("tools.") for m in mods),
               mods)
 
@@ -682,18 +857,25 @@ def main():
         test_keywords_line_shape,
         test_dependency_direction,
         test_version_constant,
-        # ---- G3 ----
-        test_g3_corpus_extracts_only_input,
-        test_g3_corpus_only_two_key_rows,
-        test_g3_corpus_dedupes_pairs,
-        test_g3_corpus_filters_broken_and_unsuitable,
-        test_g3_bag_reproducible_and_no_repeat,
-        test_g3_bag_does_not_touch_global_random,
-        test_g3_session_seed_derivation,
-        test_g3_corpus_missing_is_explicit_not_bank,
-        test_g3_bag_load_from_file,
-        test_g3_real_corpus_shape,
-        test_g3_experiment_has_no_own_keyword_logic,
+        # ---- G4: 独立词库 + 随机重新组合 ----
+        test_g4_vocab_expands_every_row,
+        test_g4_vocab_is_words_not_pairs,
+        test_g4_vocab_counts_and_dedupe,
+        test_g4_vocab_rejects_sentence_fragments,
+        test_g4_vocab_extracts_only_input,
+        test_g4_vocab_unsuitable_filtered,
+        test_g4_bag_recombines_independently,
+        test_g4_bag_reproducible_and_no_short_repeat,
+        test_g4_bag_relaxes_instead_of_hanging,
+        test_g4_keyword_order_is_deterministic_bytes,
+        test_g4_bag_does_not_touch_global_random,
+        test_g4_session_seed_derivation,
+        test_g4_vocab_unavailable_is_explicit_not_bank,
+        test_g4_load_bag_from_file,
+        test_g4_real_vocab_shape,
+        test_g4_real_vocab_gives_fresh_combinations,
+        test_g4_combos_helper,
+        test_g4_experiment_has_no_own_keyword_logic,
     ]
     for t in tests:
         t()
@@ -701,7 +883,7 @@ def main():
     if FAIL[0]:
         print(f"FAIL: 关键词种子 有 {FAIL[0]} 条不通过")
         return 1
-    print("PASS: 关键词种子(词库 + 抽取 + 方向)全部通过")
+    print("PASS: 关键词种子(独立词库 + 随机组合 + 方向)全部通过")
     return 0
 
 
