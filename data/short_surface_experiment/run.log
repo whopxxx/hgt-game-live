@@ -1,0 +1,24 @@
+01:09:55 INFO 复用 R2 的 10 条汤底(不重新生成故事)
+01:09:55 INFO model=deepseek-v4.1-flash
+01:09:55 INFO surface system = 63 字 (da4b3a8e)
+01:09:57 INFO [red-01] 截取 ok: R2 136 字 -> R3 61 字
+01:10:11 WARNING [red-01] -> Stage B 拒/失败 reject=truth_reject decision=fix error=叙事真实性审计不过: conflicts 非空
+01:10:13 INFO [red-02] 截取 ok: R2 78 字 -> R3 95 字
+01:10:28 WARNING [red-02] -> Stage B 拒/失败 reject=truth_reject decision=fix error=叙事真实性审计不过: conflicts 非空
+01:10:29 INFO [red-03] 截取 ok: R2 102 字 -> R3 29 字
+01:10:43 INFO [red-03] -> Stage B ok (short puzzle 29 字, facts 8)
+01:10:45 INFO [red-04] 截取 ok: R2 128 字 -> R3 45 字
+01:10:58 INFO [red-04] -> Stage B ok (short puzzle 45 字, facts 8)
+01:11:00 INFO [red-05] 截取 ok: R2 121 字 -> R3 64 字
+01:11:20 WARNING [red-05] -> Stage B 拒/失败 reject=review_rewrite decision=fix error=审稿要求重出: 审稿结论不合格: quality_checks 未全过(mechanism_consistent, livestream_safe)
+01:11:21 INFO [black-01] 截取 ok: R2 120 字 -> R3 66 字
+01:11:35 WARNING [black-01] -> Stage B 拒/失败 reject=truth_reject decision=fix error=叙事真实性审计不过: 叙事真实性/机制一致性不过
+01:11:37 INFO [black-02] 截取 ok: R2 109 字 -> R3 97 字
+01:11:58 INFO [black-02] -> Stage B ok (short puzzle 97 字, facts 6)
+01:11:59 INFO [black-03] 截取 ok: R2 92 字 -> R3 49 字
+01:12:12 WARNING [black-03] -> Stage B 拒/失败 reject=structure_technical_fail decision=n/a error=工具调用返回空 input (stop=tool_use)
+01:12:13 INFO [black-04] 截取 ok: R2 90 字 -> R3 50 字
+01:12:26 INFO [black-04] -> Stage B ok (short puzzle 50 字, facts 7)
+01:12:28 INFO [black-05] 截取 ok: R2 116 字 -> R3 72 字
+01:12:39 WARNING [black-05] -> Stage B 拒/失败 reject=structure_technical_fail decision=n/a error=工具调用返回空 input (stop=tool_use)
+01:12:39 INFO 完成: 截取 10/10, Stage B 4/10。原始 -> D:\whopxxwu\douyin\data\short_surface_experiment\raw.jsonl

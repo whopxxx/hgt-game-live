@@ -1,0 +1,147 @@
+{
+  "experiment": "short_surface_extraction",
+  "question": "把「故事创作」和「汤面截取」拆开后, 汤面是不是立刻正常了; 以及当前 Stage B 到底能不能承接真正的短汤面。",
+  "single_variable": "样本完全相同(R2 那 10 条: type / keywords / core_truth / answer 全部复用, 不重新抽词、不重新想故事)。唯一变量是'汤面怎么来': R2 由 observed_clues 在同一次调用里决定, R3 从已写好的完整汤底单独截取。",
+  "reused_from": "data/full_chain_experiment/raw.jsonl (R2)",
+  "base_sha": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
+  "branch": "experiment/red-black-core-stories",
+  "git_head_at_run": "892abdce44dcf5a4a962550e6b971bdb52398bf4",
+  "model_requested": "deepseek-v4.1-flash",
+  "temperature": 0.8,
+  "max_tokens": 900,
+  "counts": {
+    "total": 10,
+    "surface_ok": 10,
+    "surface_technical_failed": 0,
+    "stage_b_ok": 4,
+    "stage_b_rejected": 6,
+    "by_type": {
+      "red": {
+        "stage_b_ok": 2,
+        "stage_b_rejected": 3
+      },
+      "black": {
+        "stage_b_ok": 2,
+        "stage_b_rejected": 3
+      }
+    }
+  },
+  "length_comparison": {
+    "r2_puzzle_chars": [
+      136,
+      78,
+      102,
+      128,
+      121,
+      120,
+      109,
+      92,
+      90,
+      116
+    ],
+    "r3_puzzle_chars": [
+      61,
+      95,
+      29,
+      45,
+      64,
+      66,
+      97,
+      49,
+      50,
+      72
+    ],
+    "r2_min": 78,
+    "r2_max": 136,
+    "r3_min": 29,
+    "r3_max": 97,
+    "r2_mean": 109.2,
+    "r3_mean": 62.8
+  },
+  "prompts": {
+    "surface_system": "从下面这个完整汤底中，截取最让人想追问的一小段作为海龟汤汤面。\n不要概括完整故事，不要解释背景。\n只写 1～3 句，尽量简短。",
+    "surface_system_chars": 63,
+    "surface_system_sha8": "da4b3a8e",
+    "user_template": "【完整汤底】\n{answer}\n",
+    "tool_schema": {
+      "type": "object",
+      "properties": {
+        "puzzle": {
+          "type": "string",
+          "description": "从汤底截取的极短汤面(1~3 句)。",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "puzzle"
+      ]
+    },
+    "answers_are_canonical_from_r2": true,
+    "observed_clues_deliberately_not_passed": "user 只附完整汤底, **不附** observed_clues —— 附上就等于把 R2 那条信息暴露路径搬回来, 变量就不止一个了。"
+  },
+  "not_done": [
+    "重新抽关键词 / 重新想故事 / 重抽",
+    "自动评分 / 额外判定器",
+    "改 production / KEYWORD_IDEA_SYSTEM / observed_clues 规则",
+    "入池 / played / pool_used / archive"
+  ],
+  "rejects": [
+    {
+      "id": "red-01",
+      "type": "red",
+      "reject": "truth_reject",
+      "review_decision": "fix",
+      "issues": [
+        "谜面结尾不是问句",
+        "fact f1 的 kind 非法('public')",
+        "fact f2 的 kind 非法('public')"
+      ]
+    },
+    {
+      "id": "red-02",
+      "type": "red",
+      "reject": "truth_reject",
+      "review_decision": "fix",
+      "issues": [
+        "谜面结尾不是问句，缺少直接向玩家提出的问题。"
+      ]
+    },
+    {
+      "id": "red-05",
+      "type": "red",
+      "reject": "review_rewrite",
+      "review_decision": "fix",
+      "issues": [
+        "谜面结尾不是问句, 缺少指向 core_answer 的收束提问",
+        "编号『倒着发』在谜面里毫无痕迹, 且与『从1一直数到1237』的常规清点方向不自洽: 若尸体分袋越晚编号越大, 数到1237时登记的恰是最晚的尸袋, 无法推出『1237=第一名死者』, 这条支撑不成立",
+        "『分尸装袋冒充救援转运标记混出封锁线』依赖封锁线与转运登记流程的制度设定, 但谜面完全没给『封锁线/转运标记』的线索, 推理路径缺入口(部分体现在无外部知识依赖与机制一致性上)",
+        "以『分尸 / 一场屠杀被登记成救援』作为核心冲击点, 属于拿惨案当噱头, 不适合直播直接念出"
+      ]
+    },
+    {
+      "id": "black-01",
+      "type": "black",
+      "reject": "truth_reject",
+      "review_decision": "fix",
+      "issues": []
+    },
+    {
+      "id": "black-03",
+      "type": "black",
+      "reject": "structure_technical_fail",
+      "review_decision": "n/a",
+      "issues": []
+    },
+    {
+      "id": "black-05",
+      "type": "black",
+      "reject": "structure_technical_fail",
+      "review_decision": "n/a",
+      "issues": []
+    }
+  ],
+  "outputs": {
+    "raw": "data/short_surface_experiment/raw.jsonl",
+    "report": "data/short_surface_experiment/report.md"
+  }
+}

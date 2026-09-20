@@ -237,6 +237,26 @@ jobs:
       - name: 离线套件 full_chain
         run: uv run tests/test_experiment_full_chain.py
 
+      # 短汤面截取实验: 守「**只换一个变量**」这条底线。
+      #
+      # R3 的价值全在对照: 同样那 10 条汤底, 只改"汤面怎么截"。所以钉四件:
+      #   (a) **不重新生成故事** —— 不得调 gen_keyword_idea / load_bag,
+      #       core_truth/answer 只能从 R2 raw.jsonl 读;
+      #   (b) **截取 prompt 必须极短** —— 它是这一轮的自变量。加了 fair
+      #       clue / 问句 / 反转数量之类的规则, 实验就不再回答它声称的问题;
+      #       schema 也只许有 `puzzle` 一个字段;
+      #   (c) **只喂 canonical 汤底** —— `_surface_user` 按**白名单**校验
+      #       只能引用 answer。只查 "observed_clues" 这个词不够: 换个变量名
+      #       (`rec_clues`) 就绕过了, 变异测试实测过这个洞;
+      #   (d) Stage B 仍调生产 `structure_original_idea`, 且不得位于循环内
+      #       (拒绝不重抽)。
+      #
+      # ⚠️ 与另两个实验套件同源: 断言一律从**源码现读现 parse**, 绝不 import
+      # 取常量 —— `.pyc` 新鲜度只按秒比对 mtime, 变异测试会假绿。
+      # 6 个变异向量实测全红(1/1/1/1/1/1)。
+      - name: 离线套件 short_surface
+        run: uv run tests/test_experiment_short_surface.py
+
       # 单元测试覆盖不到的**装配**问题(线程/端口/信号/落盘接线)。
       # director 是常驻进程, 没有"跑完就退出"的模式, 所以用 timeout 兜底:
       # 正常情况一定是被 timeout 杀掉的(退出码 124), 那时看日志判定。
