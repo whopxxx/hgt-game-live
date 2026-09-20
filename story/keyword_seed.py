@@ -55,7 +55,13 @@ import random
 #:                       采样单位(已废弃 —— 那样会继承外部题库的搭配先验)。
 #: `keyword2-vocab-v1` = G4: 真实 haiguitang input 提取**独立词库**, 运行
 #:                       时随机抽两个词**重新组合**, 原始 pair 关系不保留。
-KEYWORD_SEED_VERSION = "keyword2-vocab-v1"
+#: `keyword2-vocab-v2` = G4-D: 上一版之上加了 seed 级 safety 过滤
+#:                       (`_SHOCK_MARKERS`) —— 以严重伤害/重口暴力/性暴力/
+#:                       自伤/毒品**本身作为冲击点**的词不再进词库。
+#:                       ⚠️ sampler 一行没改, bump 的是**词表口径**。
+#:                       与 `keyword_corpus.CORPUS_VERSION` 同步 bump:
+#:                       两者是"代码侧口径"与"产物侧口径", 复盘时配对看。
+KEYWORD_SEED_VERSION = "keyword2-vocab-v2"
 
 #: v1 的人工词库**版本号**(不再是生产默认来源)。保留它是因为
 #: `tools/experiment_keyword_riddles.py`(G1 实验)仍然按它抽词 ——
@@ -427,7 +433,7 @@ def load_bag(corpus_path: str, session_seed: int,
 def describe_bag(meta: dict, session_seed: int) -> str:
     """§六 要求的那行 INFO 日志的正文。
 
-    形如: `keyword2 session_seed=123 corpus_version=keyword2-vocab-v1
+    形如: `keyword2 session_seed=123 corpus_version=keyword2-vocab-v2
     keyword_count=1147`。单独一个函数是为了让**测试直接断言这行日志**,
     而不是去正则匹配一段拼在别处的字符串。
     """

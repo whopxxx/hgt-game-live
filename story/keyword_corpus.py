@@ -59,7 +59,11 @@ import re
 
 #: 产物的版本号。**只在词表或清洗规则变化时 bump** —— 它在 checked-in 的
 #: JSON 里, 与代码版本解耦(那份 JSON 可能比代码旧)。
-CORPUS_VERSION = "keyword2-vocab-v1"
+#:
+#: v2 (G4-D): 加了 `_SHOCK_MARKERS` 那一层 seed 级 safety 过滤。
+#: 口径变化 -> 词表变化 -> 必须 bump, 否则"这份词库是哪套规则产出的"
+#: 事后无法回答(而复盘要能回答)。
+CORPUS_VERSION = "keyword2-vocab-v2"
 
 #: 数据源标识。写进产物, 让"这份词从哪来"永远可查。
 CORPUS_SOURCE = "neurostellar/haiguitang"
@@ -157,6 +161,72 @@ _UNSUITABLE = (
     "海洛因", "吸毒", "裸体", "脱衣", "月经", "阴茎", "阴道",
 )
 
+# ======================================================================
+# 二之补(G4-D): **以冲击点本身**为卖点的 seed —— 窄修复
+# ======================================================================
+#
+# ## 为什么需要它, 以及为什么它必须**窄**
+#
+# 上一版只挡了上面那张表里那 22 个**词形**, 于是 `碎尸` / `分尸` /
+# `勒死` / `枪杀` / `虐待` / `截肢` 这类照样进了词库, 再被当成普通
+# seed 喂给 Stage A。任务书 §D 的原话:
+#
+#     普通死亡/事故/悲剧情节词**可以保留**;
+#     明显以严重伤害、重口暴力、性暴力、自伤、毒品等**本身作为冲击点**
+#     的 seed **不进入** vocabulary。
+#
+# 关键是"**本身作为冲击点**"这个限定。海龟汤的正常语汇里死亡是**情节点**
+# (`死亡` / `尸体` / `棺材` / `凶杀` / `遗书` / `祭奠` —— 全部保留, 它们
+# 是谜题的事实材料), 而 `碎尸` / `分尸` / `砍手` 的差别在于: 词的**全部
+# 内容**就是那个伤害动作, 它不承载任何可推理的结构, 只提供观感冲击。
+#
+# ## 为什么不扩大成内容审查器(§D 明令)
+#
+# 这套判据是**词形级**、确定性的、可逐条枚举的。它**不**判断"这道题讲
+# 了一个悲惨故事"—— 那需要读谜面/谜底, 而本模块只读 `input`(见模块
+# docstring)。所以它拦不住"用普通词拼出重口题"—— 那件事由 **G4-E 的
+# `livestream_safe` Reviewer 硬门**在成题之后兜。
+#
+# 两层是**分工**而不是重复:
+#
+#     这一层   seed 级   —— 不让明显不合适的**入口**出现
+#     livestream_safe  成品级 —— 不管入口多干净, 成品必须过直播安全判断
+#
+# 只有入口过滤没有成品门 -> "普通词拼出重口题"漏出去(本轮补 E 的原因);
+# 只有成品门没有入口过滤 -> 白烧 A/B/审稿/audit 四次调用才拒掉。
+#
+# ## 每一类的判据来源
+#
+# 全部基于**实测词库**里真实存在的词(不是想象出来的):
+#     重口暴力  碎尸 分尸 尸块 运尸 砍手 砍断 截肢 虐待
+#     性暴力    已经在 `_UNSUITABLE` 里(强奸/轮奸/乱伦…), 这里补漏网
+#     自伤      自杀 自残 割腕 上吊 —— 大部分已在 `_UNSUITABLE`
+#     毒品      已在 `_UNSUITABLE`; 这里补"吸毒/贩毒/毒瘾"等变体
+#     具体凶器  砍刀 手枪 枪支 —— ⚠️ **不收**: 见下面的"刻意不收"
+#
+# ## 刻意**不**收的(重要)
+#
+# `死亡` `尸体` `棺材` `凶杀` `枪` `刀` `血` `毒药` `埋葬` `遗书`
+# `精神病` —— 这些是**普通悬疑语汇**, 任务书明确说死亡作为普通剧情
+# 事实允许。一首 `黑人抬棺` 是网络梗, `砷中毒` 是推理小说的经典手法。
+# 收进来会把词库砍成"没有谜题可出"的样子, 而那正是保守过头的失败模式。
+_SHOCK_MARKERS = (
+    # ---- 以**肢解/碎尸**本身为卖点 ----
+    # `尸体` 不收(普通词), 但"把尸体切开"这个动作收了。
+    "碎尸", "分尸", "尸块", "运尸", "抛尸", "藏尸", "焚尸",
+    # ---- 以**致残动作**本身为卖点 ----
+    "砍手", "砍断", "砍死", "截肢", "断手", "断脚", "挖眼", "割喉",
+    "割腕", "剁", "肢解",
+    # ---- 以**虐待/折磨**本身为卖点 ----
+    "虐待", "虐杀", "折磨致死", "拷打",
+    # ---- 自伤类变体(`_UNSUITABLE` 只收了"自杀/自残"两个字面) ----
+    "上吊", "跳楼", "割脉", "自缢", "服毒",
+    # ---- 毒品类变体 ----
+    "贩毒", "制毒", "毒瘾", "吸食",
+    # ---- 性暴力类补漏(`_UNSUITABLE` 收了主干, 这里收派生写法) ----
+    "性侵", "性虐", "猥亵", "迷奸", "诱奸", "娼妓",
+)
+
 
 def _norm(s) -> str:
     """归一: 只去**纯格式差异**(首尾空白 + 内部连续空白折叠)。
@@ -242,7 +312,59 @@ def is_valid_keyword(w: str) -> bool:
     for bad in _UNSUITABLE:
         if bad in low:
             return False
+    # (5) G4-D: 以冲击点**本身**为卖点的 seed
+    #
+    # 与 (4) 分开成两步是刻意的: 两张表的**理由不同**(一个是"不能直播
+    # 出现", 一个是"这个词除了冲击感没有别的信息"), 分开之后报告里能
+    # 分别统计两类各挡了多少, 合并成一个数字就再也拆不开了。
+    for shock in _SHOCK_MARKERS:
+        if shock in w:
+            return False
     return True
+
+
+#: 过滤**类别**的确定性归属。G4-D §D 要求报告"只统计过滤数量和类别"。
+#:
+#: 为什么要有这张表: `is_valid_keyword` 只回 bool, 于是"这一轮 safety
+#: 过滤挡住了什么"无法回答 —— 只能看到一个总数, 拆不开"其中多少是
+#: 句子碎片、多少是 safety"。分开之后, 报告里能写"挡住了 N 个, 分布是
+#: ...", 而不是含糊的"过滤了 968 个词"。
+def reject_reason(w: str) -> str:
+    """这个片段**为什么**被拒。返回类别名, 通过则返回空串。
+
+    类别与 `is_valid_keyword` 的四道门一一对应, **顺序也一致**:
+
+        empty      归一后为空
+        length     长度不在 [MIN_KEYWORD_LEN, MAX_KEYWORD_LEN]
+        charset    有标点/空白/符号, 或含白名单外的字符
+        sentence   含句子性词素(代词/虚词/连词/量词短语…)
+        unsafe     命中 `_UNSUITABLE`(不能直播出现的字面)
+        shock      命中 `_SHOCK_MARKERS`(以冲击点本身为卖点)
+        ""         通过
+
+    ⚠️ 它**不**被 `is_valid_keyword` 调用(那会变成每词两遍扫描)。
+    它是**给报告/审计用**的独立入口, 两边判据必须手工保持一致 ——
+    `tests/test_keyword_seed.py` 有一条测试断言"两个函数对所有词
+    结论一致", 就是防它漂。
+    """
+    w = _norm(w)
+    if not w:
+        return "empty"
+    if not (MIN_KEYWORD_LEN <= _cjk_len(w) <= MAX_KEYWORD_LEN):
+        return "length"
+    if not _ALLOWED.match(w) or _BAD_CHARS.search(w):
+        return "charset"
+    for marker in _SENTENCE_MARKERS:
+        if marker in w:
+            return "sentence"
+    low = w.lower()
+    for bad in _UNSUITABLE:
+        if bad in low:
+            return "unsafe"
+    for shock in _SHOCK_MARKERS:
+        if shock in w:
+            return "shock"
+    return ""
 
 
 def build_vocabulary(rows) -> dict:
@@ -257,6 +379,7 @@ def build_vocabulary(rows) -> dict:
           "raw_token_count":  int,   # 拆出来的**全部**片段(未过滤)
           "valid_token_count":int,   # 通过 `is_valid_keyword` 的片段数
           "unique_token_count":int,  # 去重后的词数(len(keywords))
+          "rejected_by_reason":{str:int},  # G4-D: 按类别统计挡了多少
           "keywords":         [str], # 已排序, 顺序确定
         }
 
@@ -269,6 +392,12 @@ def build_vocabulary(rows) -> dict:
     `raw - valid` 是**清洗丢掉的量**, `valid - unique` 是**重复的量**。
     两个差值都是信息, 所以三个都记。
 
+    ## G4-D: `rejected_by_reason` 只记**数量与类别**
+
+    任务书 §D: "不要在报告里大段复现这些词, 只统计过滤数量和类别即可。"
+    所以这里存的是 `{类别: 计数}`, **不是**词表 —— 落盘的产物里不会
+    出现任何被挡的具体词。
+
     ## 不保留频率(§一)
 
     同词只存一次, **不带**它原来的出现次数。任务书原话: "不保留原始
@@ -278,6 +407,7 @@ def build_vocabulary(rows) -> dict:
     rows = list(rows or ())
     raw_tokens: list = []
     valid: list = []
+    rejected: dict = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -285,6 +415,9 @@ def build_vocabulary(rows) -> dict:
             raw_tokens.append(tok)
             if is_valid_keyword(tok):
                 valid.append(_norm(tok))
+            else:
+                why = reject_reason(tok) or "unknown"
+                rejected[why] = rejected.get(why, 0) + 1
     uniq = sorted(set(valid))
     return {
         "corpus_version": CORPUS_VERSION,
@@ -293,6 +426,7 @@ def build_vocabulary(rows) -> dict:
         "raw_token_count": len(raw_tokens),
         "valid_token_count": len(valid),
         "unique_token_count": len(uniq),
+        "rejected_by_reason": dict(sorted(rejected.items())),
         "keywords": uniq,
     }
 

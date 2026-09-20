@@ -280,8 +280,10 @@ def test_version_constant():
     # G3: 生产词源从人工词库换成真实 haiguitang corpus, 所以**种子版本**
     # 前进到 v2。人工词库那个号(retired)单独留在 `KEYWORD_BANK_VERSION`,
     # 因为 G1 实验的历史数据仍按它抽。
-    check("KEYWORD_SEED_VERSION == keyword2-vocab-v1",
-          KEYWORD_SEED_VERSION == "keyword2-vocab-v1", KEYWORD_SEED_VERSION)
+    #
+    # G4-D: 词表加了 seed 级 safety 过滤 -> 口径变了 -> 再前进一版。
+    check("KEYWORD_SEED_VERSION == keyword2-vocab-v2",
+          KEYWORD_SEED_VERSION == "keyword2-vocab-v2", KEYWORD_SEED_VERSION)
     check("KEYWORD_BANK_VERSION == keyword2-v1(人工词库的历史号)",
           KEYWORD_BANK_VERSION == "keyword2-v1", KEYWORD_BANK_VERSION)
     check("两个号不相等", KEYWORD_SEED_VERSION != KEYWORD_BANK_VERSION)
@@ -844,6 +846,122 @@ def test_g4_experiment_has_no_own_keyword_logic():
               mods)
 
 
+# ======================================================================
+# G4-D: seed 级 safety 窄修复(§D)
+# ======================================================================
+def test_g4d_shock_seeds_excluded():
+    """以**冲击点本身**为卖点的词不进词库(§D)。"""
+    print("\n[K41] G4-D: 冲击点词被挡")
+    from story.keyword_corpus import (is_valid_keyword, reject_reason,
+                                      _SHOCK_MARKERS)
+    for w in ("碎尸", "分尸", "尸块", "砍手", "砍断", "截肢", "虐待",
+              "割腕", "上吊", "性侵", "猥亵"):
+        check(f"**{w} 被拒**", not is_valid_keyword(w), w)
+        check(f"{w} 的类别是 shock",
+              reject_reason(w) == "shock", reject_reason(w))
+    check("词表非空(不是把整条判据写死了)", len(_SHOCK_MARKERS) > 0)
+
+
+def test_g4d_ordinary_death_words_kept():
+    """**反证**: 普通死亡/事故/悲剧词**必须保留**(§D 明令)。
+
+    没有这条的话, "把整个词库清空" 也能让上面那条通过。
+    这里逐个断言: 它们是海龟汤的**事实材料**, 不是冲击噱头。
+    """
+    print("\n[K42] G4-D: 普通死亡词不被一刀切")
+    from story.keyword_corpus import is_valid_keyword, reject_reason
+    for w in ("死亡", "尸体", "棺材", "凶杀", "杀人", "遗书", "祭奠",
+              "手枪", "毒药", "埋葬", "精神病", "黑人抬棺", "砷中毒",
+              "血迹", "爆炸", "打猎"):
+        check(f"**{w} 仍然有效**", is_valid_keyword(w),
+              reject_reason(w))
+
+
+def test_g4d_two_filter_layers_are_separate():
+    """两层的**类别**必须分得开 —— 否则报告里拆不出数量。
+
+    `unsafe`(不能直播出现的字面)与 `shock`(以冲击点本身为卖点)是
+    两个不同的理由。合成一个数字就再也拆不开了。
+    """
+    print("\n[K43] G4-D: unsafe 与 shock 是两个类别")
+    from story.keyword_corpus import reject_reason
+    check("强奸 -> unsafe", reject_reason("强奸") == "unsafe",
+          reject_reason("强奸"))
+    check("碎尸 -> shock", reject_reason("碎尸") == "shock",
+          reject_reason("碎尸"))
+    check("**两者不相等**", reject_reason("强奸") != reject_reason("碎尸"))
+
+
+def test_g4d_reason_matches_validator():
+    """`reject_reason` 与 `is_valid_keyword` 对**每个词**结论必须一致。
+
+    两个函数是分开实现的(一个给报告, 一个给生产), 手工保持同步迟早会漂
+    —— 漂了之后报告里写的"挡了多少"就是假的。这条测试用一份混合样本
+    (含边界词)钉住它们。
+    """
+    print("\n[K44] G4-D: reason 与 validator 结论一致")
+    from story.keyword_corpus import is_valid_keyword, reject_reason
+    sample = ["死亡", "碎尸", "我", "图书馆", "很暗", "强奸", "手枪",
+              "a", "110", "一姐妹母亲去世", "回家后却把姐姐杀了",
+              "截肢", "遗书", "x" * 40, "带 空格", "砷中毒"]
+    for w in sample:
+        passed = is_valid_keyword(w)
+        reason = reject_reason(w)
+        check(f"**{w!r} 两边一致**(valid={passed})",
+              passed == (reason == ""), (passed, reason))
+
+
+def test_g4d_product_reports_reasons_not_words():
+    """产物里只有**数量与类别**, 没有具体词(§D)。"""
+    print("\n[K45] G4-D: 产物不带被挡的词")
+    import json as _json
+    import os as _os
+    from story.keyword_corpus import DEFAULT_CORPUS_PATH, build_vocabulary
+    # ① builder 的返回值只有计数
+    d = build_vocabulary([{"input": "关键词：碎尸，死亡，我"}])
+    check("有 rejected_by_reason", isinstance(
+        d.get("rejected_by_reason"), dict), d.get("rejected_by_reason"))
+    check("**shock 计了一次**", d["rejected_by_reason"].get("shock") == 1,
+          d["rejected_by_reason"])
+    check("**sentence 计了一次**",
+          d["rejected_by_reason"].get("sentence") == 1,
+          d["rejected_by_reason"])
+    check("**被挡的词不在 keywords 里**", "碎尸" not in d["keywords"],
+          d["keywords"])
+    check("正常词在", "死亡" in d["keywords"], d["keywords"])
+    check("**rejected 里没有任何词面**(只有类别->计数)",
+          all(isinstance(v, int) for v in d["rejected_by_reason"].values())
+          and all(k in ("empty", "length", "charset", "sentence",
+                        "unsafe", "shock", "unknown")
+                  for k in d["rejected_by_reason"]),
+          d["rejected_by_reason"])
+    # ② 盘上那份 checked-in 的产物同理
+    if _os.path.exists(DEFAULT_CORPUS_PATH):
+        raw = _json.load(open(DEFAULT_CORPUS_PATH, encoding="utf-8"))
+        check("盘上产物有 rejected_by_reason",
+              isinstance(raw.get("rejected_by_reason"), dict),
+              raw.get("rejected_by_reason"))
+        check("**盘上产物没有一个被挡的具体词**(只存了计数)",
+              all(isinstance(v, int)
+                  for v in raw["rejected_by_reason"].values()),
+              raw["rejected_by_reason"])
+
+
+def test_g4d_real_vocab_has_no_shock_seeds():
+    """端到端: checked-in 词库里**一个冲击点词都没有**。"""
+    print("\n[K46] G4-D: 真实词库无 shock seed")
+    from story.keyword_corpus import (_SHOCK_MARKERS, DEFAULT_CORPUS_PATH,
+                                      load_vocabulary)
+    d = load_vocabulary(DEFAULT_CORPUS_PATH)
+    hits = [w for w in d["keywords"]
+            if any(s in w for s in _SHOCK_MARKERS)]
+    check("**零命中**", not hits, hits[:10])
+    check("但词库仍然够大(>1000)", len(d["keywords"]) > 1000,
+          len(d["keywords"]))
+    check("corpus_version 是 v2", d["corpus_version"] == "keyword2-vocab-v2",
+          d["corpus_version"])
+
+
 def main():
     tests = [
         test_bank_shape,
@@ -876,6 +994,13 @@ def main():
         test_g4_real_vocab_gives_fresh_combinations,
         test_g4_combos_helper,
         test_g4_experiment_has_no_own_keyword_logic,
+        # ---- G4-D: seed 级 safety 窄修复 ----
+        test_g4d_shock_seeds_excluded,
+        test_g4d_ordinary_death_words_kept,
+        test_g4d_two_filter_layers_are_separate,
+        test_g4d_reason_matches_validator,
+        test_g4d_product_reports_reasons_not_words,
+        test_g4d_real_vocab_has_no_shock_seeds,
     ]
     for t in tests:
         t()
