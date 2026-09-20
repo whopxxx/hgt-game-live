@@ -14,10 +14,31 @@
 | | |
 |---|---|
 | 基线 | `7411277a4f1eecb92bca13e90d5b53f84521e34a` |
-| commit | `f789775`(A/B/C/E) → `6d0f4b4`(D) → `08c187d`(§一~§九) |
+| commit | `f789775`(A/B/C/E) → `6d0f4b4`(D) → `08c187d`(§一~§九) → `b6720b8`(回归+变异+报告) → `6c5dc59`(CI 修复) |
+| main | `6c5dc59ae96de0287cbbb03d3672858eed691385` |
+| exact-head CI | `offline-tests` on `6c5dc59` = **success** |
 | 新增 LLM 调用 | **0**(全部离线) |
 | 回归 | 23 个离线套件全绿 |
 | 装配冒烟 | exit=124 / 0 Traceback / 题就位 / banner 可见 |
+
+### CI 迭代记录(如实记)
+
+第一次推的 `b6720b8` **CI 红了**, 挂在 `离线套件 g4_source`。本地、
+干净 clone、`uv run` 三种方式**全绿** —— 差异在平台。
+
+根因: banner 测试为了拿到**真实渲染出来的**那几行, 跑的是真的
+`run()`(在 `_build_source` 上截断)。`run()` 在 banner 之后、截断点
+之前会起 `RenderServer`, 三次迭代都用默认端口 8765。Windows 的
+`SO_REUSEADDR` 语义宽松, 连着 bind 看不出来; **Linux 上第二次 bind
+撞 TIME_WAIT 直接失败**。
+
+修法两条: 每次迭代换端口(`18700+idx`), 并在 `finally` 里
+`dr.server.stop()` —— 测试起的服务测试自己收掉。`6c5dc59` 转绿。
+
+这条值得留在报告里, 因为它是**同类问题的第二次**: 上一笔里
+`test_g3_session_seed_reproducible_end_to_end` 也是"两次运行共享了
+一份状态"而本地看不出来。测试里的**隐式共享资源**(tmpdir、端口)
+是一个反复出现的失败模式。
 
 ---
 
