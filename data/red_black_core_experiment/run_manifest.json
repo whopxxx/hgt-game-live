@@ -1,0 +1,77 @@
+{
+  "experiment": "red_black_core_stories",
+  "question": "无约束时模型自己会想出值得玩的红汤/黑汤故事吗",
+  "base_sha": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
+  "branch": "experiment/red-black-core-stories",
+  "git_head_at_run": "62b069b1ec1abbe3a027df19f293f6b041e58ad5",
+  "model_requested": "deepseek-v4.1-flash",
+  "model_returned": [
+    "deepseek-v4.1-flash"
+  ],
+  "base_url": "http://127.0.0.1:8080",
+  "temperature": 0.8,
+  "max_tokens": 2600,
+  "n_per_type": 10,
+  "seed_red": 20260921,
+  "seed_black": 20260922,
+  "counts": {
+    "total": 20,
+    "ok": 20,
+    "technical_failed": 0,
+    "by_type": {
+      "red": {
+        "ok": 10,
+        "technical_failed": 0
+      },
+      "black": {
+        "ok": 10,
+        "technical_failed": 0
+      }
+    }
+  },
+  "prompts": {
+    "red_system": "你在为海龟汤设计隐藏故事。\n只写事情真正发生了什么, 不要写谜面(writer 之后会从故事里截取)。\n偏红汤: 真相本身要有分量, 值得最后揭晓 —— 不是普通事故, 也不是单纯的悲剧。",
+    "black_system": "你在为海龟汤设计隐藏故事。\n只写事情真正发生了什么, 不要写谜面(writer 之后会从故事里截取)。\n偏黑汤: 真相揭晓后应让人明显不安或后背发凉 —— 靠关系、意图或世界规则, 不靠血腥描写。",
+    "user_template": "写一个完整的故事。可以围绕「{subject}」, 也可以不围绕。",
+    "tool": {
+      "name": "emit_core_story",
+      "description": "交出一个完整的隐藏故事。",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "story": {
+            "type": "string",
+            "description": "完整故事全文。",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "story"
+        ]
+      }
+    },
+    "red_system_chars": 94,
+    "black_system_chars": 98,
+    "red_system_sha8": "02e6ed12",
+    "black_system_sha8": "d4fe029f"
+  },
+  "not_generated": [
+    "puzzle(汤面)",
+    "title",
+    "fair_clues",
+    "facts",
+    "solve_atoms",
+    "discovery_beats",
+    "completion_fact_ids",
+    "hints",
+    "signature",
+    "reviewer 分数",
+    "自动分类器结果"
+  ],
+  "no_filtering": "20 个候选全部原样保留 —— 没有删除 / 没有重抽到满意 / 没有排名。只有技术失败(HTTP/网络)会重试, 记在 attempts。",
+  "outputs": {
+    "raw": "data/red_black_core_experiment/raw.jsonl",
+    "report": "data/red_black_core_experiment/report.md",
+    "raw_report": "data/red_black_core_experiment/raw_report.md"
+  }
+}
