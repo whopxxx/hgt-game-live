@@ -1,0 +1,495 @@
+{
+  "meta": {
+    "seed": 20260920,
+    "base_main": "e6125639afa2fc95045fee5e83abfb042fcc4c4b",
+    "cmd": ".venv/Scripts/python.exe -X utf8 tools/experiment_keyword_riddles.py --out data/g1b --seed 20260920",
+    "elapsed_s": 90.2,
+    "llm_calls": 35
+  },
+  "summary": {
+    "n": 5,
+    "valid": 3,
+    "stage1_ok": 5,
+    "review": {
+      "fix": 4
+    },
+    "audit_pass": 3,
+    "audit_ran": 3,
+    "validate_pass": 3,
+    "puzzle_median": 64.0,
+    "answer_median": 44.0,
+    "two_total": 0,
+    "two_valid": 0,
+    "three_total": 5,
+    "three_valid": 3,
+    "stage1_attempts": 5,
+    "stage2_attempts": 7
+  },
+  "items": [
+    {
+      "index": 11,
+      "group": "3key",
+      "keywords": [
+        "电梯",
+        "迟到",
+        "钟表"
+      ],
+      "slots": [
+        "place",
+        "state",
+        "object"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260931,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "电梯里的三分钟",
+      "puzzle": "小林每天上班都提前十分钟到公司，今天却迟到了半小时。同事问他怎么回事，他说：“我在电梯里只待了三分钟。” 可他进电梯时看了一次钟表，出电梯时又看了一次，两次相差整整三十五分钟。为什么？",
+      "answer": "他进的那部“电梯”是公司所在大楼的观光电梯，而他人其实在一家医院里——他当天早上突然晕倒被送医，醒来后从病床被推去做检查，进的是医院的运送电梯。他在电梯里因低血糖再次昏迷，护士发现后立即停下电梯抢救，前后耽误了三十五分钟。他迷糊中只记得电梯门开合的“三分钟”感觉，而两次看钟表的记忆其实是同一块挂钟——进电梯前和出电梯后他都在同一楼层、同一个位置看到它，所以他自己以为只过了三分钟。真正的解释是：他在电梯里昏过去又醒过来，中间的时间完全丢失了，而“钟表相差三十五分钟”是因为他看到的其实是电梯外大厅的挂钟，两次都停在同一个位置——他误把出电梯后看到的挂钟当成进电梯前那次的比较对象，实际上进电梯前他看的是自己手机，手机因晕倒时摔在地上时间没变（屏幕定格显示的是他晕倒那一刻），所以他误以为只过了三分钟。",
+      "stage2_attempts": 0,
+      "stage2_stage": "ai_gate",
+      "stage2_reject_reasons": [
+        "accepted=false",
+        "no_reasonable_explanation",
+        "ambiguous"
+      ],
+      "core_answer": "",
+      "observed_signature": {},
+      "review_decision": "",
+      "review_issues": [],
+      "truth_audit": {},
+      "validate_ok": false,
+      "validate_reasons": [],
+      "final": "rejected_ai_gate",
+      "puzzle_chars": 92,
+      "answer_chars": 351,
+      "elapsed_s": 11.1,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": false,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": false,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 12,
+      "group": "3key",
+      "keywords": [
+        "打电话",
+        "毛巾",
+        "同学"
+      ],
+      "slots": [
+        "action",
+        "object",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260932,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "深夜来电",
+      "puzzle": "深夜，他给同学打电话，电话那头的人却一直在擦毛巾，一句话不说。第二天他才知道，同学昨晚根本没带手机。这是怎么回事？",
+      "answer": "接电话的是同学的室友。同学当晚在浴室洗澡，手机落在宿舍桌上，室友听到来电便替他接了，同时正用毛巾擦头发——他刚洗完澡，毛巾捂着脸，说话含糊，对方只听见摩擦声。而同学本人确实没带手机进浴室，\"没带手机\"是指没把手机带在身边。真正接电话的人一直在擦毛巾，所以一言不发只是听不清/顾不上说，并非诡异。",
+      "stage2_attempts": 2,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "接电话的是正在擦头发的室友，同学本人在洗澡、没把手机带在身边。",
+      "observed_signature": {
+        "mechanism_family": "identity_misread",
+        "solution_shape": "identity_reversal",
+        "domain": "daily",
+        "emotion_mode": "eerie",
+        "relation": "friend",
+        "time_shape": "single_day",
+        "death": false,
+        "past_trauma": false,
+        "long_term_profession": false,
+        "repeated_ritual": false,
+        "reveal_mode": "identity_flip",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "fix",
+      "review_issues": [
+        "observed_signature 的枚举值非法：mechanism_family/solution_shape/domain/emotion_mode/relation/time_shape/reveal_mode 全是自由文本或空串，代码无法归一化。"
+      ],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 57,
+      "answer_chars": 31,
+      "elapsed_s": 32.9,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": true,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 13,
+      "group": "3key",
+      "keywords": [
+        "同学",
+        "睡觉",
+        "图书馆"
+      ],
+      "slots": [
+        "person",
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260933,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "图书馆里的同学",
+      "puzzle": "我在图书馆自习时睡着了，醒来发现对面桌上趴着一个睡着的同学，我再也不敢去那家图书馆了。为什么？",
+      "answer": "那个\"同学\"其实是我自己。我睡着后，图书馆到了闭馆时间，管理员没注意到角落里的我，锁门离开并拉下了总电闸。我在黑暗中醒来，迷迷糊糊走到对面坐下又睡去，中途还去洗手间的镜子里看见过\"另一个人\"，其实那就是我自己；第二天早上被人发现时，我才明白那一夜图书馆里只有我一个人，而我对面趴着的\"同学\"是我自己在另一张桌子上的倒影/错觉——更准确地说，那具\"趴着的同学\"是我之前坐的位置留下的、我睡着时被管理员以为已经离开而留下的外套和书包堆，我以为那是别人。总之真正让我恐惧的是：那一晚我以为图书馆里有别人，其实从头到尾都只有我，而我对\"同学\"的记忆全部属于我自己。",
+      "stage2_attempts": 0,
+      "stage2_stage": "truth_audit",
+      "stage2_reject_reasons": [
+        "conflicts 非空"
+      ],
+      "core_answer": "",
+      "observed_signature": {},
+      "review_decision": "fix",
+      "review_issues": [],
+      "truth_audit": {},
+      "validate_ok": false,
+      "validate_reasons": [],
+      "final": "rejected",
+      "puzzle_chars": 47,
+      "answer_chars": 278,
+      "elapsed_s": 61.3,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 14,
+      "group": "3key",
+      "keywords": [
+        "服务员",
+        "图书馆",
+        "发烧"
+      ],
+      "slots": [
+        "person",
+        "place",
+        "state"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260934,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "图书馆里的服务员",
+      "puzzle": "我在图书馆里叫来服务员，点了杯热咖啡，然后量了体温：39度。我笑了，因为我知道自己发烧不是生病。这是为什么？",
+      "answer": "这里的\"图书馆\"其实是一间名为\"图书馆\"的咖啡馆（或酒吧），所谓\"服务员\"就是店员。我点的不是咖啡而是酒，喝下后体温计显示39度——但那不是发烧，而是我刚点的热饮让口腔温度骤然升高，用口含体温计测出的假象。更重要的是，我此行是为了骗保/骗取请假条，所以我\"笑\"了：证据到手了。",
+      "stage2_attempts": 1,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "\"图书馆\"是家咖啡馆，\"39度\"是刚喝的热饮造成的口温假象，此人在为骗保/骗病假造证据。",
+      "observed_signature": {
+        "mechanism_family": "object_misuse",
+        "solution_shape": "misunderstood_object",
+        "domain": "daily",
+        "emotion_mode": "neutral",
+        "relation": "self",
+        "time_shape": "instant",
+        "death": false,
+        "past_trauma": false,
+        "long_term_profession": false,
+        "repeated_ritual": false,
+        "reveal_mode": "recontextualization",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "fix",
+      "review_issues": [
+        "谜面为第一人称叙事，需改为第三人称客观事实",
+        "第1条提示32字，超过30字上限"
+      ],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 64,
+      "answer_chars": 44,
+      "elapsed_s": 18.1,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 15,
+      "group": "3key",
+      "keywords": [
+        "相册",
+        "理发师",
+        "搬家"
+      ],
+      "slots": [
+        "object",
+        "person",
+        "state"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260935,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "剪发认亲",
+      "puzzle": "我请理发师上门给卧床多年的母亲剪头发，剪完他收好碎发就走了。第二天，我看见他把那撮头发夹进一本旧相册里带走了。他为什么要带走我母亲的头发？",
+      "answer": "那位\"理发师\"其实是我母亲失散多年的儿子，也就是我的哥哥。当年父母离婚，他随父亲搬走，从此失去联系；他只知道母亲年轻时有个习惯：把每次剪下的头发夹进相册保存。他辗转打听到母亲病重，就假扮成上门理发师来到家中，剪下头发只是为了确认——相册里那些旧发丝和母亲现在新生白发连发根的颜色、卷度完全一致，他由此确认这确实是他亲生的母亲。带走这撮头发，是把它夹回那本属于自己的旧相册里，作为认亲的凭据。",
+      "stage2_attempts": 4,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "\"理发师\"其实是老人失散多年的儿子（家中子女的哥哥），他借剪发取到老人新生白发的发根，与相册里旧发丝比对确认亲生关系，并把头发夹回属于自己的旧相册认亲。",
+      "observed_signature": {
+        "mechanism_family": "identity_misread",
+        "solution_shape": "identity_reversal",
+        "domain": "family",
+        "emotion_mode": "warm",
+        "relation": "family",
+        "time_shape": "years_long",
+        "death": false,
+        "past_trauma": true,
+        "long_term_profession": false,
+        "repeated_ritual": true,
+        "reveal_mode": "identity_flip",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "fix",
+      "review_issues": [
+        "谜面原为第一人称叙事，需改为第三人称客观事实"
+      ],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 82,
+      "answer_chars": 76,
+      "elapsed_s": 60.9,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    }
+  ],
+  "groups": [
+    {
+      "index": 11,
+      "group": "3key",
+      "n_keys": 3,
+      "keywords": [
+        "电梯",
+        "迟到",
+        "钟表"
+      ],
+      "slots": [
+        "place",
+        "state",
+        "object"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260931
+    },
+    {
+      "index": 12,
+      "group": "3key",
+      "n_keys": 3,
+      "keywords": [
+        "打电话",
+        "毛巾",
+        "同学"
+      ],
+      "slots": [
+        "action",
+        "object",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260932
+    },
+    {
+      "index": 13,
+      "group": "3key",
+      "n_keys": 3,
+      "keywords": [
+        "同学",
+        "睡觉",
+        "图书馆"
+      ],
+      "slots": [
+        "person",
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260933
+    },
+    {
+      "index": 14,
+      "group": "3key",
+      "n_keys": 3,
+      "keywords": [
+        "服务员",
+        "图书馆",
+        "发烧"
+      ],
+      "slots": [
+        "person",
+        "place",
+        "state"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260934
+    },
+    {
+      "index": 15,
+      "group": "3key",
+      "n_keys": 3,
+      "keywords": [
+        "相册",
+        "理发师",
+        "搬家"
+      ],
+      "slots": [
+        "object",
+        "person",
+        "state"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260935
+    }
+  ],
+  "note": "G1-B: 同一 seed、同一 stage1/stage2/Reviewer/truth audit, 只把 `--key-count` 换成 3。抽到的 5 组是第 11~15 组 —— 抽取序列与 G1-A **逐字相同**, 所以两批可比。**没有**为 3-key 增加任何 prompt 规则。"
+}

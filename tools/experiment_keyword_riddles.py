@@ -149,11 +149,11 @@ def _dedupe(bank: dict) -> dict:
     return out
 
 
-def draw_keyword_groups(seed: int) -> list:
+def draw_keyword_groups(seed: int, key_count: int = 0) -> list:
     """按 seed 抽 20 组(§二: 10 组 x 2 + 10 组 x 3)。
 
-    返回 `[{index, pair, keywords, slots, seed, seed_used}, ...]` ——
-    `keyswords` 原样保留, 报告直接写它。
+    返回 `[{index, group, keywords, slots, seed, seed_used}, ...]` ——
+    `keywords` 原样保留, 报告直接写它。
 
     ## 抽取方式
 
@@ -163,7 +163,19 @@ def draw_keyword_groups(seed: int) -> list:
     挑词, 不像自然的关键词提示)。
 
     `seed_used` 逐组记录(基 seed + 组号), 便于复现任何**单组**。
+
+    ## `key_count`(G1-B)
+
+    `0` = 两组都返回(默认, 与 G1-A 行为逐位一致)。
+    `2` / `3` = **只**返回那一组。
+
+    ⚠️ 这是**过滤**, 不是重新抽词。20 组的抽取序列**完全不变** ——
+    所以 3-key 的第 11~15 组与 G1-A 里"如果跑下去会拿到的"那几组
+    一模一样。重新设计抽取方式会让两批数据无法对比, 那正是本实验
+    最不该引入的变量。
     """
+    if key_count not in (0, 2, 3):
+        raise ValueError("key_count 只能是 0 / 2 / 3, 收到 %r" % (key_count,))
     bank = _dedupe(KEYWORD_BANK)
     groups: list = []
     idx = 0
@@ -183,6 +195,8 @@ def draw_keyword_groups(seed: int) -> list:
                 "seed": seed,
                 "seed_used": seed_used,
             })
+    if key_count:
+        groups = [g for g in groups if g["n_keys"] == key_count]
     return groups
 
 
@@ -597,6 +611,35 @@ SKIP_NOTE = ("本轮按用户指示**提前收手**: 用户要求 5 道即可(�
              "下面 5 道是 seed 20260920 抽到的**前 5 组**(全部 2-key)。 "
              "第 6~20 组的词已抽出但**未跑**, 不在此报告中冒充结果。")
 
+#: G1-B: 同一脚本的 3-key 批(与 G1-A 的 2-key 批对照)。
+G1B_NOTE = ("G1-B: 同一 seed、同一 stage1/stage2/Reviewer/truth audit, "
+            "只把 `--key-count` 换成 3。抽到的 5 组是第 11~15 组 —— "
+            "抽取序列与 G1-A **逐字相同**, 所以两批可比。"
+            "**没有**为 3-key 增加任何 prompt 规则。")
+
+#: G1-B 的决策结论(§决策规则)。
+DECISION_NOTE = [
+    "### 决策",
+    "",
+    "> **默认采用 2-key。**",
+    "",
+    "依据(对照表见 `data/audit/G1B_2key_vs_3key.md`):",
+    "",
+    "* 两者 **valid 持平(3/5)**、stage1 成题率持平(5/5)、"
+    "truth audit 持平(3/3) —— 3-key **没有**输在通过率上。",
+    "* 但 3-key 的**谜面中位长度 64 字 vs 2-key 33 字(近两倍)**, "
+    "而这是直播场景 —— 谜面越长, 观众听完抓住反常点的成本越高。",
+    "* 5 道 3-key 里 **2 道出现\\\"为一个词硬造一层身份\\\"**"
+    "(`[14]` 为塞\\\"服务员\\\"把图书馆改成咖啡馆; `[15]` 为塞\\\"相册\\\""
+    "加上\\\"失散多年的儿子认亲\\\")。2-key 批**没有**这个现象。",
+    "* 第 3 个词带来的是**背景复杂度**, 不是**故事自然度** —— "
+    "而任务书的三条判据里, 只有\\\"更自然/更有变化\\\"这一条支持 3-key, "
+    "它**没有**在样本上成立。",
+    "",
+    "即:\\\"valid 不差\\\"成立, 但\\\"更自然\\\"**不成立**、"
+    "\\\"没有硬塞\\\"**不成立**。按决策规则取保守分支。",
+]
+
 
 def _median(xs: list) -> float:
     xs = sorted(x for x in xs if x is not None)
@@ -833,6 +876,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="阶段 1 temperature(默认沿用网关/配置)")
     ap.add_argument("--limit", type=int, default=0,
                     help="只跑前 N 组(调试用; 正式跑留 0 = 全 20)")
+    ap.add_argument("--key-count", type=int, default=0, choices=(0, 2, 3),
+                    help=("只跑几 key 的组: 0=两组都跑(默认, G1-A 行为), "
+                          "2 / 3 = 只跑那一组。**过滤**而非重抽 —— 抽取序列"
+                          "不变, 所以与 G1-A 的对应组逐字相同。"))
     ap.add_argument("--concurrency", type=int, default=3,
                     help=("并发组数(默认 3)。组与组完全独立, 唯一共享物是"
                           "无状态 HTTP 连接; writer 是**每组一个**, 因为"
@@ -858,7 +905,7 @@ def main(argv=None) -> int:
     if a.log_file:
         logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 
-    groups = draw_keyword_groups(a.seed)
+    groups = draw_keyword_groups(a.seed, a.key_count)
 
     # ---- 从已跑好的数据重新出报告(不调 LLM) ----
     #
