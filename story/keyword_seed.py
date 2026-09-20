@@ -545,6 +545,12 @@ def keyword_spec(writer, bag, session_seed: int, *,
         "interrupted"  直播变忙, 让路 —— **不计失败不退避**(G1 语义)
         "gen_fail"     Stage A 没成题 / Stage B 空谜面 —— 真的失败
 
+    ⚠️ G4-R2 §六: `gen_fail` 只是"没成"这个**结果**, 而"**为什么**没成"
+    写在 spec 的 `metrics["reject"]` 里(`structure_technical_fail` /
+    `review_rewrite` / `truth_reject` / `validation_reject`)。两者正交:
+    结果决定状态机怎么走, 原因决定复盘时该改什么。调用方**按原样**把
+    这个标签带进 `extra`, 不要在这里翻译成别的词。
+
     ⚠️ 这里**不**做试玩、**不**入池、**不**上屏 —— 那些是调用方的
     契约(live 直接 submit, prefetch 走 pool.add)。骨架只负责"产出一
     个合格的 spec"。
@@ -585,5 +591,10 @@ def keyword_spec(writer, bag, session_seed: int, *,
     if bool((getattr(spec, "metrics", None) or {}).get("interrupted")):
         return None, "interrupted"
     if spec is None or not getattr(spec, "puzzle", ""):
+        # ---- G4-R2 §六: 把 Stage B 写下的原因标签**原样**带出去 ----
+        # 拿不到就是 Stage A 那一边没成(没走到结构调用), 记 "gen_fail"
+        # 之外的默认标签 "structure_technical_fail" 是不对的 —— 那是
+        # "结构调用失败", 而这里可能是"Stage A 没成题"。所以只在拿到
+        # 标签时才覆盖, 否则留空由调用方按 "gen_fail" 记账。
         return None, "gen_fail"
     return spec, ""

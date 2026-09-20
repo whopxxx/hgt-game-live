@@ -218,6 +218,24 @@ class PoolPrefetcher:
                                None) or ())
         self._backoff_schedule = tuple(
             float(x) for x in _sched if float(x) > 0) or (self._backoff_s,)
+        # ---- G4-R2 §五: 空池时的**紧急**退避序列 ----
+        #
+        # 实播形状: 池子已经 stock=0 / playable=0(最需要补池的一刻),
+        # 而连续几次坏稿把退避推到 30 → 60 → 120 → **240**, 于是后台
+        # 四分钟不再尝试。那不是"少烧网关", 那是**在最需要库存的时候
+        # 把自己冻住**。
+        #
+        # 所以空池时换成一条又短又封顶的序列(默认 15/30/60, 上限 60),
+        # 池子一有可播库存就立刻回到上面那条保守序列。
+        #
+        # ⚠️ 这不是"疯狂刷 LLM": 调度只换档位, **所有**启动闸门照旧
+        # (低压力 / pending / inflight / hint / reveal guard / 协作取消),
+        # 一道都没少。它改变的只是"连续失败之后该等多久"。
+        _empty_sched = tuple(
+            getattr(cfg, "pool_prefetch_empty_backoff_schedule_s", None) or ())
+        self._empty_backoff_schedule = tuple(
+            float(x) for x in _empty_sched if float(x) > 0) or (15.0, 30.0,
+                                                                60.0)
 
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
         # blueprint 序列随"补池开不开"而变 —— 那既难排查, 也让
@@ -296,6 +314,29 @@ class PoolPrefetcher:
         #: 只反映直播活跃度了。
         self.interrupted_count = 0
         self.skip_count = 0
+        # ---- G4-R2 §六: 把"未成题"拆成可分辨的几类 ----
+        #
+        # 实播复盘时只有一个统一的 `keyword2 未成题` 计数, 于是"这轮为什么
+        # 通过率低"只能人工逐行数日志。这五项正是**决策树上的五个出口**:
+        #
+        #     structure_technical_fail  结构调用的**技术**失败(空 tool_input
+        #                               等, 已重试一次仍失败) —— 网关问题
+        #     review_rewrite            Reviewer 读懂后要求重出 —— 内容问题
+        #     truth_reject              truth audit 判叙事/机制不成立 —— 内容问题
+        #     validation_reject         validate_spec 硬门不过 —— 结构问题
+        #     success                   真正入池
+        #
+        # 前两项与后两项的**处置完全不同**(前者值得重试/换网关, 后者
+        # 值得改 prompt/改创作), 所以必须分开。全部由 worker 线程的
+        # `extra["reject"]` 单写, 与既有的 fail_streak 状态机正交 ——
+        # 它们**不**参与退避决策, 只是账本。
+        self.reject_count: dict = {
+            "structure_technical_fail": 0,
+            "review_rewrite": 0,
+            "truth_reject": 0,
+            "validation_reject": 0,
+            "success": 0,
+        }
 
     # ------------------------------------------------------------------
     def _enabled(self) -> bool:
@@ -370,10 +411,10 @@ class PoolPrefetcher:
                     if cur is not None and cur != self._scene_at_submit:
                         self._scene_at_submit = cur
                         self._fail_streak = 1
-                        self._retry_at = now + self._backoff_for_streak(1)
+                        _w = self._backoff_for_streak_now(1)
+                        self._retry_at = now + _w
                         log.info("补池: 直播已进入新一题(场景指纹 %s), "
-                                 "长退避重置为第一档 %.0fs",
-                                 cur, self._backoff_for_streak(1))
+                                 "长退避重置为第一档 %.0fs", cur, _w)
                 if now < self._retry_at:
                     return
 
@@ -498,7 +539,12 @@ class PoolPrefetcher:
             log.exception("补池提交失败")
             with self._lock:
                 self._future = None
-                self._retry_at = now + self._backoff_s
+                # G4-R2 §五: 提交失败也算一次连续失败, 所以同样按"池空与否"
+                # 选序列 —— 否则空池时的这条兜底会退回 240/300 秒, 而它
+                # 恰恰是"池子空 + 提交路径出问题"这个最该快速重试的组合。
+                self._fail_streak += 1
+                self._retry_at = now + self._backoff_for_streak_now(
+                    self._fail_streak)
             return
         with self._lock:
             # 只有还是自己占的那个标记才认(理论上期间不会被改, 但留个护栏)
@@ -544,6 +590,24 @@ class PoolPrefetcher:
             # 完全不同的第四类。它有自己的计数, 且**绝不**进失败链。
             self.interrupted_count += 1
 
+        # ---- ②b G4-R2 §六: 分类账 ----
+        # worker 在 `extra["reject"]` 里写一个**短标签**, 说明这道候选
+        # 到底死在哪一步。与上面按 `kind` 分的账**正交**: `kind` 说的是
+        # "这一轮的结果是什么"(ok/gen_fail/…), 这里说的是"**为什么**"。
+        # 一个 `gen_fail` 可能是 structure_technical_fail 也可能是
+        # truth_reject —— 不分开就永远只能靠人读日志。
+        #
+        # ⚠️ 认不出的标签一律忽略(不记), 而不是归到 other —— 指标里
+        # 多一个恒为 0 的桶比"悄悄把未知原因算进某个已知桶"安全。新增
+        # 出口时**必须**同时在这里加一个 key(否则它静默不计数)。
+        _rej = str((extra or {}).get("reject") or "")
+        if _rej in self.reject_count:
+            self.reject_count[_rej] += 1
+        elif _rej:
+            log.warning("补池: 未知的 reject 标签 %r(未计入分类账)", _rej)
+        if kind == "ok":
+            self.reject_count["success"] += 1
+
         # ---- ③ 退避 ----
         # 成功入池清退避并且**重置连续失败序列**; 让路既不清也不加;
         # 其余一律按连续失败次数取递增档位。
@@ -564,7 +628,7 @@ class PoolPrefetcher:
             log.info("补池让路(直播变忙), 不计失败不退避: %s", detail)
             return
         self._fail_streak += 1
-        wait = self._backoff_for_streak(self._fail_streak)
+        wait = self._backoff_for_streak_now(self._fail_streak)
         self._retry_at = now + wait
         self._last_fail = detail or kind
         if wait > self._backoff_s:
@@ -608,11 +672,63 @@ class PoolPrefetcher:
         已经和停掉它没区别了, 但保留 300 秒能保证它**最终**会再试。
 
         `streak` 从 1 开始(第一次失败取第一档)。
+
+        ⚠️ **G4-R2 §五**: 这只是**序列取值**, 不知道池子空不空。该用哪条
+        序列由 `_backoff_schedule_now()` 决定 —— 保持这个函数是纯的, 才能
+        让"档位序列"与"当前该用哪条序列"分开测。
         """
         idx = max(0, int(streak) - 1)
         if idx >= len(self._backoff_schedule):
             return float(self._backoff_schedule[-1])
         return float(self._backoff_schedule[idx])
+
+    def _is_empty(self) -> bool:
+        """池子是不是**真的**没得播了(G4-R2 §五)。
+
+        判据是 `stock == 0 or playable == 0`, 与 `_on_tick_locked_ish` 的
+        补池触发条件**同一套**(那边是"少了就补", 这边是"没了就急")。
+
+        fail **closed** 的方向在这里是反的: 读不到就返回 False(当作
+        "不空"), 于是退避退回**保守**长序列。理由: 误判成"空"会让后台
+        在没有确认缺货时改用激进档; 误判成"不空"最多是慢一点补上 ——
+        而池子真的空了的时候, `stock`/`playable` 是读得到的(它们不依赖
+        探针, 只读 pool)。
+        """
+        try:
+            if self._stock() == 0:
+                return True
+            return self._playable(self._generation_inputs()) == 0
+        except Exception:                       # noqa: BLE001
+            log.exception("读空池状态异常, 按不空(保守退避)处理")
+            return False
+
+    def _schedule_now(self) -> tuple:
+        """当前该用哪条退避序列(G4-R2 §五)。
+
+            池子还有可播库存  -> 保守序列(30/60/120/240/300...)
+            stock=0 或 playable=0 -> 紧急序列(15/30/60, 封顶 60)
+
+        ⚠️ 只换**序列**, 不碰任何启动闸门: 低压力 / pending / inflight /
+        hint / reveal guard / 协作取消全部照旧。所以"池空"不会让补池
+        变得可以在直播最忙时抢网关 —— 它只保证**网关空闲且确实没题**时,
+        后台不会因为连续坏稿把自己冻结四五分钟。
+        """
+        if self._is_empty():
+            return self._empty_backoff_schedule
+        return self._backoff_schedule
+
+    def _backoff_for_streak_now(self, streak: int) -> float:
+        """`streak` 次连续失败, **按当前池子状态**该等多久(G4-R2 §五)。
+
+        与 `_backoff_for_streak` 的分工: 那个是"从这条序列里取第几档",
+        这个是"该用哪条序列"。分成两个函数是因为它们回答的是两个不同的
+        问题, 而且"序列对不对"与"选对了序列没有"必须能分别测。
+        """
+        sched = self._schedule_now()
+        idx = max(0, int(streak) - 1)
+        if idx >= len(sched):
+            return float(sched[-1])
+        return float(sched[idx])
 
     # ------------------------------------------------------------------
     def _ledger_ok(self) -> bool:
@@ -1105,9 +1221,27 @@ class PoolPrefetcher:
             if reason == "interrupted":
                 return ("interrupted", "直播变忙, keyword2 让路",
                         {"interrupted": True})
-            return ("gen_fail", "keyword2 未成题", {})
+            # ---- G4-R2 §六: 把"为什么没成"带进分类账 ----
+            # `keyword_spec` 只回一个粗粒度的 `gen_fail` —— 那正是实播
+            # 复盘时"只有 keyword2 未成题"的来源。细因写在**失败那一次
+            # 的 spec.metrics 里**, 所以从 writer 的侧信道取。
+            return ("gen_fail", "keyword2 未成题", self._reject_extra())
         # ---- 之后与 classic 路径完全一致(试玩 / add) ----
         return self._finish_one(spec, {}, should_continue)
+
+    def _reject_extra(self) -> dict:
+        """G4-R2 §六: 取上一次 keyword2 失败的**原因标签**。
+
+        Stage B 把标签写进自己返回的那个 spec 的 `metrics["reject"]`,
+        而那个 spec 在 `keyword_spec` 里被丢掉(它没有 puzzle)。所以
+        这里从 writer 的侧信道(`_last_reject`)读 —— 与
+        `_last_review_decision` / `_last_review_call_count` 是同一套约定:
+        **实例属性是唯一能穿过"失败即丢弃"这条缝的东西**。
+
+        读不到就返回空 dict —— 没有标签好过编一个错的标签。
+        """
+        tag = str(getattr(self.writer, "_last_reject", "") or "")
+        return {"reject": tag} if tag else {}
 
     def _generate_classic_one(self, inputs: dict,
                               should_continue=None) -> tuple:
@@ -1311,6 +1445,11 @@ class PoolPrefetcher:
                 "reveal_target": self._reveal_target,
                 "reveal_playable_target": self._reveal_playable_target,
                 "reveal_guard_s": self._reveal_guard_s,
+                # G4-R2 §五: 当前用的是哪条退避序列 —— 复盘时"为什么只等
+                # 了 15 秒"与"为什么等了 240 秒"必须一眼看得出, 否则
+                # 空池紧急档会被误读成"退避坏了"。
+                "empty_pool": self._is_empty(),
+                "backoff_schedule": list(self._schedule_now()),
                 # G1: **实际生效**的 guard(>= 一轮预算 + 余量)。报这个
                 # 而不是配置里那个原始值 —— 否则复盘时会看到"guard=15
                 # 却仍然在剩余 20 秒时启动"这种自相矛盾的指纹, 而那
@@ -1327,6 +1466,11 @@ class PoolPrefetcher:
                 # G1: 与 generation_fail **分开** —— 让路是优先级, 不是故障。
                 "interrupted": self.interrupted_count,
                 "skip": self.skip_count,
+                # G4-R2 §六: 决策树上的五个出口, 直接可读。实播复盘
+                # (原来是"只有 keyword2 未成题")现在能一眼看到
+                # "技术失败 3 / 审稿重出 2 / 审计不过 1 / 结构不过 0 /
+                #  成功 1"。**这是 §六 的全部目的**。
+                "reject": dict(self.reject_count),
 
                 "playtest": {
                     "pass": self.playtest_pass_count,

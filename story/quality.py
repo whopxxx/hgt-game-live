@@ -201,6 +201,8 @@ _FIX_REASON_PATTERNS = (
     ("fact_enum", "的 kind 非法"),
     ("fact_enum", "的 visibility 非法"),
     ("core_length", "core_answer 有"),
+    # G4-R2 §三: core 标签超限 -> 只重标分类。
+    ("core_count", "core hidden facts 有"),
     ("linkage", "没有被任何 solve_atom 引用"),
     ("linkage", "指向通关事实的推理路径"),
     ("clue_quote", "fair_clue 缺 quote"),
@@ -217,6 +219,18 @@ _FIX_REASON_PATTERNS = (
 #: 而它们迟早会漂移 —— 那正是 L1 里 `_candidate_block_reason_locked`
 #: 的同一个教训。
 _PUZZLE_TOUCH_MARK = "[需改谜面]"
+
+#: G4-R2 §三: 标在"**只许重标 fact 分类**"的修复文案里的记号。
+#:
+#: `story/llm.py` 的 `_core_fix_scope_violation` 靠它认出"这一次修复是
+#: core 数量问题", 从而只对**那一种**修复执行"不许改内容"的硬检查。
+#: 用文本标记而不是另开一个字段, 与 `_PUZZLE_TOUCH_MARK` 同一个理由:
+#: `fixable` 的消费方只有一处, 多一个平行字段就得两处各写一遍判据。
+#:
+#: ⚠️ **文案里必须出现这个记号**: 改了文案忘了带记号, 检查会静默失效
+#: (变成"永远不触发"), 而不是响亮地失败。`test_g4_source` 里有一条
+#: 断言把文案与记号钉在一起。
+_CORE_COUNT_MARK = "[只改分类]"
 
 
 # ======================================================================
@@ -527,9 +541,36 @@ def validate_spec(spec: PuzzleSpec,
             r.fail("有通关合同但没有 solve_atom(观众没有推理抓手)")
 
     # ---- core hidden facts 上限 ----
+    #
+    # ---- G4-R2 §三: 超限 -> **可修**(不再整道扔掉) ----
+    #
+    # 实播证明这条 hard fail 的代价远大于它的收益: Stage B 只是**多贴了
+    # 一个 core 标签**(4 条而不是 3 条), 故事 / 谜面 / 谜底 / 推理全都没
+    # 问题 —— 却整道丢弃, 再花 A+B+审稿+audit 四到六次昂贵调用重来一轮。
+    #
+    # 它不是安全门, 也不是逻辑门: `core` / `support` 是**分类标签**, 而
+    # 通关只由 `completion_fact_ids` 决定(见 puzzle.py 的说明)。多标一条
+    # core 不会让题变得不可玩, 只会让"≤3 条核心"这条内部不变量失真。
+    #
+    # 所以交给 reviewer **只改分类**: 把不属于最小核心的额外 core 重标成
+    # support。这不是"放水" —— 修完仍然要过一遍 `validate_spec`(下面那条
+    # `if n_core > max_core_hidden` 会在**改后**的稿子上再判一次), 修完
+    # 还是 >3 就照样拒。
+    #
+    # ⚠️ 反馈措辞必须把 reviewer 的手**绑死**: 它唯一的合法动作是改 kind。
+    # 不写清楚的话, 它会顺手改谜面 / 改谜底 / 删事实来"把数字凑对" ——
+    # 那是改题, 不是改分类。
     n_core = len(spec.core_hidden_facts())
     if n_core > max_core_hidden:
-        r.fail(f"core hidden facts 有 {n_core} 条, 超过 {max_core_hidden}")
+        r.can_fix(
+            f"{_CORE_COUNT_MARK} core hidden facts 有 {n_core} 条, "
+            f"超过 {max_core_hidden}: "
+            f"**只把不属于最小核心的那几条的 kind 从 core 改成 support**。\n"
+            f"  必须保持: fact.id 不变 / fact.text 不变 / "
+            f"completion_fact_ids 指向的那 1~2 条 fact **仍然是 core**。\n"
+            f"  不得: 改谜面 / 改谜底 / 删除任何 fact / 创造新 fact / "
+            f"改动核心机制。\n"
+            f"  改完后 core+hidden 的事实必须 <= {max_core_hidden} 条。")
 
     # ---- fair_clues: 必须真的在谜面里 ----
     #

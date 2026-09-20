@@ -1044,6 +1044,571 @@ def test_banner_prints_source_mode():
               [l for l in lines if l.startswith("  curated     :")])
 
 
+# ======================================================================
+# 八、G4-R2 —— 不再因为技术失败 / 分类标签 / 展示长度丢掉合格候选
+# ======================================================================
+#: 这些用例要造真 spec、真 reviewer 载荷, 所以直接借用 `test_llm` /
+#: `test_puzzle` 的夹具 —— 再造一份只会得到第三个会漂的替身。
+from story.puzzle import PuzzleFact, SolveAtom  # noqa: E402
+from story.llm import LLMResult  # noqa: E402
+from tests.test_llm import (FakeClient, riddle, review_ok,  # noqa: E402
+                            review_rewrite, qc_ok, _truth_tool, clues_for)
+
+
+def _struct_calls(cli) -> int:
+    """这次 fake client 上 `emit_structure` 被调了几次。
+
+    ⚠️ **不能**数 `len(cli.calls)`: 同一条链上 review / truth audit 也走
+    同一个 client, 于是"结构调用 2 次"会被数成 4 次(第一版就是这么挂的)。
+    断言必须落在**真正被测的那个工具**上。
+    """
+    return len([c for c in cli.calls
+                if (c.get("tool") or {}).get("name") == "emit_structure"])
+
+
+def test_stage_b_empty_tool_input_retries_once():
+    """**§8-1**: 第一次 empty tool_input -> 同一 idea 技术重试一次 -> 成功。
+
+    ⚠️ 关键在于"**同一 idea**": 两次结构调用的 puzzle/answer 必须逐字
+    相同。若实现退化成"重新抽词再走一遍 Stage A", 那两条断言就会红 ——
+    那才是"这是重试, 不是恢复多稿生成"的可测判据。
+    """
+    print("\n[G4-R2-1] Stage B 空 tool_input -> 技术重试一次 -> 成")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import FakeClient, riddle, _truth_tool
+    # 第 1 次结构调用: tool_use 但 payload 为空; 第 2 次: 正常结果。
+    #
+    # ⚠️ Stage A 的三样必须来自**同一道合格题**(`_GOOD_PUZ`)。用一个
+    # 随手编的"谜面?"会让 `validate_spec` 把这次**成功**判成结构不过,
+    # 于是用例红在一个与被测机制无关的地方(第一版就是这么挂的)。
+    _base = riddle()
+    cli = FakeClient([LLMResult(tool_input={}, error=""),
+                      LLMResult(tool_input=_base),
+                      LLMResult(tool_input=review_ok(_base["puzzle"]))])
+    w = PuzzleWriter(cli)
+    s = w.structure_original_idea(title=_base["title"],
+                                 puzzle=_base["puzzle"], answer=_base["answer"],
+                                 should_continue=lambda: True,
+                                 max_attempts=1)
+    check("**成功了**(不是空稿)", bool(s.puzzle),
+          (s.error or "")[:80] or s.metrics.get("reject", ""))
+    check("**结构调用恰好 2 次**", _struct_calls(cli) == 2,
+          _struct_calls(cli))
+    check("**记了 structure_calls == 2**",
+          s.metrics.get("structure_calls") == 2, s.metrics.get("structure_calls"))
+    check("**记了 structure_technical_retries == 1**",
+          s.metrics.get("structure_technical_retries") == 1,
+          s.metrics.get("structure_technical_retries"))
+    check("**没有 reject 标签**", not s.metrics.get("reject"),
+          s.metrics.get("reject"))
+    check("**puzzle 仍是 Stage A 的(冻结)**",
+          s.puzzle == _base["puzzle"], s.puzzle[:30])
+    check("**answer 仍是 Stage A 的(冻结)**",
+          s.answer == _base["answer"], s.answer[:30])
+
+
+def test_stage_b_double_empty_gives_up():
+    """**§8-2**: 第二次仍 empty -> 失败, **不**第三次调用。"""
+    print("\n[G4-R2-2] Stage B 两次空 -> 放弃, 不第三次")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import FakeClient
+    cli = FakeClient([LLMResult(tool_input={}, error="e1"),
+                      LLMResult(tool_input={}, error="e2")])
+    w = PuzzleWriter(cli)
+    s = w.structure_original_idea(title="T", puzzle="谜面?", answer="谜底",
+                                 should_continue=lambda: True,
+                                 max_attempts=1)
+    check("**没有成题**", not s.puzzle, s.puzzle)
+    check("**恰好 2 次结构调用(没有第 3 次)**",
+          _struct_calls(cli) == 2, _struct_calls(cli))
+    check("**标为 structure_technical_fail**",
+          s.metrics.get("reject") == "structure_technical_fail",
+          s.metrics.get("reject"))
+    check("**侧信道也写了**(供 prefetch 记账)",
+          w._last_reject == "structure_technical_fail", w._last_reject)
+
+
+def test_stage_b_clean_first_try_calls_once():
+    """**§8-3**: 第一次就拿到合法 tool_input -> **只调用一次**。
+
+    反证: 若实现无条件重试(或把 +1 写成了"总是发两次"), 这条会红 ——
+    而 §8-1 仍然会绿。两条合起来才钉住"**只在技术形状下**重试"。
+    """
+    print("\n[G4-R2-3] Stage B 一次成功 -> 只调一次")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import FakeClient, riddle
+    _base = riddle()
+    cli = FakeClient([LLMResult(tool_input=_base),
+                      LLMResult(tool_input=review_ok(_base["puzzle"]))])
+    w = PuzzleWriter(cli)
+    s = w.structure_original_idea(title=_base["title"],
+                                 puzzle=_base["puzzle"], answer=_base["answer"],
+                                 should_continue=lambda: True,
+                                 max_attempts=1)
+    check("**成题**", bool(s.puzzle),
+          (s.error or "")[:80] or s.metrics.get("reject", ""))
+    check("**结构调用恰好 1 次**", _struct_calls(cli) == 1,
+          _struct_calls(cli))
+    check("structure_calls == 1", s.metrics.get("structure_calls") == 1,
+          s.metrics.get("structure_calls"))
+    check("**没有技术重试**",
+          s.metrics.get("structure_technical_retries") in (0, None),
+          s.metrics.get("structure_technical_retries"))
+
+
+def _b_semantic_fail_case(kind: str):
+    """三种**语义**失败之一, 断言它们**都不触发**结构重试(§8-4/5/6)。
+
+    `kind` 取 "validation" / "rewrite" / "truth"。
+
+    共同判据: `client.calls` 里**结构工具的调用只有 1 次**。语义失败发生
+    在结构循环之外, 所以这条断言实际上验的是"控制流结构"而不是运气 ——
+    但正因为它是结构性的, 一次回归就能永久钉住它。
+    """
+    print(f"\n[G4-R2] 语义失败({kind})不触发结构重试")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import (FakeClient, riddle, review_rewrite,
+                                qc_ok, _truth_tool)
+    calls = []
+    if kind == "validation":
+        # 结构结果**本身**违反硬门: 一条 atom 引用了不存在的 fact。
+        #
+        # ⚠️ 必须挑一条**真的 `fail()`**(不是 fixable)的毛病:
+        #   - fixable 会走审稿修复那条路, 测的就不是"语义拒绝"了;
+        #   - 也不能用"少一条 exclusion" —— 现在的 `validate_spec`
+        #     **不**要求它, 那样 payload 反而是合格的, 于是这条会一路
+        #     跑到审稿去(第一版就是这么挂的)。
+        bad = riddle()
+        bad["solve_atoms"] = [dict(a) for a in bad["solve_atoms"]]
+        bad["solve_atoms"][0]["fact_ids"] = ["f99"]
+        cli = FakeClient([LLMResult(tool_input=bad)])
+    elif kind == "rewrite":
+        _b = riddle()
+        cli = FakeClient([LLMResult(tool_input=_b),
+                          LLMResult(tool_input=review_rewrite("核心机关不成立"))])
+    else:                                    # truth
+        _b = riddle()
+        cli = FakeClient([LLMResult(tool_input=_b),
+                          LLMResult(tool_input=review_ok(_b["puzzle"])),
+                          _truth_tool(truthful=False, consistent=True,
+                                      conflicts=["谜面撒谎"])])
+    w = PuzzleWriter(cli)
+    _p = (locals().get("_b") or {}).get("puzzle") or "x?"
+    s = w.structure_original_idea(title="T", puzzle=_p, answer="谜底",
+                                 should_continue=lambda: True,
+                                 max_attempts=1)
+    check("**没有成题**", not s.puzzle, s.puzzle)
+    check("**结构调用只有 1 次(没有重试)**", _struct_calls(cli) == 1,
+          _struct_calls(cli))
+    check("structure_technical_retries 为 0(或没写)",
+          s.metrics.get("structure_technical_retries") in (0, None),
+          s.metrics.get("structure_technical_retries"))
+    return s
+
+
+def test_semantic_failures_never_retry_structure():
+    """**§8-4 / §8-5 / §8-6**: 语义失败一律**不**重试 Stage B。"""
+    s1 = _b_semantic_fail_case("validation")
+    check("validation -> 标签是 validation_reject",
+          s1.metrics.get("reject") == "validation_reject",
+          s1.metrics.get("reject"))
+    s2 = _b_semantic_fail_case("rewrite")
+    check("rewrite -> 标签是 review_rewrite",
+          s2.metrics.get("reject") == "review_rewrite",
+          s2.metrics.get("reject"))
+    s3 = _b_semantic_fail_case("truth")
+    check("truth -> 标签是 truth_reject",
+          s3.metrics.get("reject") == "truth_reject",
+          s3.metrics.get("reject"))
+    check("三个标签**互不相同**",
+          len({s1.metrics.get("reject"), s2.metrics.get("reject"),
+               s3.metrics.get("reject")}) == 3, "指标分不开")
+
+
+def test_stage_b_retry_checks_should_continue():
+    """**§8-7**: 每次技术重试**之前**必须再查一次 `should_continue`。
+
+    构造: 第 1 次结构调用返回空 payload; 谓词在第 1 次调用**之后**变 False。
+    正确行为 = **不**发第 2 次, 直接让路。
+
+    ⚠️ 断言在 `client.calls` 上而不是在 metrics 上: metrics 只说明
+    "没有重试", 而这条要证明的是"**因为让路**才没有重试"。
+    """
+    print("\n[G4-R2-7] 技术重试前再查谓词")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import FakeClient
+    cli = FakeClient([LLMResult(tool_input={}, error=""),
+                      LLMResult(tool_input={}, error="")])
+    state = {"n": 0}
+
+    def sc():
+        # 允许第 1 次调用(以及它之前的那次检查), 之后一律让路。
+        state["n"] += 1
+        return state["n"] <= 1
+
+    w = PuzzleWriter(cli)
+    s = w.structure_original_idea(title="T", puzzle="谜面?", answer="谜底",
+                                 should_continue=sc, max_attempts=1)
+    check("**让路(不是失败)**", s.metrics.get("interrupted") is True,
+          s.metrics)
+    check("**没有发第 2 次结构调用**", _struct_calls(cli) == 1,
+          _struct_calls(cli))
+    check("让路时**不写 reject 标签**", not s.metrics.get("reject"),
+          s.metrics.get("reject"))
+
+
+def test_stage_a_prompt_carries_answer_length():
+    """**§8-8**: Stage A prompt/schema 明确 answer <=260。"""
+    print("\n[G4-R2-8] Stage A 展示约束进了 prompt 与 schema")
+    from story.llm import (KEYWORD_IDEA_SYSTEM, _TOOL_KEYWORD_IDEA,
+                           KEYWORD_IDEA_PROMPT_VERSION)
+    check("**system prompt 写了 260**", "260" in KEYWORD_IDEA_SYSTEM,
+          "没找到")
+    check("**说了这是给直播念的**",
+          "念" in KEYWORD_IDEA_SYSTEM, "缺少理由说明")
+    _d = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]["answer"]["description"]
+    check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
+    check("**版本号 bump 了**", KEYWORD_IDEA_PROMPT_VERSION == "keyword2-v3",
+          KEYWORD_IDEA_PROMPT_VERSION)
+    # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
+    for banned, why in (("第一人称", "v1 人称硬限制"),
+                        ("职业", "v1 禁职业"),
+                        ("Blueprint", "v1 多层结构配额"),
+                        ("单机关", "v1 单机关限制")):
+        check(f"**没有恢复 {why}**", banned not in KEYWORD_IDEA_SYSTEM, banned)
+
+
+def test_answer_over_300_still_hard_rejected():
+    """**§8-9**: 最终 answer >300 仍然 HARD reject(300 是保险, 不放宽)。"""
+    print("\n[G4-R2-9] answer > 300 仍然硬拒")
+    from story.quality import validate_spec, ANSWER_HARD_MAX_LEN
+    from tests.test_puzzle import good_spec
+    check("硬上限仍是 300", ANSWER_HARD_MAX_LEN == 300, ANSWER_HARD_MAX_LEN)
+    s = good_spec()
+    s.answer = "字" * (ANSWER_HARD_MAX_LEN + 1)
+    r = validate_spec(s)
+    check("**被拒(ok False)**", not r.ok, r.errors)
+    check("**不是 fixable**", not r.fixable, r.fixable)
+    check("指向上限", any("谜底超过" in e for e in r.errors), r.errors)
+    # 反证: 恰好 300 必须过(否则 260 的建议会变成事实上的新硬门)。
+    s2 = good_spec()
+    s2.answer = "字" * ANSWER_HARD_MAX_LEN
+    r2 = validate_spec(s2)
+    check("**恰好 300 通过**", not any("谜底超过" in e for e in r2.errors),
+          r2.errors)
+
+
+def _core4_spec():
+    """一道**只有 core 标签太多**这一个毛病**的稿子。
+
+    ⚠️ 刻意让其它一切都干净: 谜面/谜底/atoms/clues 全部来自 `good_spec()`
+    或与它一致。这样"能不能救回"就只取决于 core 那一处的处置, 而不是
+    被别的硬门(缺 exclusion / clue 不在谜面 / atom 悬空)顺手拒掉 ——
+    夹具自相矛盾会让用例红在一个与被测机制无关的地方。
+    """
+    from tests.test_puzzle import good_spec as _gs
+    s = _gs()
+    # 4 条 core hidden(超过 3)。f1 是合同指向的那条, 必须保住。
+    s.facts = [
+        PuzzleFact(id="f1", text="退潮时礁石露出水面", kind="core",
+                   visibility="hidden"),
+        PuzzleFact(id="f2", text="灯是用来标礁石位置的", kind="core",
+                   visibility="hidden"),
+        PuzzleFact(id="f3", text="守塔人知道那片礁石", kind="core",
+                   visibility="hidden"),
+        PuzzleFact(id="f4", text="多余的一条核心", kind="core",
+                   visibility="hidden"),
+        PuzzleFact(id="f5", text="这不是灯坏了", kind="exclusion",
+                   visibility="hidden"),
+    ]
+    s.completion_fact_ids = ["f1", "f2"]
+    s.solve_atoms = [
+        SolveAtom(id="a1", role="key", text="礁石位置", fact_ids=["f1"]),
+        SolveAtom(id="a2", role="mechanism", text="标位置", fact_ids=["f2"]),
+    ]
+    from story.puzzle import FairClue
+    s.fair_clues = [FairClue(quote=c["quote"],
+                             supports_atoms=list(c["supports_atoms"]))
+                    for c in clues_for(s.puzzle)]
+    return s
+
+
+def _review_payload_retag(spec, retag: dict, **over):
+    """造一份"审稿人只改了 fact 分类"的 fix 答复。
+
+    `retag` 形如 `{"f4": "support"}` —— 只动 `kind`, 其余(fact.text /
+    puzzle / answer / atoms / clues)全部**原样**回传。这正是 §三 允许
+    reviewer 做的唯一动作。
+    """
+    from tests.test_llm import clues_for, qc_ok, sig_ok
+    d = spec.to_dict()
+    d["facts"] = [dict(f) for f in d["facts"]]
+    for f in d["facts"]:
+        if f["id"] in retag:
+            f["kind"] = retag[f["id"]]
+    d.update({"decision": "fix", "note": "只重标了分类",
+              "observed_signature": sig_ok(),
+              "quality_checks": qc_ok(),
+              "core_answer": spec.core_answer or "礁石标位",
+              "completion_fact_ids": list(spec.completion_fact_ids),
+              "fair_clues": clues_for(spec.puzzle)})
+    d.update(over)
+    return d
+
+
+def test_core_hidden_4_can_be_rescued_by_reviewer():
+    """**§8-10**: core hidden=4 可以经 reviewer **只改分类**救回。
+
+    完整链路: 4 条 core hidden -> `validate_spec` 判 fixable(**不再拒**)
+    -> 带着 must_fix 送审 -> reviewer 把多余 core 重标 support -> 改后稿
+    **再过一遍** `validate_spec`, core<=3 -> 通过。
+
+    ⚠️ 关键在于"改后**还要再校验一遍**": 若实现只是"不拒了", 那 reviewer
+    什么都不改也能过 —— 那是放水, 不是修复。所以这里同时钉住
+    "修好的稿子过门"与"没修的稿子仍然不过门"。
+    """
+    print("\n[G4-R2-10] core hidden=4 -> reviewer 只改分类 -> 救回")
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from tests.test_llm import FakeClient
+    s = _core4_spec()
+    # ---- ① 4 条 core hidden: 现在必须**可修**, 不是硬拒 ----
+    check("**有 4 条 core hidden**", len(s.core_hidden_facts()) == 4,
+          len(s.core_hidden_facts()))
+    vr = validate_spec(s)
+    check("**不再是硬拒**", vr.ok, vr.errors)
+    check("**判为 fixable**", any("core hidden" in f for f in vr.fixable),
+          vr.fixable)
+    check("送审前 core 仍然 > 3", len(s.core_hidden_facts()) > 3, "")
+    # ---- ② 送审: reviewer 只把 f4 改成 support ----
+    w = PuzzleWriter(FakeClient(
+        [LLMResult(tool_input=_review_payload_retag(s, {"f4": "support"}))]))
+    new, why, rewrite, technical = w._review_spec(
+        s, must_fix=vr.must_fix(), own_fix_focus=list(vr.fixable))
+    check("**审稿没有拒稿**", new is not None, why)
+    if new is not None:
+        check("**改后 core hidden <= 3**", len(new.core_hidden_facts()) <= 3,
+              len(new.core_hidden_facts()))
+        check("**f4 的文字没被改**",
+              [f.text for f in new.facts if f.id == "f4"] == ["多余的一条核心"],
+              [f.text for f in new.facts if f.id == "f4"])
+        check("**f4 只是 kind 变了**",
+              [f.kind for f in new.facts if f.id == "f4"] == ["support"],
+              [f.kind for f in new.facts if f.id == "f4"])
+        check("**合同指向的 f1 仍是 core**",
+              [f.kind for f in new.facts if f.id == "f1"] == ["core"],
+              [f.kind for f in new.facts if f.id == "f1"])
+        check("**谜面没被改**", new.puzzle == s.puzzle, new.puzzle[:30])
+        check("**谜底没被改**", new.answer == s.answer, new.answer[:30])
+        check("**fact 条数没变(没删没加)**", len(new.facts) == len(s.facts),
+              (len(new.facts), len(s.facts)))
+        vr2 = validate_spec(new)
+        check("**改后过硬校验(含 core<=3)**",
+              vr2.ok and not any("core hidden" in f for f in vr2.fixable),
+              vr2.errors + vr2.fixable)
+
+
+def test_core_fix_must_not_change_content():
+    """**§8-11**: reviewer 若借修复之名改 fact text / puzzle, 必须**拒**。
+
+    "只改分类"这条约束**必须由代码执行**, 不能只靠 prompt 写一句
+    "请不要改内容" —— 模型会顺手改写, 而改写后的稿子仍然满足
+    "core <= 3", 于是它会被当成一次成功的修复收下。这条就是那个后门的
+    守卫, 而且**与 §8-10 配对**: 一个证明合法修复能过, 一个证明越界
+    修复不能过。只写前者的话, "把 reviewer 的答复整个丢掉"也能绿。
+    """
+    print("\n[G4-R2-11] 借修复之名改内容 -> 拒")
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from tests.test_llm import FakeClient
+    s = _core4_spec()
+    vr = validate_spec(s)
+
+    # ---- 反例 A: 降级的同时**改掉 fact.text** ----
+    a = _review_payload_retag(s, {"f4": "support"})
+    for f in a["facts"]:
+        if f["id"] == "f4":
+            f["text"] = "被悄悄改写过的内容"
+    w = PuzzleWriter(FakeClient([LLMResult(tool_input=a)]))
+    new, why, _r, _t = w._review_spec(s, must_fix=vr.must_fix(),
+                                     own_fix_focus=list(vr.fixable))
+    # 合法的 `_apply_review` 会用**审稿人给的** facts 重建 spec —— 于是
+    # 被改掉的 text 会一路带进池子。所以判据是: **要么拒稿, 要么
+    # f4 的文字仍然是原文**。两者都不能是"收下了一份被改写的稿子"。
+    _txt = [f.text for f in (new.facts if new is not None else [])]
+    check("**不能收下被改写的事实文本**",
+          new is None or "被悄悄改写过的内容" not in _txt, (why, _txt))
+
+    # ---- 反例 B: 降级的同时**换掉谜面** ----
+    b = _review_payload_retag(
+        s, {"f4": "support"},
+        puzzle="换了一个完全不同的谜面, 用来凑数?",
+        fair_clues=[{"quote": "换了一个完全不同的谜面", "supports_atoms": ["a1"]}])
+    w2 = PuzzleWriter(FakeClient([LLMResult(tool_input=b)]))
+    new2, why2, _r2, _t2 = w2._review_spec(s, must_fix=vr.must_fix(),
+                                          own_fix_focus=list(vr.fixable))
+    check("**换掉谜面的'修复'不能被当成只改分类**",
+          new2 is None or new2.puzzle == s.puzzle,
+          (why2, (new2.puzzle[:30] if new2 is not None else None)))
+
+    # ---- 反例 C: **降级不够**(4 条 core 只把 1 条改成 support, 还剩 4)
+    #      改后的稿子必须**仍然**被 `validate_spec` 判为不合格。
+    c = _review_payload_retag(s, {})       # 什么都不改
+    w3 = PuzzleWriter(FakeClient([LLMResult(tool_input=c)]))
+    new3, _why3, _r3, _t3 = w3._review_spec(s, must_fix=vr.must_fix(),
+                                            own_fix_focus=list(vr.fixable))
+    if new3 is not None:
+        vr3 = validate_spec(new3)
+        check("**没修干净的稿子仍然不过门**",
+              (not vr3.ok) or any("core hidden" in f for f in vr3.fixable),
+              vr3.errors + vr3.fixable)
+
+
+def test_empty_pool_backoff_capped_at_60():
+    """**§8-12**: stock=0 连续失败时 backoff **不超过 60s**。"""
+    print("\n[G4-R2-12] 空池紧急退避: 封顶 60s")
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        pf._stock = lambda *a, **k: 0
+        pf._playable = lambda *a, **k: 0
+        check("**判为空池**", pf._is_empty() is True, pf._is_empty())
+        check("**用的是紧急序列**",
+              list(pf._schedule_now()) == [15.0, 30.0, 60.0],
+              pf._schedule_now())
+        for streak in range(1, 9):
+            w = pf._backoff_for_streak_now(streak)
+            check(f"第 {streak} 次失败 <= 60s", w <= 60.0, w)
+        check("**第 1 档是 15s**", pf._backoff_for_streak_now(1) == 15.0,
+              pf._backoff_for_streak_now(1))
+        check("**封顶不再增长**",
+              pf._backoff_for_streak_now(8) == pf._backoff_for_streak_now(4),
+              (pf._backoff_for_streak_now(4), pf._backoff_for_streak_now(8)))
+
+
+def test_normal_stock_keeps_long_backoff():
+    """**§8-13**: stock 有可播库存时**继续**用原来的长序列。
+
+    反证这条与上一条配对 —— 单独任何一条都可能是"恒定序列"假绿。
+    """
+    print("\n[G4-R2-13] 有库存 -> 保留原长退避")
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        pf._stock = lambda *a, **k: 5
+        pf._playable = lambda *a, **k: 3
+        check("**判为不空**", pf._is_empty() is False, pf._is_empty())
+        check("**用的是保守序列**",
+              list(pf._schedule_now()) == [30.0, 60.0, 120.0, 240.0, 300.0],
+              pf._schedule_now())
+        check("**第 4 档是 240s(原行为)**",
+              pf._backoff_for_streak_now(4) == 240.0,
+              pf._backoff_for_streak_now(4))
+        check("**第 5 档封顶 300s**",
+              pf._backoff_for_streak_now(5) == 300.0
+              and pf._backoff_for_streak_now(9) == 300.0,
+              pf._backoff_for_streak_now(9))
+
+
+def test_success_resets_fail_streak_empty_pool():
+    """**§8-14**: 成功入池**清零** fail streak(空池也一样)。"""
+    print("\n[G4-R2-14] 成功 -> fail streak 归零")
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        pf._stock = lambda *a, **k: 0
+        pf._playable = lambda *a, **k: 0
+        pf._fail_streak = 3
+        pf._retry_at = 9e9
+        pf._apply_result("ok", "", {}, 1000.0)
+        check("**fail_streak 归零**", pf._fail_streak == 0, pf._fail_streak)
+        check("**退避被清**", pf._retry_at == 0.0, pf._retry_at)
+        check("**success 计数 +1**",
+              pf.reject_count.get("success") == 1, pf.reject_count)
+
+
+def test_reject_labels_survive_to_stats():
+    """**§六**: 五类出口在 `stats()` 里各自可读(不再只有一个"未成题")。"""
+    print("\n[G4-R2-6] 拒绝原因分类账在 stats 里可读")
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        pf._stock = lambda *a, **k: 3
+        pf._playable = lambda *a, **k: 2
+        for lbl in ("structure_technical_fail", "review_rewrite",
+                    "truth_reject", "validation_reject"):
+            pf._apply_result("gen_fail", "x", {"reject": lbl}, 1000.0)
+        pf._apply_result("ok", "", {}, 1000.0)
+        st = pf.stats()
+        check("**stats 里有 reject 账**", isinstance(st.get("reject"), dict),
+              st.get("reject"))
+        for lbl in ("structure_technical_fail", "review_rewrite",
+                    "truth_reject", "validation_reject", "success"):
+            check(f"**{lbl} 可读且为 1**", st["reject"].get(lbl) == 1,
+                  st["reject"].get(lbl))
+        check("**未知标签不计数**",
+              "other" not in st["reject"], st["reject"])
+        # 分类账**不**影响退避状态机(与 fail_streak 正交)。
+        pf2 = _mk_bare_prefetcher(mkcfg(d, pool_prefetch_enabled=True))
+        pf2._stock = lambda *a, **k: 3
+        pf2._playable = lambda *a, **k: 2
+        pf2._apply_result("gen_fail", "x", {"reject": "truth_reject"}, 1000.0)
+        check("**未知标签不会污染 fail_streak**",
+              pf2._fail_streak == 1, pf2._fail_streak)
+        check("**空 extra 不炸**",
+              pf2._apply_result("gen_fail", "x", {}, 1000.0) is None, "")
+
+
+def test_cooperative_cancellation_not_regressed():
+    """**§8-15**: normal background / live / prewarm 的协作取消**不回退**。
+
+    G4-R2 动了 Stage B 的调用次数与退避调度, 所以这里把三条链的让路
+    判据再钉一遍 —— 新增一次"技术重试"最容易犯的错就是让它绕过了
+    `_should_continue`(§8-7 单测那一处), 或者在空池紧急档下把
+    "直播忙"也一起解禁了。
+    """
+    print("\n[G4-R2-15] 协作取消不回退")
+    from story.state import Phase
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        # ---- 后台: 直播忙(SETTING) -> 让路 ----
+        pf._probe = lambda: {"phase": Phase.SETTING, "pending": 0,
+                             "inflight": 0}
+        check("**后台在 SETTING 让路**", pf._should_continue() is False,
+              pf._should_continue())
+        # ---- 空池**不**解禁让路: 池子空不是抢网关的理由 ----
+        pf._stock = lambda *a, **k: 0
+        pf._playable = lambda *a, **k: 0
+        check("**空池下仍然让路(紧急档只换退避)**",
+              pf._should_continue() is False, pf._should_continue())
+        check("**空池确实被认出来了**", pf._is_empty() is True, "")
+        # ---- 预热: 不检查相位, 只看 stop + 预算 ----
+        pf._probe = lambda: {"phase": Phase.IDLE, "pending": 0, "inflight": 0}
+        sc = pf.prewarm_should_continue(deadline=None, should_abort=None)
+        check("**预热在 IDLE 下继续**", sc() is True, sc())
+        sc2 = pf.prewarm_should_continue(deadline=0.0, should_abort=None)
+        check("**预热超预算停手**", sc2() is False, sc2())
+        sc3 = pf.prewarm_should_continue(deadline=None,
+                                         should_abort=lambda: True)
+        check("**预热被 stop 信号中止**", sc3() is False, sc3())
+
+
+def _mk_bare_prefetcher(cfg):
+    """建一个**不带 executor 的**真 PoolPrefetcher, 只测它的决策逻辑。
+
+    不需要 Director / 真实 pool / writer: 这些用例问的是"退避与分类账
+    怎么算", 那是决策层的事, 与生成链无关。`_stock` / `_playable` 由
+    各用例自己替换成常量(它们才是我要控制的输入)。
+    """
+    from story.prefetch import PoolPrefetcher
+    return PoolPrefetcher(cfg=cfg, pool=None, writer=None,
+                          probe=lambda: {},
+                          probe_inputs=lambda: {},
+                          pick_blueprint=lambda *a, **k: None,
+                          clock=lambda: 1000.0)
+
+
 def main():
     tests = [
         test_default_config_curated_off,
@@ -1073,6 +1638,21 @@ def main():
         test_passes_ladder_matches_doc,
         test_source_labels_are_distinguishable,
         test_banner_prints_source_mode,
+        # ---- G4-R2: 不再因为技术失败 / 分类标签 / 展示长度丢掉合格候选 ----
+        test_stage_b_empty_tool_input_retries_once,
+        test_stage_b_double_empty_gives_up,
+        test_stage_b_clean_first_try_calls_once,
+        test_semantic_failures_never_retry_structure,
+        test_stage_b_retry_checks_should_continue,
+        test_stage_a_prompt_carries_answer_length,
+        test_answer_over_300_still_hard_rejected,
+        test_core_hidden_4_can_be_rescued_by_reviewer,
+        test_core_fix_must_not_change_content,
+        test_empty_pool_backoff_capped_at_60,
+        test_normal_stock_keeps_long_backoff,
+        test_success_resets_fail_streak_empty_pool,
+        test_reject_labels_survive_to_stats,
+        test_cooperative_cancellation_not_regressed,
     ]
     for t in tests:
         t()

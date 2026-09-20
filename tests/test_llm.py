@@ -3605,8 +3605,8 @@ def test_g2_keyword_provenance_and_generated():
     spec = w.structure_original_idea(title=idea["title"],
                                      puzzle=idea["puzzle"],
                                      answer=idea["answer"])
-    check("**prompt_version == keyword2-v2(G3 收敛后)**",
-          spec.prompt_version == "keyword2-v2", spec.prompt_version)
+    check("**prompt_version == keyword2-v3(G4-R2 展示约束后)**",
+          spec.prompt_version == "keyword2-v3", spec.prompt_version)
     check("**与 classic 的 riddle-v9 不同**",
           spec.prompt_version != RIDDLE_PROMPT_VERSION, spec.prompt_version)
     check("metrics 有 generation_mode=keyword2",

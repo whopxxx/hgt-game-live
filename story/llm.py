@@ -41,6 +41,9 @@ from .quality import (
     ngrams, too_similar, validate_blueprint, validate_reveal_adherence,
     validate_spec,
     _PUZZLE_TOUCH_MARK,
+    #: G4-R2 §三: 认出"这一次修复是 core 数量问题" —— 只有那一类修复才
+    #: 执行"不许改内容"的硬检查(见 `_core_fix_scope_violation`)。
+    _CORE_COUNT_MARK,
     describe_constraints,
     saturated_constraints,
 )
@@ -597,6 +600,64 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
     """是不是带 signature 的新版 spec。老数据不做严格比对。"""
     sig = getattr(spec, "signature", None)
     return bool(sig and (sig.mechanism_family or sig.solution_shape))
+
+
+def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
+                              ti: dict, own_fix_focus) -> str:
+    """G4-R2 §三: `core hidden > 3` 的修复**只许改分类**。
+
+    这条约束写在 `validate_spec` 的 `can_fix()` 文案里, 而文案只是**请求**
+    —— 模型完全可能借这次修复顺手重写一条 fact / 换掉谜面, 而改后的稿子
+    仍然满足 "core <= 3", 于是它会被当成一次**成功的修复**收下。那就把
+    一次"重标标签"变成了"偷偷改题", 而且没有任何一层会看见。
+
+    所以这里把文案里的三条禁令**变成代码**:
+
+        fact.id 不变       (改了 id 等于换了一条事实)
+        fact.text 不变     (改了文字等于换了事实本身)
+        谜面 / 谜底不变
+
+    ## 只在**这一条**修复上生效
+
+    判据是 `own_fix_focus` 里有没有 core-count 那条(`_CORE_COUNT_MARK`)。
+    其余 fixable(core_answer 太长 / 重新摘 quote / 人称…)本来就有改内容
+    的正当理由, 对它们套这一层会**拒掉合法的修复** —— 那是另一类 bug。
+
+    ⚠️ **fact 数量的增减也算越界**(§三 明写"不得删除事实 / 创造新事实")。
+    不查这一条的话, "把一条 core 整条删掉"同样能让数字落到 3 —— 但那样
+    通关合同可能指向一条不存在的事实。
+
+    返回 `""` 表示没有越界; 否则返回给调用方的拒稿原因。
+    """
+    _focus = " ".join(str(f) for f in (own_fix_focus or []))
+    if _CORE_COUNT_MARK not in _focus:
+        return ""
+    if new is None:
+        return ""
+    # ---- 谜面 / 谜底 ----
+    if (new.puzzle or "").strip() != (old.puzzle or "").strip():
+        return ("core 数量修复**不得改谜面**(只许重标 fact 分类) —— "
+                "审稿改动谜面, 拒绝这次修复")
+    if (new.answer or "").strip() != (old.answer or "").strip():
+        return ("core 数量修复**不得改谜底**(只许重标 fact 分类) —— "
+                "审稿改动谜底, 拒绝这次修复")
+    # ---- facts: id / text / 条数三样都不许动 ----
+    _old = {f.id: f for f in (old.facts or [])}
+    _new = {f.id: f for f in (new.facts or [])}
+    if set(_old) != set(_new):
+        return ("core 数量修复**不得增删 fact**(只许把多余 core 改标 "
+                "support) —— 审稿改动了 fact 集合, 拒绝这次修复")
+    for fid, of in _old.items():
+        if (of.text or "").strip() != (_new[fid].text or "").strip():
+            return (f"core 数量修复**不得改 fact 文本**(fact {fid} 被改) "
+                    f"—— 只许把多余的 core 重标成 support, 拒绝这次修复")
+    # ---- 合同指向的 fact 必须仍然是 core(§三 明写) ----
+    for fid in (old.completion_fact_ids or []):
+        nf = _new.get(fid)
+        if nf is not None and nf.kind != "core":
+            return (f"core 数量修复**不得把通关合同指向的 fact({fid}) "
+                    f"降级** —— 那样观众再也建不出合同, 拒绝这次修复")
+    return ""
 
 
 def _blueprint_block_for_review(bp) -> str:
@@ -1993,7 +2054,23 @@ def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
 #: ⚠️ **质量门一条都没放宽**(§七) —— 自由的 Stage A 如果产出的题不成立,
 #: 后面的 Stage B / Reviewer / truth audit / 跨题门直接拒。**不要**因为
 #: 通过率回头把这几十条规则再写回来。
-KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v2"
+#:
+#: ## v2 -> v3(G4-R2 §二): 补上**唯一**一条真实 UI 约束
+#:
+#: 实播里 Stage A **根本不知道** answer 有长度上限, 于是故事已经写完、
+#: Stage B 回填 canonical answer 之后才发现 >300, 然后**整道扔掉**。
+#: 那不是质量政策在起作用 —— `ANSWER_HARD_MAX_LEN = 300` 是前端展示的
+#: 硬合同(固定画布), 不是"这故事好不好"。让 Stage A 提前知道它, 是
+#: 把一次必然的失败变成一次正常的创作约束。
+#:
+#: ⚠️ **只加这一条, 一个字都不多加**。v1 那些被 G3 拿掉的写作规范
+#: (第三人称 / 1~3 句 / 单机关 / 禁职业 / 禁复杂背景 / 多层结构配额 /
+#: Blueprint)**不恢复** —— 它们改变的是题的**分布**, 而 answer 长度
+#: 改变的是"能不能上屏"。两者不是一回事。
+#:
+#: 260 是 `ANSWER_PREFERRED_MAX_LEN`(建议值), 300 的 hard max **保留**
+#: 作为最终保险(见 `validate_spec`), 所以"建议 260"不会变成新的硬门。
+KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v3"
 
 KEYWORD_IDEA_SYSTEM = """你是一个中文海龟汤故事生成器。根据给定关键词创造一道海龟汤：谜面应简洁、有悬念或明显的意外/反常，给玩家留下可以提问探索的空间；谜底必须逻辑自洽，能够解释谜面中的悬念与异常。关键词要自然融入情境。可以有自然产生的意外转折，但不要为了数量硬塞额外转折。
 
@@ -2003,7 +2080,9 @@ KEYWORD_IDEA_SYSTEM = """你是一个中文海龟汤故事生成器。根据给�
 2. **不依赖冷门专业知识** —— 谜底要能靠常识讲通。
 3. **不依赖外部图片 / 音频 / 特定软件** —— 观众只能靠文字与提问。
 4. **适合普通直播场景** —— 能被念出来、能被弹幕追问。
-5. 输出**只有** title / puzzle / answer 三样。
+5. **谜底保持简洁** —— 建议 2~4 句, 中文总长度不超过 260 字。
+   谜底是**揭晓时直接念给观众**的, 写成长篇说明会拖垮直播节奏。
+6. 输出**只有** title / puzzle / answer 三样。
 """
 
 #: Stage A 的工具 schema —— **只有三样**。
@@ -2022,7 +2101,9 @@ _TOOL_KEYWORD_IDEA = {
                                        "给玩家留下可以提问探索的空间")},
             "answer": {"type": "string",
                        "description": ("谜底: 逻辑自洽, 解释谜面中的悬念"
-                                       "与异常")},
+                                       "与异常。保持简洁(建议 2~4 句, "
+                                       "中文不超过 260 字)—— 揭晓时会被"
+                                       "直接念给观众")},
         },
         "required": ["puzzle", "answer"],
     },
@@ -3661,6 +3742,21 @@ class PuzzleWriter:
         self._last_review_call_count: int = 0
         #: `_review_spec` 的 `technical` 出口(见 `_review_spec_with_retry`)。
         self._last_review_technical: bool = False
+        #: G4-R2 §六: 上一次 Stage B 失败的**原因标签**。
+        #:
+        #: ## 为什么必须是侧信道
+        #:
+        #: 标签写在 `structure_original_idea` 返回的那个 spec 的 metrics 里,
+        #: 而那个 spec 是**没有 puzzle 的失败稿** —— `keyword_seed.keyword_spec`
+        #: 拿到它之后只回一个 `(None, "gen_fail")`, 稿子本身被丢掉。于是
+        #: "为什么没成"这条信息走不出 Stage B, 实播复盘就只剩统一的
+        #: `keyword2 未成题`。
+        #:
+        #: ⚠️ 与 `_last_review_decision` 完全同一套约定: 每次进入
+        #: `structure_original_idea` **先清零**, 每条失败出口都写,
+        #: 成功时不写(留给下一次清零)。否则上一道题的原因会被下一道
+        #: 读到 —— 那会让"技术失败 3 次"这种数字完全不可信。
+        self._last_reject: str = ""
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -4295,18 +4391,42 @@ class PuzzleWriter:
         让路 -> `puzzle` 为空、`metrics["interrupted"]=True` 的 spec。
         失败 -> `puzzle` 为空、`error` 非空的 spec。
 
-        ## 预算: 1 attempt(§十)
+        ## 预算: 1 normal attempt + at most 1 technical retry(G4-R2 §一)
 
-        只**结构化一次**。Reviewer 自己的技术重试(`_review_spec_with_retry`
-        内部那一次)保留 —— 那是既有行为, 不是这次新加的重试。
+        结构调用**最多两次**, 但第二次**只在技术形状下**发生:
+
+            第 1 次   正常发出
+            第 2 次   仅当第 1 次是"请求回来了但没有可用 payload"
+                      (tool_input 为空 / tool payload 取不到 /
+                       等价的纯 transport / tool 技术失败)
+
+        ⚠️ 这**不是**恢复多稿生成: 两次调用结构化的是**同一个 Stage A
+        idea**(title/puzzle/answer 一个字都没变), 变的只是那次 HTTP 的
+        运气。语义类的失败(validate_spec / Reviewer rewrite / truth audit
+        conflict)一律**不重试**, 直接淘汰 candidate —— 它们发生在循环
+        之外, 结构上就够不到这条重试。
+
+        第 2 次之前**必须再查一次 `should_continue`**: 重试同样是几十秒
+        的昂贵调用, 直播已经在忙时不能发。
+
+        Reviewer 自己的技术重试(`_review_spec_with_retry` 内部那一次)
+        保留 —— 那是既有行为, 不是这次新加的重试。
         """
         # ---- 组装: 走 gen_spec 同一套门, 但输入是我们自己给的 ----
         import time as _t
         t0 = _t.monotonic()
         m: dict = {"generation_attempts": 0, "review_calls": 0,
                    "rewrite_count": 0, "review_issues": [],
-                   "review_decision": "", "generation_mode": "keyword2"}
+                   "review_decision": "", "generation_mode": "keyword2",
+                   #: G4-R2: 结构调用的**实际发出次数**与其中因技术形状
+                   #: 重试的次数。两个数分开报, 否则"结构了一次还是两次"
+                   #: 与"是不是技术重试"就分不出来了(§六 的同一套口径)。
+                   "structure_calls": 0, "structure_technical_retries": 0}
         interrupted = {"v": False}
+        # ---- G4-R2 §六: 侧信道清零(必须在**任何**出口之前) ----
+        # 见 `_last_reject` 的声明。成功路径不写它, 所以不清零就会把
+        # 上一道题的原因带到这一道 —— 哪怕这一道根本没失败。
+        self._last_reject = ""
 
         def _stop() -> bool:
             """该收手了吗? 谓词抛异常按"该收手"处理(fail closed)。"""
@@ -4321,14 +4441,22 @@ class PuzzleWriter:
                 interrupted["v"] = True
             return not ok
 
-        def _bail(err: str = "") -> PuzzleSpec:
-            """中断/失败的统一出口 —— **绝不**把半成品当结果返回。"""
+        def _bail(err: str = "", reject: str = "") -> PuzzleSpec:
+            """中断/失败的统一出口 —— **绝不**把半成品当结果返回。
+
+            `reject` 是 G4-R2 §六 的分类标签(见 `m["reject"]`)。
+            让路(`interrupted`)时**不写**它 —— 让路不是一次拒绝。
+            """
             m["ok"] = False
             m["generation_latency_ms"] = int((_t.monotonic() - t0) * 1000)
             if interrupted["v"]:
                 m["interrupted"] = True
                 log.info("Stage B 让路(直播变忙), 放弃本次候选")
                 return PuzzleSpec(error="", metrics=dict(m))
+            if reject:
+                m["reject"] = reject
+                # 侧信道 —— 让"为什么没成"能穿过 keyword_spec 的丢弃。
+                self._last_reject = reject
             log.info("Stage B 未成(%s)", (err or "无")[:120])
             return PuzzleSpec(error=err or "结构化未成", metrics=dict(m))
 
@@ -4341,9 +4469,16 @@ class PuzzleWriter:
                                       avoid=avoid, recent=recent)
         spec: Optional[PuzzleSpec] = None
         last_err = ""
-        for attempt in range(1, max(1, int(max_attempts)) + 1):
-            m["generation_attempts"] = attempt
-            # ---- 让路检查 ②: 第 2 稿之前(默认 max_attempts=1, 走不到) ----
+        #: G4-R2 §一: 允许一次**纯技术**重试。见下面的循环注释。
+        max_attempts = max(1, int(max_attempts)) + 1
+        for attempt in range(1, max_attempts + 1):
+            m["structure_calls"] = attempt
+            # ---- 让路检查 ②: 第 2 次结构调用之前 ----
+            #
+            # ⚠️ G4-R2: 这条以前只在 `attempt > 1` 时存在, 而那时
+            # max_attempts=1 意味着它**永远走不到**(死代码)。现在第 2 次
+            # 结构调用真的会发生, 所以它变成了一处**活的**让路检查 ——
+            # 一次技术重试同样是几十秒的昂贵调用, 直播忙起来时必须能拦。
             if attempt > 1 and _stop():
                 return _bail()
             res = self.client.messages(
@@ -4353,6 +4488,28 @@ class PuzzleWriter:
                 last_err = res.error or "结构化没有 tool_input"
                 log.warning("Structurize 第 %d 稿没有 tool_input: %s",
                             attempt, last_err[:100])
+                # ---- G4-R2 §一: 技术形状允许**同一次 Stage A idea** 再结构化一次 ----
+                #
+                # 实播里 Stage A 已经产出了完全可用的 idea, 而 Stage B 因为
+                # `stop=tool_use` 但 `tool_input` 为空(纯 transport / 工具
+                # 调用没写完)整道被丢弃。那不是题的问题, 是网关的问题 ——
+                # 丢掉它等于把一次生成成本白烧。
+                #
+                # ⚠️ **只对技术形状重试**, 判据是"请求回来了但没有可用的
+                # payload"。下面这些**绝不**触发重试(它们会被下一行的
+                # `continue` 之后的逻辑直接淘汰):
+                #
+                #     validate_spec 语义失败   -> 题不成立, 重试也是同一道题
+                #     Reviewer rewrite         -> 审稿读懂了, 说这题不行
+                #     truth audit conflict     -> 叙事真实性不成立
+                #
+                # 后三者发生在**这个循环之外**, 结构上就不可能触发重试。
+                # 这是"1 次正常 + 最多 1 次技术重试", 不是恢复多稿生成。
+                if attempt < max_attempts:
+                    m["structure_technical_retries"] = (
+                        m.get("structure_technical_retries", 0) + 1)
+                    log.warning("Structurize 技术失败(空 tool_input), "
+                                "同一 idea 重试一次")
                 continue
             d = _unwrap_tool_input(res.tool_input)
             # ---- 组装: _spec_from_tool 填结构化字段, 代码回填 canonical ----
@@ -4376,12 +4533,14 @@ class PuzzleWriter:
             spec.prompt_version = KEYWORD_IDEA_PROMPT_VERSION
             break
         if spec is None:
-            return _bail(last_err or "结构化未成")
+            # 结构调用两次都没拿到 payload —— 纯技术失败。
+            return _bail(last_err or "结构化未成",
+                         "structure_technical_fail")
 
         # ---- ① 结构硬门(与出题链同一套, 不放宽) ----
         vr = validate_spec(spec)
         if not vr.ok:
-            return _bail("结构不过: " + vr.why())
+            return _bail("结构不过: " + vr.why(), "validation_reject")
         # ---- 让路检查 ③: 审稿之前 ----
         if _stop():
             return _bail()
@@ -4397,20 +4556,25 @@ class PuzzleWriter:
             # ---- 技术失败与语义拒绝分开记账(与 gen_spec 同一口径) ----
             if technical:
                 m["review_technical_fail"] = 1
-                return _bail("审稿技术失败: " + str(why)[:120])
+                return _bail("审稿技术失败: " + str(why)[:120],
+                             "structure_technical_fail")
             # ---- §五: Reviewer 判 rewrite => **整道候选失败** ----
             #
             # 不去修它, 也不重出: 下一轮 prefetch 会**重新抽关键词**。
             # 这里坚持"一次结构化只有一个 candidate"正是 §十 的预算哲学
             # ——在 Stage B 里再生成一道, 就等于把两阶段悄悄变回多稿链。
+            #
+            # ⚠️ G4-R2: rewrite 是**语义拒绝**, **绝不**触发结构重试 ——
+            # 审稿读懂了这道题, 说它不行。重试同一道题只会得到同一道题。
             m["rewrite_count"] = 1
-            return _bail("审稿要求重出: " + str(why)[:120])
+            return _bail("审稿要求重出: " + str(why)[:120], "review_rewrite")
         spec = reviewed
         # ---- ② 改完之后再走一遍硬校验(必须完全干净) ----
         vr2 = validate_spec(spec)
         if not vr2.ok or vr2.fixable:
             return _bail("改稿后仍不合格: "
-                         + "; ".join(vr2.errors + vr2.fixable))
+                         + "; ".join(vr2.errors + vr2.fixable),
+                         "validation_reject")
         # ---- 让路检查 ④: truth audit 之前 ----
         if _stop():
             return _bail()
@@ -4425,10 +4589,12 @@ class PuzzleWriter:
                 if ta.get("technical"):
                     m["truth_audit_technical"] = 1
                     return _bail("叙事真实性审计技术失败: "
-                                 + str(ta.get("why") or "")[:120])
+                                 + str(ta.get("why") or "")[:120],
+                                 "structure_technical_fail")
                 m["truth_audit_issues"] = list(ta.get("conflicts") or [])
                 return _bail("叙事真实性审计不过: "
-                             + str(ta.get("why") or "")[:120])
+                             + str(ta.get("why") or "")[:120],
+                             "truth_reject")
         # ---- ④ 跨题门 —— **G4-A: SOFT, 只记录不拒稿** ----
         #
         # G4 之前这里是 HARD(`return _bail("跨题重复: ...")`)。产品决定改掉了:
@@ -4805,7 +4971,6 @@ class PuzzleWriter:
         self._last_review_issues = None
         self._last_review_checks = None
         self._last_review_technical = False
-
         bp = blueprint or spec.blueprint
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"
@@ -5085,6 +5250,10 @@ class PuzzleWriter:
                 # 把它当成技术失败去重试同一稿, 会得到同一个残缺 bundle
                 # —— 白烧一次调用, 还绕过了"不许沿用旧字段"那条硬规则。
                 return None, err or "审稿回传 bundle 不完整", True, False
+            # ---- G4-R2 §三: 只改分类的修复不得顺手改内容 ----
+            _bad = _core_fix_scope_violation(spec, merged, ti, own_fix_focus)
+            if _bad:
+                return None, _bad, True, False
             return merged, note, False, False
 
         # ---- fix: 必须有改后的谜面 ----
@@ -5118,6 +5287,15 @@ class PuzzleWriter:
         merged, err = self._apply_review(spec, ti, bp, new_p)
         if merged is None:
             return None, err or "审稿回传 bundle 不完整", True, False
+        # ---- G4-R2 §三: 只改分类的修复不得顺手改内容 ----
+        #
+        # ⚠️ 这一处与上面 `pass` 分支里那处**都必须有**: 审稿人对同一道
+        # 题可能回 `pass` 也可能回 `fix`(§三 只约束它"不许改内容", 并没
+        # 规定它必须选哪个 decision)。只在 `pass` 那侧装守卫, 会让"改内容
+        # + fix"这条最省事的绕法完全畅通。
+        _bad = _core_fix_scope_violation(spec, merged, ti, own_fix_focus)
+        if _bad:
+            return None, _bad, True, False
         return merged, note or "审稿已修改", False, False
 
     @staticmethod

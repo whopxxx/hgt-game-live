@@ -379,15 +379,30 @@ def test_no_fair_clue_rejected():
 
 
 def test_too_many_core_hidden_facts_rejected():
-    print("[validate_spec: core hidden facts > 3 -> 拒]")
+    print("[validate_spec: core hidden facts > 3 -> **可修**(G4-R2 §三)]")
     s = good_spec()
     s.facts = [PuzzleFact(id=f"f{i}", text=f"核心{i}", kind="core")
                for i in range(1, 5)]        # 4 条 core hidden
     s.solve_atoms = [SolveAtom(id="a1", role="cause", text="x", fact_ids=["f1"]),
                      SolveAtom(id="a2", role="mechanism", text="y", fact_ids=["f2"])]
     r = validate_spec(s)
-    check("被拒", not r.ok, r.errors)
-    check("指出 core 太多", any("core hidden" in e for e in r.errors), r.errors)
+    # ---- G4-R2 §三: 整道拒 -> 交给审稿人**只重标分类** ----
+    #
+    # 这条曾经是 `r.fail()`。实播证明它的代价远大于收益: Stage B 只是
+    # 多贴了一个 core 标签, 故事/谜面/谜底/推理全都没问题, 却整道丢弃。
+    # `core` / `support` 是**分类标签**, 而通关只由 completion_fact_ids
+    # 决定 —— 它不是安全门, 也不是逻辑门。
+    check("不再整道拒(ok 仍为真)", r.ok, r.errors)
+    check("**没有** error", not r.errors, r.errors)
+    check("转为 fixable", any("core hidden" in f for f in r.fixable), r.fixable)
+    # ⚠️ 反馈措辞必须把手绑死: 唯一合法动作是改 kind。
+    _msg = " ".join(r.fixable)
+    check("要求只改分类", "只把" in _msg and "support" in _msg, _msg[:80])
+    check("禁止改事实文本", "fact.text 不变" in _msg, _msg[:120])
+    check("禁止改谜面谜底", "改谜面" in _msg and "改谜底" in _msg, _msg[:120])
+    # 归类进 G4-R2 新增的 core_count 桶(指标要能分开看)
+    check("归类为 core_count", "core_count" in r.fix_reasons(),
+          r.fix_reasons())
 
 
 def test_atom_count_bounds():
