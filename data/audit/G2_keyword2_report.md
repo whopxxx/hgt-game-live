@@ -159,9 +159,28 @@ curated_policy_version: ''      <- 没被标成 curated
   gate —— 联网非确定性; `test_web` 需浏览器, 由 CI 提供)。
 - **装配冒烟**: `director.py --sim ... --no-llm --no-window --reveal-hold 3
   --max-puzzles 2` -> exit=**124**、**0 Traceback**、"题就位" 存在。
-- **G1 抽取序列未变**: `--draw-only` md5 = `049c7073412f906f962e32f4ff20e3fe`
-  (与 G1-A/G1-B 基线逐字节相同)。
+- **G1 抽取序列未变**: `--draw-only` 输出按 **LF 归一**后的 md5 =
+  `9493d2cc11fe03b49d516f5233455dcd`(与 G1-A/G1-B 基线**同一段文本**;
+  见下面那笔 CI 事故)。
 - CI 加了 `离线套件 keyword_seed` 一步。
+
+### ⚠️ CI 事故: 一条平台相关的绿
+
+第一版 `test_g1_draw_sequence_pinned` 直接对 `subprocess` 的 `r.stdout`
+取 md5, 常量写的是**本地**(Windows)那个值 `049c7073...`。本地全绿,
+**CI 上 `离线套件 keyword_seed` 挂了**。
+
+根因: `--draw-only` 用 `print()`, Python 的 stdout 在 Windows 上把 `\n`
+翻成 `\r\n`, Linux 上不翻 —— 于是同一个抽取序列在两个平台上得到**两个
+不同的 md5**。这是一条**假绿**(本地)加一条**假红**(CI)。
+
+修法: 先把输出 `.replace("\r\n", "\n")` 归一, 再取 md5, 常量改成
+`9493d2cc...`。两个平台现在一致。
+
+> 教训与 H4-F 的 M2 同源, 但形状不同: 那次是"变异打在不生效的路径上",
+> 这次是"断言依赖了运行环境"。**只在本地跑过的绿灯不足以证明它是绿的** ——
+> 这条如果没接 CI, 会以"CI 红而本地绿"的形式一直挂着, 而那种红最容易被
+> 当成 flake 忽略掉。
 
 ---
 

@@ -45,7 +45,14 @@ FAIL = [0]
 #: 这个数字是**契约**, 不是"当前碰巧的值"。它证明"抽取序列没有被 G2 的
 #: 搬模块改动碰过"。若它变了, 要么是有人改了词库/抽取方式(那会让 G1 的
 #: 结论失效, 需要重新论证), 要么是 index/格式动了(报告里的组号会对不上)。
-G1_DRAW_MD5 = "049c7073412f906f962e32f4ff20e3fe"
+#:
+#: ⚠️ **必须按归一化换行后的字节算**。理由: `--draw-only` 用 `print()`,
+#: 而 Python 的 stdout 在 Windows 上把 `\n` 翻成 `\r\n`、在 Linux 上不翻。
+#: 直接对 `r.stdout` 取 md5 会得到一个**平台相关**的值 —— 本地绿、CI 红。
+#: (第一版就是这么写的: 本地 md5 = 049c7073..., 而 CI 上是另一个值,
+#: 于是 `离线套件 keyword_seed` 在 CI 上挂了而本地全绿。)
+#: 下面这个常量是 **LF 归一化后**的值, 两个平台一致。
+G1_DRAW_MD5 = "9493d2cc11fe03b49d516f5233455dcd"
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -127,17 +134,25 @@ def test_key_count_is_filter_not_redraw():
 
 
 def test_g1_draw_sequence_pinned():
-    """`--draw-only` 的输出必须与 G1 基线**逐字节相同**(md5)。"""
+    """`--draw-only` 的输出必须与 G1 基线**逐字节相同**(md5)。
+
+    ⚠️ 归一化换行再算 md5 —— 见 `G1_DRAW_MD5` 的说明。不对齐这一步会让
+    这条测试**平台相关**(Windows 绿 / Linux 红), 那是假绿也是假红。
+    """
     print("\n[K4] 抽取序列与 G1 基线逐字节相同")
     tool = REPO / "tools" / "experiment_keyword_riddles.py"
     r = subprocess.run(
         [sys.executable, "-X", "utf8", str(tool), "--draw-only"],
         cwd=str(REPO), capture_output=True)
     check("--draw-only 退出码 0", r.returncode == 0, r.returncode)
-    md5 = hashlib.md5(r.stdout).hexdigest()
-    check(f"--draw-only md5 == {G1_DRAW_MD5}", md5 == G1_DRAW_MD5, md5)
-    check("输出里有 20 组", r.stdout.decode("utf-8").count("  [") == 20,
-          r.stdout.decode("utf-8").count("  ["))
+    text = r.stdout.decode("utf-8").replace("\r\n", "\n")
+    md5 = hashlib.md5(text.encode("utf-8")).hexdigest()
+    check(f"--draw-only md5(LF 归一) == {G1_DRAW_MD5}", md5 == G1_DRAW_MD5, md5)
+    check("输出里有 20 组", text.count("  [") == 20, text.count("  ["))
+    # 顺带钉住"两个词之间是全角逗号"这条格式 —— 报告与外部题库观感都靠它。
+    check("组内两个词用全角逗号分隔",
+          all("，" in ln for ln in text.splitlines() if ln.strip().startswith("[")),
+          [ln for ln in text.splitlines() if ln.strip().startswith("[")][:2])
 
 
 # ======================================================================
