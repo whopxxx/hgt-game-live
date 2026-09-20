@@ -195,8 +195,11 @@ class ValidationResult:
 #: 每加一条新的 `can_fix()` 规则, 这里**应当**同步加一行; 忘了加不会
 #: 出错(落到 "other"), 只是指标少一个维度 —— 这个方向比"猜错"安全。
 _FIX_REASON_PATTERNS = (
-    ("puzzle_question", "谜面结尾不是问句"),
-    ("puzzle_person", "谜面是第一人称叙事"),
+    # ⚠️ G4-RB §三/§四: `puzzle_question`(谜面结尾不是问句)与
+    # `puzzle_person`(谜面是第一人称叙事)两条**已删除** —— 对应的
+    # `can_fix()` 不再产生, 留着这两行只会是永不匹配的死分类。
+    # 消费方(`fix_reasons()` 的调用点 / metrics / 回归 fixture)不必改:
+    # 它们看到的是"这两类不再出现", 而不是"分类表少了两行"。
     ("puzzle_meta", "谜面混进了"),
     ("fact_enum", "的 kind 非法"),
     ("fact_enum", "的 visibility 非法"),
@@ -398,8 +401,18 @@ CORE_ANSWER_MAX_LEN = 80
 #:     81 ~ 120   fixable —— 交给 reviewer **只压缩 core_answer**
 #:     > 120      这是真的写偏了(一段话而不是一句话), 硬失败
 CORE_ANSWER_FIXABLE_MAX_LEN = 120
-#: 直播固定画布的通用长度合同。preferred 只供提示/分析使用；第一版仅把
-#: hard max 作为确定性门，不让 reviewer 因长度自由改写故事。
+#: 直播展示的**可读性上限** —— **不是**画布物理硬合同。
+#:
+#: ⚠️ G4-RB §八: 措辞改准。先前注释写成"直播固定画布的通用长度合同",
+#: 读起来像是从 UI 反推出来的、不可动的边界。**实际不是**:
+#: `web/app.js` 的 `layout()` 里**没有任何字符数常量** —— 它做的是从
+#: 58px 起逐级降字号(最低 46px), 仍溢出就交给 AutoScroller。所以这两个
+#: 数字是**经验值**(46px 下大约多少字会超出谜面可用高度), 是产品侧的
+#: 可读性判断, 不是渲染器的硬约束。
+#:
+#: ⚠️ 本轮**不改数值**(§八 明确冻结)。要用它当依据去提高上限, 得先真的
+#: 在 46px 下量一次行高 —— 那是单独一轮的事。preferred 只供提示/分析,
+#: 不参与判定; hard max 仍然作为确定性门(避免必然滚动)。
 PUZZLE_PREFERRED_MAX_LEN = 180
 PUZZLE_HARD_MAX_LEN = 220
 ANSWER_PREFERRED_MAX_LEN = 260
@@ -407,12 +420,25 @@ ANSWER_HARD_MAX_LEN = 300
 #: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
 #:
 #: ⚠️ 它**不是**整道题的复杂度上限。v8 起这一点由 `discovery_beats`
-#: 显式承载: 题目可以有 2~4 个发现阶段, 而通关仍然只需 1~2 条事实。
+#: 显式承载: 题目可以有 1~4 个发现阶段, 而通关仍然只需 1~2 条事实。
 #: 产品规则: **题目允许有层次, 通关必须简单。**
 MAX_COMPLETION_FACTS = 2
-#: discovery_beats 的条数区间(quality-v8)。少于 2 = 没有层次;
-#: 多于 4 = 一道海龟汤塞不下, 观众会跟丢。
-MIN_DISCOVERY_BEATS = 2
+#: discovery_beats 的条数区间。
+#:
+#: ⚠️ G4-RB §六: 下限从 **2 改成 1**。
+#:
+#: 原来的 2 是"少于 2 = 没有层次"—— 但那条判断把**结构**当成了质量:
+#: 一道**单核强反转**的经典汤只有一个发现阶段, 它结构上不可能凑出 2 条,
+#: 于是要么编一个伪层次, 要么整道被杀。红黑实验里最好的几道
+#: (53~84 字的单核题)全是这个形状。
+#:
+#: 现在: 1 条 = 合法的"一个强反转/一个核心机关"。上限 4 保留
+#: (多于 4 = 一道海龟汤塞不下, 观众会跟丢)。
+#:
+#: ⚠️ 仍然要求的(与条数无关): id 合法唯一 / fact 引用存在 /
+#: text 非空 / 多条时不能**全部**重复。这些是**结构合法性**,
+#: 不是"够不够复杂"。
+MIN_DISCOVERY_BEATS = 1
 MAX_DISCOVERY_BEATS = 4
 
 
@@ -436,15 +462,39 @@ def validate_spec(spec: PuzzleSpec,
         r.fail(f"谜底超过直播展示硬上限 {ANSWER_HARD_MAX_LEN} 字")
 
     # ---- 谜面格式 ----
-    # 注意: 这三样归 `can_fix` 而不是 `fail` —— 审稿人改一句话就能救,
-    # 整题重出会把一道好题丢掉(实测: 只差一个人称)。
+    #
+    # ⚠️ **G4-RB §三 / §四: 这里只剩一条。**
+    #
+    # 原先有三条 can_fix:
+    #
+    #     谜面结尾不是问句   -> 末尾补一句"为什么?"
+    #     谜面是第一人称叙事 -> 改成第三人称客观事实
+    #     谜面混进了元文本   -> 删掉它们
+    #
+    # 前两条**已删除**。它们是"形状门"而不是"质量门":
+    #
+    #   1. `has_closing_question` 把"谜面必须是个问题"实现成"最后一个
+    #      字符必须是问号"。而一个**自明其问**的异常场景
+    #      ("每天晚上十二点，她都会听到自己从门外敲门。") 本身就是
+    #      完整的问题 —— 强行加尾巴不但没增加信息, 反而把问题**说死**,
+    #      缩小了观众的提问方向。
+    #   2. `is_first_person` 把第一人称当成需要修复的毛病。而第一人称
+    #      本来就是大量海龟汤非常自然的形式(实测里最好的几道正是
+    #      第一人称 + 对话体)。
+    #
+    # 这两条在改稿路径上**实际是硬改**: `must_fix` 里的谜面类问题会让
+    # Reviewer 必须交出不同的谜面, 交不出就 rewrite -> **整稿丢弃**。
+    # 红黑实验(24 道)里 21 道被"结尾不是问句"卡住, 其中包括生产自己
+    # 的 5/8 —— 这条规则连当前生产自己的输出都在罚。
+    #
+    # ⚠️ **两个判定函数都保留**(`has_closing_question` /
+    # `is_first_person`, 在 `story/puzzle.py`) —— 它们是**分析信号**,
+    # 别处仍在用(metrics / 实验脚本 / 回归)。这里只是不再把它们接进
+    # 修复路径。
+    #
+    # 仍然保留的: 元文本。它不是形状偏好, 而是**内容污染** ——
+    # 【谜底】/【提示】出现在谜面上就是当众剧透。
     if spec.puzzle:
-        if not has_closing_question(spec.puzzle):
-            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面结尾不是问句, "
-                      f"末尾补一句'为什么?'")
-        if is_first_person(spec.puzzle):
-            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面是第一人称叙事, "
-                      f"改成第三人称客观事实")
         if has_meta_text(spec.puzzle):
             r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面混进了【谜底】/【提示】"
                       f"之类的元文本, 删掉它们")
@@ -829,6 +879,11 @@ def validate_spec(spec: PuzzleSpec,
     # 重复" —— 那是 Reviewer 的活(它读得懂语义), 代码硬判只会误伤。
     # 代码能判的是结构: 条数、唯一、非空、引用存在、整组不重复、
     # 至少一条通向通关路径。
+    #
+    # ⚠️ G4-RB §六: 条数下限 2 -> 1。**"只有 1 条"本身不是拒稿理由。**
+    # 一道单核强反转的题只有一层发现阶段, 那是合法的形状(见
+    # `MIN_DISCOVERY_BEATS` 的说明)。下面那些**结构**检查照旧适用 ——
+    # 1 条也要有合法 id / 非空 text / 存在的 fact 引用 / 通向通关路径。
     beats = list(getattr(spec, "discovery_beats", None) or [])
     if is_v5:
         # 只对**当前政策**的题强制。旧 archive 读到空表是合法的 ——
@@ -837,8 +892,9 @@ def validate_spec(spec: PuzzleSpec,
             r.fail(f"当前政策({QUALITY_POLICY_VERSION}) 的 "
                    f"discovery_beats 有 {len(beats)} 条, 应为 "
                    f"{MIN_DISCOVERY_BEATS}~{MAX_DISCOVERY_BEATS} 条"
-                   f"(题目允许有层次 —— 但通关仍只需 "
-                   f"completion_fact_ids 那 1~{MAX_COMPLETION_FACTS} 条)")
+                   f"(1 条 = 一个强反转/一个核心机关, 是合法形状; "
+                   f"通关仍只需 completion_fact_ids 那 "
+                   f"1~{MAX_COMPLETION_FACTS} 条)")
     if beats:
         known_facts = {f.id for f in (spec.facts or []) if f.id}
         seen_ids: set = set()

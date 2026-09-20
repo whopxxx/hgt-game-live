@@ -441,7 +441,7 @@ def test_puzzle_format_checks():
     结果是审稿人根本没机会改它, 一道只差一个人称的好题被丢掉 ——
     而且 gen_spec 会一直重出直到次数耗尽。
     """
-    print("[validate_spec: 谜面格式问题 -> fixable, 不是 error]")
+    print("[validate_spec: 谜面格式 -> **只剩元文本**是 fixable(G4-RB §三/§四)]")
     def with_puzzle(text, quote):
         """换谜面时同步换 clue —— 否则会先被"quote 不在谜面里"拦下,
         测不到格式那一档。"""
@@ -450,22 +450,23 @@ def test_puzzle_format_checks():
         sp.fair_clues = [FairClue(quote=quote, supports_atoms=["a1"])]
         return sp
 
+    # ---- G4-RB §三/§四: 人称与问句**不再是毛病** ----
     s = with_puzzle("他每天晚上都亮灯, 从不断, 也从不说为什么。",
                     "他每天晚上都亮灯")
     r = validate_spec(s)
     check("没有问句: 结构仍算过", r.ok, r.errors)
-    check("没有问句: 记进 fixable", any("问句" in f for f in r.fixable), r.fixable)
+    check("**没有问句: 不再是 fixable**", r.fixable == [], r.fixable)
 
     s2 = with_puzzle("我每天晚上都亮灯, 从不间断。为什么?", "我每天晚上都亮灯")
     r2 = validate_spec(s2)
     check("第一人称: 结构仍算过", r2.ok, r2.errors)
-    check("第一人称: 记进 fixable",
-          any("第一人称" in f for f in r2.fixable), r2.fixable)
+    check("**第一人称: 不再是 fixable**", r2.fixable == [], r2.fixable)
 
+    # ---- 元文本**仍然**是 fixable(内容污染, 不是形状偏好) ----
     s3 = with_puzzle(PUZZLE + " 【谜底】其实是礁石。", "只在退潮的那几个小时亮")
     r3 = validate_spec(s3)
     check("meta 污染: 结构仍算过", r3.ok, r3.errors)
-    check("meta 污染: 记进 fixable",
+    check("meta 污染: **仍然**记进 fixable",
           any("元文本" in f for f in r3.fixable), r3.fixable)
 
     # 结构性错误**仍然**是 error(区分必须真的生效)
@@ -1160,12 +1161,14 @@ def test_q2_discovery_beat_validation():
                            fact_ids=["f2"])])
     check("合法的 2 条 -> 过", validate_spec(ok).ok,
           validate_spec(ok).errors[:1])
-    check("常量区间是 2~4",
-          (MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS) == (2, 4),
+    check("常量区间是 1~4 (G4-RB §六: 单层题合法)",
+          (MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS) == (1, 4),
           (MIN_DISCOVERY_BEATS, MAX_DISCOVERY_BEATS))
 
     vr = validate_spec(mk([DiscoveryBeat(id="b1", text="x", fact_ids=["f1"])]))
-    check("**只有 1 条 -> 拒**", not vr.ok, vr.errors[:1])
+    check("**只有 1 条 -> 过(一个强反转是合法形状)**", vr.ok, vr.errors[:1])
+    vr = validate_spec(mk([]))
+    check("**0 条 -> 拒(下限是 1)**", not vr.ok, vr.errors[:1])
     vr = validate_spec(mk([DiscoveryBeat(id=f"b{i}", text=f"t{i}",
                                          fact_ids=["f1"])
                            for i in range(5)]))

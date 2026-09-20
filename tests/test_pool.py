@@ -223,10 +223,16 @@ def test_rejects_spec_with_unfixed_issues():
     print("\n[1c] 还有 fixable 未修的不能入池(它没走完质量链)")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
-        # 谜面缺收尾问句 -> validate_spec 给 can_fix(不是 fail)
-        s = good_spec(puzzle="灯塔守塔人只在退潮时亮灯, 涨潮后熄掉。")
+        # 谜面混进元文本 -> validate_spec 给 can_fix(不是 fail)
+        #
+        # ⚠️ G4-RB §三/§四: 这里原本用"缺收尾问句"。那条已不再是
+        # fixable(形状不是毛病), 所以改用**仅剩的**谜面类 fixable ——
+        # 元文本。被测的东西没变: "带未修 fixable 的题不能入池"。
+        # `good_spec()` 的谜面**本来就有问号**, 所以它自然满足剩下的门。
+        pz = "灯塔守塔人只在退潮时亮灯, 涨潮后熄掉。为什么? 【提示】看礁石。"
+        s = good_spec(puzzle=pz)
         s.fair_clues = [FairClue(quote="只在退潮时亮灯", supports_atoms=["a1"])]
-        check("缺收尾问句被判 fixable", pool.add(s) is False)
+        check("谜面含元文本被判 fixable", pool.add(s) is False)
 
 
 def test_no_cached_approval():

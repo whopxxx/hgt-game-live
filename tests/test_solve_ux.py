@@ -1100,11 +1100,18 @@ def test_c6b_current_policy_field_lists_all_include_beats():
     check("_QUALITY_CHECK_FIELDS 确实是 13 项",
           len(_llm._QUALITY_CHECK_FIELDS) == 13,
           _llm._QUALITY_CHECK_FIELDS)
-    check("**自由生成链查前 9 项**(含 livestream_safe; 题型四问不适用)",
+    check("**自由生成链查五项硬门**(G4-RB §五: 正确性 + 安全)",
           _llm._quality_check_contract(
               type("S", (), {"source_type": ""})())
-          == _llm._QUALITY_CHECK_FIELDS[:9])
-    check("**第 9 项是 livestream_safe 而不是题型字段**",
+          == _llm.FREE_GEN_HARD_CHECKS)
+    check("**livestream_safe 仍在硬门里**(安全一项没被放宽)",
+          "livestream_safe" in _llm.FREE_GEN_HARD_CHECKS,
+          _llm.FREE_GEN_HARD_CHECKS)
+    check("**四项质量信号已被降级**(不再拒稿)",
+          not (set(_llm.FREE_GEN_SIGNAL_CHECKS)
+               & set(_llm.FREE_GEN_HARD_CHECKS)),
+          (_llm.FREE_GEN_HARD_CHECKS, _llm.FREE_GEN_SIGNAL_CHECKS))
+    check("**livestream_safe 仍是 _QUALITY_CHECK_FIELDS 的第 9 项**",
           _llm._QUALITY_CHECK_FIELDS[8] == "livestream_safe",
           _llm._QUALITY_CHECK_FIELDS[8])
     # ---- H4-D1 §四: 语义断言, **不是计数断言** ----

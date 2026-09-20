@@ -1235,6 +1235,34 @@ class Director:
             "repair_success_reasons":
                 dict(gen.get("repair_success_reasons") or {}),
         })
+        # ---- G4-RB §九: keyword2 溯源必须进 puzzle.jsonl ----
+        #
+        # `story/keyword_seed.keyword_spec()` 早就把这五个键写进了
+        # `spec.metrics`:
+        #
+        #     generation_mode          "keyword2" | "classic" | ...
+        #     keywords                 ["词1", "词2"]
+        #     keyword_seed_version     词库口径版本(keyword2-vocab-v2)
+        #     keyword_corpus_version   产物侧口径(data/keyword2_vocabulary.json)
+        #     keyword_session_seed     本次 session 的抽词 seed
+        #
+        # 但 `_archive_reveal()` **只挑上面那几个字段**写进 puzzle.jsonl,
+        # 不搬整个 `spec.metrics` —— 于是这五个键在正式 archive 里
+        # **看不见**。复盘时就没法回答"这一场出的题是哪条链产的、用的
+        # 是哪两个词、哪个 seed" —— 而这正是 keyword2 上线后最需要看的东西。
+        #
+        # ⚠️ **只搬不改**: 值原样来自 `spec.metrics`, 一个字节都不加工。
+        # ⚠️ 缺省用 `""` / `[]`: 老题、兜底题、`--no-llm` 的假题都没有
+        # 这些键, 而"没有"与"空"在复盘里是同一个结论。不要 `None` ——
+        # archive 里 null 与空值混杂会让下游多一层判断。
+        out.update({
+            "generation_mode": str(gen.get("generation_mode") or ""),
+            "keywords": list(gen.get("keywords") or []),
+            "keyword_seed_version": str(gen.get("keyword_seed_version") or ""),
+            "keyword_corpus_version":
+                str(gen.get("keyword_corpus_version") or ""),
+            "keyword_session_seed": gen.get("keyword_session_seed", ""),
+        })
         return out
 
     # ---- 离线(--no-llm)用的固定内容 ----

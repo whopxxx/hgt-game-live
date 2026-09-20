@@ -16,7 +16,7 @@ from story.llm import (  # noqa: E402
     KEYWORD_IDEA_SYSTEM, _TOOL_KEYWORD_IDEA, _TOOL_STRUCTURE, check_tool,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
-from story.puzzle import FairClue, PuzzleSpec  # noqa: E402
+from story.puzzle import DiscoveryBeat, FairClue, PuzzleSpec  # noqa: E402
 
 FAIL = [0]
 
@@ -166,7 +166,8 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
              "fact_ids": ["f2", "f3"]},
         ],
         "fair_clues": clues_for(puzzle),
-        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        # G4-RB §六: 允许 1~4 个发现阶段。这里给 2 条(多层的正常形状);
+        # 单层题另有专门回归(见 test_g4rb_single_beat_is_legal)。
         "discovery_beats": [
             {"id": "b1", "text": "先注意到灯只在退潮时亮",
              "fact_ids": ["f1"]},
@@ -611,23 +612,31 @@ def test_reviewer_fixes_in_place():
           len(gen_calls(fc)) == 2, len(gen_calls(fc)))
 
 
-def test_hard_rule_asks_reviewer_to_fix():
-    print("[审稿: 硬规则(第一人称)也交给审稿人改, 不直接丢]")
-    # 第一人称是代码能确定判出来的, 但**能改**(换个人称而已)。
-    # 所以不是丢掉重出, 而是点名让审稿人改。
+def test_g4rb_shape_is_not_asked_of_reviewer():
+    """G4-RB §三/§四: 审稿请求里**不再**注入人称/问句的 hard focus。
+
+    旧行为(`test_hard_rule_asks_reviewer_to_fix` 记的是它): 代码在
+    `must_fix` 为空时**替审稿人决定**"谜面是第一人称, 改成第三人称",
+    于是哪怕 `validate_spec` 已经不判它, 形状门也会从这一处继续生效。
+
+    现在 `hard` **只**来自 `must_fix`(真正的结构问题)。审稿人对一条
+    第一人称、无结尾问句的谜面**没有任何**代码注入的问题要改。
+    """
     P0 = "我每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
-    P1 = "他每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
     fc = FakeClient([
         LLMResult(tool_input=riddle(puzzle=P0)),
-        LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
+        LLMResult(tool_input=review_ok(P0)),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
-    check("改成第三人称后被采用",
-          r.puzzle and r.puzzle.startswith("他每晚"), r)
-    # 审稿请求里应点名"第一人称"这个已知问题
+    check("第一人称稿被采用", bool(r.puzzle), r)
     review_user = fc.calls[1]["user"]
-    check("点名了第一人称问题", "第一人称" in review_user, review_user[-300:])
+    check("审稿请求里没有人称 hard focus",
+          "改成第三人称" not in review_user, review_user[-300:])
+    check("审稿请求里没有补问句 hard focus",
+          "末尾补一句" not in review_user, review_user[-300:])
+    check("审稿请求里没有【已知问题】段",
+          "【已知问题, 必须改掉】" not in review_user, review_user[-300:])
 
 
 def test_reviewer_no_fix_falls_back_to_regen():
@@ -688,8 +697,13 @@ def test_riddle_check_retries_empty_tool_use():
           fc.calls[1]["max_tokens"] == 3500, fc.calls[1]["max_tokens"])
 
 
-def test_first_person_story_rejected():
-    print("[出题: 第一人称叙事是故事, 不是谜题]")
+def test_first_person_story_still_detectable():
+    """G4-RB §四: `_is_first_person_story` **保留为分析信号**。
+
+    它不再接进修复/拒稿路径(见 `story/llm.py` 的函数 docstring),
+    但判据本身仍然要正确 —— 回归 / 实验脚本 / 将来的 metrics 读它。
+    """
+    print("[出题: 第一人称判据(仅信号, 不再用于修复)]")
     from story.llm import _is_first_person_story
     for t in ["深夜我独自在家，座机响了，接起来是我自己的声音。",
               "我住的老楼电梯里，只有我和邻居老太太两个人。",
@@ -699,17 +713,6 @@ def test_first_person_story_rejected():
               "男人对酒保说：「请给我一杯水。」酒保却掏出一把枪指着他。",
               "她在葬礼上遇见一个陌生男人，回家后就把亲姐姐杀了。"]:
         check(f"第三人称: {t[:14]}", _is_first_person_story(t) is False, t)
-    # 端到端: 第一人称那稿交给审稿人改(而不是直接弃用)
-    P0 = "深夜我独自在家, 座机响了, 接起来是我自己的声音。为什么?"
-    P1 = "一个男人深夜独自在家, 座机响了, 接起来是他自己的声音。为什么?"
-    fc = FakeClient([
-        LLMResult(tool_input=riddle(puzzle=P0)),
-        LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
-    ])
-    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    r = w.gen_riddle(blueprint=fc.default_blueprint)
-    check("第一人称那稿被审稿人改成第三人称",
-          r.puzzle and r.puzzle.startswith("一个男人"), r)
 
 
 def test_no_repeat_puzzles():
@@ -1875,51 +1878,196 @@ def test_director_only_airs_clean_spec():
     check("不再只判断 puzzle", "if spec.puzzle else None" not in src, src)
 
 
-def test_fixable_format_goes_to_reviewer_not_rejected():
-    """第一人称/没问句是**审稿人能改的**, 不能直接毙掉整题。
+def test_g4rb_puzzle_shape_is_not_fixable():
+    """G4-RB §三/§四: 第一人称与"没有结尾问句"**不再**是毛病。
 
-    实测踩过: 硬校验把"第一人称"当成结构性错误直接拒, 于是审稿人
-    根本没机会改它 —— 一道只差一个人称的好题被丢掉, 而且循环会一直
-    重出直到次数耗尽。
+    旧行为(`test_fixable_format_goes_to_reviewer_not_rejected` 记的是它):
+    `validate_spec` 把这两样归 `can_fix`, 而 `_review_spec` 再把它
+    注入 `must_fix` —— 实际效果是**硬改**: 审稿人必须交出不同的谜面,
+    交不出就 rewrite, **整稿丢弃**。
+
+    红黑实验(24 道)里 21 道被"结尾不是问句"卡住, 其中包括生产自己的
+    5/8。而第一人称本来就是海龟汤非常自然的形式。
+
+    现在: 两样都**不是** fixable, 谜面原样通过。仍然保留的是 meta
+    文本(那是内容污染, 不是形状偏好)。
     """
     from story.quality import validate_spec
     from story.llm import _spec_from_tool
-    # validate_spec: 人称/问句/meta 归 fixable, 不 ok=False
+    # 一条**第一人称 + 没有结尾问句**的谜面: 两样都不该被点名
     spec = _spec_from_tool(riddle(puzzle="我每晚都在数楼上的脚步声。"))
     r = validate_spec(spec)
-    check("没问句不算结构失败", r.ok, r.errors)
-    check("但记进了 fixable", any("问句" in f for f in r.fixable), r.fixable)
-    check("must_fix() 能转成文本", bool(r.must_fix()), r.must_fix())
-    # 端到端: 第一人称那稿交给审稿人 -> 2 次调用就成功
+    check("第一人称 + 无问句仍然 ok", r.ok, r.errors)
+    check("不再是 fixable", r.fixable == [], r.fixable)
+    check("must_fix() 为空", r.must_fix() == "", repr(r.must_fix()))
+    check("fix_reasons() 里没有人称/问句",
+          not ({"puzzle_person", "puzzle_question"} & set(r.fix_reasons())),
+          r.fix_reasons())
+
+    # meta 文本**仍然**是 fixable —— 上面放宽的是形状, 不是内容污染。
+    # ⚠️ 这里**只**改谜面, 让它带上元文本; facts/atoms/clue 沿用
+    # `riddle()` 的默认那份。谜面一换, 逐字 quote 就对不上了, 于是会
+    # **同时**触发 fair_clue 那条 —— 所以断言只问"元文本在不在
+    # fixable 里", 不问 fixable 是否只有它一条。
+    bad = _spec_from_tool(riddle())
+    bad.puzzle = "他为什么走了？ 【提示】因为他怕。"
+    rb = validate_spec(bad)
+    check("meta 文本仍然 fixable",
+          any("元文本" in f for f in rb.fixable), rb.fixable)
+    check("meta 仍标记为需改谜面",
+          any("[需改谜面]" in f and "元文本" in f for f in rb.fixable),
+          rb.fixable)
+    check("meta 仍然不是结构失败(不会被硬拒)", rb.ok, rb.errors)
+
+
+def test_g4rb_first_person_survives_end_to_end():
+    """G4-RB §四: 第一人称稿走完正式链**不需要被改**。
+
+    旧端到端路径: 出题(第一人称) -> 代码注入 must_fix("改成第三人称")
+    -> 审稿人必须交新谜面 -> 采用改后的。现在那条注入没了。
+
+    ⚠️ 直接调 `_review_spec` 而不是 `gen_riddle` —— 后者还牵着
+    blueprint 校验与队列长度, 前置用例一改共享状态就会假红。这里要
+    断言的只是"代码不再往审稿请求里注入形状要求"。
+    """
+    from story.llm import _spec_from_tool
     P0 = "我每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
-    P1 = "他每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
-    fc = FakeClient([
-        LLMResult(tool_input=riddle(puzzle=P0)),
-        LLMResult(tool_input=review_fix(P1, note="改成第三人称")),
-    ])
+    fc = FakeClient([LLMResult(tool_input=review_ok(P0))])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    r2 = w.gen_riddle(blueprint=fc.default_blueprint)
-    check("第一人称稿被审稿人改好并采用",
-          r2.puzzle and r2.puzzle.startswith("他每晚"), r2)
-    check("只用了 2 次调用(出题 + 审稿)", len(gen_calls(fc)) == 2, len(gen_calls(fc)))
-    check("审稿请求点名了人称问题",
-          "第一人称" in fc.calls[1]["user"], fc.calls[1]["user"][-400:])
+    spec = _spec_from_tool(riddle(puzzle=P0), blueprint=fc.default_blueprint)
+    spec.puzzle, spec.answer = P0, "楼上住的是他自己的录音。"
+    reviewed, why, rewrite, technical = w._review_spec(
+        spec, fc.default_blueprint)
+    user = fc.calls[0]["user"]
+    check("审稿请求里没有注入人称 hard focus",
+          "改成第三人称" not in user, user[-300:])
+    check("审稿请求里没有注入补问句 hard focus",
+          "末尾补一句" not in user, user[-300:])
+    check("审稿请求里没有【已知问题】段",
+          "【已知问题, 必须改掉】" not in user, user[-300:])
+    check("pass 之后谜面仍是第一人称(没被改)",
+          reviewed is not None and reviewed.puzzle == P0,
+          (reviewed.puzzle if reviewed else why))
 
 
-def test_unfixed_format_still_rejected():
-    """审稿人**没改掉**人称时不能放行 —— 否则第一人称会溜到直播上。"""
+def test_g4rb_unfixed_shape_is_no_longer_rejected():
+    """G4-RB §三/§四: "没改人称/没补问句"**不再**导致拒稿。
+
+    旧行为(`test_unfixed_format_still_rejected` 记的是它): 审稿人回
+    pass 却没动谜面 -> 代码判"未处理已知问题" -> rewrite -> 整稿丢弃。
+    那条守卫的前提是"人称/问句是必须改的毛病" —— 现在它们不是,
+    所以守卫也一并消失。
+    """
     P0 = "我每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
     fc = FakeClient([
         LLMResult(tool_input=riddle(puzzle=P0)),
-        # 审稿"通过"了, 但谜面还是第一人称(没真改)
         LLMResult(tool_input=review_ok(P0)),
-        LLMResult(tool_input=riddle(puzzle="他每天数楼梯台阶。为什么?")),
-        LLMResult(tool_input=review_ok("他每天数楼梯台阶。为什么?")),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     r = w.gen_riddle(blueprint=fc.default_blueprint)
-    check("没改人称的稿被拒, 最终采用第三人称的",
-          r.puzzle and not r.puzzle.startswith("我"), r)
+    check("第一人称稿**被采用**(不再因为没改人称而重出)",
+          bool(r.puzzle) and r.puzzle.startswith("我每晚"), r.puzzle)
+    check("没有触发重出(出题 + 审稿 + 自动 audit = 3 次调用)",
+          len(fc.calls) == 3, len(fc.calls))
+
+
+def test_g4rb_single_beat_is_legal():
+    """G4-RB §六: **只有 1 个 discovery beat 不能拒稿**。
+
+    旧政策: `MIN_DISCOVERY_BEATS = 2` + schema `minItems: 2` —— 一道
+    单核强反转的经典汤结构上不可能合格, 要么编个伪层次, 要么被杀。
+
+    现在 1 条合法。但**结构合法性照旧**: id / fact 引用 / text 非空 /
+    通向通关路径。
+    """
+    from story.quality import validate_spec, MIN_DISCOVERY_BEATS
+    from story.llm import _spec_from_tool
+    check("下限是 1", MIN_DISCOVERY_BEATS == 1, MIN_DISCOVERY_BEATS)
+
+    # 单条 beat, 且指向通关 fact -> 合法
+    one = _spec_from_tool(riddle())
+    one.discovery_beats = [DiscoveryBeat(id="b1", text="意识到灯是在标礁石",
+                                         fact_ids=["f1"])]
+    r = validate_spec(one)
+    check("**1 条 beat 合法(单核题的形状)**", r.ok, r.errors)
+
+    # 单条但**不指向通关路径** -> 仍然拒(结构要求不减)
+    orphan = _spec_from_tool(riddle())
+    orphan.discovery_beats = [DiscoveryBeat(id="b1", text="无关的一层",
+                                            fact_ids=[])]
+    rb = validate_spec(orphan)
+    check("1 条但不通向通关事实 -> 仍拒", not rb.ok, rb.why()[:120])
+
+    # 0 条 -> 仍拒(下限是 1, 不是 0)
+    zero = _spec_from_tool(riddle())
+    zero.discovery_beats = []
+    rz = validate_spec(zero)
+    check("0 条 -> 仍拒", not rz.ok, rz.why()[:120])
+
+
+def test_g4rb_fun_four_are_soft_signals():
+    """G4-RB §五: "好不好玩"四项 false **不再拒稿**。
+
+    自由生成链的硬门收窄到五项(正确性 + 安全); 四项质量信号仍然要
+    Reviewer 返回, 但 false 只进 metrics。
+    """
+    from story.llm import (FREE_GEN_HARD_CHECKS, FREE_GEN_SIGNAL_CHECKS,
+                           _quality_check_contract)
+    check("硬门恰好五项",
+          set(FREE_GEN_HARD_CHECKS) == {
+              "narrator_truthful", "mechanism_consistent",
+              "core_answer_direct", "completion_contract_minimal",
+              "livestream_safe"}, FREE_GEN_HARD_CHECKS)
+    check("信号恰好四项",
+          set(FREE_GEN_SIGNAL_CHECKS) == {
+              "concrete_anomaly", "clue_recontextualized",
+              "dramatic_payoff", "reasoning_beats_nonredundant"},
+          FREE_GEN_SIGNAL_CHECKS)
+    check("**门与信号不相交**",
+          not (set(FREE_GEN_HARD_CHECKS) & set(FREE_GEN_SIGNAL_CHECKS)),
+          (FREE_GEN_HARD_CHECKS, FREE_GEN_SIGNAL_CHECKS))
+
+    # 端到端: 四项全 false + 五项全 true -> 采用(不再因为"不好玩"被拒)
+    from story.llm import _spec_from_tool
+    spec = _spec_from_tool(riddle(), blueprint=bp_for())
+    qc = dict(qc_ok())
+    for k in FREE_GEN_SIGNAL_CHECKS:
+        qc[k] = False
+    fc = FakeClient([LLMResult(tool_input=review_ok(
+        spec.puzzle, quality_checks=qc))])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    reviewed, why, rewrite, technical = w._review_spec(spec, bp_for())
+    check("**四项质量信号全 false 仍然通过**", reviewed is not None, why)
+    check("不是 rewrite(是语义通过)", not rewrite, rewrite)
+
+    # 反向: 五项硬门里任一项 false -> **仍然拒**
+    for k in ("livestream_safe", "narrator_truthful"):
+        bad = dict(qc_ok())
+        bad[k] = False
+        fc2 = FakeClient([LLMResult(tool_input=review_ok(
+            spec.puzzle, quality_checks=bad))])
+        w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+        got, why2, rw2, _ = w2._review_spec(spec, bp_for())
+        check(f"**{k}=false 仍然拒稿**", got is None, (got, why2[:80]))
+
+    """G4-RB §三/§四: "没改人称/没补问句"**不再**导致拒稿。
+
+    旧行为(`test_unfixed_format_still_rejected` 记的是它): 审稿人回
+    pass 却没动谜面 -> 代码判"未处理已知问题" -> rewrite -> 整稿丢弃。
+    那条守卫的存在前提是"人称/问句是必须改的毛病" —— 现在它们不是,
+    所以守卫也一并消失。
+    """
+    P0 = "我每晚都听见楼上有人走动, 可楼上根本没人住。为什么?"
+    fc = FakeClient([
+        LLMResult(tool_input=riddle(puzzle=P0)),
+        LLMResult(tool_input=review_ok(P0)),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    r = w.gen_riddle(blueprint=fc.default_blueprint)
+    check("第一人称稿**被采用**(不再因为没改人称而重出)",
+          bool(r.puzzle) and r.puzzle.startswith("我每晚"), r.puzzle)
+    check("没有触发重出(只用了 出题+审稿 两次调用)",
+          len(fc.calls) == 3, len(fc.calls))   # +1 是自动回的 truth audit
 
 
 def test_writer_reads_temperature_from_runtime_cfg():
@@ -3051,7 +3199,7 @@ def test_q2_discovery_beats_schema_and_prompts():
                            CHECK_SYSTEM, _QUALITY_CHECK_FIELDS)
     rb = _TOOL_RIDDLE["input_schema"]["properties"].get("discovery_beats")
     check("RIDDLE 工具接受 discovery_beats", rb is not None)
-    check("条数区间 2~4", (rb or {}).get("minItems") == 2
+    check("条数区间 1~4 (G4-RB §六: 单层题合法)", (rb or {}).get("minItems") == 1
           and (rb or {}).get("maxItems") == 4,
           ((rb or {}).get("minItems"), (rb or {}).get("maxItems")))
     check("Reviewer 工具也能带回 discovery_beats",
@@ -5129,9 +5277,10 @@ def main():
               test_messages_timeout_override,
               test_answer_passes_qa_budget_to_client,
               test_qa_budget_reaches_final_judge,
-              test_hard_rule_asks_reviewer_to_fix,
+              test_g4rb_shape_is_not_asked_of_reviewer,
+              test_g4rb_first_person_survives_end_to_end,
               test_reviewer_no_fix_falls_back_to_regen,
-              test_first_person_story_rejected,
+              test_first_person_story_still_detectable,
               test_no_repeat_puzzles,
               test_riddle_check_retries_empty_tool_use, test_english_riddle_rejected_on_text_path,
               test_atom_role_gate,
@@ -5165,8 +5314,10 @@ def main():
               # ---- Q0: 链路缺陷回归 ----
               test_check_tool_schema_matches_generator,
               test_reviewer_structured_atoms_survive,
-              test_fixable_format_goes_to_reviewer_not_rejected,
-              test_unfixed_format_still_rejected,
+              test_g4rb_puzzle_shape_is_not_fixable,
+              test_g4rb_unfixed_shape_is_no_longer_rejected,
+              test_g4rb_single_beat_is_legal,
+              test_g4rb_fun_four_are_soft_signals,
               test_writer_reads_temperature_from_runtime_cfg,
               test_client_cfg_is_not_used_for_temperature,
               test_quotas_read_from_runtime_cfg,

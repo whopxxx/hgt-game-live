@@ -113,13 +113,25 @@ def _looks_meta(text: str) -> bool:
 
 
 def _is_first_person_story(puzzle: str) -> bool:
-    """谜面是不是"我"的叙述(而不是第三人称客观事实)?
+    """谜面是不是"我"的叙述?
+
+    ⚠️ **G4-RB §四: 这只是一个分析信号, 不再是修复/拒稿判据。**
+
+    原先它被接进 `validate_spec` 的 `can_fix` 与 `_review_spec` 的
+    auto hard focus, 于是第一人称题会被**强制**改成第三人称 ——
+    改不出来就 rewrite, 整稿丢弃。
+
+    而第一人称本来就是大量海龟汤非常自然的形式(红黑实验里读起来
+    最好的几道正是"第一人称 + 对话体 + 无结尾问句")。形式本身不是缺陷。
+
+    函数保留: 回归(`test_llm` 专门测了它的判据) / 实验脚本 /
+    将来的 metrics 仍可读它。
 
     精确判据 —— 不是"含不含'我'字"那么简单:
       经典海龟汤里"我"常出现在**引语**中, 那是正常的:
-          '男人对酒保说：「请给我一杯水」'   <- 第三人称, 合格
-      不合格的是"我"作为**叙述主体**:
-          '深夜我独自在家, 座机响了…'        <- 第一人称叙事, 是故事不是谜题
+          '男人对酒保说：「请给我一杯水」'   <- 第三人称
+      这里要认的是"我"作为**叙述主体**:
+          '深夜我独自在家, 座机响了…'        <- 第一人称叙事
 
     做法: 把引号/书名号里的内容抠掉, 再看剩下的部分。
     剩下的文本里若出现"我"(或"我们"), 就判为第一人称叙事。
@@ -312,7 +324,7 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
     clues = [FairClue.from_dict(c) for c in _norm_clues(d.get("fair_clues"))]
 
     # quality-v8: 发现阶段。模型可能漏给(旧 prompt 缓存 / 拒稿重出) ——
-    # 那就留空, 由 validate_spec 按政策判(当前政策要求 2~4 条)。
+    # 那就留空, 由 validate_spec 按政策判(当前政策要求 1~4 条)。
     beats = []
     for i, raw in enumerate(d.get("discovery_beats") or []):
         b = DiscoveryBeat.from_dict(raw)
@@ -424,9 +436,16 @@ def _remember(store: list, why: str) -> None:
 def _has_closing_question(puzzle: str) -> bool:
     """谜面结尾是不是一个问句?
 
-    海龟汤的谜面**必须以问句收尾** —— 否则观众读完只知道"有这么件事",
-    不知道该回答什么, 屏幕上就是一段普通叙述(实测踩过: "深夜的便利店,
-    店员报警说有人倒在饮料柜前…店员说: 他进店后一直没动过手机。")。
+    ⚠️ **G4-RB §三: 这只是一个分析信号, 不再是修复/拒稿判据。**
+
+    原先它被接进 `validate_spec` 的 `can_fix` 与 `_review_spec` 的
+    auto hard focus —— 那等于要求**谜面最后一个字符必须是问号**。
+    而一个**自明其问**的异常场景
+    ("每天晚上十二点，她都会从门外听见自己敲门") 本身就是完整的问题;
+    强行加一句"为什么?"不但没增加信息, 反而把问题**说死**,
+    缩小了观众的提问方向。
+
+    函数保留: 回归 / 实验脚本 / 将来的 metrics 仍可读它。
 
     判据: 谜面以问号(? / ？)结尾, 允许后面跟引号/空格等收尾符号。
     不能只看"全文里有问号" —— 中间引语常带问号
@@ -1248,8 +1267,8 @@ RIDDLE_SYSTEM = """你是中文「海龟汤」(情境推理谜题)的出题人�
 - 1~2 条。超过 2 条说明**合同**写细了 —— 收窄它, 不要放宽成 4、5 条。
   但这**不是**"这题必须只有 1~2 个信息点": 完整谜底、facts 与
   `discovery_beats` 都可以比合同丰富得多。
-- **题目允许有层次, 通关必须简单。** 观众要经历 2~4 个发现阶段
-  (`discovery_beats`), 而通关只要求合同那 1~2 条。
+- **题目允许有层次, 通关必须简单。** 观众要经历 1~4 个发现阶段
+  (`discovery_beats`) —— 一个强反转也算一层; 而通关只要求合同那 1~2 条。
 - 只能指向 kind=core 且 visibility=hidden 的 fact。
   **support / exclusion 永远不能作为通关要求。**
 - 每条都必须被某条 solve_atom 引用(否则观众没有推理抓手)。
@@ -1313,7 +1332,7 @@ core_answer "古董商通过人为制造虚高成交记录, 抬高手中同类�
 
 ═══ v8: 题目允许有层次, 通关必须简单 ═══
 
-一道题应当有 **2~4 个发现阶段**(`discovery_beats`): 观众正常玩下来
+一道题可以有 **1~4 个发现阶段**(`discovery_beats`): 观众正常玩下来
 会一层层想通什么。例如:
 
     b1 先意识到时间/地点理解错了
@@ -1701,12 +1720,9 @@ _QUALITY_CHECK_FIELDS = (
     # 两边同名、且 schema 里已经有成熟的判据措辞(见 `_TOOL_CHECK` 的
     # `livestream_safe.description`, 两条链**共用那一份**)。
     #
-    # ⚠️ **位置是契约的一部分**: 必须紧跟 `reasoning_beats_nonredundant`,
-    # 也就是 `_quality_check_contract` 切片 `[:9]` 的**第 9 项**。若只把它
-    # append 到元组末尾, 切片会取到后面的题型四问(`story_reconstruction`
-    # …)而把 livestream_safe 留在切片外 —— 那正是本项第一版的 bug:
-    # 生产会对每一道自由生成的题索要它根本没被问过的题型字段, 于是
-    # **每一道题都判不合格**。(`qc_ok()` 缺字段时 test_llm 立刻红。)
+    # ⚠️ G4-RB §五 起, 自由生成链的门**不再靠位置切片**取 —— 具名的
+    # `FREE_GEN_HARD_CHECKS` 才是门, 这个元组只是"Reviewer 要填什么"的
+    # 契约总表(schema 的 required 读它)。往这里插一项不会再静默改变门。
     "livestream_safe",
     # ---- H3-D3: 题型四问(§六) ----
     # 原先由**独立的一次调用** (`CuratedCompiler.story_review`) 回答, 于是
@@ -1760,7 +1776,7 @@ _QUALITY_CHECK_FIELDS = (
 #:     附件"没有任何关系。一道**必须看图才能答**的题完全可能有很强的
 #:     dramatic payoff —— 于是它在 Reviewer 这一层**过关**, 而它本该被
 #:     拒。假映射的代价不是"多拒了", 是"**漏放了**"。
-#:   - `reasoning_beats_nonredundant` 问的是"有没有 2~4 个真正不同的
+#:   - `reasoning_beats_nonredundant` 问的是"有没有 1~4 个真正不同的
 #:     发现阶段" —— 这**正是** §三 明确降级成 soft signal 的那条
 #:     `multi_step_deduction` 的另一种说法。把它当硬门 = 把刚拆掉的门
 #:     从后门装回去。而且它与 `livestream_safe`(毒不毒/血不血)无关。
@@ -1807,6 +1823,12 @@ _CURATED_HARD_CHECK_FIELDS = (
 #: 观众容易参与、揭晓有趣"就够了。一道单点脑筋急转弯不可能有
 #: `reasoning_beats_nonredundant=true` —— 若它还是硬门, 那种题就被
 #: 全灭, 与 §三/§十六 直接冲突。
+#:
+#: ⚠️ **G4-RB §五: 上面的"双标"已经取消。** 红黑实验(24 道真实样本)
+#: 证明同一条推理对自由生成链**同样成立** —— 于是自由生成链也把这四项
+#: 降为信号(见 `FREE_GEN_HARD_CHECKS` / `FREE_GEN_SIGNAL_CHECKS`)。
+#: 两条链在这一点上现在一致。这段历史保留下来是因为它记录了"为什么
+#: 该降级"的完整推理 —— 它先被 curated 验证, 再推广到自由生成。
 _CURATED_SIGNAL_FIELDS = (
     "dramatic_payoff", "reasoning_beats_nonredundant",
     "story_reconstruction", "multi_step_deduction", "single_trick",
@@ -1840,13 +1862,49 @@ _CURATED_SIGNAL_FIELDS = (
 #: 一致。后两项的语义是错的 —— 详见 `_CURATED_HARD_CHECK_FIELDS`。
 #: 现在 curated 用**与编译侧同名**的六条, 没有映射表可画错。
 #:
-#: ⚠️ 自由生成链(前八项)**原样不动**: 那是 AI 原创创作标准, 任务书
-#: §九 明写"这次只改 curated external puzzle"。原创以后仍然可以保持
-#: 更高的创作标准 —— "现成题有趣就能用, AI 原创既然是自己生成, 可以
-#: 要求更好", 两套标准是合理的。
+#: ⚠️ **G4-RB §五: 自由生成链的门从九项收窄到五项。**
 #:
-#: 也就是说 `dramatic_payoff` / `reasoning_beats_nonredundant` 现在是
-#: **双标的**: 对 AI 原创是硬门(前八项), 对 curated 是信号。
+#: 红黑实验(24 道真实样本)确认: `concrete_anomaly` /
+#: `clue_recontextualized` / `dramatic_payoff` /
+#: `reasoning_beats_nonredundant` 这四项问的是"**够不够精彩**",
+#: 而一道单核强反转的经典汤(53~84 字的那些)结构上不可能全 true ——
+#: 把它们当硬门等于**全灭**这个形状。
+#:
+#: 这不是新政策: curated 链在 H4-D1 已经对**同样四项**做过同样的推理
+#: 并降为信号(见上面 `_CURATED_SIGNAL_FIELDS` 那段), 只是当时只放开了
+#: curated。现在把**同一套推理**用到自由生成链 —— 两条链在这一点上
+#: 终于一致, 不再"双标"。
+#:
+#: 留下的是**正确性 + 安全**五项, 一项都没放宽:
+#:
+#:     narrator_truthful          谜底有没有推翻谜面的无归属事实
+#:     mechanism_consistent       物理/时间/方向/数量/因果成不成立
+#:     core_answer_direct         core_answer 有没有正面回答谜面
+#:     completion_contract_minimal 通关合同是不是最小语义拆分
+#:     livestream_safe            能不能在直播间直接念出来
+#:
+#: 降级的那四项**仍然要 Reviewer 返回**(schema 里照旧), 只是 false
+#: 不再拒稿 —— 进 `_last_review_checks` / metrics, 供复盘看分布。
+#: 判据与 `check_value_ok(n, v)` 一起用: 两项都是"true = 好", 没有反向项。
+FREE_GEN_HARD_CHECKS = (
+    "narrator_truthful", "mechanism_consistent",
+    "core_answer_direct", "completion_contract_minimal",
+    "livestream_safe",
+)
+
+#: 自由生成链里**降为信号**的四项(仍然返回, 不再拒稿)。
+#:
+#: ⚠️ 与上面那五项**必须不相交** —— 两边都列会让"这道题为什么被拒"
+#: 变得无法回答(与 `_CURATED_SIGNAL_FIELDS` 的纪律同一条)。
+#: `reasoning_beats_nonredundant` 的降级还附带一个重要效果:
+#: 它不再与 `discovery_beats` 的条数联动 (§六 允许单层题之后,
+#: "只有 1 个 beat" 不该同时引发两个门)。
+FREE_GEN_SIGNAL_CHECKS = (
+    "concrete_anomaly", "clue_recontextualized",
+    "dramatic_payoff", "reasoning_beats_nonredundant",
+)
+
+
 def _quality_check_contract(spec: Any) -> tuple:
     """这道题该按哪一份 `quality_checks` 清单验收。
 
@@ -1854,14 +1912,21 @@ def _quality_check_contract(spec: Any) -> tuple:
     **同名同序**。测试 `test_curated_reviewer_contract_is_semantically_honest`
     断言的是**逐字相等**, 不是长度相等 —— 长度相等正是 H4-D 第一版
     漏掉这个 bug 的原因。
+
+    ⚠️ G4-RB §五: 自由生成链**不再用切片**。
+
+    原先这里写的是 `_QUALITY_CHECK_FIELDS[:9]`, 靠"第 9 项正好是
+    `livestream_safe`"这个**位置**成立。那个写法很脆: 往
+    `_QUALITY_CHECK_FIELDS` 里插一项就会静默取错(注释里也警告过)。
+    现在直接用 `FREE_GEN_HARD_CHECKS` 具名元组 —— 门是哪五项**写在
+    名字里**, 不依赖任何下标。
+
+    `_QUALITY_CHECK_FIELDS` 仍然是**契约总表**(schema 的 required 用它,
+    十五项都要 Reviewer 填)。改变的是"哪几项能拒稿", 不是"要填几项"。
     """
-    if str(getattr(spec, "source_type", "") or "") == "curated":
+    if _is_curated(spec):
         return _CURATED_HARD_CHECK_FIELDS
-    #: G4-E: 自由生成链从八项变**九项** —— 第 9 项是 `livestream_safe`。
-    #: 切片上界必须跟着改, 否则新增的那一项只是躺在元组里没人查。
-    #: ⚠️ 它必须排在 `_QUALITY_CHECK_FIELDS` 的第 9 位(紧跟四项"好不好玩"),
-    #: **不能** append 到末尾 —— 末尾是题型四问, 切片会取错。
-    return _QUALITY_CHECK_FIELDS[:9]
+    return FREE_GEN_HARD_CHECKS
 
 
 def _is_curated(spec: Any) -> bool:
@@ -1943,7 +2008,7 @@ _TOOL_RIDDLE = {
                     "⚠️ 若压不进 2 条, 说明**合同**写细了 —— 请收窄到"
                     "core_answer 的最小语义, 不要把 4、5 条都塞进来"
                     "(代码会拒稿)。这**不是**要求你把整道题写简单: "
-                    "题目允许有层次(2~4 个 discovery_beats), 通关仍需简单。"),
+                    "题目允许有层次(1~4 个 discovery_beats), 通关仍需简单。"),
             },
             "hints": {
                 "type": "array", "minItems": 3, "maxItems": 3,
@@ -1951,7 +2016,7 @@ _TOOL_RIDDLE = {
                 "description": "3 条由浅入深的提示, 每条不超过 30 字, 不剧透",
             },
             "discovery_beats": {
-                "type": "array", "minItems": 2, "maxItems": 4,
+                "type": "array", "minItems": 1, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1968,7 +2033,7 @@ _TOOL_RIDDLE = {
                     "required": ["id", "text"],
                 },
                 "description": (
-                    "2~4 个**发现阶段** —— 观众正常玩下来会一层层想通什么。"
+                    "1~4 个**发现阶段**(1 条 = 一个强反转, 完全合法)。观众正常玩下来"
                     "⚠️ 它**不是**通关条件: 通关只由 completion_fact_ids 决定。"
                     "用途是让题目**有层次**: 先意识到 A, 再意识到 B, 最后理解 C。"
                     "每条必须是**不同的发现阶段** —— 不要写"
@@ -2183,13 +2248,37 @@ def _unconstrained_blueprint():
 def _keywords_prompt(keywords) -> str:
     """Stage A 的 user message。
 
-    形状刻意与外部题库一致(`关键词：X，Y`) —— G1-A 就是照这个形状测的,
-    换掉它等于换掉被测变量。
+    `关键词：X，Y` 这个**形状**刻意与外部题库一致 —— G1-A 就是照它测的,
+    换掉它等于换掉被测变量。变的是后面那段指令。
+
+    ## G4-RB §一: 删掉 v3 遗留的"直接给出谜面与谜底"
+
+    那段原先是:
+
+        请围绕这几个关键词写一道中文海龟汤。
+        直接给出谜面与谜底。
+
+    这是 **v3 时代的指令** —— 那时 Stage A 只产出谜面与谜底两样。
+    v4 起 `_TOOL_KEYWORD_IDEA` 要求先交 core_truth / observed_clues /
+    event_chain, 于是"直接给出谜面与谜底"与 schema **直接矛盾**:
+    模型被同时要求"先想清真相"和"直接给答案"。上一轮接入 Case-first 时
+    漏改了这一句。
+
+    现在改成与 v4 一致的短指令: 先想清真实故事 -> 再决定信息怎么分配
+    (哪些进汤面、哪些留给提问) -> 最后按工具字段输出。
+
+    ⚠️ **不要求关键词字面命中**, 也不新增 keyword checker(§一 明确)。
+    只要求两个词在故事里有**具体作用**, 不当作气氛词。理由见红黑实验:
+    关键词的作用是**强制换题材**(无词时模型会往自己的舒适区塌缩,
+    4 道里 3 道都落在殡仪馆/遗物), 而不是"必须在谜面里出现"。
     """
     words = [str(k).strip() for k in (keywords or []) if str(k).strip()]
     return ("关键词：" + "，".join(words) + "\n\n"
-            "请围绕这几个关键词写一道中文海龟汤。\n"
-            "直接给出谜面与谜底。")
+            "请按系统要求先想清真实故事/核心真相,\n"
+            "再决定哪些信息放在汤面、哪些留给玩家通过是/否提问确认,\n"
+            "最后输出工具要求的字段。\n\n"
+            "两个关键词都要在故事里有具体作用,\n"
+            "不要只作为气氛词; 不要求两个词都直接写进汤面。")
 
 
 def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
@@ -2367,17 +2456,25 @@ KEYWORD_IDEA_SYSTEM = """你是一个擅长设计中文海龟汤的悬疑谜题�
 
 3. 用简短的 event_chain 写清事情真实发生的顺序。
    写完检查一遍：玩家如果能一条条确认这些步骤，是不是就能还原真相？
-   如果有一条关键步骤在谜面里完全没有痕迹，回到第 2 步补一条线索。
+   如果有一条关键步骤在谜面里完全没有痕迹，那没关系 ——
+   只要它之后**能通过是/否提问确认**就行。
 
 4. 最后才写 title / puzzle / answer。
 
 谜面应该像一个值得调查的现场，而不是一道抽象逻辑题。
-谜面中的关键细节应该来自前面已经想好的现场线索。
+
+汤面需要至少有一个具体、可调查的异常锚点。
+
+不是所有关键事实都必须直接写在汤面。
+人物关系、过去、真实用途、时间顺序等可以隐藏，
+只要观众之后能够通过是/否提问确认。
+
+不要把汤面写成案情说明书。
 
 谜底应解释同一件事情，主要把谜面已有细节串回真实事件；
 不要在最后突然添加决定性的巨大背景来补洞。
-如果删掉某段新背景核心真相就讲不通，说明前面线索设计失败了 ——
-回到第 2 步重新设计线索，而不是用背景把谜底糊过去。
+如果删掉某段新背景核心真相就讲不通，回到第 2 步重新设计线索，
+而不是用背景把谜底糊过去。
 
 不要求复杂。
 不要求固定数量的反转。
@@ -2722,7 +2819,7 @@ _TOOL_STRUCTURE = {
                     "事实。quote 必须逐字出自**上面给出的谜面**。"),
             },
             "discovery_beats": {
-                "type": "array", "minItems": 2, "maxItems": 4,
+                "type": "array", "minItems": 1, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -2739,7 +2836,7 @@ _TOOL_STRUCTURE = {
                     "required": ["id", "text"],
                 },
                 "description": (
-                    "2~4 个**发现阶段** —— 观众正常玩下来会一层层想通什么。"
+                    "1~4 个**发现阶段**(1 条 = 一个强反转, 完全合法)。观众正常玩下来"
                     "⚠️ 它**不是**通关条件。每条必须是**不同的发现阶段**。"
                     "至少一条要指向 completion 里的 fact。"),
             },
@@ -3067,7 +3164,7 @@ _TOOL_CHECK = {
                     "atom** —— 否则这道题就没有公平推理路径, 应该 rewrite。"),
             },
             "discovery_beats": {
-                "type": "array", "minItems": 2, "maxItems": 4,
+                "type": "array", "minItems": 1, "maxItems": 4,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -3079,7 +3176,7 @@ _TOOL_CHECK = {
                     "required": ["id", "text"],
                 },
                 "description": (
-                    "2~4 个**发现阶段**。原样保留即可; 只有当你发现"
+                    "1~4 个**发现阶段**(1 条 = 一个强反转, 是合法形状)。原样保留即可; 只有当你发现"
                     "它们是同义重复的伪层次时才改写。"
                     "**不要**把它当成通关条件 —— 通关只由 "
                     "completion_fact_ids 决定。"),
@@ -3291,7 +3388,7 @@ _TOOL_CHECK = {
                     "reasoning_beats_nonredundant": {
                         "type": "boolean",
                         "description": (
-                            "**2~4 个 discovery_beats 是真正不同的发现阶段。**\n"
+                            "**1~4 个 discovery_beats 是真正不同的发现阶段。**\n"
                             "  反例: b1 画框有问题 / b2 画框比较特殊 / b3 画框"
                             "不正常 —— 同义重复, 伪层次。\n"
                             "  例: b1 先意识到时间理解错了 / b2 再意识到某物的"
@@ -3445,12 +3542,16 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix 
 
 ═══ fix: 局部修复 ═══
 **只改该改的地方, 其余一律保留原样。** 适合这些:
-- 第一人称叙事 -> 改成第三人称
-- 只叙述、结尾没有问句 -> 末尾补一个问句
 - 某句把答案说出口了 -> 删掉那一句(但见下面 ⚠)
 - 提示剧透了 -> 换成方向性的
 - 措辞不清 -> 说清楚
 - 小范围 fact/atom 不一致 -> 对齐
+- 谜面混进了【谜底】/【提示】之类的元文本 -> 删掉它们
+
+⚠ **第一人称与"结尾没有问句"都**不是**毛病, 不要改。**
+第一人称本来就是海龟汤非常自然的形式; 一个自明其问的异常场景
+("每天晚上十二点，她都会从门外听见自己敲门") 本身就是完整的问题,
+不需要再补一句"为什么?"。带着这两样把题判成 fix/rewrite 是错的。
 
 ⚠ **不要连"可回溯的线索"一起删掉。**
 删的是"答案本身", 留的是"知道答案后回看能指向它的事实"。
@@ -3482,7 +3583,7 @@ CHECK_SYSTEM = """你是海龟汤谜题的审稿人。读完给出 **pass / fix 
 - `solve_atoms` 必须重出, 且 fact_ids 要指向**新的** fact id。
 - `fair_clues` 的 quote 必须**逐字**出自**改后的**谜面(代码会验)。
 - `discovery_beats` 必须重出或**原样带回** —— 它是观众正常推理会经过
-  的 2~4 个发现阶段。改了谜底却留着旧 beats, 结果是"新谜底 + 旧推理
+  的 1~4 个发现阶段。改了谜底却留着旧 beats, 结果是"新谜底 + 旧推理
   层次"的混合稿: 代码查不出(fact id 往往没变), 但观众看到的推理
   路径已经和谜底对不上了。**当前政策下漏回会被拒稿。**
 - `observed_signature` 必须**如实重新判断** —— 你把题改成了什么形状
@@ -3629,7 +3730,7 @@ kind=core 且 visibility=hidden。混进 support/exclusion, 或者为了保险
 背景("因为单位有规定")、没有重构异常 -> false。
 
 **8. reasoning_beats_nonredundant**
-2~4 个 discovery_beats 是真正不同的发现阶段。同义重复
+1~4 个 discovery_beats 是真正不同的发现阶段。同义重复
 ("画框有问题"/"画框比较特殊"/"画框不正常")是伪层次 -> false。
 
 **v6 新增 —— 不得严于 core_answer**(这条最容易漏):
@@ -4445,7 +4546,11 @@ class PuzzleWriter:
 
             # ---- ① 硬校验(确定性, 不花 LLM 调用) ----
             # `errors` = 结构性错误 -> 直接毙, 不浪费 reviewer 调用。
-            # `fixable` = 格式问题(人称/问句/meta) -> 交给 reviewer 就地改。
+            # `fixable` = 可就地修的问题 -> 交给 reviewer。
+            #
+            # ⚠️ G4-RB §三/§四: `fixable` 里**不再有**人称/问句两条。
+            # 现在只剩 meta 文本 / fact 枚举 / core 长度 / 连线 /
+            # clue quote / hint 超长 —— 全是内容或结构问题, 没有形状偏好。
             vr = validate_spec(spec)
             if not vr.ok:
                 log.info("出题第 %d 稿硬校验不过: %s", attempts, vr.why()[:120])
@@ -4469,8 +4574,13 @@ class PuzzleWriter:
                 continue
 
             # ---- ③ reviewer(需要语义理解的才交给它) ----
-            # 格式问题(人称/问句/meta)作为 must_fix 点名让它改 ——
-            # 这三样都是"改一句话", 重出整题是浪费。
+            # 可就地修的确定性问题(meta 文本 / 枚举 / 长度 / 连线 /
+            # quote / hint)作为 must_fix 点名让它改 ——
+            # 这些都是"改一句话", 重出整题是浪费。
+            #
+            # ⚠️ G4-RB §三/§四: 人称与问句两条**已从这里移除**。
+            # 它们不再是毛病, 所以既不在 `fixable` 里, 也不会被
+            # `_review_spec` 注入成 hard focus。
             #
             # ---- G1 检查点 ②: Reviewer 之前 ----
             # 这是后台补池最常撞上的那一个: 出稿回来时直播已经切进
@@ -5522,7 +5632,7 @@ class PuzzleWriter:
             # solve_atoms / fair_clues 同级) —— 漏回会被 `_apply_review`
             # 直接拒稿。所以要在这里明说"必须带上", 而不是像早先那样
             # 含蓄地说"原样带回"(漏了也能过)。
-            user += ("\n【现有 discovery_beats(2~4 个发现阶段; **必须原样带回**, "
+            user += ("\n【现有 discovery_beats(1~4 个发现阶段; **必须原样带回**, "
                      "发现伪层次才改写 —— 它不是通关条件; "
                      "当前政策下漏回会被拒稿)】\n"
                      + "\n".join(f"{b.id}. {b.text}  "
@@ -5551,12 +5661,23 @@ class PuzzleWriter:
         user += _blueprint_block_for_review(bp)
 
         # 代码已经确定的毛病, 直接点名让它改
+        #
+        # ⚠️ **G4-RB §三/§四: 这里不再自动补"谜面形状"的 hard focus。**
+        #
+        # 原先在 `must_fix` 为空时会**代码替审稿人决定**两条:
+        #
+        #     谜面是第一人称叙事 -> "改成第三人称客观事实"
+        #     谜面结尾没有问句   -> "末尾补一句'为什么?'之类的提问"
+        #
+        # 那两条已经被 `validate_spec` 删除(见 `story/quality.py` 里
+        # 那段说明), 这里必须跟着删 —— 否则只要留下这一处, 形状门就
+        # 换个地方继续生效: 审稿人仍然被**要求**改掉第一人称/补问号,
+        # 交不出新谜面就 rewrite -> 整稿丢。
+        #
+        # `hard` 现在**只**来自 `must_fix`(真正的确定性结构问题:
+        # 元文本 / fact 枚举 / core 长度 / 连线 / clue quote / hint 超长)。
+        # 没有任何代码注入的谜面形状要求。
         hard = must_fix or ""
-        if not hard:
-            if _is_first_person_story(spec.puzzle):
-                hard = "谜面是第一人称叙事, 改成第三人称客观事实"
-            elif not _has_closing_question(spec.puzzle):
-                hard = "谜面结尾没有问句, 末尾补一句'为什么?'之类的提问"
         if hard:
             user += f"\n\n【已知问题, 必须改掉】{hard}"
         elif own_fix_focus and not any(
@@ -5638,7 +5759,7 @@ class PuzzleWriter:
                 "═══ 只是信号(如实填, 填什么都不影响收不收)═══\n"
                 "\n"
                 "  dramatic_payoff             揭晓够不够有力?\n"
-                "  reasoning_beats_nonredundant 有没有 2~4 个真正不同的发现"
+                "  reasoning_beats_nonredundant 有没有 1~4 个真正不同的发现"
                 "阶段?\n"
                 "  story_reconstruction        谜底揭开后观众多了**一个故事**"
                 "还是只多了**一个知识点**?\n"
@@ -5738,9 +5859,11 @@ class PuzzleWriter:
         # (压缩 core_answer / 重摘 quote / 缩短 hint)。所以"谜面没变"
         # 只有在**确实有与谜面有关的毛病**时才算没干活。
         #
-        # 判据是**白名单**: 只有人称/问句/meta 这三条真的需要改谜面
-        # (见 `_PUZZLE_TOUCH_MARK`)。将来新增 fixable 规则时忘了标,
-        # 后果只是"被当成需要动谜面"(保守), 而不是反过来放任一次没改。
+        # 判据是**白名单**: 现在**只有 meta 文本**真的需要改谜面
+        # (见 `_PUZZLE_TOUCH_MARK`)。G4-RB §三/§四 删掉了人称与问句
+        # 两条 —— 它们不再是 fixable, 自然也不再需要动谜面。
+        # 将来新增 fixable 规则时忘了标, 后果只是"被当成需要动谜面"
+        # (保守), 而不是反过来放任一次没改。
         _touching = [f for f in (own_fix_focus or [])
                      if _PUZZLE_TOUCH_MARK in f]
         _puzzle_irrelevant_fix = bool(own_fix_focus) and not _touching
@@ -5787,9 +5910,11 @@ class PuzzleWriter:
         #
         # 判据必须**窄**: 只有当代码点名要改的问题**全部**与谜面无关时,
         # 才允许 `puzzle` 原样回传。否则"改了谜面"这件事就没人保证了。
-        # `must_fix` 是代码**已经确定**的毛病(人称/问句/meta 等) ——
-        # 那些**必须**动谜面。所以这里判的是: 除了那些之外, 剩下的
-        # fixable 是否**全部**与谜面无关。
+        # `must_fix` 是代码**已经确定**的毛病(meta 文本 / 枚举 / 长度 /
+        # 连线 / quote / hint 等) —— 其中**只有 meta 文本**必须动谜面。
+        # 所以这里判的是: 除了那些之外, 剩下的 fixable 是否**全部**
+        # 与谜面无关。(G4-RB §三/§四 之后 must_fix 里已经没有形状类
+        # 要求了; 这段白名单逻辑仍然成立, 只是白的部分只剩 meta。)
         _touching = [f for f in (own_fix_focus or [])
                      if _PUZZLE_TOUCH_MARK in f]
         _puzzle_irrelevant_fix = bool(own_fix_focus) and not _touching

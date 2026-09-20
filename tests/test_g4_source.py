@@ -1610,31 +1610,35 @@ def test_core_fix_only_kind_change_allowed():
 def test_core_fix_coexists_with_other_fixable():
     """**R1 §二**: core-count + 另一个合法 fixable 能同时修, 不误伤。
 
-    夹具: `core hidden=4` **且** 谜面缺结尾问句。Reviewer:
+    夹具: `core hidden=4` **且** 谜面混进元文本。Reviewer:
 
-        * 改谜面**只补问句**
+        * 改谜面**只删元文本**(这是**仅剩**的一条谜面类 fixable)
         * 把多余 core -> support
 
     必须**收下**。一刀切(有 core-count 就冻结谜面)会把这次合法修复判成
     越界 —— 那正是 R2 第一版的形状。
+
+    ⚠️ G4-RB §三/§四: 这里原本用"缺结尾问句"。那条 fixable 已删除
+    (它把形状当质量), 所以改用**仅剩的**谜面类 fixable —— 元文本。
+    被测的东西没变: "core-count + 另一条合法 fixable 能不能同时修"。
     """
-    print("\n[G4-R2-R1-3] core-count + 补问句 同时修")
+    print("\n[G4-R2-R1-3] core-count + 元文本 同时修")
     from story.llm import PuzzleWriter
     from story.quality import validate_spec
     from story.puzzle import FairClue
     from tests.test_llm import FakeClient, clues_for, qc_ok
     s = _core4_spec()
-    # 让谜面**缺结尾问句**(另一种 fixable)。
-    s.puzzle = s.puzzle.rstrip("?？").rstrip()
+    # 让谜面混进元文本(另一种 fixable)。
+    s.puzzle = s.puzzle.rstrip() + " 【提示】他去问过了。"
     s.fair_clues = [FairClue(quote=c["quote"],
                              supports_atoms=list(c["supports_atoms"]))
                     for c in clues_for(s.puzzle)]
     vr = validate_spec(s)
     check("**同时有两种 fixable**",
           any("core hidden" in f for f in vr.fixable)
-          and any("问句" in f for f in vr.fixable), vr.fixable)
-    # Reviewer: 补问句 + 重标 f4
-    new_puzzle = s.puzzle + " 为什么?"
+          and any("元文本" in f for f in vr.fixable), vr.fixable)
+    # Reviewer: 删元文本 + 重标 f4
+    new_puzzle = s.puzzle.replace(" 【提示】他去问过了。", "")
     payload = _review_payload_retag(s, {"f4": "support"})
     payload["puzzle"] = new_puzzle
     payload["fair_clues"] = clues_for(new_puzzle)
@@ -1646,8 +1650,8 @@ def test_core_fix_coexists_with_other_fixable():
     check("**合法双重修复被收下(不误拒)**", new is not None,
           (why or "")[:80])
     if new is not None:
-        check("**问句补上了**", new.puzzle.rstrip().endswith("?"),
-              new.puzzle[-12:])
+        check("**元文本删掉了**", "【提示】" not in new.puzzle,
+              new.puzzle[-20:])
         check("**core 降到 <= 3**", len(new.core_hidden_facts()) <= 3,
               len(new.core_hidden_facts()))
         vr2 = validate_spec(new)
@@ -1662,7 +1666,7 @@ def test_core_fix_coexists_with_other_fixable():
     w2 = PuzzleWriter(FakeClient([LLMResult(tool_input=payload2)]))
     new2, why2, _r2, _t2 = w2._review_spec(s, must_fix=vr.must_fix(),
                                           own_fix_focus=list(vr.fixable))
-    check("**拒: 借补问句之名改谜底**", new2 is None, (why2 or "")[:70])
+    check("**拒: 借删元文本之名改谜底**", new2 is None, (why2 or "")[:70])
 
 
 def test_core_fix_still_over_limit_rejected():
@@ -1812,19 +1816,24 @@ def test_core_guard_does_not_touch_wide_fixables():
 def _clue_case(mutate, *, puzzle_fix=False):
     """跑一次带 `fair_clues` 变更的修复, 返回 `(new, why)`。
 
-    `puzzle_fix=True` 时同时授权"补问句" —— 那是混合修复的形状。
+    `puzzle_fix=True` 时同时授权一条**谜面类** fixable(混进元文本) ——
+    那是混合修复的形状。
+
+    ⚠️ G4-RB §三/§四: 原本授权的是"补问句"。那条 fixable 已删除, 所以
+    改用**仅剩的**谜面类 fixable —— 元文本。被测的东西没变。
     """
     from story.llm import PuzzleWriter
     from story.quality import validate_spec
     from tests.test_llm import FakeClient, clues_for, qc_ok
     s = _core4_spec()
+    _META = " 【提示】他去问过了。"
     if puzzle_fix:
-        s.puzzle = s.puzzle.rstrip("?？").rstrip()
+        s.puzzle = s.puzzle.rstrip() + _META
         s.fair_clues = [FairClue(quote=c["quote"],
                                  supports_atoms=list(c["supports_atoms"]))
                         for c in clues_for(s.puzzle)]
     vr = validate_spec(s)
-    new_puzzle = (s.puzzle + " 为什么?") if puzzle_fix else s.puzzle
+    new_puzzle = (s.puzzle.replace(_META, "")) if puzzle_fix else s.puzzle
     payload = _review_payload_retag(s, {"f4": "support"})
     payload["puzzle"] = new_puzzle
     payload["fair_clues"] = clues_for(new_puzzle)
@@ -1847,9 +1856,11 @@ def test_clue_quote_only_domain():
     puzzle_changed: continue` —— 于是"core-count + 补问句"这类混合修复
     会把**整个 fair_clues** 放行, Reviewer 可以顺手改 clue 数量 / 顺序 /
     supports_atoms。契约只允许重摘被点名的那一句话。
+    ⚠️ G4-RB §三/§四: 混合里的那条谜面类 fixable 已从"补问句"换成
+    元文本(前者已删除)。断言不变。
     """
     print("\n[G4-R2-R2-1] fair_clues 只允许改 quote")
-    # ① core-count + 补问句 + **只**重摘 quote -> 通过
+    # ① core-count + 元文本 + **只**重摘 quote -> 通过
     _n, why = _clue_case(lambda p: None, puzzle_fix=True)
     check("**① 只重摘 quote -> 通过**", _n is not None, (why or "")[:70])
 
