@@ -1271,7 +1271,7 @@ def test_stage_a_prompt_carries_answer_length():
           "念" in KEYWORD_IDEA_SYSTEM, "缺少理由说明")
     _d = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]["answer"]["description"]
     check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
-    check("**版本号 bump 了**", KEYWORD_IDEA_PROMPT_VERSION == "keyword2-v3",
+    check("**版本号 bump 了**", KEYWORD_IDEA_PROMPT_VERSION == "keyword2-v4",
           KEYWORD_IDEA_PROMPT_VERSION)
     # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
     for banned, why in (("第一人称", "v1 人称硬限制"),

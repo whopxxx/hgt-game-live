@@ -530,6 +530,19 @@ def draw_two_keywords(rng: random.Random,
 # ⚠️ 这个抽取是**刻意的**: 两份实现会在"哪里写 metrics / 哪里判让路 /
 # 哪里补 provenance"这些细节上漂, 而漂了以后 live 与 prefetch 出的题
 # 就不是同一种东西了 —— 那正是本轮要消灭的形状。所以骨架只写一次。
+#
+# ⚠️ 逻辑 0 改动(本轮只补这条注释): Stage A 从 `keyword2-v4` 起内部含
+# **Case-first 创作脚手架**(先想清 core_truth -> 现场 observed_clues ->
+# event_chain, 最后才写谜面谜底)。但下面这一行刻意**只**把
+# title/puzzle/answer 交给 Stage B:
+#
+#     structure_original_idea(title=idea["title"], puzzle=idea["puzzle"],
+#                             answer=idea["answer"], ...)
+#
+# 三个脚手架字段是**一次性**的 —— 它们帮模型先想清楚, 然后在这里终止。
+# **不要**把它们也传进 Stage B: Stage B 已经从**最终** canonical 谜面谜底
+# 建了 core_answer / facts / completion / atoms / beats, 再传一份草稿
+# 结构进去就有了两个事实来源, 以后要解决"谁权威"。
 def keyword_spec(writer, bag, session_seed: int, *,
                  avoid=None, recent=None, should_continue=None,
                  corpus_version: str = ""):

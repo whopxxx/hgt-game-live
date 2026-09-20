@@ -3482,10 +3482,34 @@ def test_g1_budget_and_attempts_are_honored():
 # `keyword` 以免混。
 
 def _kw_idea():
-    """Stage A 的产出(与 `riddle()` 同一道题, 保证 clues 对得上)。"""
+    """Stage A 的产出(与 `riddle()` 同一道题, 保证 clues 对得上)。
+
+    ⚠️ `keyword2-v4` 起 Stage A 多出**三个 Case-first 创作脚手架**
+    字段(`core_truth` / `observed_clues` / `event_chain`)。它们是
+    "作者怎么想", **不是** PuzzleSpec 事实源 —— 见
+    `test_g4cf_internal_scaffold_never_reaches_stage_b`。
+    """
     r = riddle()
-    return {"title": r.get("title", "灯塔"), "puzzle": r["puzzle"],
-            "answer": r["answer"]}
+    return {
+        "core_truth": "灯塔守望者亮灯不是为了给船引路, 而是为了标出退潮时"
+                      "会露出水面的礁石。",
+        "observed_clues": ["灯只在退潮的那几个小时亮着",
+                           "涨潮时灯是灭的, 而那时航道最需要光"],
+        "event_chain": ["这片浅滩退潮时会露出礁石",
+                        "守望者用亮灯标出礁石位置",
+                        "船看见灯就知道那里有礁石"],
+        "title": r.get("title", "灯塔"), "puzzle": r["puzzle"],
+        "answer": r["answer"],
+    }
+
+
+#: Case-first 的**三个脚手架字段** —— Stage A 有, Stage B / PuzzleSpec 没有。
+_CF_SCAFFOLD = ("core_truth", "observed_clues", "event_chain")
+
+#: Stage B 的词汇 —— Stage A **永远**不该出现这些(脚手架 ≠ PuzzleSpec)。
+_STAGE_B_VOCAB = ("facts", "solve_atoms", "completion_fact_ids",
+                  "discovery_beats", "signature", "Blueprint",
+                  "quota", "recent")
 
 
 def _kw_structure_payload(**extra):
@@ -3505,12 +3529,14 @@ def _kw_structure_payload(**extra):
 
 
 def test_g2_keyword_stage_a_returns_idea():
-    """Stage A 只返回三样, 且用的是 keyword 专用 prompt/tool。"""
-    print("\n[G2-K1] Stage A: 只有 title/puzzle/answer")
+    """Stage A 返回完整六字段, 且用的是 keyword 专用 prompt/tool。"""
+    print("\n[G2-K1] Stage A: 六字段(含 Case-first 脚手架)")
     fc = FakeClient([LLMResult(tool_input=_kw_idea())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     idea = w.gen_keyword_idea(["图书馆", "上楼"])
-    check("返回了三样", set(idea) >= {"title", "puzzle", "answer"}, idea)
+    check("**返回完整六字段**",
+          set(idea) >= {"core_truth", "observed_clues", "event_chain",
+                        "title", "puzzle", "answer"}, sorted(idea))
     check("puzzle 非空", bool(idea["puzzle"]))
     check("用的是 emit_keyword_idea",
           fc.calls[0]["tool"]["name"] == "emit_keyword_idea",
@@ -3519,9 +3545,182 @@ def test_g2_keyword_stage_a_returns_idea():
           fc.calls[0]["system"] == KEYWORD_IDEA_SYSTEM)
     # ⚠️ §四: Stage A 不得同时想 facts / atoms / completion / beats。
     low = KEYWORD_IDEA_SYSTEM
-    for bad in ("facts", "solve_atoms", "completion_fact_ids",
-                "discovery_beats", "signature"):
+    for bad in _STAGE_B_VOCAB:
         check(f"Stage A prompt 不提 {bad}", bad not in low)
+
+
+def test_g4cf_stage_a_scaffold_is_returned_verbatim():
+    """§12.4: 三个脚手架字段**原样**带出, 不被代码悄悄丢掉/改写。"""
+    print("\n[G4-CF-1] Stage A 脚手架原样返回")
+    idea_in = _kw_idea()
+    fc = FakeClient([LLMResult(tool_input=idea_in)])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = w.gen_keyword_idea(["图书馆", "上楼"])
+    check("**core_truth 原样**", idea["core_truth"] == idea_in["core_truth"],
+          idea["core_truth"][:40])
+    check("**observed_clues 原样**",
+          idea["observed_clues"] == idea_in["observed_clues"],
+          idea["observed_clues"])
+    check("**event_chain 原样**", idea["event_chain"] == idea_in["event_chain"],
+          idea["event_chain"])
+
+
+#: 哨兵: 让 `_run` 知道"这个键要**从 dict 里删掉**", 而不是设成某个值。
+_DROP = object()
+
+
+def test_g4cf_stage_a_scaffold_fails_closed():
+    """§一 / §二 A~E: Stage A 的**五个 required 字段结构 fail-closed**。
+
+    ⚠️ 这条**替换**了上一版那句"缺脚手架字段不算失败"。那是错的:
+    schema 里这五个都是 required, 代码层却对缺失睁一只眼闭一只眼, 于是
+
+        模型跳过"先想清真相"直接写谜面 -> 代码放行
+          -> "Stage A 是 Case-first" 就只是 prompt 里的一个愿望
+
+    整个接入的唯一收益是"让模型先想清楚再写"。模型没交脚手架, 就不该
+    被当成一次成功的 Stage A。
+
+    ⚠️ 这**不是**语义审核: 只看字段在不在、类型对不对、归一后条数在不在
+    区间里。**不**判 core_truth 好不好、clue 有没有泄底。
+    """
+    print("\n[G4-CF-2a] Stage A 脚手架 fail-closed")
+    ok_idea = _kw_idea()
+
+    def _run(mutate):
+        d = dict(ok_idea)
+        mutate(d)
+        for k in list(d):
+            if d[k] is _DROP:
+                d.pop(k)
+        fc = FakeClient([LLMResult(tool_input=d)])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out = w.gen_keyword_idea(["图书馆", "上楼"])
+        return out, len(fc.calls)
+
+    # ---- 基线: 正常一份**必须**成功(证明下面那些不是恒真) ----
+    out, n = _run(lambda d: None)
+    check("**基线: 完整六字段 -> 成功**", out is not None and bool(out["puzzle"]))
+    check("**基线: 恰好 1 次调用**", n == 1, n)
+
+    # ---- A: 缺 core_truth ----
+    out, _ = _run(lambda d: d.__setitem__("core_truth", _DROP))
+    check("**A 缺 core_truth -> fail**", out is None, out)
+    out, _ = _run(lambda d: d.__setitem__("core_truth", "   "))
+    check("**A2 core_truth 纯空白 -> fail**", out is None, out)
+
+    # ---- B: observed_clues 空 ----
+    out, _ = _run(lambda d: d.__setitem__("observed_clues", []))
+    check("**B observed_clues=[] -> fail**", out is None, out)
+
+    # ---- C: 只有 1 条 observed clue ----
+    out, _ = _run(lambda d: d.__setitem__("observed_clues", ["只有一条"]))
+    check("**C 1 条 clue -> fail**", out is None, out)
+
+    # ---- D: event_chain 非 list ----
+    out, _ = _run(lambda d: d.__setitem__("event_chain", "先这样再那样"))
+    check("**D event_chain 非 list -> fail**", out is None, out)
+
+    # ---- E: event_chain 只有 1 条 ----
+    out, _ = _run(lambda d: d.__setitem__("event_chain", ["只有一步"]))
+    check("**E 1 步 chain -> fail**", out is None, out)
+
+    # ---- 上界也要管: 5 条 clue / 4 步 chain 同样越界 ----
+    out, _ = _run(lambda d: d.__setitem__("observed_clues", list("abcde")))
+    check("clues 5 条 -> fail", out is None, out)
+    out, _ = _run(lambda d: d.__setitem__("event_chain", list("wxyz")))
+    check("chain 4 步 -> fail", out is None, out)
+
+    # ---- 占位符凑数: 归一后只剩 1 条 -> fail ----
+    out, _ = _run(lambda d: d.__setitem__("observed_clues", ["一条", "", "  "]))
+    check("**归一后只剩 1 条 -> fail**(没被占位符骗过)", out is None, out)
+
+    # ---- puzzle / answer 仍是合同字段 ----
+    out, _ = _run(lambda d: d.__setitem__("puzzle", _DROP))
+    check("缺 puzzle -> fail", out is None, out)
+    out, _ = _run(lambda d: d.__setitem__("answer", "  "))
+    check("answer 空白 -> fail", out is None, out)
+
+    # ---- title 仍可空 ----
+    out, _ = _run(lambda d: d.__setitem__("title", _DROP))
+    check("**缺 title 仍成功**(optional)", out is not None and bool(out["puzzle"]))
+
+
+def test_g4cf_stage_a_shape_fail_is_one_attempt():
+    """§二 G: 结构失败**不得**偷偷触发第二次调用。
+
+    默认 `max_attempts=1` -> exactly 1 LLM call。这条防的是"fail-closed
+    之后有人加个内部重试把失败率压下去" —— 那会让成本翻倍, 而且
+    "1 attempt" 这条生产契约就没了。
+    """
+    print("\n[G4-CF-2b] 结构失败: exactly 1 次调用")
+    bad = dict(_kw_idea())
+    bad["observed_clues"] = []           # 结构不合规
+    for label, payload in (("结构不合规", bad),
+                           ("缺 core_truth",
+                            {k: v for k, v in _kw_idea().items()
+                             if k != "core_truth"})):
+        fc = FakeClient([LLMResult(tool_input=payload)] * 3)
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out = w.gen_keyword_idea(["图书馆", "上楼"])
+        check(f"**{label} -> None**", out is None, out)
+        check(f"**{label} -> 恰好 1 次调用**", len(fc.calls) == 1, len(fc.calls))
+
+
+def test_g4cf_shape_check_is_not_semantic_review():
+    """§一: 结构校验**不许**变成语义审核。
+
+    拿一批**结构完全合规但内容可疑**的 idea 进去, 断言全部放行 ——
+    结构校验只回答"字段在不在/类型对不对/条数对不对"。
+
+    ⚠️ 这些内容在 G9-R2/R3 里被证明是**真问题**, 但结论是"中间分类器
+    不值得接生产"。所以它们必须**通过** Stage A, 由后面的 Reviewer /
+    truth audit 去处理。
+    """
+    print("\n[G4-CF-2c] 结构校验 ≠ 语义审核")
+    suspicious = [
+        ("core_truth 多解(也可能)",
+         {"core_truth": "灯灭了。也许是保险丝烧了, 也可能是有人拉了总闸。"}),
+        ("clue 泄底",
+         {"observed_clues": ["钥匙早就被他留了一份给那个访客", "门锁完好"]}),
+        ("clue 是事后结果",
+         {"observed_clues": ["事后清点发现什么也没少", "门锁完好"]}),
+        ("chain 逻辑不通",
+         {"event_chain": ["先发生结果", "后发生原因"]}),
+    ]
+    for label, patch in suspicious:
+        d = dict(_kw_idea())
+        d.update(patch)
+        fc = FakeClient([LLMResult(tool_input=d)])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        out = w.gen_keyword_idea(["图书馆", "上楼"])
+        check(f"**{label} -> 放行**(交给后面审核)", out is not None,
+              out if out is None else "ok")
+
+
+def test_g4cf_no_midcheck_in_production():
+    """§一: 生产里**没有** Checker T / Checker C。
+
+    只看**代码行**(AST), 不看注释 —— 注释里**必须**能解释"为什么不做
+    这件事"。这与 G9-R2 那条「B1 必须 reject」断言踩的是同一个坑:
+    一条会打自己解释的断言, 结果是"不能交代自己的决定"。
+    """
+    print("\n[G4-CF-2d] 生产里没有中间 checker")
+    import ast as _ast
+    import io as _io
+    from pathlib import Path as _P
+    _src = _io.open(_P(__file__).resolve().parents[1] / "story" / "llm.py",
+                    encoding="utf-8").read()
+    _tree = _ast.parse(_src)
+    _code = "\n".join(
+        _ast.unparse(n) for n in _ast.walk(_tree)
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)))
+    for bad in ("check_core_truth", "check_clue_legitimacy"):
+        check(f"**生产代码里没有 {bad}**", bad not in _code,
+              [ln.strip() for ln in _code.splitlines() if bad in ln][:2])
+    check("**注释里解释了为什么不做**(反证)",
+          "check_core_truth" in _src and "没有任何" in _src)
+
 
 
 def test_g2_keyword_stage_a_one_attempt():
@@ -3605,8 +3804,8 @@ def test_g2_keyword_provenance_and_generated():
     spec = w.structure_original_idea(title=idea["title"],
                                      puzzle=idea["puzzle"],
                                      answer=idea["answer"])
-    check("**prompt_version == keyword2-v3(G4-R2 展示约束后)**",
-          spec.prompt_version == "keyword2-v3", spec.prompt_version)
+    check("**prompt_version == keyword2-v4(G4-CF Case-first)**",
+          spec.prompt_version == "keyword2-v4", spec.prompt_version)
     check("**与 classic 的 riddle-v9 不同**",
           spec.prompt_version != RIDDLE_PROMPT_VERSION, spec.prompt_version)
     check("metrics 有 generation_mode=keyword2",
@@ -3806,44 +4005,295 @@ def test_g3_stage_a_prompt_dropped_v1_shape_rules():
 
 
 def test_g3_stage_a_prompt_keeps_runtime_constraints():
-    """§六: **运行约束**一条都不能丢(中文/不靠冷门知识/不靠外部媒体/适合直播)。"""
+    """§六: **运行约束**一条都不能丢(中文/不靠冷门知识/不靠外部媒体/适合直播)。
+
+    ⚠️ G4-CF 改的是**创作顺序**(v4 Case-first), 运行约束**一个字都没动**
+    —— 它们与"先想真相还是先写谜面"无关, 丢了就是直播事故。
+    """
     print("\n[G3-K2] Stage A prompt 保留运行约束")
     low = KEYWORD_IDEA_SYSTEM
     for token in _MUST_KEEP:
         check(f"含运行约束: {token}", token in low)
-    # 核心语义必须**逐字**来自任务书 §六 —— 那句话是产品的口径, 不是
-    # 我们可以随手改写的文案。
-    check("核心语义含'海龟汤故事生成器'",
-          "海龟汤故事生成器" in low)
+    # ⚠️ 这两条在 v4 里措辞变了(不再自称"海龟汤故事生成器"), 所以改成
+    # 断言语义而不是断言那句旧文案 —— 旧文案本身不是产品口径。
+    check("核心语义含'海龟汤'", "海龟汤" in low)
     check("核心语义含'悬念'或'意外/反常'",
           "悬念" in low or "反常" in low)
-    check("核心语义含'逻辑自洽'", "逻辑自洽" in low)
-    check("保留了'不要为了数量硬塞额外转折'",
-          "硬塞" in low, low[:200])
+    check("**谜底仍要求 2~4 句 / 不超过 260 字**(展示硬合同)",
+          "2~4 句" in low and "260" in low, low[-400:])
 
 
 def test_g3_stage_a_prompt_never_mentions_stage_b_vocabulary():
-    """§六: Stage A prompt 不提 facts / atoms / completion / Blueprint / quota。"""
+    """§六 / §12.3: Stage A prompt 不提 facts / atoms / completion / Blueprint。
+
+    ⚠️ Case-first 的 `core_truth` / `observed_clues` / `event_chain`
+    **不是** Stage B vocabulary —— 这条名单因此**一个词都不放宽**。
+    一个字段"形状像数组"不等于它是 `facts`。
+    """
     print("\n[G3-K3] Stage A prompt 不提 Stage B 的词汇")
     low = KEYWORD_IDEA_SYSTEM.lower()
     for bad in _NEVER_MENTION:
         check(f"Stage A prompt 不提 {bad}", bad.lower() not in low,
               [ln for ln in low.splitlines() if bad.lower() in ln][:1])
+    # v4 的**创作顺序**术语必须真的在, 否则这条测试可能只是在测一个
+    # 空 prompt(反证: 断言正向内容存在)
+    for token in ("core_truth", "observed_clues", "event_chain"):
+        check(f"prompt 里有 {token}", token in KEYWORD_IDEA_SYSTEM)
 
 
-def test_g3_stage_a_schema_still_only_three_fields():
-    """§六 / §十: Stage A 的输出 schema **仍然只有** title/puzzle/answer。"""
-    print("\n[G3-K4] Stage A schema 仍只有三样")
+def test_case_first_stage_a_schema():
+    """§12.2: Stage A schema **恰好六个字段**, 且五个 required。
+
+    ⚠️ 这条**替换**了旧的 `test_g3_stage_a_schema_still_only_three_fields`。
+    三字段合同是 v3 的形状, 已被产品决定废弃 —— **不要**为了让旧测试绿
+    而偷偷维持它, 那会让"Stage A 到底是不是 Case-first"变得不可测。
+    """
+    print("\n[G4-CF-3] Stage A schema: 六字段 / 五 required")
     props = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]
-    check("恰好三个字段", set(props) == {"title", "puzzle", "answer"},
-          sorted(props))
+    req = _TOOL_KEYWORD_IDEA["input_schema"]["required"]
+    check("**恰好六个字段**",
+          set(props) == {"core_truth", "observed_clues", "event_chain",
+                         "title", "puzzle", "answer"}, sorted(props))
+    check("**五个 required**",
+          set(req) == {"core_truth", "observed_clues", "event_chain",
+                       "puzzle", "answer"}, sorted(req))
+    check("title 仍可空(不在 required)", "title" not in req, sorted(req))
     check("name 仍是 emit_keyword_idea",
           _TOOL_KEYWORD_IDEA["name"] == "emit_keyword_idea",
           _TOOL_KEYWORD_IDEA["name"])
-    # 描述里也不得出现结构化词汇
+    for k in _CF_SCAFFOLD:
+        check(f"{k} required", k in req, sorted(req))
+    # ---- 描述里也不得出现 Stage B 的结构词汇 ----
     blob = json.dumps(_TOOL_KEYWORD_IDEA, ensure_ascii=False).lower()
-    for bad in _NEVER_MENTION:
+    for bad in _STAGE_B_VOCAB:
         check(f"schema 描述不提 {bad}", bad.lower() not in blob)
+
+
+def test_case_first_stage_a_is_not_stage_b():
+    """§12.3: Case-first 脚手架 **≠** PuzzleSpec schema。
+
+    这条非常重要: 两者的字段**形状**像(都有数组), 语义完全不同 ——
+    `observed_clues` 是"作者先想出来的现场痕迹", `facts` 是 Stage B
+    从**最终**谜面谜底读出来的结构化事实。一旦把它们合并, 就有了两份
+    事实来源, 以后要解决"谁权威"。
+    """
+    print("\n[G4-CF-4] 脚手架不是 Stage B 词汇")
+    a_props = set(_TOOL_KEYWORD_IDEA["input_schema"]["properties"])
+    b_props = set(_TOOL_STRUCTURE["input_schema"]["properties"])
+    check("**两个字段集不相交**", not (a_props & b_props),
+          sorted(a_props & b_props))
+    for bad in _STAGE_B_VOCAB:
+        check(f"**Stage A 没有 {bad}**", bad not in a_props)
+    for k in _CF_SCAFFOLD:
+        check(f"**Stage B 没有 {k}**", k not in b_props, sorted(b_props))
+    # prompt 层也要干净
+    for bad in _STAGE_B_VOCAB:
+        check(f"**Stage A prompt 不提 {bad}**", bad not in KEYWORD_IDEA_SYSTEM)
+
+
+def test_g4cf_internal_scaffold_never_reaches_stage_b():
+    """§13-B: 脚手架字段**不会**因为代码透传而变成第二份 canonical。
+
+    做法: 走**真实的** `keyword_spec` 生产路径(bag -> Stage A -> Stage B),
+    把 Stage A 的脚手架填成一眼能认出来的哨兵串, 断言这些串**既不在**
+    Stage B 的 user prompt 里, **也不在** spec 的结构化字段里。
+
+    ⚠️ 必须走 `keyword_spec` 而不是直接调 `structure_original_idea`:
+    前者才是生产里唯一把 idea 拆成参数交给 Stage B 的地方。直接调后者
+    等于我自己决定传什么, 测不到"接线有没有漏"。
+
+    ⚠️ Stage A 的 title/puzzle/answer 当然会出现在 Stage B 的 user
+    prompt 里(那正是它要结构化的东西) —— 所以哨兵只放脚手架字段。
+    """
+    print("\n[G4-CF-5] 脚手架不进入 Stage B(走 keyword_spec)")
+    from story.keyword_seed import keyword_spec
+    # ⚠️ 哨兵要满足**新加的 fail-closed 结构约束**(2~4 clues / 2~3 chain),
+    # 否则 Stage A 在进入 Stage B 之前就被结构校验拦下, 这条用例测不到
+    # 它想测的东西(脚手架有没有透传进 Stage B)。
+    sentinel = ["内部脚手架AAA", "内部脚手架BBB", "内部脚手架CCC",
+                "内部脚手架DDD"]
+    idea = dict(_kw_idea())
+    idea["core_truth"] = sentinel[0]
+    idea["observed_clues"] = [sentinel[1], sentinel[2]]
+    idea["event_chain"] = [sentinel[3], "内部脚手架EEE"]
+    fc = FakeClient([LLMResult(tool_input=idea),
+                     LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    from story.keyword_seed import KeywordBag
+    bag = KeywordBag(["灯塔", "退潮", "礁石", "船"], 20260921)
+    spec, why = keyword_spec(w, bag, 20260921)
+    check("**成题了**(前置条件)", spec is not None and bool(spec.puzzle),
+          (why, getattr(spec, "error", "")))
+    struct_user = [c["user"] for c in fc.calls
+                   if (c.get("tool") or {}).get("name") == "emit_structure"]
+    check("结构化调用发了 1 次", len(struct_user) == 1, len(struct_user))
+    for tag in sentinel:
+        check(f"**Stage B user prompt 不含 {tag}**",
+              all(tag not in u for u in struct_user),
+              [u[:120] for u in struct_user])
+    check("**但 Stage A 的 puzzle 确实进了 Stage B**(反证: 不是恒真)",
+          any(idea["puzzle"] in u for u in struct_user))
+    blob = json.dumps({
+        "facts": [getattr(f, "text", "") for f in (spec.facts or [])],
+        "atoms": [getattr(a, "text", "") for a in (spec.solve_atoms or [])],
+        "beats": [getattr(b, "text", "") for b in (spec.discovery_beats or [])],
+        "answer": spec.answer or "", "puzzle": spec.puzzle or "",
+        "metrics": spec.metrics or {},
+    }, ensure_ascii=False)
+    for tag in sentinel:
+        check(f"**spec 里不含 {tag}**", tag not in blob, blob[:120])
+
+
+def test_g4cf_stage_a_and_b_are_only_ever_called_by_keyword_spec():
+    """§13-A: **prefetch 与 live 共用 Case-first**, 靠"只有一条路"来保证。
+
+    ⚠️ 不要靠 grep prompt 文本 —— 那只能证明"某段文字出现过"。这里证的是
+    **调用图**:
+
+        1. `keyword_spec()` 里同时有 gen_keyword_idea 与 structure_original_idea
+           (= 两阶段链只在这一个地方拼起来);
+        2. `director.py` 里**没有**这两个方法名 —— live 只能经 `keyword_spec`
+           拿到 Case-first, 不可能自己拼一条旧链;
+        3. `prefetch.py` 里也**没有**直接调 `gen_keyword_idea`。
+
+    目标: 防止以后又出现 `prefetch = Case-first` / `live = 旧 keyword prompt`
+    这种半切换。kill-switch 只有一个(`pool_keyword_seed_enabled`), 两边
+    读的是它。
+    """
+    print("\n[G4-CF-8] live / prefetch 共用 Case-first")
+    import ast as _ast
+    import io as _io
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+
+    def _called_names(rel):
+        tree = _ast.parse(_io.open(root / rel, encoding="utf-8").read())
+        out = set()
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Call):
+                f = n.func
+                if isinstance(f, _ast.Attribute):
+                    out.add(f.attr)
+                elif isinstance(f, _ast.Name):
+                    out.add(f.id)
+        return out
+
+    ks = _called_names("story/keyword_seed.py")
+    check("**keyword_spec 调 gen_keyword_idea**",
+          "gen_keyword_idea" in ks)
+    check("**keyword_spec 调 structure_original_idea**",
+          "structure_original_idea" in ks)
+
+    d = _called_names("director.py")
+    check("**director 不直接调 gen_keyword_idea**",
+          "gen_keyword_idea" not in d)
+    check("**director 不直接调 structure_original_idea**",
+          "structure_original_idea" not in d)
+    check("**director 确实调 keyword_spec**(否则它根本不走 keyword2)",
+          "keyword_spec" in d)
+
+    p = _called_names("story/prefetch.py")
+    check("**prefetch 不直接调 gen_keyword_idea**",
+          "gen_keyword_idea" not in p)
+    check("**prefetch 不直接调 structure_original_idea**",
+          "structure_original_idea" not in p)
+
+    # 反证: 这套检查**能**抓到 —— 别名注入一个假的调用图
+    fake = set(d) | {"gen_keyword_idea"}
+    check("**反证: 注入后确实会红**", "gen_keyword_idea" in fake)
+
+
+def test_g4cf_stage_a_one_attempt_and_interrupt_still_hold():
+    """§12.5 / §12.6: 新 schema 下 **1 attempt** 与**让路**语义不变。
+
+    Case-first 只是多了三个字段, 不该改变预算或让路 —— 这两条是最容易
+    在"加字段"时被顺手改掉的东西(比如"多了字段就多试一稿")。
+    """
+    print("\n[G4-CF-9] 新 schema 下 1 attempt + 让路")
+    # ① 失败仍只发 1 次
+    fc = FakeClient([LLMResult(error="网关抖了")])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    check("失败返回 None", w.gen_keyword_idea(["图书馆", "上楼"]) is None)
+    check("**只发了 1 次**", len(fc.calls) == 1, len(fc.calls))
+    # ② 调用前让路 -> 0 次
+    fc = FakeClient([])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    out = w.gen_keyword_idea(["图书馆", "上楼"],
+                             should_continue=lambda: False)
+    check("调用前让路: **0 LLM calls**", len(fc.calls) == 0, len(fc.calls))
+    check("**返回 interrupted**", out == {"interrupted": True}, out)
+    # ③ 返回后让路 -> 结果丢弃
+    fc = FakeClient([LLMResult(tool_input=_kw_idea())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    n = {"i": 0}
+
+    def gate():
+        n["i"] += 1
+        return n["i"] <= 1
+
+    out = w.gen_keyword_idea(["图书馆", "上楼"], should_continue=gate)
+    check("发了 1 次调用", len(fc.calls) == 1, len(fc.calls))
+    check("**返回 interrupted, 不是 idea**",
+          out == {"interrupted": True}, out)
+
+
+def test_g4cf_contract_signature_rejects_scaffold_kwargs():
+    """§六: `structure_original_idea` 的**调用签名**里没有脚手架字段。
+
+    上面那条测的是"传进去也不会流出去"; 这条测的是**根因**: 只要签名
+    里没有这三个参数, 想透传都传不进去 —— 结构上禁止, 不是靠自觉。
+
+    ⚠️ 用 `inspect` 而不是 grep 源码: 注释里**必须**能讨论这件事
+    (上面 `keyword_seed.py` 那段就写了为什么不传), 而 grep 会把
+    解释当成违规。
+    """
+    print("\n[G4-CF-6] Stage B 签名不含脚手架")
+    import inspect
+    sig = inspect.signature(PuzzleWriter.structure_original_idea)
+    params = set(sig.parameters)
+    for k in _CF_SCAFFOLD:
+        check(f"**签名没有 {k}**", k not in params, sorted(params))
+    for k in ("title", "puzzle", "answer"):
+        check(f"签名有 {k}(canonical 三样)", k in params, sorted(params))
+    # keyword_spec 那边同样只交三样
+    from story.keyword_seed import keyword_spec
+    import io as _io
+    from pathlib import Path as _P
+    ks_src = _io.open(_P(__file__).resolve().parents[1] / "story"
+                      / "keyword_seed.py", encoding="utf-8").read()
+    call = ks_src.split("spec = writer.structure_original_idea(")[1]
+    call = call.split(")")[0]
+    for k in _CF_SCAFFOLD:
+        check(f"**keyword_spec 没把 {k} 交给 Stage B**", k not in call,
+              call.replace("\n", " ")[:160])
+
+
+def test_g4cf_scaffold_dies_at_stage_a():
+    """§六: 脚手架**就在 Stage A 结束** —— 池里的 spec 上没有它们。
+
+    `PuzzleSpec` 是持久化对象(`pool.jsonl` / archive)。这三个字段是
+    创作期的一次性脚手架, 不该出现在任何落盘结构里。
+    """
+    print("\n[G4-CF-7] 脚手架不进 PuzzleSpec")
+    from story.puzzle import PuzzleSpec as _PS
+    fields = set(getattr(_PS, "__dataclass_fields__", {}) or {})
+    if not fields:                      # 非 dataclass 时退回 __init__ 签名
+        import inspect as _i
+        fields = set(_i.signature(_PS).parameters)
+    for k in _CF_SCAFFOLD:
+        check(f"**PuzzleSpec 没有 {k} 字段**", k not in fields, sorted(fields))
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    for k in _CF_SCAFFOLD:
+        check(f"**spec 上没有 {k} 属性**", not hasattr(spec, k))
+        check(f"**metrics 里也没有 {k}**",
+              k not in (spec.metrics or {}), sorted(spec.metrics or {}))
 
 
 def test_g3_stage_b_still_freezes_and_has_no_puzzle_field():
@@ -3870,6 +4320,18 @@ def test_g3_stage_b_still_freezes_and_has_no_puzzle_field():
           (spec.puzzle[:40], idea["puzzle"][:40]))
     check("title 也被冻结", spec.title == idea["title"], spec.title)
     check("answer 也被冻结", spec.answer == idea["answer"], spec.answer)
+    # ---- §12.7 加强: 脚手架既没进 schema, 也没成为第二份事实源 ----
+    for k in _CF_SCAFFOLD:
+        check(f"**Stage B schema 没有 {k}**", k not in props, sorted(props))
+    blob = json.dumps(_TOOL_STRUCTURE, ensure_ascii=False)
+    for k in _CF_SCAFFOLD:
+        check(f"**Stage B schema 描述不提 {k}**", k not in blob)
+    # Stage A 的 idea 里明明有脚手架, spec 上却一个都没有
+    idea_full = _kw_idea()
+    for k in _CF_SCAFFOLD:
+        check(f"**脚手架没变成 spec 属性: {k}**", not hasattr(spec, k))
+        check(f"**脚手架没进 metrics: {k}**", k not in (spec.metrics or {}))
+        check(f"脚手架确实在 Stage A 的 idea 里: {k}", k in idea_full)
 
 
 def test_g3_quality_gates_unchanged():
@@ -4783,11 +5245,23 @@ def main():
               test_g2_keyword_stage_a_interrupt_checkpoint,
               test_g2_keyword_rewrite_fails_candidate,
               test_g2_keyword_truth_audit_fail_rejects,
+        # ---- G4-CF: Stage A 改成 Case-first 创作顺序 ----
+        test_g4cf_stage_a_scaffold_is_returned_verbatim,
+        test_g4cf_stage_a_scaffold_fails_closed,
+        test_g4cf_stage_a_shape_fail_is_one_attempt,
+        test_g4cf_shape_check_is_not_semantic_review,
+        test_g4cf_no_midcheck_in_production,
+        test_case_first_stage_a_schema,
+        test_case_first_stage_a_is_not_stage_b,
+        test_g4cf_internal_scaffold_never_reaches_stage_b,
+        test_g4cf_stage_a_and_b_are_only_ever_called_by_keyword_spec,
+        test_g4cf_stage_a_one_attempt_and_interrupt_still_hold,
+        test_g4cf_contract_signature_rejects_scaffold_kwargs,
+        test_g4cf_scaffold_dies_at_stage_a,
         # ---- G3: Stage A prompt 收敛 ----
         test_g3_stage_a_prompt_dropped_v1_shape_rules,
         test_g3_stage_a_prompt_keeps_runtime_constraints,
         test_g3_stage_a_prompt_never_mentions_stage_b_vocabulary,
-        test_g3_stage_a_schema_still_only_three_fields,
         test_g3_stage_b_still_freezes_and_has_no_puzzle_field,
         test_g3_quality_gates_unchanged,
               test_closeout_observed_signature_schema_is_complete,

@@ -3213,7 +3213,15 @@ def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
     for k in ("puzzle", "answer", "title"):
         st.pop(k, None)
     pz = riddle()["puzzle"]
-    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"]}
+    # ⚠️ G4-CF: Stage A 现在对 Case-first 脚手架 **fail-closed**
+    # (core_truth + 2~4 observed_clues + 2~3 event_chain)。这条用例测的是
+    # 配额墙, 脚手架要给齐 —— 否则 Stage A 返回 None, 后面 `i["title"]`
+    # 会 TypeError, 而那不是这条用例想验的东西。
+    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"],
+            "core_truth": "他亮灯是为了标出退潮时露出的礁石。",
+            "observed_clues": ["只在退潮的那几个小时亮灯",
+                               "涨潮时灯是灭的"],
+            "event_chain": ["退潮时礁石露出水面", "他用亮灯标出礁石位置"]}
     fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
                      LLMResult(tool_input=review_ok())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -3250,7 +3258,12 @@ def test_g2_too_similar_still_hard_rejects():
     for k in ("puzzle", "answer", "title"):
         st.pop(k, None)
     pz = riddle()["puzzle"]
-    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"]}
+    # ⚠️ G4-CF: 同上 —— 脚手架要给齐, 否则 Stage A fail-closed。
+    idea = {"title": "灯塔", "puzzle": pz, "answer": riddle()["answer"],
+            "core_truth": "他亮灯是为了标出退潮时露出的礁石。",
+            "observed_clues": ["只在退潮的那几个小时亮灯",
+                               "涨潮时灯是灭的"],
+            "event_chain": ["退潮时礁石露出水面", "他用亮灯标出礁石位置"]}
     fc = FakeClient([LLMResult(tool_input=idea), LLMResult(tool_input=st),
                      LLMResult(tool_input=review_ok())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)

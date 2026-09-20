@@ -1156,6 +1156,22 @@ class AnthropicMessagesClient:
                     text=(text or "").strip()[:200] or None,
                     model=got_model, usage=d.get("usage"))
             # 没触顶却也空 -> 网关抖动, 同样报错(但原因不同)
+            #
+            # ⚠️ **G4-CF 记账, 本轮不修**: 2026-09-20 的 5 道真实 smoke 里,
+            # 2/5 组的 Stage B 撞上这条。单独对 2 个失败组 + 1 个成功对照组
+            # reprobe 4 次:
+            #
+            #     group1 ok 4/4   group3 ok 1/4   group5 ok 1/4
+            #
+            # 输出都在 1066~1405 token, 而 Stage B 的预算是 `max_tokens=4000`
+            # —— 所以**不是** `max_tokens` 不够被截断(G4-R2 修过的那种),
+            # 是网关在长结构化 `tool_use` 上的抖动。它与 Case-first **无关**:
+            # 同一段 Stage B, classic 链的题也会遇到(实测 group1 的
+            # classic 形状 4/4 通过, 说明抖动跟 prompt 内容关系不大)。
+            #
+            # 下一轮单独处理(可能要换重试策略或换网关), **不要**顺手在
+            # Case-first 这条链上加无限重试 —— 那会把成本翻倍, 而且
+            # "Stage B 1 normal + 1 technical retry" 这条 G4-R2 契约就没了。
             return LLMResult(
                 error=f"工具调用返回空 input (stop={stop or '?'})",
                 text=(text or "").strip()[:200] or None,
@@ -2234,15 +2250,24 @@ def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
 #
 # ## 生产接在哪
 #
-# **只有**普通 AI 后台补池(`PoolPrefetcher`)走这条链。live 现场出题
-# 仍然是一阶段 Blueprint 链 —— 那里观众在等, 两阶段会显著拉长等待时间。
+# **prefetch 与 live 共用同一条链**, 都经 `story/keyword_seed.py::keyword_spec()`:
+#
+#     PoolPrefetcher  --\
+#                       >-- keyword_spec() -> Stage A -> Stage B
+#     Director live   --/
+#
+# 两边**不是**各实现一份 —— live 现场出题在池子空时也走 `keyword_spec`
+# (见 `director._riddle` 的 fallback), 否则观众会看到风格断层: 池子里是
+# keyword 题, 现场生成突然冒出 blueprint 命题作文。kill-switch 是
+# `--no-keyword-seed`: 关掉时 prefetch 与 live **一起**回 classic。
+#
 # curated 链更不相关(那是"搬运"链, 不是"发明"链)。
 
 #: Stage A prompt 的版本号。
 #:
 #: ⚠️ 与 `RIDDLE_PROMPT_VERSION` **并列**而不是替换它: 两条链同时存在于
-#: 生产里(live 走 classic, prefetch 走 keyword2), archive 必须能区分
-#: "这题是哪条链产的"。所以这是**新开的号**, 不是 bump 老号。
+#: 生产里(live 的 Blueprint fallback 走 classic, keyword2 走 `keyword_spec`),
+#: archive 必须能区分"这题是哪条链产的"。所以这是**新开的号**, 不是 bump 老号。
 #:
 #: 同理 `QUALITY_POLICY_VERSION` **不 bump** —— 接受标准一个字都没改
 #: (同一套 Reviewer / truth audit / validate_spec / 跨题门), 改的只是
@@ -2278,11 +2303,90 @@ def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
 #:
 #: 260 是 `ANSWER_PREFERRED_MAX_LEN`(建议值), 300 的 hard max **保留**
 #: 作为最终保险(见 `validate_spec`), 所以"建议 260"不会变成新的硬门。
-KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v3"
+#:
+#: ## v3 -> v4(G9 -> 生产): Stage A 内部改成 **Case-first** 创作顺序
+#:
+#: G9(`tools/case_first_quick.py` 的 B 臂)验证过的创作顺序是:
+#:
+#:     先想清楚唯一真相 -> 由真相反推现场线索 -> 排真实发生顺序
+#:       -> **最后**才写谜面谜底
+#:
+#: 与 v3 的差别**只在候选怎么想出来**: v3 的第一步就是"写一个谜面",
+#: 解释是后补的; 于是谜面里常出现最后解释不掉的装饰细节。v4 把顺序
+#: 倒过来, 谜面里的关键细节必须来自**已经想好的**现场线索。
+#:
+#: ⚠️ 这三个新字段(`core_truth` / `observed_clues` / `event_chain`)是
+#: **一次性创作脚手架**, 不是 PuzzleSpec 的第二份事实源:
+#:
+#:     * 它们**只**活在 Stage A 的返回值里;
+#:     * `keyword_spec` 刻意只把 title/puzzle/answer 交给 Stage B
+#:       (见 `story/keyword_seed.py`), Stage B 的 schema 里一个字都
+#:       没有它们;
+#:     * 没有任何 resolve/gate 会去读它们 —— 质量门一条都没加。
+#:
+#: 为什么不让 Stage B 也收: Stage B 已经从**最终** canonical 谜面谜底
+#: 建了 core_answer / facts / completion / atoms / beats。再把 Stage A
+#: 的草稿结构塞进去就有了两份事实来源, 以后要解决"谁权威"。
+#: 本轮要的收益只有一句: **让模型先想清楚, 再写。**
+#:
+#: ⚠️ 同时: G9-R2 / G9-R3 已经证明"中间分类器"不值得接生产
+#: (Checker T precision 太差、Checker C 类别边界重叠 + 误杀过高),
+#: 所以这里**只有创作顺序**, 没有任何 `check_core_truth()` /
+#: `check_clue_legitimacy()` 之类的审核。
+#:
+#: ## 为什么 `QUALITY_POLICY_VERSION` **不**跟着 bump
+#:
+#: 接受标准一个字都没改 —— 同一套 Reviewer / truth audit / validate_spec
+#: / 跨题门。改的只是**候选怎么产生**。bump policy 会把盘上现有库存全部
+#: 隔离掉, 而那批库存的隔离与"生成风格变了"无关。
+#:
+#: ⚠️ 旧 `keyword2-v3` 库存因此**不会自动消失**(`PuzzlePool._validate_pool_spec`
+#: 不检查 keyword prompt version)。上线用**一次性 pool rotation** 处理,
+#: 不是新造 pool gate, 也不是 bump quality policy。
+KEYWORD_IDEA_PROMPT_VERSION = "keyword2-v4"
 
-KEYWORD_IDEA_SYSTEM = """你是一个中文海龟汤故事生成器。根据给定关键词创造一道海龟汤：谜面应简洁、有悬念或明显的意外/反常，给玩家留下可以提问探索的空间；谜底必须逻辑自洽，能够解释谜面中的悬念与异常。关键词要自然融入情境。可以有自然产生的意外转折，但不要为了数量硬塞额外转折。
+KEYWORD_IDEA_SYSTEM = """你是一个擅长设计中文海龟汤的悬疑谜题作者。
 
-## 运行约束(这几条不能丢)
+观众会把自己当成正在调查一件反常事件的侦探。
+你的任务不是先写一个悬疑谜面再临时编解释，而是按下面的顺序完成创作：
+
+1. 先确定这道题唯一的核心真相 core_truth。
+   先想清楚事情到底发生了什么。
+   只允许一个核心解释：不允许"其实是 A，也可能是 B"。
+
+2. 从这个真相自然反推出几个现场可观察的异常 observed_clues。
+   它们应该是现场中可以被看到、听到、记录到，或通过 Yes / No
+   提问确认的具体事实：谁看到了什么、谁听到了什么、什么东西
+   摆在哪里、什么时候发生的。
+
+   好的线索让玩家自然想调查人物、时间、地点、物品、目的或因果。
+
+   不要把核心答案本身直接写成线索。
+   不要把调查结束后才知道的结果冒充初始线索。
+   不要写隐藏背景（"他其实有个失散多年的弟弟"）。
+
+3. 用简短的 event_chain 写清事情真实发生的顺序。
+   写完检查一遍：玩家如果能一条条确认这些步骤，是不是就能还原真相？
+   如果有一条关键步骤在谜面里完全没有痕迹，回到第 2 步补一条线索。
+
+4. 最后才写 title / puzzle / answer。
+
+谜面应该像一个值得调查的现场，而不是一道抽象逻辑题。
+谜面中的关键细节应该来自前面已经想好的现场线索。
+
+谜底应解释同一件事情，主要把谜面已有细节串回真实事件；
+不要在最后突然添加决定性的巨大背景来补洞。
+如果删掉某段新背景核心真相就讲不通，说明前面线索设计失败了 ——
+回到第 2 步重新设计线索，而不是用背景把谜底糊过去。
+
+不要求复杂。
+不要求固定数量的反转。
+不要求某种固定题型。
+不要为了显得高级堆叠不必要的机关。
+
+关键词自然融入即可，不必把关键词硬做成机关。
+
+## 运行约束
 
 1. **全程中文**。
 2. **不依赖冷门专业知识** —— 谜底要能靠常识讲通。
@@ -2290,32 +2394,200 @@ KEYWORD_IDEA_SYSTEM = """你是一个中文海龟汤故事生成器。根据给�
 4. **适合普通直播场景** —— 能被念出来、能被弹幕追问。
 5. **谜底保持简洁** —— 建议 2~4 句, 中文总长度不超过 260 字。
    谜底是**揭晓时直接念给观众**的, 写成长篇说明会拖垮直播节奏。
-6. 输出**只有** title / puzzle / answer 三样。
+6. 按工具字段输出。
 """
 
-#: Stage A 的工具 schema —— **只有三样**。
+#: Stage A 的工具 schema —— 六个字段。
 #:
-#: ⚠️ 这里的字段集合是**刻意的**: 任何 facts / atoms / completion /
-#: signature 字段的出现都会把模型拉回"填表"模式(见上面代码块里的说明)。
+#: ⚠️ 前三个(`core_truth` / `observed_clues` / `event_chain`)是
+#: **创作脚手架**(见上面版本号那段说明): 它们帮模型先想清楚再写,
+#: 然后**在 Stage A 结束处终止** —— `keyword_spec` 只把
+#: title/puzzle/answer 交给 Stage B。
+#:
+#: ⚠️ 它们**仍然不是** facts / solve_atoms / completion_fact_ids /
+#: discovery_beats / signature。那两个名单必须保持不相交: 前三个是
+#: "作者怎么想", 后五个是 Stage B 从**最终**谜面谜底读出来的结构。
+#: 形状像(都有数组)不等于语义是同一件事。
+#:
+#: `2~4` / `2~3` 是 G9 已验证过的**创作画布**, **不是**质量政策 ——
+#: 没有"observed_clues 少一条就 reject"这种门(`minItems` 只防"模型
+#: 直接给个空数组", 不是质量判断)。
 _TOOL_KEYWORD_IDEA = {
     "name": "emit_keyword_idea",
-    "description": "围绕 2 个关键词输出一个海龟汤的谜面与谜底(只有这三样)",
+    "description": ("围绕 2 个关键词先想清真相与现场, 再输出一个海龟汤的"
+                    "谜面与谜底"),
     "input_schema": {
         "type": "object",
         "properties": {
+            "core_truth": {
+                "type": "string",
+                "description": ("这道题唯一的核心真相: 事情实际是怎么回事。"
+                                "只允许一个核心解释, 不允许\"其实是 A, "
+                                "也可能是 B\""),
+            },
+            "observed_clues": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "items": {"type": "string"},
+                "description": ("由核心真相自然产生的现场可调查事实(2~4 条); "
+                                "不是答案本身, 也不是调查结束后的结果"),
+            },
+            "event_chain": {
+                "type": "array", "minItems": 2, "maxItems": 3,
+                "items": {"type": "string"},
+                "description": ("事情真实发生的简短顺序(2~3 步), 用来保证"
+                                "汤底是在还原同一件事"),
+            },
             "title": {"type": "string", "description": "极短标题(可留空)"},
             "puzzle": {"type": "string",
-                       "description": ("谜面: 简洁, 有悬念或明显的意外/反常, "
-                                       "给玩家留下可以提问探索的空间")},
+                       "description": ("谜面: 像一个值得调查的现场, 有悬念或"
+                                       "明显的意外/反常, 给玩家留下可以提问"
+                                       "探索的空间; 关键细节来自已想好的"
+                                       "现场线索")},
             "answer": {"type": "string",
-                       "description": ("谜底: 逻辑自洽, 解释谜面中的悬念"
-                                       "与异常。保持简洁(建议 2~4 句, "
-                                       "中文不超过 260 字)—— 揭晓时会被"
-                                       "直接念给观众")},
+                       "description": ("谜底: 解释同一个核心真相, 把谜面已有"
+                                       "细节串回真实事件。保持简洁(建议 "
+                                       "2~4 句, 中文不超过 260 字)—— 揭晓时"
+                                       "会被直接念给观众")},
         },
-        "required": ["puzzle", "answer"],
+        "required": ["core_truth", "observed_clues", "event_chain",
+                     "puzzle", "answer"],
     },
 }
+
+
+def _str_list(v) -> list:
+    """把 Stage A 脚手架里的数组字段归一成 `list[str]`(**纯解析防御**)。
+
+    ⚠️ 这里**不判断内容好不好** —— 只保证下游拿到的是干净的字符串列表:
+
+        * 模型偶尔把数组写成单个字符串(或写成 `"a; b"`) -> 包成一项,
+          不炸 `str.join` / `for`;
+        * 非字符串元素(数字 / None / dict) -> `str()` 兜住;
+        * 空串 / 纯空白 -> 丢掉。
+
+    ⚠️ **归一 ≠ 放行**: 归一之后的条数由 `_keyword_idea_shape_error` 判
+    (2~4 / 2~3)。所以 `["a", "", "  "]` 在这里变成 1 条, 然后**在那边
+    被拒** —— 否则"模型塞占位符凑数"就能骗过数量检查。
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple)):
+        v = [v]
+    out = []
+    for x in v:
+        s = str(x if x is not None else "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _schema_bounds(key: str) -> tuple:
+    """从 `_TOOL_KEYWORD_IDEA` **读出**某个数组字段的 `(minItems, maxItems)`。
+
+    ⚠️ 不在这里另写一份 `2,4` —— schema 与校验必须**同源**。写两份的话,
+    改 schema 忘记改校验(或反过来)就会出现"schema 说 2~4、代码放行 8 条"
+    这种谁也没注意的裂缝。
+    """
+    p = _TOOL_KEYWORD_IDEA["input_schema"]["properties"][key]
+    return int(p.get("minItems") or 0), int(p.get("maxItems") or 10 ** 6)
+
+
+def _keyword_idea_shape_error(d) -> "str | None":
+    """Stage A **结构校验**: 模型有没有实际交出 Case-first 创作脚手架。
+
+    返回 `None` = 合规; 返回一个短字符串 = 不合规的原因(**供日志**)。
+    调用方把它当成**本次 attempt 失败**(见 `gen_keyword_idea`)。
+
+    ## 这是结构校验, 不是语义审核
+
+    ⚠️ 这里**只**回答一个问题: **字段在不在、类型对不对、归一后数量在不在
+    区间里**。它**不判断内容好不好**:
+
+        ⛔ core_truth 是不是"好"的真相
+        ⛔ clue 有没有泄底 / 是不是 posthoc
+        ⛔ event_chain 逻辑通不通
+        ⛔ 接 Checker T / Checker C
+
+    那些在 G9-R2 / G9-R3 已经被证伪(Checker T precision 太差、Checker C
+    类别边界重叠 + 误杀过高), 不要接进来。
+
+    ## 为什么必须 fail-closed
+
+    schema 里 `core_truth` / `observed_clues` / `event_chain` 都是
+    **required**。如果代码层对缺失睁一只眼闭一只眼, 就会出现:
+
+        模型跳过了"先想清真相"这一步, 直接写谜面
+          -> 代码放行
+          -> 拿到的是一道**没有走过 Case-first** 的题
+          -> "Stage A 是 Case-first" 这句话就只是 prompt 里的一个愿望
+
+    整个接入的**唯一收益**是"让模型先想清楚再写"。模型没交脚手架, 就
+    等于这次没有享受到那个收益 —— 那就不该被当成一次成功的 Stage A。
+
+    默认 `max_attempts=1`, 所以生产上就是**这一道候选失败**, 下一轮重新
+    抽关键词(后台哲学: 小预算、失败下轮再来)。**不要**为了通过率把它
+    降级成 warning —— 那正是"Stage A 悄悄退回 v3 行为"的形状。
+
+    ## 归一后计数, 用 `_str_list`
+
+    `observed_clues` / `event_chain` 先过 `_str_list`(类型归一 + 去空),
+    **再**数条数。所以 `["灯亮着", "", "  "]` 是 **1** 条, 不是 3 条 ——
+    数原始元素个数会让"模型塞占位符凑数"骗过去。
+    """
+    def _nonempty_str(key) -> bool:
+        v = d.get(key)
+        return isinstance(v, str) and bool(v.strip())
+
+    if not _nonempty_str("core_truth"):
+        return "core_truth 缺失或为空"
+    if not _nonempty_str("puzzle"):
+        return "puzzle 缺失或为空"
+    if not _nonempty_str("answer"):
+        return "answer 缺失或为空"
+    # ---- 两个数组字段: 先看类型, 再看归一后的条数 ----
+    for key in ("observed_clues", "event_chain"):
+        lo, hi = _schema_bounds(key)
+        raw = d.get(key)
+        if isinstance(raw, str):
+            # 模型偶尔把数组写成单个字符串 —— `_str_list` 会包成一项,
+            # 那**仍然**是一次类型不合规(条数也会因此常常越界)。
+            return "%s 是字符串, 不是数组" % key
+        if not isinstance(raw, (list, tuple)):
+            return "%s 缺失或不是数组" % key
+        n = len(_str_list(raw))
+        if not (lo <= n <= hi):
+            return "%s 归一后 %d 条, 要求 %d~%d 条" % (key, n, lo, hi)
+    return None
+
+
+
+    """把 Stage A 脚手架里的数组字段归一成 `list[str]`(**纯解析防御**)。
+
+    ⚠️ 这里**不判断内容好不好** —— 只保证下游拿到的是干净的字符串列表:
+
+        * 模型偶尔把数组写成单个字符串(或写成 `"a; b"`) -> 包成一项,
+          不炸 `str.join` / `for`;
+        * 非字符串元素(数字 / None / dict) -> `str()` 兜住;
+        * 空串 / 纯空白 -> 丢掉。
+
+    脚手架字段缺失或为空**不是** Stage A 失败: 合同字段是 puzzle/answer,
+    它们空了才算失败(见 `gen_keyword_idea`)。一个字段坏了就整道题扔掉,
+    会把"模型这次把数组写成字符串"变成"这次补池白跑"。
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple)):
+        v = [v]
+    out = []
+    for x in v:
+        s = str(x if x is not None else "").strip()
+        if s:
+            out.append(s)
+    return out
 
 #: Stage B 的工具 schema —— 结构化的**全部**产出。
 #:
@@ -4476,11 +4748,19 @@ class PuzzleWriter:
             model=getattr(last, "model", None))
 
     # ==================================================================
-    # G2 —— keyword2 两阶段链(只给普通 AI 后台补池用)
+    # G2 —— keyword2 两阶段链(Case-first 起题)
     # ==================================================================
     #
-    # 这两条方法**只有** `PoolPrefetcher` 会调。live 现场出题继续走
-    # `gen_spec`(一阶段 Blueprint 链), curated 走 `CuratedCompiler`。
+    # 这两条方法**由 `story/keyword_seed.py::keyword_spec()` 调用**, 而
+    # prefetch 与 live **都**经 `keyword_spec` —— 所以它们是同一条链:
+    #
+    #     PoolPrefetcher  --\
+    #                       >-- keyword_spec -> gen_keyword_idea (Stage A)
+    #     Director live   --/                -> structure_original_idea (B)
+    #
+    # live 只在池子空、且 `--no-keyword-seed` 没关掉时走这条; 关掉时两边
+    # **一起**回 classic (`pick_blueprint -> gen_spec`)。director.py 自己
+    # **不**调这两个方法(它只调 `keyword_spec`), 否则就会有第二份实现。
     #
     # 生产**不**复用 `CuratedCompiler`: 它带着 external curated 的 policy
     # 语义(curated-v5 准入账本 / provenance / 与 AI 原创链不同的 diversity
@@ -4491,9 +4771,31 @@ class PuzzleWriter:
                          max_attempts: int = 1,
                          temperature: Optional[float] = None
                          ) -> Optional[dict]:
-        """**Stage A**: 围绕 2 个关键词自由形成一个海龟汤。
+        """**Stage A**: 围绕 2 个关键词按 **Case-first** 顺序想出一道海龟汤。
 
-        返回 `{"title", "puzzle", "answer", "interrupted"}` 或 `None`。
+        返回 `{"core_truth", "observed_clues", "event_chain", "title",
+        "puzzle", "answer"}` 或 `{"interrupted": True}` 或 `None`。
+
+        ## 创作顺序(v4 起)
+
+        模型先定唯一真相, 再由真相反推现场线索、排真实发生顺序, **最后**
+        才写谜面谜底(见 `KEYWORD_IDEA_SYSTEM`)。前三个字段是**脚手架**:
+        它们在这里被原样带出去, 但 `keyword_spec` 只会把 title/puzzle/
+        answer 交给 Stage B —— 见 `_TOOL_KEYWORD_IDEA` 上面那段说明。
+
+        ## 这里**不做**语义审核
+
+        G9-R2 / G9-R3 已经证明"中间分类器"不值得接生产(Checker T
+        precision 太差, Checker C 类别边界重叠 + 误杀过高)。所以这里
+        **只有解析防御**:
+
+            * list 类型归一(模型偶尔回字符串而不是数组);
+            * 去掉空字符串;
+            * 结构明显坏掉(没有 puzzle/answer)-> 按 Stage A 失败处理。
+
+        **不判断"好不好"** —— 没有 `if "也可能" in core_truth: reject`,
+        没有 clue 的 posthoc / leak 判定。那些是 Reviewer / truth audit
+        的职责, 而且它们在**最终**谜面谜底上有更完整的上下文。
 
         ## 为什么它单独存在(而不是并进 gen_spec)
 
@@ -4539,17 +4841,22 @@ class PuzzleWriter:
             ti = res.tool_input
             if ti:
                 d = _unwrap_tool_input(ti)
-                pz = str(d.get("puzzle", "") or "").strip()
-                an = str(d.get("answer", "") or "").strip()
-                if pz and an:
+                bad = _keyword_idea_shape_error(d)
+                if bad is None:
+                    pz = str(d.get("puzzle", "") or "").strip()
+                    an = str(d.get("answer", "") or "").strip()
                     # ---- 让路检查: 请求回来了, 但房间可能已经忙了 ----
                     if (should_continue is not None
                             and not should_continue()):
                         log.info("Stage A 让路(返回后, 直播已忙; 本次结果丢弃)")
                         return {"interrupted": True}
-                    return {"title": str(d.get("title", "") or "").strip(),
-                            "puzzle": pz, "answer": an}
-                last_err = "Stage A 返回的谜面或谜底为空"
+                    return {
+                        "core_truth": str(d.get("core_truth") or "").strip(),
+                        "observed_clues": _str_list(d.get("observed_clues")),
+                        "event_chain": _str_list(d.get("event_chain")),
+                        "title": str(d.get("title", "") or "").strip(),
+                        "puzzle": pz, "answer": an}
+                last_err = "Stage A 结构不合规: %s" % bad
             else:
                 last_err = res.error or "Stage A 没有 tool_input"
             log.warning("Stage A 第 %d 稿失败: %s", attempt, last_err[:100])

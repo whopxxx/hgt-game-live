@@ -345,25 +345,32 @@ class Config:
     # 两稿都不合格就放弃, 等下一轮, 而不是一路打到第 4 稿。
     pool_prefetch_max_attempts: int = 2
     pool_prefetch_budget_seconds: float = 25.0
-    # ---- G2: keyword2 两阶段起题(只影响普通 AI 后台补池) ----
+    # ---- G2: keyword2 两阶段起题(prefetch 与 live 现场生成共用) ----
     #
-    # 打开时, 后台补池换一条候选产生方式:
+    # 打开时, 候选的产生方式换成 keyword2:
     #
     #     程序随机抽 2 个普通生活关键词
-    #       -> Stage A: 只生成 title / puzzle / answer(自由成题)
+    #       -> Stage A: 先想清唯一真相/现场线索/发生顺序, 再写
+    #                   title / puzzle / answer(Case-first 顺序)
     #       -> Stage B: 冻结谜面谜底, 只结构化成 PuzzleSpec
     #       -> 现有 Reviewer / truth audit / validate_spec / 跨题门
     #
     # 依据 G1-A / G1-B: 这样出来的题**谜面更短、单机关、没有硬塞的第二
     # 机关**, 更接近外部题库的语感; 而 Blueprint 链最容易丢的就是这个。
     #
-    # ⚠️ **只影响普通 AI prefetch**:
-    #     * live 现场出题 **不动** —— 那里观众在等, 两阶段会显著拉长
-    #       等待时间, 所以继续走一阶段 Blueprint 链;
-    #     * curated 链 **不动** —— 那是"搬运"链, 不是"发明"链。
+    # ⚠️ **prefetch 与 live 现场生成走的是同一条链**(G4-2 §四):
+    #     * 两边都经 `story/keyword_seed.py::keyword_spec()`, 所以
+    #       "prefetch 是 keyword2 而 live 是 classic"在结构上不可能发生
+    #       —— 它们读的是**同一个** config flag;
+    #     * kill-switch `--no-keyword-seed` 让两边**一起**回 classic
+    #       (`pick_blueprint -> gen_spec`);
+    #     * curated 链不受影响 —— 那是"搬运"链, 不是"发明"链。
     #
-    # 设为 False 必须**完整**回到旧行为(`pick_blueprint -> gen_spec`),
-    # 所以旧路径**保留**在代码里作为 kill-switch, 不是删掉。
+    # ⚠️ 风格版本号是 `KEYWORD_IDEA_PROMPT_VERSION`(v4 起是 Case-first),
+    # 与 `QUALITY_POLICY_VERSION` **分开** —— 接受标准一个字都没改。
+    # 旧版本的盘上库存**不会**因为这个 flag 自动消失, 上线用一次性
+    # pool rotation 处理(备份 pool.jsonl -> 生成池从空开始 -> 由现有
+    # prewarm / prefetch 重新产生), **不要**动 played / used / archive。
     #
     # ⚠️ 质量策略**一条都不放宽**: keyword 题仍然走同一套 Reviewer /
     # truth audit / validate_spec / cross_puzzle_gate HARD / too_similar /
@@ -883,11 +890,11 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- G2: keyword2 两阶段起题(kill-switch) ----
     ap.add_argument("--no-keyword-seed", dest="pool_keyword_seed_enabled",
                     action="store_false",
-                    help="后台补池回到旧的一阶段 Blueprint 链"
-                         "(`pick_blueprint -> gen_spec`)。默认**开启** "
-                         "keyword2: 随机抽 2 个普通生活关键词 -> 自由成题 "
-                         "-> 再结构化。只影响普通 AI 后台补池; live 现场"
-                         "出题与 curated 链本来就不走它")
+                    help="后台补池**与 live 现场生成一起**回到旧的一阶段 "
+                         "Blueprint 链(`pick_blueprint -> gen_spec`)。"
+                         "默认**开启** keyword2: 随机抽 2 个普通生活关键词 "
+                         "-> 先想清真相/现场线索/发生顺序, 再写谜面谜底 "
+                         "(Case-first)-> 再结构化。curated 链本来就不走它")
     # ---- G3: keyword2 的 seed 来源 ----
     ap.add_argument("--keyword-corpus", dest="keyword_corpus_path", default="",
                     help="keyword2 的 seed 词库路径(默认 "
