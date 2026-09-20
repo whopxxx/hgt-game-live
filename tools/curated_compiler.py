@@ -43,8 +43,24 @@ AI **不可以**:
     validate_spec              结构/通关合同硬门
     PuzzleWriter._review_spec_with_retry  Reviewer(带技术重试)
     PuzzleWriter._audit_with_retry        truth audit
-    cross_puzzle_gate          跨题分布
     quality.too_similar        文本去重
+
+## **不**复用的: `cross_puzzle_gate`(题型分布)
+
+产品边界: **题型 / recent-10 / diversity quota 只对 AI 原创链具有硬约束。
+下载获得的 external curated 不得因为题型分布被拒绝。**
+
+`cross_puzzle_gate` 的输出在 curated 编译里只作为**非阻塞 diagnostic**
+落进 `info["diversity_signals"]`, 永远不 `continue`。原因:
+
+    observed classification  !=  admission requirement
+
+那些维度(mechanism / shape / death / grief / domain / relation / emotion /
+reveal_mode / procedural / dark-tone / 结构等价)是 **selection metadata** ——
+live pool 的 Pass 1 拿它们做**软排序**(H4-E), 而不是准入判据。
+
+⚠️ 早先这里是 `xbad = cross_puzzle_gate(...) -> continue`。当时 LazyCurator
+恰好传 `recent=[]`, 所以**没有触发** —— 是 latent policy bug。不要"修回去"。
 
 **不新增第四个内容审核 LLM**(任务书明确)。
 """
@@ -1656,17 +1672,53 @@ class CuratedCompiler:
                 last_err = "; ".join(ra)
                 _bump(info, "reveal_adherence")
                 continue
-            # ---- ⑦ 跨题门(**复用**) ----
+            # ---- ⑦ 跨题分布: **只记录, 不拒绝**(产品边界, H4-F) ----
+            #
+            # external curated 的准入**不看题型分布**。
+            #
+            #     题型 / recent-10 / diversity quota
+            #         只对 **AI 原创链** 具有硬约束。
+            #     下载获得的 external curated
+            #         **不得因为题型分布被拒绝**。
+            #
+            # 所以下面这些**全都不是** reject / retry 理由:
+            #   same mechanism / same solution_shape / death quota /
+            #   past_trauma / grief / information_gap / domain / relation /
+            #   emotion / reveal_mode / procedural / dark-tone target /
+            #   mechanism+solution 结构等价 / 任何其他 cross_puzzle_gate 项
+            #
+            # 它们是 **selection metadata, 不是 admission criteria**:
+            # 观察到的分类照常写进 `spec.signature`(见下), live pool 的
+            # Pass 1 还要拿它做**软排序**(H4-E)。但
+            #
+            #     observed classification  !=  admission requirement
+            #
+            # ⚠️ 这里**曾经**是 `xbad = cross_puzzle_gate(...) -> continue`。
+            # 当时 LazyCurator 恰好传 `recent=[]` 所以没触发, 是 **latent
+            # policy bug**。任何"修回去"的改动都是把 AI 原创链的配额硬门
+            # 误加到外部题上 —— 那正是本次要清除的。
+            #
+            # 真正的 curated 硬门在别处, **不放宽**: curated-v5 内容门
+            # (clear_anomaly / unique_explanation / yes_no_progress /
+            # no_obscure_system / no_external_media / livestream_safe)、
+            # truth audit(narrator_truthful / mechanism_consistent)、
+            # schema/结构合法性(validate_spec)、真 identity duplicate、
+            # 文本 near-duplicate(⑧)。
             rcfg = self.writer._cfg()
-            xbad = cross_puzzle_gate(
-                spec, recent,
-                Quotas.from_config(rcfg) if rcfg is not None else None,
-                spec.blueprint)
-            if xbad:
-                last_err = "; ".join(xbad)
-                _bump(info, "cross_gate")
-                continue
-            # ---- ⑧ 与已出过的题太像 ----
+            try:
+                _xsoft = cross_puzzle_gate(
+                    spec, recent,
+                    Quotas.from_config(rcfg) if rcfg is not None else None,
+                    spec.blueprint)
+            except Exception:                   # noqa: BLE001
+                _xsoft = []
+            if _xsoft:
+                # 非阻塞 diagnostic —— 只落进 info / 日志, 供人工观察
+                # "这批外部题的分布长什么样", **绝不** continue。
+                info["diversity_signals"] = list(_xsoft)
+                log.info("curated 分布信号(仅记录, 不拒绝) %s: %s",
+                         info["external_id"], "; ".join(_xsoft)[:160])
+            # ---- ⑧ 与已出过的题太像(**真硬门: 文本 near-duplicate**) ----
             dup = _too_similar_pub(spec.puzzle, recent)
             if dup:
                 last_err = f"与最近某题太像: {dup[:40]}"
@@ -1717,7 +1769,10 @@ _STAGE_DEPTH = {
     "truth_audit": 6,
     "truth_audit_technical": 6,
     "reveal_adherence": 7,
-    "cross_gate": 8,
+    # ⚠️ H4-F: 这里**曾经**有 `"cross_gate": 8`。跨题分布自本批起不再是
+    # curated 的门(产品边界: 外部题不因题型分布被拒), 所以那个 stage
+    # **永远不会再产生**。留着它反而是一个"看起来该有这道门"的误导 ——
+    # 删掉, 免得以后有人照着它把拒绝逻辑装回去。
     "too_similar": 9,
 }
 

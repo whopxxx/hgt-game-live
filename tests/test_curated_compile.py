@@ -777,21 +777,34 @@ def test_unwrap_nested_tool_input():
     check("平铺不变", CC._unwrap(flat) == flat)
 
 
-def test_curated_rejected_when_cross_gate_blocks():
-    """跨题门拒 -> 没收(且不该崩)。"""
-    print("\n[H2-D] 跨题门生效")
+def test_curated_accepted_even_when_cross_gate_blocks():
+    """**产品边界(H4-F)**: 跨题分布**不得**拒绝 external curated。
+
+        题型 / recent-10 / diversity quota 只对 AI 原创链具有硬约束。
+        下载获得的 external curated 不得因为题型分布被拒绝。
+
+    内容硬门全过时, 即使 recent 里已有一道**同 mechanism + 同 shape** 的
+    题(结构等价 + 配额全满), 也必须 compile **accepted**。
+
+    ⚠️ 这条测试**曾经**断言相反的行为(`被跨题门拦下` / `stage ==
+    "cross_gate"`)。那是把 AI 原创链的配额硬门误加到外部题上 ——
+    即本次清除的 latent policy bug。断言已按产品边界反转。
+    """
+    print("\n[H4-F] 跨题分布**不**拒绝 curated")
     w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
                      _review_pass()])
     from tools.curated_compiler import CuratedCompiler
     from story.puzzle import PuzzleSignature
-    # 造一个与本题**同结构**的 recent -> 结构重复
+    # 与本题**同结构**的 recent —— 结构等价 + 配额占满
     dup = PuzzleSignature(mechanism_family="hidden_function",
                           solution_shape="hidden_function_explains_behavior",
                           domain="maritime", relation="stranger",
                           emotion_mode="neutral", time_shape="instant")
-    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[dup])
-    check("被跨题门拦下", spec is None, info)
-    check("stage 标 cross_gate", info["stage"] == "cross_gate", info)
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[dup] * 10)
+    check("**仍然 accepted(不被分布拒绝)**", spec is not None, info)
+    check("stage 不是 cross_gate", info.get("stage") != "cross_gate", info)
+    check("**分布信号被记录(非阻塞 diagnostic)**",
+          bool(info.get("diversity_signals")), info.get("diversity_signals"))
 
 
 def test_provenance_survives_reviewer():
@@ -834,37 +847,209 @@ def test_provenance_survives_reviewer():
 def test_stage_reports_deepest_gate():
     """stage 要报**走到过的最深一道门**, 而不是最后一稿死在哪。
 
-    实测场景: 第 1 稿一路走到跨题门被拒(题本身没问题, 是分布重复),
-    第 2 稿因网关抖动在 compile_call 就挂了。若 stage 取"最后一次",
-    报告会把一个**分布问题**记成**网关问题** —— 运维照着这个数字去查
-    网络, 方向完全错了。
+    实测场景: 第 1 稿一路走到很深的一道门才被拒, 第 2 稿因网关抖动在
+    compile_call 就挂了。若 stage 取"最后一次", 报告会把一个**内容问题**
+    记成**网关问题** —— 运维照着这个数字去查网络, 方向完全错了。
+
+    ⚠️ 这里**曾经**用 `cross_gate` 当"最深那道门"。跨题分布自 H4-F 起
+    **不再是** curated 的门(产品边界: 外部题不因题型分布被拒), 所以改用一个
+    **仍然存在**的硬门 —— 文本 near-duplicate(⑧)。
     """
     print("\n[H2] stage 报最深门(不被后续抖动覆盖)")
     from tools.curated_compiler import CuratedCompiler
-    from story.puzzle import PuzzleSignature
     w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
                      _review_pass()])
-    dup = PuzzleSignature(mechanism_family="hidden_function",
-                          solution_shape="hidden_function_explains_behavior",
-                          domain="maritime", relation="stranger",
-                          emotion_mode="neutral", time_shape="instant")
-    # 第 1 稿走到 cross_gate; 第 2 稿队列空 -> compile_call
-    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[dup],
+    # ⑧ 只对带 `puzzle` **属性**的项做检查(dict 不算), 所以用一个
+    #    轻量对象带上与本题相同的谜面 -> 触发文本 near-duplicate。
+    near_dup = type("R", (), {"puzzle": mk_rec().surface})()
+    # 第 1 稿走到 ⑧; 第 2 稿队列空 -> compile_call
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[near_dup],
                                                 max_attempts=2)
     check("没收", spec is None)
-    check("**stage 是 cross_gate(不是 compile_call)**",
-          info["stage"] == "cross_gate", info)
+    check("**stage 是 too_similar(不是 compile_call)**",
+          info["stage"] == "too_similar", info)
 
 
 def test_stage_does_not_regress_to_shallower():
     print("\n[H2] stage 单调不后退")
     from tools.curated_compiler import _pick_stage
-    check("深覆盖浅", _pick_stage("cross_gate", "compile_call")
-          == "cross_gate")
+    check("深覆盖浅", _pick_stage("too_similar", "compile_call")
+          == "too_similar")
     check("更深则更新", _pick_stage("validate", "review") == "review")
     check("同级取新", _pick_stage("review", "review_technical")
           == "review_technical")
     check("空则取新", _pick_stage("", "ai_gate") == "ai_gate")
+
+
+def test_h4f_quota_wall_never_rejects_curated():
+    """§6-1: 配额墙最满时, 内容硬门全过的 external curated **必须 accepted**。
+
+    逐个维度铺满 recent: mechanism / solution_shape / death / information_gap /
+    domain / relation / emotion / reveal_mode / dark-tone —— 一个都不能
+    变成 reject 理由。
+    """
+    print("\n[H4-F] 配额全维铺满 -> 仍 accepted")
+    from tools.curated_compiler import CuratedCompiler
+    from story.puzzle import PuzzleSignature
+    # 与本题完全同签名 -> 同时命中"配额满"与"结构等价"
+    same = PuzzleSignature(
+        mechanism_family="hidden_function",
+        solution_shape="hidden_function_explains_behavior",
+        domain="maritime", relation="stranger", emotion_mode="neutral",
+        time_shape="instant")
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[same] * 10)
+    check("**配额墙最满 -> 仍 accepted**", spec is not None, info)
+    check("没有 reject_reasons",
+          not info.get("reject_reasons"), info.get("reject_reasons"))
+    check("**分布信号落进 info(非阻塞)**",
+          bool(info.get("diversity_signals")), info.get("diversity_signals"))
+
+
+def test_h4f_same_mechanism_and_shape_still_accepted():
+    """§6-2: 同 mechanism + solution 的 external curated 仍可 compile accepted。"""
+    print("\n[H4-F] 同 mechanism+shape 仍 accepted")
+    from tools.curated_compiler import CuratedCompiler
+    from story.puzzle import PuzzleSignature
+    same = PuzzleSignature(
+        mechanism_family="hidden_function",
+        solution_shape="hidden_function_explains_behavior",
+        domain="maritime", relation="stranger", emotion_mode="neutral",
+        time_shape="instant")
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[same])
+    check("**accepted**(同结构不是拒绝理由)", spec is not None, info)
+    check("**signature 完整写入**",
+          spec is not None
+          and spec.signature.mechanism_family == "hidden_function"
+          and spec.signature.solution_shape
+          == "hidden_function_explains_behavior",
+          getattr(spec, "signature", None))
+
+
+def test_h4f_death_gap_domain_saturated_still_accepted():
+    """§6-3: death / information_gap / domain 配额满时仍 accepted。"""
+    print("\n[H4-F] death/gap/domain 配额满 -> 仍 accepted")
+    from tools.curated_compiler import CuratedCompiler
+    from story.puzzle import PuzzleSignature
+    walls = {
+        "death": PuzzleSignature(
+            mechanism_family="causal_reversal",
+            solution_shape="causal_reversal", domain="nature",
+            relation="family", emotion_mode="grief", time_shape="instant",
+            death=True),
+        "information_gap": PuzzleSignature(
+            mechanism_family="information_gap",
+            solution_shape="information_advantage", domain="daily",
+            relation="colleague", emotion_mode="tense",
+            time_shape="instant"),
+        "domain": PuzzleSignature(
+            mechanism_family="object_misuse",
+            solution_shape="misunderstood_object", domain="maritime",
+            relation="stranger", emotion_mode="neutral",
+            time_shape="instant"),
+    }
+    for label, sig in walls.items():
+        w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                         _review_pass()])
+        spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[sig] * 10)
+        check(f"**{label} 配额满 -> 仍 accepted**", spec is not None, info)
+        check(f"{label}: 没有 reject", not info.get("reject_reasons"),
+              info.get("reject_reasons"))
+
+
+def test_h4f_signature_still_fully_recorded():
+    """§6-4: 分类照常**完整记录**(只是不构成准入要求)。"""
+    print("\n[H4-F] signature 仍完整记录")
+    from tools.curated_compiler import CuratedCompiler
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[])
+    check("accepted", spec is not None, info)
+    if spec is None:
+        return
+    sig = spec.signature
+    check("mechanism_family", sig.mechanism_family == "hidden_function",
+          sig.mechanism_family)
+    check("solution_shape",
+          sig.solution_shape == "hidden_function_explains_behavior",
+          sig.solution_shape)
+    check("domain", sig.domain == "maritime", sig.domain)
+    check("relation", sig.relation == "stranger", sig.relation)
+    check("emotion_mode", sig.emotion_mode == "neutral", sig.emotion_mode)
+    check("death 字段可读", hasattr(sig, "death"))
+
+
+def test_h4f_true_text_near_duplicate_still_rejected():
+    """§6-5: 真文本 near-duplicate **仍然拒绝**(与题型分布无关)。"""
+    print("\n[H4-F] 文本近重复仍拒绝")
+    from tools.curated_compiler import CuratedCompiler
+    near_dup = type("R", (), {"puzzle": mk_rec().surface})()
+    w, fc = _writer([LLMResult(tool_input=_compile_tool(), model="m"),
+                     _review_pass()])
+    spec, info = CuratedCompiler(w).compile_one(mk_rec(), recent=[near_dup])
+    check("**被拒(文本重复不是 diversity)**", spec is None, info)
+    check("stage 标 too_similar", info.get("stage") == "too_similar", info)
+
+
+def test_h4f_real_content_hard_gate_still_rejects():
+    """§6-6: 真硬门(livestream_safe / narrator_truthful 等)**仍然拒绝**。"""
+    print("\n[H4-F] 真内容硬门仍拒绝")
+    from tools.curated_compiler import CuratedCompiler
+    # livestream_safe=False -> 内容硬门拒
+    bad_live = _compile_tool(quality_checks=_qc_v2(livestream_safe=False))
+    w, fc = _writer([LLMResult(tool_input=bad_live, model="m")])
+    spec, info = CuratedCompiler(w).compile_one(mk_rec())
+    check("**livestream_safe=False -> 被拒**", spec is None, info)
+    check("**拒因里能看到 livestream_safe**",
+          "livestream_safe" in str(info.get("reject_reasons"))
+          or "livestream_safe" in str(info.get("stage")),
+          (info.get("stage"), info.get("reject_reasons")))
+
+    # narrator_truthful=False (truth audit) -> 拒
+    class _AuditFail(FakeClient):
+        def messages(self, system, user, max_tokens=None, tool=None,
+                     temperature=None, timeout=None, max_retries=None):
+            name = (tool or {}).get("name")
+            if name == "emit_truth_audit":
+                return LLMResult(tool_input={
+                    "__truth_audit__": True, "narrator_truthful": False,
+                    "mechanism_consistent": True, "conflicts": [],
+                    "why": "叙事不实"}, model="m")
+            return super().messages(system, user, max_tokens=max_tokens,
+                                    tool=tool, temperature=temperature,
+                                    timeout=timeout, max_retries=max_retries)
+
+    from story.llm import PuzzleWriter
+    fc2 = _AuditFail([LLMResult(tool_input=_compile_tool(), model="m"),
+                      _review_pass()])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=_runtime_cfg())
+    spec2, info2 = CuratedCompiler(w2).compile_one(mk_rec())
+    check("**narrator_truthful=False -> 被拒**", spec2 is None, info2)
+
+
+def test_h4f_generated_pool_cross_gate_unchanged():
+    """§6-7/8: AI 原创链的 cross_puzzle_gate **硬行为不变**。
+
+    产品边界是单向的: external curated 不看分布, **AI 原创链照旧看**。
+    """
+    print("\n[H4-F] generated pool 的 cross gate 不变")
+    import test_pool as TP
+    from story.quality import Quotas, cross_puzzle_gate
+    with TP.tmpdir() as d:
+        pool = TP.PuzzlePool.open(TP.mkcfg(d))
+        s = TP.good_spec()
+        check("生成池入池", pool.add(s) is True)
+        wall = [s.signature.to_dict()] * 10
+        check("**生成池配额满 -> playable=0(硬门未变)**",
+              pool.playable_count(wall) == 0, pool.playable_count(wall))
+        check("**生成池配额满 -> pop None**", pool.pop_next(wall) is None)
+        # `cross_puzzle_gate()` 本体对 AI 原创仍然是硬判据
+        gate = cross_puzzle_gate(s, wall, Quotas.from_config(pool.cfg),
+                                 s.blueprint)
+        check("**cross_puzzle_gate 本体仍返回违规**", bool(gate), gate)
 
 
 def test_build_user_prompt_injects_blueprint():
@@ -920,7 +1105,15 @@ def main():
         test_compile_rejects_when_clue_not_in_puzzle,
         test_compile_handles_empty_tool_input,
         test_unwrap_nested_tool_input,
-        test_curated_rejected_when_cross_gate_blocks,
+        test_curated_accepted_even_when_cross_gate_blocks,
+        # ---- H4-F: 产品边界 (external curated 不因题型分布被拒) ----
+        test_h4f_quota_wall_never_rejects_curated,
+        test_h4f_same_mechanism_and_shape_still_accepted,
+        test_h4f_death_gap_domain_saturated_still_accepted,
+        test_h4f_signature_still_fully_recorded,
+        test_h4f_true_text_near_duplicate_still_rejected,
+        test_h4f_real_content_hard_gate_still_rejects,
+        test_h4f_generated_pool_cross_gate_unchanged,
     ]
     for t in tests:
         try:
