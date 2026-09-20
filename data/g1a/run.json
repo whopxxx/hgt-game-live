@@ -1,0 +1,491 @@
+{
+  "meta": {
+    "seed": 20260920,
+    "base_main": "2b426ecc1ec369d8c8e8aae4cd3f50464ed4a6ef",
+    "cmd": ".venv/Scripts/python.exe -X utf8 tools/experiment_keyword_riddles.py --out data/g1a --seed 20260920",
+    "elapsed_s": 75.7,
+    "llm_calls": 32
+  },
+  "summary": {
+    "n": 5,
+    "valid": 3,
+    "stage1_ok": 5,
+    "review": {
+      "fix": 4,
+      "pass": 1
+    },
+    "audit_pass": 3,
+    "audit_ran": 3,
+    "validate_pass": 3,
+    "puzzle_median": 33.0,
+    "answer_median": 41.0,
+    "two_total": 5,
+    "two_valid": 3,
+    "three_total": 0,
+    "three_valid": 0,
+    "stage1_attempts": 5,
+    "stage2_attempts": 6
+  },
+  "items": [
+    {
+      "index": 1,
+      "group": "2key",
+      "keywords": [
+        "阳台",
+        "司机"
+      ],
+      "slots": [
+        "place",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260921,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "阳台上的司机",
+      "puzzle": "男人站在自家阳台上，朝楼下按了两下喇叭，随后他死了。为什么？",
+      "answer": "男人是开吊车的司机，他租的房子就在工地旁的居民楼里。为了省事，他从阳台把自己遥控操作的那台吊车的喇叭接了个开关，用来提醒楼下摆摊占了他车位的人挪车。那天他一按喇叭，楼下的人抬头看见他站在阳台上，发现他阳台栏杆下的花盆里埋着前一天工地失窃、警方正在追查的现金——他正是那个偷钱的司机。对方报了警，他情急逃跑时从阳台坠下身亡。",
+      "stage2_attempts": 2,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "他是偷了工地失窃现金的吊车司机，被楼下人认出花盆里的赃款后报警，他逃跑时坠楼身亡。",
+      "observed_signature": {
+        "mechanism_family": "hidden_function",
+        "solution_shape": "hidden_function_explains_behavior",
+        "domain": "daily",
+        "emotion_mode": "tense",
+        "relation": "neighbor",
+        "time_shape": "single_day",
+        "death": true,
+        "past_trauma": false,
+        "long_term_profession": true,
+        "repeated_ritual": false,
+        "reveal_mode": "recontextualization",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "fix",
+      "review_issues": [
+        "三条提示均超过 30 字上限（34/34/38 字）"
+      ],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 30,
+      "answer_chars": 41,
+      "elapsed_s": 33.6,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 2,
+      "group": "2key",
+      "keywords": [
+        "上楼",
+        "老人"
+      ],
+      "slots": [
+        "action",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260922,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "楼层",
+      "puzzle": "老人住在三楼，却每天都要先上到顶楼，再走楼梯下到三楼回家。有一天他上到顶楼后，却直接嚎啕大哭起来。为什么？",
+      "answer": "老人是电梯维修工，也是个盲人。他每天\"上楼\"其实是被人带上自家楼层的电梯——他家在三楼，但楼里的电梯坏了很久，只有电梯检修时才通到顶楼再往下走（他从顶楼走楼梯下到三楼，靠数台阶认路，因为三楼电梯门对他来说等不到）。那天他上到顶楼后摸到的台阶数不对——顶楼通往天台的护栏被人拆了/被堆满杂物，他\"数不出回家的那段楼梯\"，更关键的是他一摸就发现楼梯的第一级台阶被人打掉、台阶数变了，意味着他家那栋楼的楼梯被改造，他再也无法靠数台阶回家了。他哭，是因为他刚刚知道：一向替他数台阶、牵他下楼的邻居/老伴已经不在了（或他意识到自己彻底回不了家）。",
+      "stage2_attempts": 2,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "他是盲人，靠数台阶回家；那天台阶数变了，他再也数不回三楼的家。",
+      "observed_signature": {
+        "mechanism_family": "information_gap",
+        "solution_shape": "misunderstood_object",
+        "domain": "daily",
+        "emotion_mode": "grief",
+        "relation": "self",
+        "time_shape": "habitual",
+        "death": false,
+        "past_trauma": false,
+        "long_term_profession": false,
+        "repeated_ritual": true,
+        "reveal_mode": "meaning_flip",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "fix",
+      "review_issues": [
+        "第1条提示超过30字(36字)",
+        "第3条提示超过30字(44字)"
+      ],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 53,
+      "answer_chars": 31,
+      "elapsed_s": 28.7,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 3,
+      "group": "2key",
+      "keywords": [
+        "开车",
+        "地下室"
+      ],
+      "slots": [
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260923,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "不拔钥匙",
+      "puzzle": "他每天开车进自家地下室，倒车入库后熄火，却从不拔钥匙就下车走人。邻居说他家根本没有车。这是怎么回事？",
+      "answer": "他是一名学车教练式的地下车库\"倒车入库\"陪练，其实开的是驾校的教练车；所谓\"自家地下室\"是他每天下班后把教练车开回驾校地下车库停放——那不是他家。邻居说的\"他家\"是住宅，当然没有车，因为他开回来的车属于驾校，钥匙也要留在车上交给值班员，所以熄火后不拔钥匙就走。",
+      "stage2_attempts": 0,
+      "stage2_stage": "hard_gate",
+      "stage2_reject_reasons": [
+        "no_external_media"
+      ],
+      "core_answer": "",
+      "observed_signature": {},
+      "review_decision": "fix",
+      "review_issues": [
+        "第 3 条提示 31 字，超过 30 字上限"
+      ],
+      "truth_audit": {},
+      "validate_ok": false,
+      "validate_reasons": [],
+      "final": "rejected_hard_gate",
+      "puzzle_chars": 50,
+      "answer_chars": 130,
+      "elapsed_s": 26.5,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": false,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 4,
+      "group": "2key",
+      "keywords": [
+        "理发师",
+        "桥"
+      ],
+      "slots": [
+        "person",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260924,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "桥下的理发师",
+      "puzzle": "老王每天在桥洞下给人理发，价格便宜，生意很好。可桥上没有一个人敢往下看，他也从不抬头。为什么？",
+      "answer": "老王是被人从桥上推下去摔断了双腿，从此坐在桥洞下,靠捡来的推子给过往的流浪汉、拾荒者理发糊口。他从不抬头，是因为一抬头就会看到当年把他推下去的那个人每天从桥上走过；而桥上的人不敢往下看，是因为往下看就会认出桥下这个被他们以为早已死了的受害者。凶手和帮凶都心照不宣：一个不敢低头，一个不敢抬头，于是这桩旧案就在桥上桥下相安无事地\"藏\"了下去。",
+      "stage2_attempts": 0,
+      "stage2_stage": "truth_audit",
+      "stage2_reject_reasons": [
+        "core hidden facts 有 4 条, 超过 3"
+      ],
+      "core_answer": "",
+      "observed_signature": {},
+      "review_decision": "fix",
+      "review_issues": [
+        "第 2 条提示 33 字，超过 30 字上限。"
+      ],
+      "truth_audit": {},
+      "validate_ok": false,
+      "validate_reasons": [],
+      "final": "rejected",
+      "puzzle_chars": 47,
+      "answer_chars": 170,
+      "elapsed_s": 49.2,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": true,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    },
+    {
+      "index": 5,
+      "group": "2key",
+      "keywords": [
+        "上楼",
+        "图书馆"
+      ],
+      "slots": [
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260925,
+      "stage1_attempts": 1,
+      "stage1_error": "",
+      "title": "七楼",
+      "puzzle": "图书馆一共只有六层。他每天爬楼梯到七楼去自习，从没走错过。为什么？",
+      "answer": "他爬的是图书馆外面那段公用大台阶——从广场上来要先上十几级台阶才到一楼的入口。他把这段台阶算作\"上一层\"，于是六楼的阅览室在他嘴里就成了\"七楼\"。他说的七个楼层，其实只有六层楼加一段台阶。",
+      "stage2_attempts": 2,
+      "stage2_stage": "",
+      "stage2_reject_reasons": [],
+      "core_answer": "他把入口外那一段公用大台阶也算作\"一层\"，所以实际只有六层的图书馆在他口中就成了\"七楼\"。",
+      "observed_signature": {
+        "mechanism_family": "information_gap",
+        "solution_shape": "misunderstood_object",
+        "domain": "daily",
+        "emotion_mode": "neutral",
+        "relation": "stranger",
+        "time_shape": "habitual",
+        "death": false,
+        "past_trauma": false,
+        "long_term_profession": false,
+        "repeated_ritual": true,
+        "reveal_mode": "recontextualization",
+        "procedural_rule_dependency": false
+      },
+      "review_decision": "pass",
+      "review_issues": [],
+      "truth_audit": {
+        "ok": true,
+        "technical": false,
+        "issues": [],
+        "why": ""
+      },
+      "validate_ok": true,
+      "validate_reasons": [],
+      "final": "valid",
+      "puzzle_chars": 33,
+      "answer_chars": 45,
+      "elapsed_s": 28.2,
+      "compile_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": true,
+        "has_reversal": true,
+        "detail_recontextualized": true,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": false,
+        "single_trick": true,
+        "no_external_knowledge_dependency": true
+      },
+      "review_checks": {
+        "clear_anomaly": true,
+        "unique_explanation": true,
+        "yes_no_progress": true,
+        "no_obscure_system": true,
+        "not_pure_puzzle": null,
+        "has_reversal": null,
+        "detail_recontextualized": null,
+        "no_external_media": true,
+        "livestream_safe": true,
+        "story_reconstruction": true,
+        "multi_step_deduction": false,
+        "single_trick": false,
+        "no_external_knowledge_dependency": true
+      }
+    }
+  ],
+  "groups": [
+    {
+      "index": 1,
+      "group": "2key",
+      "n_keys": 2,
+      "keywords": [
+        "阳台",
+        "司机"
+      ],
+      "slots": [
+        "place",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260921
+    },
+    {
+      "index": 2,
+      "group": "2key",
+      "n_keys": 2,
+      "keywords": [
+        "上楼",
+        "老人"
+      ],
+      "slots": [
+        "action",
+        "person"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260922
+    },
+    {
+      "index": 3,
+      "group": "2key",
+      "n_keys": 2,
+      "keywords": [
+        "开车",
+        "地下室"
+      ],
+      "slots": [
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260923
+    },
+    {
+      "index": 4,
+      "group": "2key",
+      "n_keys": 2,
+      "keywords": [
+        "理发师",
+        "桥"
+      ],
+      "slots": [
+        "person",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260924
+    },
+    {
+      "index": 5,
+      "group": "2key",
+      "n_keys": 2,
+      "keywords": [
+        "上楼",
+        "图书馆"
+      ],
+      "slots": [
+        "action",
+        "place"
+      ],
+      "seed": 20260920,
+      "seed_used": 20260925
+    }
+  ],
+  "note": "本轮按用户指示**提前收手**: 用户要求 5 道即可(加快进度)。 下面 5 道是 seed 20260920 抽到的**前 5 组**(全部 2-key)。 第 6~20 组的词已抽出但**未跑**, 不在此报告中冒充结果。"
+}
