@@ -96,6 +96,7 @@ from typing import Any, Optional
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
                      SOLUTION_SHAPES, TIME_SHAPES, PuzzleSpec)
 from .quality import (QUALITY_POLICY_VERSION, Quotas, cross_puzzle_gate,
+                      cross_puzzle_gate_split,
                       too_similar, validate_blueprint, validate_reveal_adherence,
                       validate_spec)
 
@@ -347,6 +348,27 @@ class PuzzlePool:
         self._used_trustworthy = False
         #: 排除了池内已有与已用过的题之后的"该避开"的谜面。
         self._avoid_extra: list[str] = []
+        # ---- H4-E: 池的身份(显式标记, **不猜路径**) ----
+        #
+        # curated 池允许"第二遍"选择: Pass 1 用完整 diversity 门, 一道都没有
+        # 时 Pass 2 忽略分布配额(结构相似 != 同一道题)。生成的池**不**享受
+        # 这一遍 —— 它由 scheduler 主动避免必死 pair(S1), 而且我们自己造的题
+        # 可以重出, 外部题只能判"能不能播"。
+        #
+        # 为什么是显式字段而不是"路径 == curated_pool_path": `open_curated`
+        # 会把 cfg 浅拷贝的 pool_path 覆盖成 curated 路径, 事后无法回推;
+        # 而且两份 cfg 共用路径时推断会直接判错。所以由**构造者**写死。
+        self.pool_kind: str = "generated"
+
+    # ------------------------------------------------------------------
+    @property
+    def _soft_diversity(self) -> bool:
+        """本池是否启用 H4-E 的两遍 soft diversity。**只有 curated 池**。
+
+        `getattr` 是刻意的: 测试替身(`_FakePool` 等 duck-typed 对象)与
+        老实例可能没有这个属性 —— 缺省按 `"generated"` 处理, 即**行为不变**。
+        """
+        return str(getattr(self, "pool_kind", "") or "") == "curated"
 
     # ------------------------------------------------------------------
     @classmethod
@@ -363,6 +385,7 @@ class PuzzlePool:
             log.info("pool_enabled=False: 本题池完全关闭")
             return None
         p = cls(cfg, rng=rng)
+        p.pool_kind = "generated"        # H4-E: 显式身份(不猜路径)
         p.load()
         return p
 
@@ -405,6 +428,9 @@ class PuzzlePool:
         # 不该被绕过(与 prefer_curated 无关: 那个只管取题顺序)。
         sub.pool_enabled = bool(getattr(cfg, "pool_enabled", True))
         p = cls(sub, rng=rng)
+        # H4-E: curated 身份 —— 它启用 Pass 2 soft diversity(见 `_soft_diversity`)。
+        # 写在这里而不是 `sub` 上: cfg 可能被 `open()` 按引用共享。
+        p.pool_kind = "curated"
         p.load()
         log.info("curated 池载入: %d 道(库存 %d)", p.size(), p.stock_count())
         return p
@@ -702,7 +728,8 @@ class PuzzlePool:
                                        recent: Optional[list],
                                        avoid: Optional[list],
                                        quotas: "Quotas",
-                                       used_texts: list) -> str:
+                                       used_texts: list,
+                                       soft_ok: bool = False) -> str:
         """这道候选**此刻**能不能播? 返回阻塞原因, 空串 = 能播。
 
         ## 为什么必须抽出来
@@ -725,12 +752,29 @@ class PuzzlePool:
         ⚠️ `used_texts` 由调用方算好传进来(`avoid + self._avoid_extra`),
         不在这里读 `self._avoid_extra` —— `playable_count()` 要在同一把
         锁里对 N 道候选复用同一份, 每次重算就是 O(N·池大小)。
+
+        ## `soft_ok`: H4-E 的两遍选择(只对 curated 池第二遍用)
+
+        `False`(默认) = 完整门: 分布配额(soft)与结构等价都挡。
+        `True`         = 只保留 **hard** 门: 忽略 `check_signature` 的全部
+                         配额维度与 `is_structurally_duplicate`。
+
+        依据: **同 mechanism_family + solution_shape != 同一道题**。结构相似
+        是多样性偏好; 而"一道都播不了、掉进 fallback 循环"是事故(实播 22 题
+        只出了 5 道 curated)。
+
+        ⚠️ `soft_ok=True` **绝不**放宽 `too_similar` —— 那是文本 near-duplicate,
+        是 identity/dedupe, 不是 diversity。同理 `_validate_pool_spec`(policy
+        兼容 / curated 授权 / used)也在两遍之外, 由调用方先跑。
         """
-        # ② 与当前分布冲突?
-        bad = cross_puzzle_gate(spec, recent, quotas, spec.blueprint)
+        # ② 与当前分布冲突? —— 两种口径都走 `cross_puzzle_gate_split`
+        #    (hard/soft 分区), 保证与 `cross_puzzle_gate` 同源不漂。
+        hard, soft = cross_puzzle_gate_split(
+            spec, recent, quotas, spec.blueprint)
+        bad = list(soft) + list(hard) if not soft_ok else list(hard)
         if bad:
             return bad[0]
-        # ③ 谜面与最近出过的太像?
+        # ③ 谜面与最近出过的太像? —— **两遍都挡**(identity, 不是 diversity)
         if too_similar(spec.puzzle, used_texts):
             return "与已出过的太像"
         return ""
@@ -788,21 +832,30 @@ class PuzzlePool:
             quotas = Quotas.from_config(self.cfg)
             used_texts = list(avoid or []) + self._avoid_extra
             n = 0
-            for s in self._items:
-                if limit is not None and n >= limit:
+            # H4-E: curated 走**两遍** —— Pass 1 完整门, Pass 2 只 hard 门。
+            # 必须与 `_pop_next_locked` 的遍序**完全一致**, 否则"一个说能播、
+            # 一个交付 None"的 bug 会以新形式复活(P0-3)。
+            passes = (False, True) if self._soft_diversity else (False,)
+            for soft_ok in passes:
+                for s in self._items:
+                    if limit is not None and n >= limit:
+                        break
+                    if spec_key(s) in self._used:
+                        continue
+                    # ① 静态准入 —— **与 stock_count 同一扇门**, 所以
+                    #    quality policy 隔离的题在这里同样不计入。
+                    ok, _ = self._validate_pool_spec(s)
+                    if not ok:
+                        continue
+                    # ②③ 动态门 —— 与 pop_next 同一份实现。
+                    if self._candidate_block_reason_locked(
+                            s, recent, avoid, quotas, used_texts, soft_ok):
+                        continue
+                    n += 1
+                if n:
+                    # Pass 1 有结果就不进 Pass 2 —— 两遍是**先后**关系,
+                    # 不是求和(Pass 1 的题已在 n 里, 不能再算一遍)。
                     break
-                if spec_key(s) in self._used:
-                    continue
-                # ① 静态准入 —— **与 stock_count 同一扇门**, 所以
-                #    quality policy 隔离的题在这里同样不计入。
-                ok, _ = self._validate_pool_spec(s)
-                if not ok:
-                    continue
-                # ②③ 动态门 —— 与 pop_next 同一份实现。
-                if self._candidate_block_reason_locked(
-                        s, recent, avoid, quotas, used_texts):
-                    continue
-                n += 1
             return n
 
     # ------------------------------------------------------------------
@@ -1129,35 +1182,42 @@ class PuzzlePool:
             # 它的内容在循环里不变, 而 `too_similar` 是 O(池大小 × 历史)。
             used_texts = list(avoid or []) + self._avoid_extra
             blocked: list[str] = []
-            for spec in cands:
-                # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
-                #    signature 可能在入池后被改坏, 只验 API 入口不够。
-                #    quality policy 不兼容的题也在这里被挡下, 而且
-                #    **在 `_persist_used` 之前** continue —— 所以隔离题
-                #    不会进 used ledger(quarantine != 已播出; 它将来
-                #    离线重审后仍可能重新合法)。
-                ok, why = self._validate_pool_spec(spec)
-                if not ok:
-                    blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
-                    continue
-                # ②③ 动态门 —— **与 `playable_count()` 共用一份实现**。
-                #     分成两套的话, 补池会按其中一个数判断"还够播"而
-                #     另一个数把它挡住, 两边永远对不上。
-                bad = self._candidate_block_reason_locked(
-                    spec, recent, avoid, quotas, used_texts)
-                if bad:
-                    blocked.append(f"{spec.puzzle[:20]}…: {bad[:60]}")
-                    continue
-                # ---- 先落盘再交付(见模块 docstring 的不变式) ----
-                if not self._persist_used(spec, aired=False):
-                    # 记不下来就**不交付** —— 宁可不播, 也不冒"重启后
-                    # 同一道题再播一次"的风险。
-                    log.warning("used 记不下来, 放弃这道题(回落现场生成)")
-                    blocked.append(f"{spec.puzzle[:20]}…: used 写失败")
-                    continue
-                self._used.add(spec_key(spec))
-                log.info("题池出题: %s…", spec.puzzle[:30])
-                return spec
+            # H4-E: curated 走**两遍** —— Pass 1 完整门, Pass 2 只 hard 门。
+            # 遍序必须与 `_playable_count_locked` **完全一致**(P0-3)。
+            passes = (False, True) if self._soft_diversity else (False,)
+            for soft_ok in passes:
+                for spec in cands:
+                    # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
+                    #    signature 可能在入池后被改坏, 只验 API 入口不够。
+                    #    quality policy 不兼容的题也在这里被挡下, 而且
+                    #    **在 `_persist_used` 之前** continue —— 所以隔离题
+                    #    不会进 used ledger(quarantine != 已播出; 它将来
+                    #    离线重审后仍可能重新合法)。
+                    ok, why = self._validate_pool_spec(spec)
+                    if not ok:
+                        blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
+                        continue
+                    # ②③ 动态门 —— **与 `playable_count()` 共用一份实现**。
+                    #     分成两套的话, 补池会按其中一个数判断"还够播"而
+                    #     另一个数把它挡住, 两边永远对不上。
+                    bad = self._candidate_block_reason_locked(
+                        spec, recent, avoid, quotas, used_texts, soft_ok)
+                    if bad:
+                        blocked.append(f"{spec.puzzle[:20]}…: {bad[:60]}")
+                        continue
+                    # ---- 先落盘再交付(见模块 docstring 的不变式) ----
+                    if not self._persist_used(spec, aired=False):
+                        # 记不下来就**不交付** —— 宁可不播, 也不冒"重启后
+                        # 同一道题再播一次"的风险。
+                        log.warning("used 记不下来, 放弃这道题(回落现场生成)")
+                        blocked.append(f"{spec.puzzle[:20]}…: used 写失败")
+                        continue
+                    self._used.add(spec_key(spec))
+                    log.info("题池出题: %s…", spec.puzzle[:30])
+                    return spec
+                # 这一遍一道都没交付 -> 自然进入下一遍(Pass 2 放宽 diversity)。
+                # 注意: Pass 2 只是再看一遍同一批候选, 只不过 soft 维度不再
+                # 阻塞; **绝不**因此绕过 ①(静态准入)与 used 写入。
 
             log.info("题池 %d 道候选全部被挡(回落现场生成): %s",
                      len(cands), " | ".join(blocked[:3]))

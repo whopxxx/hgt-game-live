@@ -282,7 +282,8 @@ class Director:
             from story.lazy_curator import build_lazy_curator
             lc_writer = PuzzleWriter(client=self.client, runtime_cfg=cfg)
             self._lazy_curator = build_lazy_curator(
-                cfg, self.curated_pool, lc_writer, self.engine.pressure)
+                cfg, self.curated_pool, lc_writer, self.engine.pressure,
+                generation_probe=self.engine.snapshot_generation_inputs)
 
     # ------------------------------------------------------------------
     def _playtest_should_continue(self) -> bool:

@@ -101,6 +101,24 @@ class _FakePool:
         return self._playable
 
 
+class _RecordingPool(_FakePool):
+    """H4-E: 记录 `playable_count` 实际收到的窗口参数。
+
+    为什么非要它: `_FakePool.playable_count(*a, **k)` 会**静默吞掉**任何
+    参数 —— 于是"`_stock()` 到底有没有把 recent/avoid 传下去"这件事,
+    用 `_FakePool` 是**测不出来**的(接线错了也照样绿)。这正是
+    `_FakeCompiler` docstring 警告的 "mutant survives"。
+    """
+
+    def __init__(self, path, stock=0, playable=0):
+        super().__init__(path, stock=stock, playable=playable)
+        self.calls = []
+
+    def playable_count(self, *a, **k):
+        self.calls.append({"args": a, "kwargs": dict(k)})
+        return self._playable
+
+
 class _FakeCompiler:
     """按脚本返回。**不发网络请求。**
 
@@ -2051,6 +2069,107 @@ def test_accepted_ledger_write_failure_is_retryable_single_active():
 
 
 # ======================================================================
+# ======================================================================
+# H4-E: LazyCurator 必须读真实 live generation context(P0-4)
+# ======================================================================
+def test_h4e_stock_passes_live_window_to_playable_count():
+    """#10: `_stock()` 把**当前** recent/avoid 传给 `playable_count`。
+
+    昨晚的事故就是这里漏了: 后台不带窗口去问 -> dynamic gate 退化成
+    静态门 -> 以为库存健康 -> 一道都不补。
+    """
+    print("\n[H4-E/p0-4] _stock 带上 live 窗口")
+    with tmpdir() as d:
+        pool = _RecordingPool(os.path.join(d, "p.jsonl"), stock=10, playable=2)
+        lc = _mk(_cfg(curated_background_enabled=True), pool,
+                 _FakeCompiler([]), [mk_rec()],
+                 CL.DecisionLedger(os.path.join(d, "dec.jsonl")),
+                 lambda: dict(FREE))
+        lc._generation_probe = lambda: {
+            "recent_signatures": [{"mechanism_family": "x"}], "avoid": ["aaa"]}
+        lc._stock()
+        check("playable_count 被调用", len(pool.calls) == 1, pool.calls)
+        kw = pool.calls[0]["kwargs"]
+        check("**recent_signatures 传下去了**",
+              kw.get("recent_signatures") == [{"mechanism_family": "x"}], kw)
+        check("**avoid 传下去了**", kw.get("avoid") == ["aaa"], kw)
+        check("limit 仍在", kw.get("limit") is not None, kw)
+
+
+def test_h4e_stock_reads_probe_fresh_every_time():
+    """探针**每次现取**, 绝不缓存(窗口每播一题就变)。"""
+    print("\n[H4-E/p0-4] 探针每次现取")
+    with tmpdir() as d:
+        pool = _RecordingPool(os.path.join(d, "p.jsonl"), stock=10, playable=2)
+        lc = _mk(_cfg(curated_background_enabled=True), pool,
+                 _FakeCompiler([]), [mk_rec()],
+                 CL.DecisionLedger(os.path.join(d, "dec.jsonl")),
+                 lambda: dict(FREE))
+        seen = []
+
+        def probe():
+            seen.append(len(seen))
+            return {"recent_signatures": [], "avoid": [f"v{len(seen)}"]}
+
+        lc._generation_probe = probe
+        lc._stock()
+        lc._stock()
+        check("**探针被调了两次(没缓存)**", len(seen) == 2, seen)
+        check("第二次拿到的是新值",
+              pool.calls[-1]["kwargs"].get("avoid") == ["v2"],
+              pool.calls[-1])
+
+
+def test_h4e_probe_failure_does_not_report_healthy_stock():
+    """#12: 探针异常 -> **不得**报告"库存健康"; 按 playable=0(fail safe)。"""
+    print("\n[H4-E/p0-4] 探针异常 -> playable=0")
+    with tmpdir() as d:
+        # stock 略低于 target(10) 但高于 min(4): 正常态**不该**补货。
+        # 探针挂掉时按 playable=0 -> 必须**进入** refill cycle(允许补货),
+        # 而不是错误地报告"库存健康"。
+        pool = _RecordingPool(os.path.join(d, "p.jsonl"), stock=6, playable=9)
+        lc = _mk(_cfg(curated_background_enabled=True), pool,
+                 _FakeCompiler([]), [mk_rec()],
+                 CL.DecisionLedger(os.path.join(d, "dec.jsonl")),
+                 lambda: dict(FREE))
+
+        def bad():
+            raise RuntimeError("probe down")
+
+        lc._generation_probe = bad
+        stock, playable = lc._stock()
+        check("**probe 挂了 -> playable=0(不是 9)**", playable == 0, playable)
+        check("降级标记被置起", lc._last_probe_failed is True)
+        check("stock 仍然可读(补货判据不受影响)", stock == 6, stock)
+        # 且必须**允许补货** —— needs_work 要因 playable<min 而进入 cycle。
+        # (对照: 若 playable 被错报成 9, stock=6 > min=4 且 playable>min,
+        #  就不会补 —— 那正是昨晚"一道都不补"的形状。)
+        check("**needs_work 判为需要补货**", lc.needs_work() is True)
+
+
+def test_h4e_refill_sees_soft_fallback_under_full_quota_wall():
+    """#11: live recent 让 Pass1=0 时, playable 仍能看到 curated 的 soft fallback。
+
+    端到端: 真 curated 池 + 昨晚那种配额占满的窗口 -> 后台仍认为"有得播"
+    (所以不会狂补) —— 而**关键是它和直播 `pop_next` 答案一致**。
+    """
+    print("\n[H4-E/p0-4] 配额墙下 playable 仍 >=1(与 pop 一致)")
+    from story.pool import PuzzlePool
+    import test_pool as TP
+    with TP.tmpdir() as d:
+        cfg = TP.mkcfg(d, prefer_curated=True)
+        TP._accept_curated(TP._curated_spec(), d)
+        pool = PuzzlePool.open_curated(cfg)
+        s = TP._curated_spec()
+        check("入池", pool.add(s) is True)
+        wall = [s.signature.to_dict()] * 10
+        check("**playable_count(带窗口) >= 1**",
+              pool.playable_count(wall) >= 1, pool.playable_count(wall))
+        check("**与 pop_next 同义**",
+              (pool.playable_count(wall) >= 1)
+              == (pool.pop_next(wall) is not None))
+
+
 def main():
     tests = [
         test_accepted_item_is_immediately_visible_in_live_pool,
@@ -2073,6 +2192,11 @@ def main():
         test_technical_defer_is_retryable,
         test_exception_becomes_defer_not_reject,
         test_budget_exceeded_is_defer,
+        # ---- H4-E: live generation context ----
+        test_h4e_stock_passes_live_window_to_playable_count,
+        test_h4e_stock_reads_probe_fresh_every_time,
+        test_h4e_probe_failure_does_not_report_healthy_stock,
+        test_h4e_refill_sees_soft_fallback_under_full_quota_wall,
         test_rejected_is_terminal_and_not_retried,
         test_needs_work_hysteresis,
         test_stops_at_target,

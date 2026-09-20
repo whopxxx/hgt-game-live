@@ -2175,6 +2175,312 @@ def test_g4b_prefill_batch_does_not_self_duplicate():
         check("库存在涨", pool.stock_count() == 5, pool.stock_count())
 
 
+# ======================================================================
+# H4-E: curated two-pass soft diversity(P0-1/2/3/5/6/7)
+# ======================================================================
+def _h4e_curated_pool(d, **spec_kw):
+    """建一个 **curated** 池, 放进一道已授权的题, 返回 (pool, spec)。"""
+    cfg = mkcfg(d, prefer_curated=True)
+    _accept_curated(_curated_spec(**spec_kw), d)   # 先登记授权
+    pool = PuzzlePool.open_curated(cfg)
+    return cfg, pool
+
+
+def test_h4e_split_matches_cross_puzzle_gate():
+    """`cross_puzzle_gate_split` 的并集必须与 `cross_puzzle_gate` **逐字等价**。
+
+    两处判据同源是这轮的核心不变式 —— 一旦漂了, Pass 1 的"有无冲突"
+    与 Pass 2 的"还剩什么"就会各说各话。
+    """
+    print("\n[H4-E1] split() 与 cross_puzzle_gate() 逐字等价")
+    from story.quality import (Quotas, cross_puzzle_gate,
+                               cross_puzzle_gate_split)
+    cases = [
+        ([], "空窗口"),
+        ([{"mechanism_family": "hidden_function",
+           "solution_shape": "hidden_function_explains_behavior"}] * 2,
+         "机制+形状超配额"),
+        ([{"domain": "maritime"}] * 3, "领域超配额"),
+        ([{"mechanism_family": "identity_misread",
+           "solution_shape": "identity_reversal"}], "结构等价对"),
+    ]
+    for i, (recent, why) in enumerate(cases):
+        s = good_spec()
+        q = Quotas()
+        full = cross_puzzle_gate(s, recent, q, s.blueprint)
+        hard, soft = cross_puzzle_gate_split(s, recent, q, s.blueprint)
+        check(f"case{i} 并集 == cross_puzzle_gate ({why})",
+              (list(soft) + list(hard)) == full,
+              f"full={full} hard={hard} soft={soft}")
+
+
+def test_h4e_curated_quota_conflict_pass2_playable():
+    """P0-1/#1: curated 被配额占满 -> **Pass 2 仍可播**。
+
+    这正是昨晚的场景: 池里有题, 但 recent-10 把配额全占了, 于是
+    Pass 1 一道都挑不出来。生成池在同样情况下必须**仍然挡住**。
+    """
+    print("\n[H4-E2] curated 配额冲突 -> Pass2 可播(generated 仍挡)")
+    with tmpdir() as d:
+        cfg, pool = _h4e_curated_pool(d)
+        s = _curated_spec()
+        check("curated 入池", pool.add(s) is True)
+        wall = [s.signature.to_dict()] * 10
+        check("**curated: 配额占满仍可播(Pass2)**",
+              pool.playable_count(wall) >= 1, pool.playable_count(wall))
+        check("**curated: pop_next 同样交付**",
+              pool.pop_next(wall) is not None)
+    with tmpdir() as d:
+        # 对照: 生成池**不**享受 Pass 2
+        pool2 = PuzzlePool.open(mkcfg(d))
+        s2 = good_spec()
+        pool2.add(s2)
+        wall2 = [s2.signature.to_dict()] * 10
+        check("**generated: 配额占满仍然挡住**",
+              pool2.playable_count(wall2) == 0, pool2.playable_count(wall2))
+        check("generated: pop_next 返回 None", pool2.pop_next(wall2) is None)
+
+
+def test_h4e_curated_structural_equivalent_pass2_playable():
+    """P0-1/#2: 结构等价(同 mechanism_family+solution_shape)在 curated 是可播的。
+
+    任务书原则原话: **同 mechanism_family + solution_shape != 同一道题**。
+    """
+    print("\n[H4-E3] curated 结构等价 -> Pass2 可播")
+    with tmpdir() as d:
+        cfg, pool = _h4e_curated_pool(d)
+        s = _curated_spec()
+        pool.add(s)
+        tw = _twin(s, "海边灯塔的守塔人只在退潮时把灯点亮, 涨潮之后"
+                      "反倒熄灯, 有船经过也照熄不误。为什么?")
+        pool.add(tw)
+        # 用 s 的签名填满窗口 -> tw 与 s 结构等价
+        wall = [s.signature.to_dict()] * 2
+        check("**结构等价 -> 仍能交付(Pass2)**",
+              pool.pop_next(wall) is not None)
+
+
+def test_h4e_pass1_prefers_nonconflicting():
+    """P0-1/#3: 有无冲突两道时, Pass 1 必须**优先**返回无冲突的那道。"""
+    print("\n[H4-E4] Pass1 优先无冲突")
+    with tmpdir() as d:
+        cfg, pool = _h4e_curated_pool(d)
+        conflict = _curated_spec()
+        pool.add(conflict)
+        # 无冲突的一道: **所有**参与配额的维度都要与墙拉开距离
+        # (机制/形状/领域/关系/情绪/reveal 结构), 否则它一样被挡住。
+        # fair_clues 必须引用它**自己的**谜面原文(见 `_twin` 的说明)。
+        clean = good_spec(
+            puzzle="钟表匠每天中午都把店里所有的钟拨慢一分钟, 却从不"
+                   "校准。客人问起他只笑而不答。为什么?",
+            answer="他是在为一位失明的老主顾保留'听见整点报时'的习惯,"
+                   "拨慢是为了让报时落在他午睡醒来那一刻。",
+            fair_clues=[
+                FairClue(quote="把店里所有的钟拨慢一分钟", supports_atoms=["a1"]),
+                FairClue(quote="从不校准", supports_atoms=["a2"]),
+            ])
+        clean.source_type = "curated"
+        clean.external_source = "Puzzling Stack Exchange"
+        clean.external_id = "pse:q:2"
+        clean.source_url = "https://puzzling.stackexchange.com/q/2"
+        clean.license = "CC BY-SA 4.0"
+        clean.answer_license = "CC BY-SA 3.0"
+        clean.attribution = {"question_author": "Q2", "answer_author": "A2",
+                             "modified": True}
+        clean.style_tags = ["object_flip"]
+        from tools.curated_compiler import CURATED_POLICY_VERSION as _CPV
+        from tools.curated_ledger import content_hash_of as _ch
+        clean.curated_policy_version = _CPV
+        clean.curated_content_hash = _ch(_mk_curated_dec_rec(clean))
+        clean.signature.mechanism_family = "object_misuse"
+        clean.signature.solution_shape = "misunderstood_object"
+        clean.signature.domain = "daily"
+        clean.signature.relation = "family"
+        clean.signature.emotion_mode = "warm"
+        clean.signature.reveal_mode = "identity_flip"
+        clean.signature.procedural_rule_dependency = False
+        clean.blueprint_specified = False
+        _accept_curated(clean, d)       # 授权它(否则池门按"未提交"挡住)
+        ok_add, why_add = PuzzlePool._validate_pool_spec(clean)
+        check("无冲突那道入池", ok_add and pool.add(clean) is True, why_add)
+        wall = [conflict.signature.to_dict()] * 2
+        got = pool.pop_next(wall)
+        check("拿到了题", got is not None)
+        check("**拿到的是无冲突那道(不是被墙挡住的那道)**",
+              got is not None and got.signature.domain == "daily",
+              got.signature.domain if got else None)
+
+
+def test_h4e_text_near_duplicate_blocks_both_passes():
+    """P0-6/#5: 文本 near-duplicate 在**两遍**都挡(这是 identity, 不是 diversity)。"""
+    print("\n[H4-E5] 文本近重复 -> 两遍都挡")
+    with tmpdir() as d:
+        cfg, pool = _h4e_curated_pool(d)
+        s = _curated_spec()
+        pool.add(s)
+        check("avoid 命中 -> playable=0",
+              pool.playable_count([], avoid=[s.puzzle]) == 0,
+              pool.playable_count([], avoid=[s.puzzle]))
+        check("**Pass2 也不得放行**", pool.pop_next([], avoid=[s.puzzle]) is None)
+
+
+def test_h4e_used_blocks_both_passes():
+    """P0-6/#6: used 在两遍都挡。"""
+    print("\n[H4-E6] used -> 两遍都挡")
+    with tmpdir() as d:
+        cfg, pool = _h4e_curated_pool(d)
+        s = _curated_spec()
+        pool.add(s)
+        got = pool.pop_next([])
+        check("先交付一次", got is not None)
+        check("**交付过之后 Pass2 也不放行**",
+              pool.pop_next([]) is None)
+
+
+def test_h4e_old_policy_blocks_both_passes():
+    """P0-7/#7: 旧 policy 在两遍都挡 —— Pass 2 **绝不**绕过静态准入。"""
+    print("\n[H4-E7] 旧 policy -> 两遍都挡")
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        # 手工写一行**旧 policy** 的 curated 题(绕过 add() 的门)
+        s = _curated_spec()
+        s.curated_policy_version = "curated-v2"
+        import json as _json
+        rec = {"pool_version": POOL_VERSION, "pool_key": spec_key(s),
+               "added_at": 1.0, "added_by": "legacy",
+               "spec": s.to_archive()}
+        _write_raw(cfg.curated_pool_path,
+                   [_json.dumps(rec, ensure_ascii=False)])
+        pool = PuzzlePool.open_curated(cfg)
+        check("旧 policy 不计入库存", pool.stock_count() == 0,
+              pool.stock_count())
+        check("**旧 policy 两遍都不可播**", pool.playable_count([]) == 0,
+              pool.playable_count([]))
+        check("旧 policy pop_next 返回 None", pool.pop_next([]) is None)
+
+
+def test_h4e_generated_pool_hard_quota_unchanged():
+    """P0-2/#8: 生成池的 hard quota 行为**逐位不变**。"""
+    print("\n[H4-E8] generated 池 hard quota 不变")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        check("pool_kind=generated", pool.pool_kind == "generated",
+              pool.pool_kind)
+        check("_soft_diversity=False", pool._soft_diversity is False)
+        s = good_spec()
+        pool.add(s)
+        wall = [s.signature.to_dict()] * 10
+        check("配额占满 -> playable=0", pool.playable_count(wall) == 0)
+        check("配额占满 -> pop None", pool.pop_next(wall) is None)
+        check("空窗口 -> 正常可播", pool.playable_count([]) == 1)
+
+
+def test_h4e_playable_matches_pop_on_both_passes():
+    """P0-3/#9: 两遍都保持 `pop_next 能交付 <=> playable_count >= 1`。"""
+    print("\n[H4-E9] playable 与 pop_next 在两遍都同义")
+    for label, prefer in (("curated", True), ("generated", False)):
+        with tmpdir() as d:
+            cfg = mkcfg(d, prefer_curated=prefer)
+            if prefer:
+                _accept_curated(_curated_spec(), d)
+                pool = PuzzlePool.open_curated(cfg)
+                s = _curated_spec()
+            else:
+                pool = PuzzlePool.open(cfg)
+                s = good_spec()
+            pool.add(s)
+            for name, recent in (("空窗口", []),
+                                 ("配额占满", [s.signature.to_dict()] * 10)):
+                n = pool.playable_count(recent)
+                got = pool.pop_next(recent)
+                check(f"{label}/{name}: 一致 (playable={n})",
+                      (n >= 1) == (got is not None),
+                      f"playable={n} pop={'spec' if got else None}")
+
+
+def test_h4e_pool_kind_is_explicit_not_inferred():
+    """P0-2: 身份是**显式标记**, 不从路径猜。"""
+    print("\n[H4-E10] pool_kind 显式标记")
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        gen = PuzzlePool.open(cfg)
+        cur = PuzzlePool.open_curated(cfg)
+        check("generated", gen.pool_kind == "generated", gen.pool_kind)
+        check("curated", cur.pool_kind == "curated", cur.pool_kind)
+        check("curated 才开 soft", cur._soft_diversity and
+              not gen._soft_diversity)
+        check("**判定不依赖路径**",
+              gen.pool_path != cur.pool_path)
+
+
+def test_h4e_fallback_loop_protection():
+    """P1: `allow_live_generation=False` 且 curated 存在时, 不得因 diversity
+    配额进入 engine fallback —— source 必须是 `curated`。
+
+    这是昨晚事故的直接回归: 22 题里 17 题掉进 fallback 循环。
+    """
+    print("\n[H4-E11] curated 存在 -> 不进 fallback")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        _accept_curated(_curated_spec(), d)
+        dr = Director(cfg)
+        check("curated 池就位", dr.curated_pool is not None)
+        s = _curated_spec()
+        dr.curated_pool.add(s)
+        # 昨晚那种 recent window: 配额全占满
+        wall = [s.signature.to_dict()] * 10
+        spec = dr.curated_pool.pop_next(recent_signatures=wall)
+        check("**仍有 curated 可播(不是 None -> 不会 fallback)**",
+              spec is not None)
+
+
+def test_h4e_live_fixture_last_night_window_still_serves_curated():
+    """**昨晚实播场景的端到端回归**(无 LLM)。
+
+    事实: 22 题里 #6~#22 全是 engine fallback, 因为直播 `pop_next` 带
+    recent-10 窗口去问, curated 全被 diversity 挡住; 而后台 `_stock()`
+    不带窗口, 以为库存健康, 一道都不补。
+
+    这个 fixture 复现"窗口把配额占满"那一刻, 断言:
+      - director 仍然交付 **curated**(经 Pass 2 soft fallback)
+      - source **不是** fallback
+      - 且后台 playable 读数与之一致(不会"一个说能播一个说 0")
+    """
+    print("\n[H4-E12] 实播放映: 配额占满仍出 curated(不是 fallback)")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, prefer_curated=True)
+        spec = _curated_spec()
+        _accept_curated(spec, d)
+        cp = PuzzlePool.open_curated(cfg)
+        check("curated 入池", cp.add(spec) is True)
+        dr = Director(cfg)
+        check("director 拿到 curated 池", dr.curated_pool is not None)
+
+        class _NoGen:
+            def gen_spec(self, *a, **k):
+                raise AssertionError("curated 可播时不该现场生成/fallback")
+
+        dr.writer = _NoGen()
+        dr.engine.start()
+        # 把 engine 的 recent 填成"配额占满"的窗口 —— 昨晚的形状。
+        wall_sig = spec.signature
+        dr.engine._recent_signatures = [wall_sig] * 10
+        try:
+            _inline_riddle(dr, payload={
+                "avoid": [], "recent_signatures": [wall_sig.to_dict()] * 10,
+                "expect_round": dr.engine.round_index,
+            })
+        except AssertionError as e:
+            check("**不该回落生成**", False, str(e))
+            return
+        check("**来源是 curated**", dr.engine._spec_source == "curated",
+              dr.engine._spec_source)
+        check("**不是 fallback**", dr.engine._spec_source != "fallback",
+              dr.engine._spec_source)
+
+
 def main():
     tests = [
         # 验收点 1
@@ -2262,6 +2568,19 @@ def main():
         test_g4b_never_raises_on_empty_or_broken_pool,
         test_g4b_prefill_sees_existing_stock_in_recent,
         test_g4b_prefill_batch_does_not_self_duplicate,
+        # ---- H4-E: curated two-pass soft diversity ----
+        test_h4e_split_matches_cross_puzzle_gate,
+        test_h4e_curated_quota_conflict_pass2_playable,
+        test_h4e_curated_structural_equivalent_pass2_playable,
+        test_h4e_pass1_prefers_nonconflicting,
+        test_h4e_text_near_duplicate_blocks_both_passes,
+        test_h4e_used_blocks_both_passes,
+        test_h4e_old_policy_blocks_both_passes,
+        test_h4e_generated_pool_hard_quota_unchanged,
+        test_h4e_playable_matches_pop_on_both_passes,
+        test_h4e_pool_kind_is_explicit_not_inferred,
+        test_h4e_fallback_loop_protection,
+        test_h4e_live_fixture_last_night_window_still_serves_curated,
     ]
     for t in tests:
         t()

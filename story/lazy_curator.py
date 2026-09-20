@@ -256,7 +256,8 @@ class LazyCurator:
                  candidates: list, ledger: DecisionLedger,
                  pressure: Callable[[], dict],
                  clock: Callable = time.monotonic,
-                 budget_seconds: Optional[float] = None):
+                 budget_seconds: Optional[float] = None,
+                 generation_probe: Optional[Callable[[], dict]] = None):
         self.cfg = cfg
         self.pool = pool
         self.compiler = compiler
@@ -264,6 +265,22 @@ class LazyCurator:
         self.ledger = ledger
         self._pressure = pressure
         self._clock = clock
+        # ---- H4-E: 真实 live generation context ----
+        #
+        # `_stock()` 要问池子"**此刻**能播几道", 而那个答案依赖当前
+        # `recent_signatures` / `avoid`。不传的话 dynamic gate 退化成静态门,
+        # 于是后台以为"库存健康"而一道都不补 —— 而直播那边 `pop_next` 带窗口
+        # 去问, 10 道全被挡住 -> 回落 fallback。这正是昨晚 22 题只出 5 道
+        # curated 的成因。
+        #
+        # 注入的是**只读回调**(`engine.snapshot_generation_inputs`), 每次
+        # `_stock()` **现取**当前快照, **绝不缓存** —— 窗口每播一题就变一次。
+        # 离线预热没有直播窗口, 传 None(退化为静态语义, 与预热替身一致)。
+        self._generation_probe = generation_probe
+        #: 最近一次探针是否失败。**可断言**用(见 P0-4 regression):
+        #: 失败时 `_stock()` 必须按 playable=0 处理(允许补货), 而不是
+        #: 错误地报告"库存健康"。
+        self._last_probe_failed = False
         #: 单条的预算上限。超了就算 technical_defer, 让下次重来 ——
         #: 不是 rejected。一道题卡住不该吃掉整个后台窗口。
         self._budget = float(
@@ -325,14 +342,39 @@ class LazyCurator:
         立刻交付"。池里堆满但全被当前窗口挡住时, 前者健康而后者是 0,
         那时**仍然要补** —— 若只看 stock, 补池会以为一切正常, 而实际
         下一题只能回落现场生成(观众干等)。
+
+        ## H4-E: playable 必须带**当前** recent/avoid 去问
+
+        早先这里只传 `limit`, 于是 `playable_count` 的 dynamic gate 拿不到
+        窗口 -> 退化成静态门 -> 后台看到"能播 10 道"而直播 `pop_next`
+        (带窗口)一道都拿不到 -> 补池不补 -> 掉进 fallback 循环。
+
+        探针**每次现取**(绝不缓存): 窗口每播一题就变一次。探针失败时
+        **按 playable=0 处理** —— 宁可多补一轮, 也不要错误地认为库存健康
+        (fail safe 的方向是"允许补货")。
         """
         try:
             stock = int(self.pool.stock_count(limit=self._max + 1))
         except Exception:                       # noqa: BLE001
             log.exception("读 stock_count 失败, 按 0 处理")
             stock = 0
+        recent, avoid = None, None
+        self._last_probe_failed = False
+        if self._generation_probe is not None:
+            try:
+                ctx = self._generation_probe() or {}
+                recent = ctx.get("recent_signatures")
+                avoid = ctx.get("avoid")
+            except Exception:                   # noqa: BLE001
+                # 拿不到窗口 -> 不能假装库存健康。按 0 处理 = 允许补货。
+                log.exception("读 generation context 失败, playable 按 0 处理")
+                self._last_probe_failed = True
+                return stock, 0
         try:
-            playable = int(self.pool.playable_count(limit=self._playable_min + 1))
+            playable = int(self.pool.playable_count(
+                recent_signatures=recent,
+                avoid=avoid,
+                limit=self._playable_min + 1))
         except Exception:                       # noqa: BLE001
             log.exception("读 playable_count 失败, 按 0 处理")
             playable = 0
@@ -1201,7 +1243,8 @@ def build_lazy_curator(cfg: Any, pool: Any, writer: Any,
                        pressure: Callable[[], dict],
                        corpus_path: Optional[str] = None,
                        ledger_path: Optional[str] = None,
-                       clock: Callable = time.monotonic
+                       clock: Callable = time.monotonic,
+                       generation_probe: Optional[Callable[[], dict]] = None
                        ) -> Optional[LazyCurator]:
     """按配置装配。**任何一步失败都返回 None**(而不是让直播起不来)。"""
     if not bool(getattr(cfg, "curated_background_enabled", True)):
@@ -1220,7 +1263,8 @@ def build_lazy_curator(cfg: Any, pool: Any, writer: Any,
                                or os.path.join("data",
                                                "curated_decisions.jsonl")))
         comp = CuratedCompiler(writer)
-        return LazyCurator(cfg, pool, comp, recs, led, pressure, clock=clock)
+        return LazyCurator(cfg, pool, comp, recs, led, pressure, clock=clock,
+                           generation_probe=generation_probe)
     except Exception:                           # noqa: BLE001
         log.exception("装配 Lazy Curator 失败 —— 直播照常, 只是不补 curated")
         return None

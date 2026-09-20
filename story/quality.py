@@ -1932,6 +1932,60 @@ def cross_puzzle_gate(spec: PuzzleSpec, recent: Optional[list],
     return bad
 
 
+def cross_puzzle_gate_split(spec: PuzzleSpec, recent: Optional[list],
+                            quotas: Optional[Quotas] = None,
+                            blueprint: Optional[PuzzleBlueprint] = None
+                            ) -> tuple:
+    """`cross_puzzle_gate` 的 **hard/soft 分区**版本。返回 `(hard, soft)`。
+
+    ## 为什么需要它(H4-E)
+
+    题池对 **curated** 题要做一个两遍选择: Pass 1 用完整门(有冲突时优先取
+    无冲突的), Pass 2 在**一道都没有**时只保留 hard 门 —— 因为
+
+        同 mechanism_family + solution_shape  !=  同一道题
+
+    结构相似是*多样性偏好*, 而"一道都播不了、掉进 fallback 循环"是**事故**。
+    实播 22 题只出了 5 道 curated, 就是这么来的。
+
+    ## 为什么不直接改 `cross_puzzle_gate` 的返回
+
+    它的调用点很多(生成后校验、池、测试), 返回类型从 `list[str]` 改成 tuple
+    会波及一圈。这里**新增**一个函数, 并让 `cross_puzzle_gate` 保持原样 ——
+    两者共用下面**同一份**判据, 拼接 `hard + soft` 与它逐字等价(有测试钉死)。
+
+    ## 分区依据
+
+        hard: **空**。`cross_puzzle_gate` 里没有任何一项是"真正相同内容身份" ——
+              它全部由 `check_signature` 的分布配额与 `is_structurally_duplicate`
+              的 `(mechanism_family, solution_shape)` 二元组构成, 两者都是
+              **结构相似 != 同一道题**。
+        soft: `check_signature` 的**全部**配额维度(mechanism / shape / death /
+              past_trauma / trauma_ritual / grief / profession_ritual / domain /
+              relation / reveal / emotion / procedural / dark-tone 带)
+              + `is_structurally_duplicate` 的结构等价对。
+
+    ⚠️ 真正的 identity / dedupe **不在这里**, 它们由池在**两遍之外**把关:
+        - `too_similar`        —— 文本 near-duplicate(换个说法重讲同一题)
+        - used 账本 / `spec_key` —— 真正相同内容身份(同 hash 即同一道题)
+        - `_validate_pool_spec` —— policy 兼容 / curated ledger 授权 / 静态校验
+    这三类在 Pass 2 **仍然硬挡**(见 `pool._candidate_block_reason_locked`)。
+    把它们和"结构相似"混为一谈, 正是实播把 17 道题逼进 fallback 循环的成因。
+    """
+    q = quotas or Quotas()
+    sig = spec.signature
+    if not sig.mechanism_family and not sig.solution_shape:
+        bp = blueprint or spec.blueprint
+        sig = signature_of(bp)
+    soft = list(check_signature(sig, recent, q))
+    dup = is_structurally_duplicate(sig, recent, q.window)
+    if dup:
+        # 结构等价是**多样性**判据(判重键刻意排除 domain), 不是 identity ——
+        # 任务书原则: 同 mechanism_family + solution_shape != 同一道题。
+        soft.append(f"与最近某题结构等价: {dup}")
+    return [], soft
+
+
 # ======================================================================
 # 文本近似(3-gram Jaccard)
 # ======================================================================
