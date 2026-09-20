@@ -2256,6 +2256,95 @@ def _mk_bare_prefetcher(cfg):
                           clock=lambda: 1000.0)
 
 
+def test_r4_provenance_reaches_live_archive():
+    """**R4**: 三段链的 provenance 必须进**正式直播 archive**。
+
+    ## 这条用例守的是什么(以及为什么单测 `to_archive()` 不够)
+
+    R4 把 lane / keywords / story- 与 surface-prompt 版本 / keyword
+    seed-corpus-session-draw index 写进了 `spec.metrics`。但
+    `PuzzleSpec.to_archive()` 通过**不等于**直播 `puzzle.jsonl` 看得见 ——
+    `director._round_metrics()` 是**白名单搬运**, 不搬整个 metrics。少了
+    这条, 复盘时从正式 archive 里分不出"这题是红是黑、哪一版 prompt 产的"。
+
+    走真实链: 建 Director -> `_archive_reveal()` -> 读回 JSON。
+    """
+    import io as _io
+    import json
+    from story.puzzle import PuzzleSpec
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        out = os.path.join(d, "puzzle.jsonl")
+        cfg.puzzle_out_path = out
+        dr = _mk_director(cfg)
+        dr.engine.start()
+        # 造一个**带全套 R4 provenance** 的 spec(模拟 keyword2 成功产物)。
+        sp = _good_gen_spec()
+        sp.prompt_version = "keyword2-v5"
+        sp.metrics = {
+            "generation_mode": "keyword2", "ok": True,
+            "lane": "black",
+            "keywords": ["新作", "掘坟"],
+            "story_prompt_version": "keyword2-v5",
+            "surface_prompt_version": "surface-v1",
+            "keyword_seed_version": "keyword2-vocab-v2",
+            "keyword_corpus_version": "keyword2-vocab-v2",
+            "keyword_session_seed": 14047211878561490874,
+            "keyword_draw_index": 7,
+        }
+        payload = {
+            "spec": sp, "puzzle": sp.puzzle, "answer": sp.answer,
+            "reason": "test", "winner": "", "core_answer": sp.core_answer,
+        }
+        dr._archive_reveal(payload, "揭晓文案")
+        rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
+        m = rec.get("metrics") or {}
+        # 逐项断言 —— 不用"有没有 metrics"这种恒真替代。
+        check("**archive.metrics.lane**", m.get("lane") == "black", m.get("lane"))
+        check("**archive.metrics.keywords**",
+              list(m.get("keywords") or []) == ["新作", "掘坟"], m.get("keywords"))
+        check("**archive.metrics.story_prompt_version**",
+              m.get("story_prompt_version") == "keyword2-v5",
+              m.get("story_prompt_version"))
+        check("**archive.metrics.surface_prompt_version**",
+              m.get("surface_prompt_version") == "surface-v1",
+              m.get("surface_prompt_version"))
+        check("**archive.metrics.keyword_seed_version**",
+              m.get("keyword_seed_version") == "keyword2-vocab-v2",
+              m.get("keyword_seed_version"))
+        check("**archive.metrics.keyword_corpus_version**",
+              m.get("keyword_corpus_version") == "keyword2-vocab-v2",
+              m.get("keyword_corpus_version"))
+        check("**archive.metrics.keyword_session_seed**",
+              m.get("keyword_session_seed") == 14047211878561490874,
+              m.get("keyword_session_seed"))
+        check("**archive.metrics.keyword_draw_index**",
+              m.get("keyword_draw_index") == 7, m.get("keyword_draw_index"))
+        check("spec.prompt_version 也在顶层",
+              rec.get("prompt_version") == "keyword2-v5",
+              rec.get("prompt_version"))
+        # ---- 反证: 老题(无 provenance)不会写出 null ----
+        sp2 = _good_gen_spec()
+        sp2.metrics = {}
+        out2 = os.path.join(d, "puzzle2.jsonl")
+        cfg.puzzle_out_path = out2
+        dr2 = _mk_director(cfg)
+        dr2.engine.start()
+        dr2._archive_reveal({"spec": sp2, "puzzle": sp2.puzzle,
+                             "answer": sp2.answer, "reason": "t",
+                             "winner": ""}, "x")
+        rec2 = json.loads(_io.open(out2, encoding="utf-8").read().strip())
+        m2 = rec2.get("metrics") or {}
+        check("老题: lane 是空串而不是 null", m2.get("lane") == "", repr(m2.get("lane")))
+        check("老题: keywords 是空列表", m2.get("keywords") == [], m2.get("keywords"))
+        check("老题: draw_index 是 0", m2.get("keyword_draw_index") == 0,
+              m2.get("keyword_draw_index"))
+        # 这几项**必须是可 JSON 序列化的**(写盘已经证明了), 且不该是 None
+        for k in ("lane", "story_prompt_version", "surface_prompt_version",
+                  "keyword_seed_version", "keyword_corpus_version"):
+            check(f"老题: {k} 非 None", m2.get(k) is not None, m2.get(k))
+
+
 def main():
     tests = [
         test_default_config_curated_off,
@@ -2318,6 +2407,8 @@ def main():
         test_success_resets_fail_streak_empty_pool,
         test_reject_labels_survive_to_stats,
         test_cooperative_cancellation_not_regressed,
+        # ---- R4: 三段链 provenance 进正式 archive ----
+        test_r4_provenance_reaches_live_archive,
     ]
     for t in tests:
         t()

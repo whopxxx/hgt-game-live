@@ -1235,6 +1235,31 @@ class Director:
             "repair_success_reasons":
                 dict(gen.get("repair_success_reasons") or {}),
         })
+        # ---- R4: 三段式生成链的 provenance ----
+        #
+        # ⚠️ 这一块与上面 G4-E 是**同一个坑**: `spec.metrics` 里写着不等于
+        # 正式 archive 里看得见 —— 本函数是白名单搬运, 不搬整个 metrics。
+        # R4 引入了 lane 与两个 prompt version(Story / Surface), 如果不
+        # 显式搬过来, 直播 `puzzle.jsonl` 就分不出"这题是红是黑、是哪一版
+        # prompt 产的" —— 而那正是下一轮复盘要拿来算的东西。
+        #
+        # 缺省与上面同规矩: 空串 / 0, 不写 null(老题 / 兜底题 / `--no-llm`
+        # 的假题都没有这些键)。
+        #
+        # ⚠️ 仍然**不** bump spec_version / policy / prompt version —— 这里
+        # 只是把已有的事实搬进 archive, 不改任何语义或准入政策。
+        out.update({
+            "lane": str(gen.get("lane") or ""),
+            "keywords": list(gen.get("keywords") or []),
+            "story_prompt_version": str(gen.get("story_prompt_version") or ""),
+            "surface_prompt_version":
+                str(gen.get("surface_prompt_version") or ""),
+            "keyword_seed_version": str(gen.get("keyword_seed_version") or ""),
+            "keyword_corpus_version":
+                str(gen.get("keyword_corpus_version") or ""),
+            "keyword_session_seed": gen.get("keyword_session_seed"),
+            "keyword_draw_index": int(gen.get("keyword_draw_index") or 0),
+        })
         return out
 
     # ---- 离线(--no-llm)用的固定内容 ----

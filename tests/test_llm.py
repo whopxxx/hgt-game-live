@@ -3763,15 +3763,30 @@ def test_r4_versions_bumped():
 def test_r4_keyword_spec_runs_three_stages():
     """**整链**: 抽词 + lane -> Story -> Surface -> Structure, 且 provenance 齐。"""
     print("\n[R4-K11] keyword_spec 三段式")
-    import random as _r
-    from story.keyword_seed import (keyword_spec, KeywordBag, draw_lane,
-                                    derive_lane_seed, LANES)
+    from story.keyword_seed import (keyword_spec, KeywordBag, draw_lane, LANES)
     check("LANES == red/black", tuple(LANES) == ("red", "black"))
-    seq1 = [draw_lane(_r.Random(derive_lane_seed(7))) for _ in range(1)]
-    seq2 = [draw_lane(_r.Random(derive_lane_seed(7))) for _ in range(1)]
-    check("lane 同 seed 可复现", seq1 == seq2, f"{seq1} vs {seq2}")
-    lanes = {draw_lane(_r.Random(derive_lane_seed(s))) for s in range(60)}
-    check("两个 lane 都抽得到", lanes == {"red", "black"}, lanes)
+
+    # ---- ⚠️ lane 必须**逐 draw 变化**, 且同 seed 可重放 ----
+    #
+    # R4-R1 的 blocker: 第一版让调用方传一把持久 `lane_rng`, 而 live /
+    # prefetch **都没传** —— 于是每次都用同一个 session_seed 现建 RNG、
+    # 取第一项, **同一场直播永远同一个 lane**(实测连跑 8 次全 red)。
+    #
+    # 这条用例直接钉住修法: lane 由 `(session_seed, draw_index)` 无状态
+    # 派生, 所以(a)连续 draw 会变、(b)同 seed 同 index 必然重放。
+    ss = 14047211878561490874
+    seq = [draw_lane(ss, i) for i in range(1, 13)]
+    check("**lane 逐 draw 会变化(不是永远同一个)**",
+          len(set(seq)) == 2, seq)
+    check("**同 seed 同 index 可重放**",
+          [draw_lane(ss, i) for i in range(1, 5)]
+          == [draw_lane(ss, i) for i in range(1, 5)])
+    check("**不是前 N 项全同**", seq[:5] != [seq[0]] * 5, seq[:5])
+    # 长期大致 50/50(不要求精确 —— 只挡"一边倒")。
+    from collections import Counter as _C
+    dist = _C(draw_lane(ss, i) for i in range(1, 401))
+    check("**400 draw 两个 lane 都出现且不一边倒**",
+          min(dist.values()) > 120, dict(dist))
 
     # 整链(用假 client)。
     fc = FakeClient([
@@ -3783,6 +3798,7 @@ def test_r4_keyword_spec_runs_three_stages():
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     bag = KeywordBag(["图书馆", "上楼", "灯塔", "礁石", "退潮", "守望"], 4242)
+    # ⚠️ **不传任何 rng** —— 这正是生产(live / prefetch)的调用形状。
     spec, why = keyword_spec(w, bag, 4242)
     check("成题", bool(getattr(spec, "puzzle", "")), why)
     check("三段各调一次",
@@ -3794,8 +3810,54 @@ def test_r4_keyword_spec_runs_three_stages():
     check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v5")
     check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v1")
     check("keywords 落盘", m.get("keywords"), m.get("keywords"))
+    check("draw_index 落盘", int(m.get("keyword_draw_index") or 0) >= 1,
+          m.get("keyword_draw_index"))
     check("spec.prompt_version == keyword2-v5",
           spec.prompt_version == "keyword2-v5", spec.prompt_version)
+
+
+def test_r4_lane_varies_across_real_keyword_spec_calls():
+    """**真实 keyword_spec 连续调用**: lane 不会永远重复第一项。
+
+    与上一条的区别: 这条走**真的** `keyword_spec`, 连续跑多次、调用方
+    **不传任何 rng** —— 上一版的 bug 正是在这个形状下才暴露(单看一次
+    调用永远是对的)。
+    """
+    print("\n[R4-K11b] 连续 keyword_spec: lane 真的会变")
+    from story.keyword_seed import keyword_spec, KeywordBag
+    words = ["图书馆", "上楼", "灯塔", "礁石", "退潮", "守望",
+             "钥匙", "雨伞", "停电", "发烧"]
+    bag = KeywordBag(words, 20260925)
+    lanes = []
+    for _ in range(10):
+        fc = FakeClient([
+            LLMResult(tool_input=_kw_story()),
+            LLMResult(tool_input=_kw_surface()),
+            LLMResult(tool_input=_kw_structure_payload()),
+            LLMResult(tool_input=review_ok()),
+            _truth_tool(),
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        spec, _why = keyword_spec(w, bag, 20260925)
+        lanes.append(str((spec.metrics or {}).get("lane") or ""))
+    check("**10 次里两个 lane 都出现过**",
+          set(lanes) == {"red", "black"}, lanes)
+    # ---- 可重放: 换一个**全新的 bag**(同 session seed)会得到同一序列 ----
+    bag2 = KeywordBag(words, 20260925)
+    lanes2 = []
+    for _ in range(10):
+        fc = FakeClient([
+            LLMResult(tool_input=_kw_story()),
+            LLMResult(tool_input=_kw_surface()),
+            LLMResult(tool_input=_kw_structure_payload()),
+            LLMResult(tool_input=review_ok()),
+            _truth_tool(),
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        spec, _why = keyword_spec(w, bag2, 20260925)
+        lanes2.append(str((spec.metrics or {}).get("lane") or ""))
+    check("**同 session seed 可重放同一 lane 序列**", lanes == lanes2,
+          f"{lanes} vs {lanes2}")
 
 
 def test_r4_story_and_surface_only_called_by_keyword_spec():
@@ -4759,6 +4821,7 @@ def main():
               test_r4_stage_b_ignores_model_puzzle,
               test_r4_versions_bumped,
               test_r4_keyword_spec_runs_three_stages,
+              test_r4_lane_varies_across_real_keyword_spec_calls,
               test_r4_story_and_surface_only_called_by_keyword_spec,
               test_r4_no_scaffold_anywhere_in_production,
               test_r4_story_fails_closed_on_missing_answer,

@@ -451,23 +451,19 @@ def combos(n: int) -> int:
 #: lane(红汤 / 黑汤)取值。顺序即 50/50 抽取的两个桶。
 LANES = ("red", "black")
 
-#: lane rng 的派生常量(SplitMix64 风格混合, 与 `derive_session_seed` 同源)。
+#: lane 的派生常量(SplitMix64 风格混合, 与 `derive_session_seed` 同源)。
 #: 换一个常量值就只有 lane 序列变, keyword 抽词序列不动 —— 两者必须隔离。
 _LANE_MIX = 0x2545F4914F6CDD1D
 
 
 def derive_lane_seed(session_seed: int) -> int:
-    """从 keyword session seed **确定性派生** lane 的 rng seed。
+    """从 keyword session seed **确定性派生** lane 的种子。
 
     ## 为什么单独派生, 而不是复用 bag 的 rng
 
     `KeywordBag` 内部那个 `random.Random` 是**抽词专用**的: 它每 draw 一次
     就推进自己的状态。拿它去掷 lane, 会让"抽到哪些词"取决于"掷了几次
     lane" —— 复盘时看到 `session_seed` 也重放不出同一组词。
-
-    所以 lane 走**另一把** rng, 由 session seed 混合出一个独立种子。
-    于是: 同一个 session seed => 同一个 `(keywords, lane)` 序列, 且
-    两者互不影响。
 
     ⚠️ 与 `derive_session_seed` 一样**不用 `hash()`** —— str 的 `hash()`
     带 PYTHONHASHSEED 随机化, 跨进程不可复现。
@@ -481,9 +477,35 @@ def derive_lane_seed(session_seed: int) -> int:
     return x
 
 
-def draw_lane(rng: random.Random) -> str:
-    """掷一个 lane(红/黑, 50/50)。`rng` **必须**由调用方提供。"""
-    return LANES[rng.randrange(len(LANES))]
+def draw_lane(session_seed: int, draw_index: int) -> str:
+    """**按 (session_seed, draw_index) 无状态派生**一个 lane(红/黑)。
+
+    ## 为什么是**无状态派生**而不是一把持久 RNG
+
+    第一版这里收一把 `rng` 让调用方持有。但**两个真实调用方(live /
+    prefetch)都没有传它**, 于是 `keyword_spec` 每次都用同一个
+    `session_seed` 新建一把 RNG、取第一项 —— 结果**同一场直播永远同一个
+    lane**(实测: 连跑 8 次全是 red)。那等于整场只有红汤或只有黑汤。
+
+    改成无状态派生的好处:
+
+        * 每个 draw 都不同(因为 `draw_index` 每次 +1);
+        * 同 seed 完全可重放 —— 不需要谁去持有 RNG 状态;
+        * live / prefetch / 实验**调用形状完全一致**, 不会再有"某条路径
+          忘了传 rng"这种只在生产上出现的偏差。
+
+    ⚠️ `draw_index` 用的是 **KeywordBag 的 draw 序号**(`bag.draw()` 返回
+    的 `index`), 不是调用方自己数的 —— 那个数已经被抽词链维护着, 且
+    与"这道题用哪两个词"一一对应。
+    """
+    x = (derive_lane_seed(session_seed) ^ (int(draw_index) * 0x9E3779B97F4A7C15)
+         ) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 30)
+    x = (x * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 27)
+    x = (x * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 31)
+    return LANES[x % len(LANES)]
 
 
 # ======================================================================
@@ -586,7 +608,7 @@ def draw_two_keywords(rng: random.Random,
 # 不要再把中间产物塞进去 —— 那会有两份事实来源, 以后要解决"谁权威"。
 def keyword_spec(writer, bag, session_seed: int, *,
                  avoid=None, recent=None, should_continue=None,
-                 corpus_version: str = "", lane_rng=None):
+                 corpus_version: str = ""):
     """跑一遍 `抽词 + 掷 lane -> Story -> Surface -> Structure + provenance`。
 
     返回 `(spec, reason)`:
@@ -624,9 +646,14 @@ def keyword_spec(writer, bag, session_seed: int, *,
 
     ## lane
 
-    `lane_rng` 由调用方给(见 `derive_lane_seed`)。**不给**时按 session
-    seed 派生一把局部的 —— 于是"同一个 session seed 重放出同一组词 +
-    同一条 lane 序列"仍然成立, 而且永远不会碰全局 `random`。
+    lane 由 **(session_seed, bag.draw() 的 index) 无状态派生**(见
+    `draw_lane`), **不需要调用方持有任何 RNG**。
+
+    ⚠️ 第一版是"调用方传一把持久 `lane_rng`, 不给就现建一把"。两个真实
+    调用方都没传, 于是每次都用同一个 seed 新建 RNG 取第一项 —— 同一场
+    直播会**一直是同一个 lane**(实测连跑 8 次全 red)。无状态派生之后,
+    live / prefetch / 实验三者的调用形状完全一致, 不会再有"某条路径忘了
+    传 rng"这种只在生产上出现的偏差。
     """
     # ---- 让路检查 ①: Story 之前 ----
     if should_continue is not None and not should_continue():
@@ -640,11 +667,10 @@ def keyword_spec(writer, bag, session_seed: int, *,
 
     keys = bag.draw()
     keywords = list(keys["keywords"])
+    draw_index = int(keys.get("index") or 0)
 
-    # ---- lane: 50/50, 用**独立**的 rng(不复用 bag 的抽词 rng) ----
-    if lane_rng is None:
-        lane_rng = random.Random(derive_lane_seed(session_seed))
-    lane = draw_lane(lane_rng)
+    # ---- lane: 50/50, 无状态派生(不复用 bag 的抽词 rng) ----
+    lane = draw_lane(session_seed, draw_index)
 
     story = writer.gen_keyword_story(keywords, lane,
                                      should_continue=should_continue)
