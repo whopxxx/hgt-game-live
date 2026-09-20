@@ -28,6 +28,7 @@ G4-2: **统一默认直播题源**的回归(任务书 §九 的 14 条)。
 """
 from __future__ import annotations
 
+import ast
 import io
 import os
 import sys
@@ -36,6 +37,22 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+#: 仓库根 —— `test_r4_smoke_draws_keywords_exactly_once` 要现读源码。
+_ROOT = str(Path(__file__).resolve().parents[1])
+
+
+def _read(path: str) -> str:
+    """现读源码。
+
+    ⚠️ **不要**用 module-level 的 AST 快照, 也不要依赖 import 缓存:
+    CPython 按秒比较 mtime, "改源码 -> 立刻跑测试"会喂进**旧的**字节码,
+    于是变异测试静默通过。每次从盘上重读是这里唯一可靠的做法。
+    """
+    with io.open(path, encoding="utf-8") as f:
+        return f.read()
+
+
 from story.config import Config, from_args  # noqa: E402
 from story.pool import PuzzlePool  # noqa: E402
 
@@ -1277,7 +1294,7 @@ def test_stage_a_prompt_carries_answer_length():
           "念" in STORY_SYSTEM, "缺少理由说明")
     _d = _TOOL_STORY["input_schema"]["properties"]["answer"]["description"]
     check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
-    check("**版本号 bump 了**", STORY_PROMPT_VERSION == "keyword2-v5",
+    check("**版本号 bump 了**", STORY_PROMPT_VERSION == "keyword2-v6",
           STORY_PROMPT_VERSION)
     # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
     for banned, why in (("第一人称", "v1 人称硬限制"),
@@ -2256,6 +2273,85 @@ def _mk_bare_prefetcher(cfg):
                           clock=lambda: 1000.0)
 
 
+def test_r4_smoke_draws_keywords_exactly_once():
+    """**R4-R2**: smoke 只能有**一个**抽词点。
+
+    ## 这条守的是一个真实发生过的测量 bug
+
+    上一版 `tools/r4_smoke.py::_one()` 先自己 `bag.draw()` 记关键词,
+    `keyword_spec()` 内部**又** `bag.draw()` 一次。后果有两层:
+
+      1. **报告上的关键词不是生成 Story 用的那两个** —— 复审据此判断
+         "关键词到底有没有起作用"时会看错题, 而这正是本轮要回答的问题;
+      2. 每次调用**白跳过**一组词, 抽词序列与生产不一致。
+
+    修法是让 `keyword_spec()` 成为唯一 draw 点, 关键词从
+    `gen_keyword_story()` 的**实参**里抄。
+
+    ## 为什么要 AST, 不只查字符串
+
+    "没有第二个 draw 点"是个**结构性**命题。查 `bag.draw()` 的字面出现
+    次数会被 `keys = bag.draw()` / `bag . draw()` / 别名绕过去。所以直接
+    数 AST 里落在 `_one()` 函数体中的 `.draw()` 调用。
+    """
+    print("\n[R4-K17] smoke 只有一个抽词点")
+    src = _read(os.path.join(_ROOT, "tools", "r4_smoke.py"))
+    tree = ast.parse(src)
+    # ---- ① `_one()` 里**不得**出现任何 `.draw()` ----
+    one_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_one":
+            one_fn = node
+    check("找得到 _one()", one_fn is not None)
+    draws = [n for n in ast.walk(one_fn)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "draw"]
+    check("**`_one()` 里零个 `.draw()` 调用**", not draws,
+          [ast.unparse(d) for d in draws])
+    # ---- ② 关键词来自 `gen_keyword_story` 的实参 ----
+    text = src
+    check("**从 writer.last_keywords 取关键词**",
+          "last_keywords" in text)
+    check("**从 writer.last_lane 取 lane**", "last_lane" in text)
+    # ---- ③ 包装器在**调用前**记录实参 ----
+    #
+    # ⚠️ 顺序很关键: 先记后调, 这样 `_inner` 抛异常时报告里仍然有
+    # "用哪两个关键词试过"。若写成先调后记, 异常路径上这条信息就丢了。
+    cls = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "ObservingPuzzleWriter":
+            cls = node
+    check("找得到 ObservingPuzzleWriter", cls is not None)
+    gks = None
+    for node in ast.walk(cls):
+        if isinstance(node, ast.FunctionDef) and node.name == "gen_keyword_story":
+            gks = node
+    check("包装器有 gen_keyword_story", gks is not None)
+    lines = [ast.unparse(n) for n in gks.body]
+    rec_i = next((i for i, ln in enumerate(lines)
+                  if "self.last_keywords" in ln), -1)
+    call_i = next((i for i, ln in enumerate(lines)
+                   if "self._inner.gen_keyword_story" in ln), -1)
+    check("**先记录实参, 再调用**",
+          rec_i >= 0 and call_i >= 0 and rec_i < call_i,
+          f"record@{rec_i} call@{call_i}")
+    # ---- ④ 生产链自己仍然抽一次(不能被顺手删掉) ----
+    ks = _read(os.path.join(_ROOT, "story", "keyword_seed.py"))
+    ktree = ast.parse(ks)
+    kfn = None
+    for node in ast.walk(ktree):
+        if isinstance(node, ast.FunctionDef) and node.name == "keyword_spec":
+            kfn = node
+    check("keyword_spec 存在", kfn is not None)
+    kdraws = [n for n in ast.walk(kfn)
+              if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "draw"]
+    check("**keyword_spec 里恰好一次 `bag.draw()`**", len(kdraws) == 1,
+          [ast.unparse(d) for d in kdraws])
+
+
 def test_r4_provenance_reaches_live_archive():
     """**R4**: 三段链的 provenance 必须进**正式直播 archive**。
 
@@ -2280,12 +2376,12 @@ def test_r4_provenance_reaches_live_archive():
         dr.engine.start()
         # 造一个**带全套 R4 provenance** 的 spec(模拟 keyword2 成功产物)。
         sp = _good_gen_spec()
-        sp.prompt_version = "keyword2-v5"
+        sp.prompt_version = "keyword2-v6"
         sp.metrics = {
             "generation_mode": "keyword2", "ok": True,
             "lane": "black",
             "keywords": ["新作", "掘坟"],
-            "story_prompt_version": "keyword2-v5",
+            "story_prompt_version": "keyword2-v6",
             "surface_prompt_version": "surface-v1",
             "keyword_seed_version": "keyword2-vocab-v2",
             "keyword_corpus_version": "keyword2-vocab-v2",
@@ -2304,7 +2400,7 @@ def test_r4_provenance_reaches_live_archive():
         check("**archive.metrics.keywords**",
               list(m.get("keywords") or []) == ["新作", "掘坟"], m.get("keywords"))
         check("**archive.metrics.story_prompt_version**",
-              m.get("story_prompt_version") == "keyword2-v5",
+              m.get("story_prompt_version") == "keyword2-v6",
               m.get("story_prompt_version"))
         check("**archive.metrics.surface_prompt_version**",
               m.get("surface_prompt_version") == "surface-v1",
@@ -2321,7 +2417,7 @@ def test_r4_provenance_reaches_live_archive():
         check("**archive.metrics.keyword_draw_index**",
               m.get("keyword_draw_index") == 7, m.get("keyword_draw_index"))
         check("spec.prompt_version 也在顶层",
-              rec.get("prompt_version") == "keyword2-v5",
+              rec.get("prompt_version") == "keyword2-v6",
               rec.get("prompt_version"))
         # ---- 反证: 老题(无 provenance)不会写出 null ----
         sp2 = _good_gen_spec()
@@ -2409,6 +2505,8 @@ def main():
         test_cooperative_cancellation_not_regressed,
         # ---- R4: 三段链 provenance 进正式 archive ----
         test_r4_provenance_reaches_live_archive,
+        # ---- R4-R2: smoke 只有一个抽词点 ----
+        test_r4_smoke_draws_keywords_exactly_once,
     ]
     for t in tests:
         t()

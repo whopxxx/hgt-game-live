@@ -16,7 +16,7 @@ from story.llm import (  # noqa: E402
     # R4: Story/Surface 两段的 prompt、schema 与审稿契约
     STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION,
     STORY_SYSTEM, SURFACE_SYSTEM, _TOOL_STORY, _TOOL_SURFACE,
-    _TOOL_STRUCTURE, check_tool,
+    _TOOL_STRUCTURE, check_tool, _story_system,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.puzzle import FairClue, PuzzleSpec  # noqa: E402
@@ -3560,7 +3560,7 @@ def test_r4_story_stage_returns_answer_only():
 
 
 def test_r4_story_lane_direction_is_short():
-    """lane 方向**极短**(两类各两句话), 不是规则手册。"""
+    """lane 方向**极短**(两类各一句话), 不是规则手册。"""
     print("\n[R4-K2] lane 方向要短")
     from story.llm import STORY_LANE_DIRECTION
     check("两个 lane 都有方向", set(STORY_LANE_DIRECTION) == {"red", "black"},
@@ -3570,6 +3570,61 @@ def test_r4_story_lane_direction_is_short():
         # 必须是**判据**, 不是禁用清单。
         for bad in ("不要写", "禁止", "不许", "至少", "必须包含"):
             check(f"{k} 不含「{bad}」", bad not in v, v)
+
+
+def test_r4_story_center_is_anomaly_not_darkness():
+    """Story 的**中心目标**是"表面反常 + 背景讲得通", 不是"更黑暗"。
+
+    ⚠️ 这是 R4-R2 的核心断言。上一版 `STORY_SYSTEM` 通篇是"危险、阴暗、
+    反转、冲击", 实测把模型推去堆题材刺激度(严重犯罪 / 死亡 / 极端悬疑),
+    而不是构造海龟汤真正需要的**结构**。所以:
+
+        * 中心语义必须是"表面看起来很奇怪 / 知道完整背景后完全说得通";
+        * "反转" / "冲击" 这种**情绪目标**不许再当中心措辞出现。
+    """
+    print("\n[R4-K2b] Story 中心目标 = 反常且可解释, 不是黑暗")
+    # ---- ① 中心语义在场 ----
+    check("说了'表面...奇怪'", "表面" in STORY_SYSTEM and "奇怪" in STORY_SYSTEM,
+          STORY_SYSTEM[:120])
+    check("说了'完整背景' + '说得通'",
+          "完整背景" in STORY_SYSTEM and "说得通" in STORY_SYSTEM)
+    check("说了'先只写真相'", "先只写真相" in STORY_SYSTEM)
+    # ---- ② 情绪目标**退出** system ----
+    #
+    # 只查 lane 方向那段不够: 上一版把"反转/冲击"写在 lane 里, 而
+    # `_story_system()` 会把它渲染进来。所以查**渲染后的完整文本**。
+    for lane in ("red", "black"):
+        rendered = _story_system(lane)
+        for bad in ("反转", "冲击", "极端"):
+            check(f"[{lane}] 渲染后不含情绪目标「{bad}」", bad not in rendered,
+                  [ln for ln in rendered.splitlines() if bad in ln])
+    # ---- ③ lane 只是**色调**, 不是题材要求 ----
+    from story.llm import STORY_LANE_DIRECTION
+    for k, v in STORY_LANE_DIRECTION.items():
+        check(f"{k} 只描述色调(带'风格偏')", "风格偏" in v, v)
+
+
+def test_r4_story_prompt_does_not_suppress_background():
+    """Story **必须**要求交代背景 —— "不要解释背景" 是反的。
+
+    ⚠️ 上一版 `STORY_SYSTEM` 里有一句 `不要解释背景，不要写成摘要。`
+    那是**错的**: 汤底恰恰**就是**完整隐藏背景, 它必须把"为什么表面那么
+    怪"解释清楚。留着那句会让模型写一个含糊梗概, 揭晓时讲不通。
+
+    这条测的是"有没有把背景要求**写进去**", 不是"有没有删掉那句话" ——
+    后者太弱(把整段删了也能过)。
+    """
+    print("\n[R4-K2c] Story 要求交代完整背景")
+    check("**不再**说'不要解释背景'", "不要解释背景" not in STORY_SYSTEM,
+          [ln for ln in STORY_SYSTEM.splitlines() if "不要解释" in ln])
+    check("**改为**要求把背景交代完整",
+          "把背景交代完整" in STORY_SYSTEM
+          or "交代完整" in STORY_SYSTEM)
+    check("要求表面反常之处能被解释",
+          "都能被解释" in STORY_SYSTEM or "解释" in STORY_SYSTEM)
+    # 不得把汤底写成不解释的梗概。
+    for bad in ("不要写成摘要", "不必解释"):
+        check(f"不含「{bad}」", bad not in STORY_SYSTEM)
 
 
 def test_r4_story_schema_has_no_scaffold():
@@ -3744,8 +3799,8 @@ def test_r4_versions_bumped():
     """R4 的版本身份。"""
     print("\n[R4-K10] 版本号")
     import story.llm as L
-    check("STORY_PROMPT_VERSION == keyword2-v5",
-          STORY_PROMPT_VERSION == "keyword2-v5", STORY_PROMPT_VERSION)
+    check("STORY_PROMPT_VERSION == keyword2-v6",
+          STORY_PROMPT_VERSION == "keyword2-v6", STORY_PROMPT_VERSION)
     check("SURFACE_PROMPT_VERSION == surface-v1",
           SURFACE_PROMPT_VERSION == "surface-v1", SURFACE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v9",
@@ -3807,13 +3862,13 @@ def test_r4_keyword_spec_runs_three_stages():
           [c["tool"]["name"] for c in fc.calls])
     m = spec.metrics or {}
     check("lane 落进 metrics", m.get("lane") in ("red", "black"), m.get("lane"))
-    check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v5")
+    check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v6")
     check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v1")
     check("keywords 落盘", m.get("keywords"), m.get("keywords"))
     check("draw_index 落盘", int(m.get("keyword_draw_index") or 0) >= 1,
           m.get("keyword_draw_index"))
-    check("spec.prompt_version == keyword2-v5",
-          spec.prompt_version == "keyword2-v5", spec.prompt_version)
+    check("spec.prompt_version == keyword2-v6",
+          spec.prompt_version == "keyword2-v6", spec.prompt_version)
 
 
 def test_r4_lane_varies_across_real_keyword_spec_calls():
@@ -4812,6 +4867,8 @@ def main():
               # ---- R4: Story / Surface / Structure 三段式 ----
               test_r4_story_stage_returns_answer_only,
               test_r4_story_lane_direction_is_short,
+              test_r4_story_center_is_anomaly_not_darkness,
+              test_r4_story_prompt_does_not_suppress_background,
               test_r4_story_schema_has_no_scaffold,
               test_r4_surface_stage_returns_puzzle_only,
               test_r4_surface_prompt_has_no_question_requirement,
