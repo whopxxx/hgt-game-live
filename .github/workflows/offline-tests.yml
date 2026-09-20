@@ -76,6 +76,15 @@ jobs:
       #   (b) 抽取序列与 G1 基线**逐字节相同**(md5 钉死) —— 改词库/改抽取
       #       方式会让两批历史数据无法对比;
       #   (c) 本模块不碰 `random` 的全局状态(否则会污染 live 出题的序列)。
+      #
+      # G3 追加: **关键词来源**换成真实 haiguitang input 之后要守的 ——
+      #   (d) corpus 只从 `input` 提词(改 output 不得影响 pair 表);
+      #   (e) 只留恰好 2-key / pair 去重 / 不带频率;
+      #   (f) bag 同 session seed 顺序可复现, 且一个 bag 内不重复;
+      #   (g) **corpus 缺失/空/损坏 -> 抛错(由调用方显式降级)**,
+      #       `keyword_corpus.py` 里不得出现 `KEYWORD_BANK` 兜底。
+      #   ⚠️ (g) 是最要紧的一条: 它挡的是"看起来在跑 keyword2, 其实
+      #   偷偷用人工词库"。那种故障在行为层**看不出来**(题照样进池)。
       - name: 离线套件 keyword_seed
         run: uv run tests/test_keyword_seed.py
 

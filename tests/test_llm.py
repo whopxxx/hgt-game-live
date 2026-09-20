@@ -5,6 +5,7 @@
 
 不联网: 用一个假的 client 顶替 AnthropicMessagesClient。
 """
+import json
 import sys
 from pathlib import Path
 
@@ -12,10 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.llm import (  # noqa: E402
     RIDDLE_PROMPT_VERSION, LLMResult, PuzzleWriter,
     # G2-keyword2: Stage A/B 的 prompt、schema 与审稿契约
-    KEYWORD_IDEA_SYSTEM, _TOOL_STRUCTURE, check_tool,
+    KEYWORD_IDEA_SYSTEM, _TOOL_KEYWORD_IDEA, _TOOL_STRUCTURE, check_tool,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
-from story.puzzle import FairClue  # noqa: E402
+from story.puzzle import FairClue, PuzzleSpec  # noqa: E402
 
 FAIL = [0]
 
@@ -3447,14 +3448,19 @@ def _kw_idea():
             "answer": r["answer"]}
 
 
-def _kw_structure_payload():
+def _kw_structure_payload(**extra):
     """Stage B 的 tool_input: `riddle()` **删掉** puzzle/answer/title。
 
     这正好模拟真实 schema —— 模型**给不出**那三样。
+
+    `**extra` 用来**故意**塞进 schema 里不存在的字段(如
+    `puzzle="模型偷偷改写的谜面"`), 验证代码会忽略它们 —— 这是 §五
+    "从结构上禁止它把自然谜面重新写成工程化谜面"的反证测试。
     """
     d = dict(riddle())
     for k in ("puzzle", "answer", "title"):
         d.pop(k, None)
+    d.update(extra)
     return d
 
 
@@ -3559,8 +3565,8 @@ def test_g2_keyword_provenance_and_generated():
     spec = w.structure_original_idea(title=idea["title"],
                                      puzzle=idea["puzzle"],
                                      answer=idea["answer"])
-    check("**prompt_version == keyword2-v1**",
-          spec.prompt_version == "keyword2-v1", spec.prompt_version)
+    check("**prompt_version == keyword2-v2(G3 收敛后)**",
+          spec.prompt_version == "keyword2-v2", spec.prompt_version)
     check("**与 classic 的 riddle-v9 不同**",
           spec.prompt_version != RIDDLE_PROMPT_VERSION, spec.prompt_version)
     check("metrics 有 generation_mode=keyword2",
@@ -3705,6 +3711,158 @@ def test_g2_keyword_truth_audit_fail_rejects():
     check("error 提到审计", "审计" in (spec.error or ""), spec.error)
     check("metrics 记 truth_audit_ok=False",
           (spec.metrics or {}).get("truth_audit_ok") is False, spec.metrics)
+
+
+# ======================================================================
+# G3 —— Stage A prompt 向 haiguitang 原始口径收敛
+# ======================================================================
+#
+# v1 那段 prompt 是我们手写的写作规范, 里面有一批**会主动改变生成分布**
+# 的硬约束。§六 逐条点名要去掉的就是它们。这一批测试把它们钉死 —— 否则
+# 将来"为了通过率"很容易再写回去, 而那正是 §七 禁止的。
+
+#: v1 里那些**创作形状硬约束** —— 必须已经消失。
+#: 每一条都标注了它当年长什么样, 免得将来有人换个说法又加回来。
+_V1_SHAPE_RULES = (
+    "第三人称",       # "用第三人称客观叙述, 不要'我'"
+    "1~3 句",         # "谜面, 1~3 句"
+    "单机关",         # "单机关也可以 —— 不需要两个诡计叠在一起"
+    "第二机关",       # "不为显得高级增加第二机关"
+    "不要职业",       # "不要求复杂人物背景, 不要求职业设定"
+    "不要求悲剧",     # "不要求多层反转, 不要求悲剧"
+    "结尾要是一个问句",  # "谜面结尾要是一个问句"
+    "不要套模板",     # "先在心里想一个自然的情境…不要套模板"
+)
+
+#: §六 要求**保留**的运行约束 —— 这些丢了会出直播事故。
+_MUST_KEEP = (
+    "中文",           # 全程中文
+    "冷门专业知识",   # 不依赖冷门专业知识
+    "图片",           # 不依赖外部图片/音频/软件
+    "直播",           # 适合普通直播场景
+)
+
+#: Stage A prompt **永远**不该提的东西(§六: 全都交给 Stage B / Reviewer)。
+_NEVER_MENTION = (
+    "facts", "atoms", "completion", "discovery_beats", "signature",
+    "Blueprint", "quota", "recent",
+)
+
+
+def test_g3_stage_a_prompt_dropped_v1_shape_rules():
+    """§六: v1 那些**创作形状**硬约束必须已经从 Stage A prompt 消失。
+
+    ⚠️ 为什么这条重要: 它们是 G1 实验里作为**单变量**被验证过的 —— 那时
+    我们想知道"少规定一点会怎样", 所以拿它们做对照。接进生产之后, 它们
+    的作用就反过来了: 变成"我们在教模型写我们想要的题", 而不是"让模型
+    按这个题源的自然方式出题"。任务书 §七 明确: **不要**为了救通过率
+    把它们写回来。
+    """
+    print("\n[G3-K1] Stage A prompt 已去掉 v1 的形状硬约束")
+    low = KEYWORD_IDEA_SYSTEM
+    for rule in _V1_SHAPE_RULES:
+        check(f"**不含 v1 形状约束: {rule}**", rule not in low,
+              [ln for ln in low.splitlines() if rule in ln][:1])
+
+
+def test_g3_stage_a_prompt_keeps_runtime_constraints():
+    """§六: **运行约束**一条都不能丢(中文/不靠冷门知识/不靠外部媒体/适合直播)。"""
+    print("\n[G3-K2] Stage A prompt 保留运行约束")
+    low = KEYWORD_IDEA_SYSTEM
+    for token in _MUST_KEEP:
+        check(f"含运行约束: {token}", token in low)
+    # 核心语义必须**逐字**来自任务书 §六 —— 那句话是产品的口径, 不是
+    # 我们可以随手改写的文案。
+    check("核心语义含'海龟汤故事生成器'",
+          "海龟汤故事生成器" in low)
+    check("核心语义含'悬念'或'意外/反常'",
+          "悬念" in low or "反常" in low)
+    check("核心语义含'逻辑自洽'", "逻辑自洽" in low)
+    check("保留了'不要为了数量硬塞额外转折'",
+          "硬塞" in low, low[:200])
+
+
+def test_g3_stage_a_prompt_never_mentions_stage_b_vocabulary():
+    """§六: Stage A prompt 不提 facts / atoms / completion / Blueprint / quota。"""
+    print("\n[G3-K3] Stage A prompt 不提 Stage B 的词汇")
+    low = KEYWORD_IDEA_SYSTEM.lower()
+    for bad in _NEVER_MENTION:
+        check(f"Stage A prompt 不提 {bad}", bad.lower() not in low,
+              [ln for ln in low.splitlines() if bad.lower() in ln][:1])
+
+
+def test_g3_stage_a_schema_still_only_three_fields():
+    """§六 / §十: Stage A 的输出 schema **仍然只有** title/puzzle/answer。"""
+    print("\n[G3-K4] Stage A schema 仍只有三样")
+    props = _TOOL_KEYWORD_IDEA["input_schema"]["properties"]
+    check("恰好三个字段", set(props) == {"title", "puzzle", "answer"},
+          sorted(props))
+    check("name 仍是 emit_keyword_idea",
+          _TOOL_KEYWORD_IDEA["name"] == "emit_keyword_idea",
+          _TOOL_KEYWORD_IDEA["name"])
+    # 描述里也不得出现结构化词汇
+    blob = json.dumps(_TOOL_KEYWORD_IDEA, ensure_ascii=False).lower()
+    for bad in _NEVER_MENTION:
+        check(f"schema 描述不提 {bad}", bad.lower() not in blob)
+
+
+def test_g3_stage_b_still_freezes_and_has_no_puzzle_field():
+    """§十: Stage B 仍冻结 canonical 三样, 且 schema 仍无 puzzle 字段。
+
+    这条是 G2 那几条的**再确认** —— G3 只改 Stage A 的 prompt, 动了
+    Stage B 就是越界。用与 G2 相同的探针验, 保证结论仍然成立。
+    """
+    print("\n[G3-K5] Stage B 仍冻结 + schema 仍无 puzzle")
+    props = _TOOL_STRUCTURE["input_schema"]["properties"]
+    for bad in ("puzzle", "answer", "title"):
+        check(f"**Stage B schema 无 {bad} 字段**", bad not in props,
+              sorted(props))
+    # 模型硬塞 puzzle 也无效
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload(
+                        puzzle="模型偷偷改写的谜面")),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("**模型塞的 puzzle 被忽略**", spec.puzzle == idea["puzzle"],
+          (spec.puzzle[:40], idea["puzzle"][:40]))
+    check("title 也被冻结", spec.title == idea["title"], spec.title)
+    check("answer 也被冻结", spec.answer == idea["answer"], spec.answer)
+
+
+def test_g3_quality_gates_unchanged():
+    """§七: **质量门一条都没放宽** —— 只改了候选怎么想出来。
+
+    做法: 造一个**自由 Stage A 也过不了**的候选(谜面里没有任何可核对的
+    事实), 断言后面的门照样拒它。若哪天有人"为了让自由 prompt 的产出能
+    过"而放宽硬门, 这条会红。
+    """
+    print("\n[G3-K6] 质量门未放宽")
+    from story.llm import RIDDLE_PROMPT_VERSION, validate_spec
+    # (a) 常量没被 bump —— 接受标准一个字都没改
+    check("**QUALITY_POLICY_VERSION 未 bump**",
+          "keyword2" not in __import__("story.llm", fromlist=["x"])
+          .QUALITY_POLICY_VERSION,
+          __import__("story.llm", fromlist=["x"]).QUALITY_POLICY_VERSION)
+    check("**RIDDLE_PROMPT_VERSION 未 bump(live 还在用)**",
+          RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
+    # (b) 结构硬门仍然会拒一个空壳 spec
+    bare = PuzzleSpec(puzzle="", answer="", core_answer="")
+    check("**空壳 spec 仍被 validate_spec 拒**", not validate_spec(bare).ok)
+    # (c) curated 的 source_type 仍会让审稿走**另一套**契约(没被合并)
+    fc = FakeClient([LLMResult(tool_input=_kw_structure_payload()),
+                     LLMResult(tool_input=review_ok())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    idea = _kw_idea()
+    spec = w.structure_original_idea(title=idea["title"],
+                                     puzzle=idea["puzzle"],
+                                     answer=idea["answer"])
+    check("产物仍是 generated(source_type 空)",
+          not getattr(spec, "source_type", ""), repr(spec.source_type))
+    check("没有 curated_policy_version",
+          not getattr(spec, "curated_policy_version", ""))
 
 
 # ======================================================================
@@ -4572,6 +4730,13 @@ def main():
               test_g2_keyword_stage_a_interrupt_checkpoint,
               test_g2_keyword_rewrite_fails_candidate,
               test_g2_keyword_truth_audit_fail_rejects,
+        # ---- G3: Stage A prompt 收敛 ----
+        test_g3_stage_a_prompt_dropped_v1_shape_rules,
+        test_g3_stage_a_prompt_keeps_runtime_constraints,
+        test_g3_stage_a_prompt_never_mentions_stage_b_vocabulary,
+        test_g3_stage_a_schema_still_only_three_fields,
+        test_g3_stage_b_still_freezes_and_has_no_puzzle_field,
+        test_g3_quality_gates_unchanged,
               test_closeout_observed_signature_schema_is_complete,
               test_closeout_incomplete_observed_signature_is_rejected,
               test_closeout_incomplete_obs_never_lands_in_signature,

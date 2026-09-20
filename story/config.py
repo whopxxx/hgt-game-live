@@ -369,6 +369,27 @@ class Config:
     # truth audit / validate_spec / cross_puzzle_gate HARD / too_similar /
     # recent-10 quota。它仍是 **AI 原创**题(不是 curated)。
     pool_keyword_seed_enabled: bool = True
+
+    # ---- G3: keyword2 的 seed 来源(真实 haiguitang corpus) ----
+    #
+    # 关键词不再来自人工 `KEYWORD_BANK`, 而是 `neurostellar/haiguitang` 的
+    # 原始 `input` 字段 —— 由 `tools/build_keyword_seed_corpus.py` **离线**
+    # 构建成这个文件(见 `story/keyword_corpus.py`)。
+    #
+    # ⚠️ 文件缺失 / 空 / 解析失败时**显式降级**: 打一条 ERROR 日志, 整条
+    # keyword2 链让位给 classic Blueprint 链。**不会**回退人工词库 ——
+    # "看起来在跑 keyword2, 其实偷偷用人工词"是要防的形状。
+    keyword_corpus_path: str = ""      # 空 = data/keyword2_seed_pairs.json
+
+    # keyword bag 的 session seed。
+    #
+    #   None + quality_seed 有值 -> 由 quality_seed 确定性派生(推荐)
+    #   None + quality_seed 也空 -> 启动时随机一次, 并**写进 INFO 日志**
+    #   给了值                    -> 直接用(复盘时从日志抄回来重放)
+    #
+    # 它只影响 keyword2 抽词, 与 live 出题的 rng / classic 链的
+    # blueprint rng **完全隔离**。
+    keyword_session_seed: Optional[int] = None
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -642,6 +663,18 @@ class Config:
                 f"keyword2 不会被用到。要测 keyword2 就两个都开; "
                 f"要关后台生成就两个都关。"
             )
+        # ---- G3: 显式指了一个不存在的 corpus ----
+        # 这条比"配置了个寂寞"更尖锐: 用户**明确**要求用某份 corpus, 而它
+        # 不在。运行时会显式降级(打 ERROR 后退回 classic), 所以不是错误;
+        # 但配置期就该告诉他, 免得实播时才发现关键词不是他要的那份。
+        if (self.pool_keyword_seed_enabled and self.keyword_corpus_path
+                and not os.path.exists(self.keyword_corpus_path)):
+            warns.append(
+                f"keyword_corpus_path({self.keyword_corpus_path}) 不存在: "
+                f"运行时 keyword2 会**显式降级**回 classic Blueprint 链"
+                f"(不会回退人工词库)。构建: "
+                f"`uv run tools/build_keyword_seed_corpus.py`。"
+            )
         if self.pool_prefetch_budget_seconds <= 0:
             warns.append(
                 f"pool_prefetch_budget_seconds("
@@ -807,6 +840,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "keyword2: 随机抽 2 个普通生活关键词 -> 自由成题 "
                          "-> 再结构化。只影响普通 AI 后台补池; live 现场"
                          "出题与 curated 链本来就不走它")
+    # ---- G3: keyword2 的 seed 来源 ----
+    ap.add_argument("--keyword-corpus", dest="keyword_corpus_path", default="",
+                    help="keyword2 的 seed corpus 路径(默认 "
+                         "data/keyword2_seed_pairs.json)。文件不可用时"
+                         "**显式降级**到 classic Blueprint 链, 不会回退"
+                         "人工词库。构建: tools/build_keyword_seed_corpus.py")
+    ap.add_argument("--keyword-session-seed", dest="keyword_session_seed",
+                    type=int, default=None,
+                    help="keyword bag 的 session seed。默认由 quality_seed "
+                         "派生; quality_seed 也没给时启动随机一次并写进 "
+                         "INFO 日志(可从日志抄回来重放)")
     # ---- Batch H2-F/G: curated 池 ----
     ap.add_argument("--no-curated", dest="prefer_curated",
                     action="store_false",
@@ -904,6 +948,8 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         pool_prefetch_max_attempts=a.prefetch_max_attempts,
         pool_prefetch_budget_seconds=a.prefetch_budget,
         pool_keyword_seed_enabled=a.pool_keyword_seed_enabled,
+        keyword_corpus_path=a.keyword_corpus_path,
+        keyword_session_seed=a.keyword_session_seed,
         pool_reveal_start_guard_seconds=a.pool_reveal_guard,
         playtest_enabled=a.playtest_enabled,
         playtest_max_turns=a.playtest_max_turns,

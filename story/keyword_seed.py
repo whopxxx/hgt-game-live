@@ -47,14 +47,30 @@ from __future__ import annotations
 
 import random
 
-#: 抽词逻辑的版本号。与 prompt 版本(`story.llm.KEYWORD_IDEA_PROMPT_VERSION`)
-#: **分开**: 词库变动与 prompt 变动是两件事, 合成一个号会让复盘时分不清
-#: "这题风格变了" 是因为换词还是因为换 prompt。
-KEYWORD_SEED_VERSION = "keyword2-v1"
+#: **关键词来源**的版本号。与 `KEYWORD_IDEA_PROMPT_VERSION` 分开 ——
+#: 换 seed 来源与换 prompt 是两件事, 合成一个号会让复盘时分不清
+#: "这题风格变了" 是因为换了词, 还是因为换了 prompt。
+#:
+#: `keyword2-v1` = G1/G2 的人工 5x20 词库 `KEYWORD_BANK`。
+#: `keyword2-seeds-v2` = G3 起改用的**真实 haiguitang input** corpus。
+KEYWORD_SEED_VERSION = "keyword2-seeds-v2"
+
+#: v1 的人工词库**版本号**(不再是生产默认来源)。保留它是因为
+#: `tools/experiment_keyword_riddles.py`(G1 实验)仍然按它抽词 ——
+#: 那批历史数据要能对上号。
+KEYWORD_BANK_VERSION = "keyword2-v1"
 
 # ======================================================================
-# 一、词库(§二)
+# 一、词库(**实验用**, 不再是生产来源)
 # ======================================================================
+#
+# ⚠️ G3 起生产**不再**从这里抽词 —— 生产读 `data/keyword2_seed_pairs.json`
+# (真实 haiguitang input, 见 `story/keyword_corpus.py`)。这份人工词库留着
+# 只有一个理由: `tools/experiment_keyword_riddles.py` 的 G1-A/G1-B 历史
+# 数据是按它抽的, 那批报告要能复现。
+#
+# **不得**作为生产默认数据源(任务书 §五)。corpus 缺失时生产走显式降级,
+# 而不是"偷偷用回人工词"。
 #
 # 每个槽 20 个词。刻意都是"一眼就是日常场景"的短词。
 
@@ -164,11 +180,176 @@ def keywords_line(g: dict) -> str:
 
 
 # ======================================================================
-# 三、生产入口: 用调用方的 rng 抽一组 2-key
+# 三、生产入口: shuffled bag(§三 / §四)
 # ======================================================================
+#
+# G2 的生产入口是 `rng.choice()` **有放回**地从人工词库里抽。G3 换成:
+#
+#     corpus(unique 2-key pairs) -> 独立 keyword RNG shuffle
+#       -> 顺序消费
+#       -> 一个 bag 用完之前同一个 pair 不重复
+#       -> 用完后重新 shuffle 下一轮
+#
+# 为什么(任务书 §三 原话): "这样比'小人工词库 + choice'有更高的实际
+# 组合熵, 也不会短时间连续撞同一 pair。"
+#
+# 有放回抽样的真实观感是**会重复**: 301 对里抽 20 次, 撞一次的概率约
+# 50%(生日问题)。直播里连着两道题拿到同一对词是肉眼可见的尴尬。
+#
+# ⚠️ **不再要求两个词来自不同槽位**。那是 G1 实验人为加的结构 ——
+# 真实 haiguitang 的 input 里 `三兄弟/杀人`、`下雨/棺材` 这种同语义场的
+# 组合大量存在。G3 起以**真实 source pair 为准**, 不再叠一层我们的先验。
+
+
+def derive_session_seed(base_seed, session: int = 0) -> int:
+    """从 `quality_seed` 确定性地派生 keyword session seed(§四)。
+
+    ## 为什么要有 session 这一维
+
+    bag 是**有状态**的(消费到哪了)。一场直播从头开始跑, 同一个
+    `quality_seed` 会得到同一个 pair 序列 —— 这是可复现性要的。但**同一场
+    直播里**重启一次 prefetcher 不该把已经消费过的 pair 从头再放一遍
+    (那会在重启点附近立刻重复)。给一个 `session` 号, 重启时 +1, 序列
+    就往前走一段, 而"同 session 同序列"仍然成立。
+
+    ⚠️ 与 `quality_seed` **同一把号**但不能共用: `director.py` 给 live 出题
+    用 `quality_seed`, 给补池用 `quality_seed ^ 0x9E3779B9`。keyword 采样
+    再走一层派生, 于是三者互不干扰 —— 这是"不要让 keyword RNG 改变 live
+    generation RNG"的**结构性**保证(§四)。
+
+    派生用的是 SplitMix64 风格的混合(常量取自 mmix / 黄金比), 不是
+    `hash()` —— `hash()` 对 str 有 PYTHONHASHSEED 随机化, 跨进程不可复现,
+    正好会毁掉这里要的东西。
+    """
+    if base_seed is None:
+        raise ValueError("derive_session_seed 需要 base_seed(quality_seed)")
+    x = (int(base_seed) ^ 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    x = (x + (int(session) & 0xFFFFFFFFFFFFFFFF) * 0xBF58476D1CE4E5B9
+         ) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 30)
+    x = (x * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 27)
+    x = (x * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    x ^= (x >> 31)
+    return x
+
+
+class KeywordBag:
+    """从 corpus 的 unique pair 表里**不放回**地发 pair。一个 bag 发完再洗。
+
+    ## 为什么是类而不是一个函数
+
+    "不放回"是一种**状态**。G2 的 `draw_two_keywords(rng, used_pairs=...)`
+    把状态交给调用方维护, 结果是: 调用方忘了传 `used_pairs` 就静默退化成
+    有放回(那个 bug 真发生过, 见 `_dedupe` 上面那段注释)。把状态收进对象,
+    调用方就没有"忘了传"这个失败模式。
+
+    ## 可复现(§四)
+
+    同一个 corpus + 同一个 session seed => **同一个 pair 顺序**。这由
+    `random.Random(seed)` 在同一个 `pairs` 列表上 shuffle 保证 —— 所以
+    `pairs` 的顺序必须确定(corpus 构建时已排序, 见 `pairs_from_rows`)。
+
+    ## 与全局 random 无关
+
+    本类**只**用自己 new 出来的 `random.Random(seed)`, 从不碰 `random`
+    模块的全局状态。这条是硬要求: 否则补池的抽词会改变 live 出题的序列。
+    """
+
+    def __init__(self, pairs, session_seed: int):
+        if not pairs:
+            raise ValueError("KeywordBag 需要非空 pairs")
+        self.pairs = [(str(a), str(b)) for a, b in pairs]
+        self.session_seed = int(session_seed)
+        self._rng = random.Random(self.session_seed)
+        self._bag: list = []
+        self._round = 0
+        self.served = 0
+
+    # ---- 内部 ----
+    def _refill(self):
+        """洗一轮新的。**刻意不避开上一轮的末尾**。
+
+        "洗牌时把上一轮最后一个 pair 挪到首位"听起来能防"跨轮重复", 但它
+        会让分布**不再均匀**(那个 pair 的本轮位置被强制了), 而 §三 要的是
+        "运行时默认在 unique pair 上**近似均匀**采样"。301 对的表里, 跨轮
+        撞同一个 pair 的概率是 1/301 —— 不值得用破坏均匀性去换。
+        """
+        self._bag = list(self.pairs)
+        self._rng.shuffle(self._bag)
+        self._round += 1
+
+    # ---- 公开 ----
+    def draw(self) -> dict:
+        """取下一个 pair。返回 `{keywords, slots, round, index}`。
+
+        `slots` 恒为 `[]` —— 真实 source pair 没有槽位概念(§三: "不要再
+        要求两个词必须来自不同 slot")。留着这个 key 是为了调用方与日志的
+        形状不变, 而不是暗示它还有意义。
+        """
+        if not self._bag:
+            self._refill()
+        a, b = self._bag.pop()
+        self.served += 1
+        return {
+            "keywords": [a, b],
+            "slots": [],
+            "round": self._round,
+            "index": self.served,
+        }
+
+
+def load_bag(corpus_path: str, session_seed: int) -> tuple:
+    """读 corpus 并建 bag。返回 `(bag, corpus_meta)`。
+
+    `corpus_meta` 只带日志/溯源要用的字段(`corpus_version` / `pairs` 数),
+    不含整张 pair 表 —— 那 300 多条不该进日志。
+
+    ⚠️ corpus 不可用时**抛 `CorpusError`**(从 `keyword_corpus` 透传)。
+    调用方必须显式降级到 classic 链, **不得**回退 `KEYWORD_BANK`(§五)。
+    """
+    from .keyword_corpus import load_corpus
+    d = load_corpus(corpus_path)
+    pairs = d["pairs"]
+    meta = {
+        "corpus_version": str(d.get("corpus_version") or ""),
+        "pair_count": len(pairs),
+        "source": str(d.get("source") or ""),
+    }
+    return KeywordBag(pairs, session_seed), meta
+
+
+def describe_bag(meta: dict, session_seed: int) -> str:
+    """§四 要求的那行 INFO 日志的正文。
+
+    形如: `keyword2 session_seed=123 corpus_version=keyword2-seeds-v2
+    pair_count=301`。单独一个函数是为了让**测试直接断言这行日志**,
+    而不是去正则匹配一段拼在别处的字符串。
+    """
+    return ("keyword2 session_seed=%s corpus_version=%s pair_count=%s"
+            % (session_seed, meta.get("corpus_version", ""),
+               meta.get("pair_count", 0)))
+
+
+# ======================================================================
+# 四、兼容: G2 的 `draw_two_keywords`(人工词库)
+# ======================================================================
+#
+# ⚠️ **生产不再调用它**。保留它是为了:
+#   * G1 实验入口(`draw_keyword_groups`)与它共用 `KEYWORD_BANK`;
+#   * `tests/test_keyword_seed.py` 里 G2 那批性质测试(槽位不重复、
+#     `used_pairs` 生效)仍然描述**历史行为**, 那些测试不该被删 ——
+#     删了就看不出"G3 换掉了什么"。
+#
+# 任何**生产**代码路径引用本函数都应当被视为 bug: 它就是 §五 点名的
+# "偷偷用人工词"。
+
 def draw_two_keywords(rng: random.Random,
                       used_pairs: "set | None" = None) -> dict:
-    """抽 **2 个来自不同槽位**的普通生活词。返回 `{keywords, slots}`。
+    """**G2 遗留 / 仅实验与历史测试用**: 抽 2 个来自不同槽位的人工词。
+
+    ⚠️ 生产走 `KeywordBag`(真实 haiguitang corpus)。本函数的词来自
+    `KEYWORD_BANK` —— 那是 G1/G2 的人工先验, G3 起不再是生产来源。
 
     ## 为什么是 2 个(不是 3 个)
 

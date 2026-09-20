@@ -127,6 +127,11 @@ from .playtest import (
     UNAVAILABLE as OUTCOME_UNAVAILABLE,
     UNSOLVED as OUTCOME_UNSOLVED,
 )
+#: G3: 只为一个 provenance 常量 —— 它决定 `metrics` 里 "这对词是哪份
+#: 抽词实现发的"。 `keyword_corpus` / `KeywordBag` 仍然是**函数内**
+#: import(见 `_init_keyword_bag`), 因为那几个要读盘, 装配期出错要在
+#: 那里被 catch 成"显式降级", 而不是冒泡成 import 错误。
+from .keyword_seed import KEYWORD_SEED_VERSION
 
 log = logging.getLogger("story.prefetch")
 
@@ -217,7 +222,34 @@ class PoolPrefetcher:
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
         # blueprint 序列随"补池开不开"而变 —— 那既难排查, 也让
         # "同 seed 下补池不影响出题" 这个可测性质消失。
+        #
+        # ⚠️ G3: keyword2 的抽词**不再**用这把 rng。它走 `self._bag`
+        # (见下), 因为"不放回"是一种状态, 而 rng 只是一个数流。
+        # 这把 rng 现在只服务 classic 链的 `pick_blueprint`。
         self._rng = rng if rng is not None else random.Random()
+
+        # ---- G3: keyword bag(真实 haiguitang corpus) ----
+        #
+        # ## 为什么状态住在这里
+        #
+        # "一个 bag 用完之前同一个 pair 不重复"是**跨调用**的状态。G2 把它
+        # 交给调用方(`used_pairs` 参数), 于是"忘了传"就静默退化成有放回 ——
+        # 那个 bug 真发生过。收进 prefetcher 就没有失败模式了。
+        #
+        # ## corpus 不可用 = **显式降级**, 不是回退人工词库(§五)
+        #
+        # 读失败时: 打一条明确的 ERROR, 把 `self._bag` 留成 None, 然后
+        # `_keyword_enabled()` 返回 False —— 整条 keyword2 链让位给 classic
+        # Blueprint 链。**绝不**回退 `KEYWORD_BANK`: 那会让生产"看起来在跑
+        # keyword2, 其实用人工词", 而这正是任务书点名的形状。
+        #
+        # 降级发生在**装配时**(一次), 不在每次 `_generate_one_inner` 里
+        # 反复读盘 —— 后台补池是热路径。
+        self._bag = None
+        self._bag_meta: dict = {}
+        self._keyword_session_seed: Optional[int] = None
+        self._bag_error: str = ""
+        self._init_keyword_bag(cfg)
 
         # 自己起 executor(不借 Director 的): 它是本模块的内部实现细节,
         # 而且 max_workers=1 只是第二道防线, 单飞由 _future 保证。
@@ -862,6 +894,63 @@ class PoolPrefetcher:
         return self._generate_classic_one(inputs)
 
     # ------------------------------------------------------------------
+    def _init_keyword_bag(self, cfg: Any) -> None:
+        """装配时建 keyword bag(§三 / §四 / §五)。**只在配置开启时做**。
+
+        ## session seed 的来源(§四)
+
+            给了 `keyword_session_seed`      -> 直接用
+            只给了 `quality_seed`            -> `derive_session_seed()` 派生
+            两个都没给                        -> 随机生成一次, 打 INFO 记下来
+
+        第三条是刻意的: 随机 session seed 只在**启动时**取一次, 然后写进
+        日志。于是"这一场直播的 pair 序列"事后永远可复现 —— 从日志里抄那个
+        数就能重放。若每次抽词都 random, 复盘时就没有锚点。
+        """
+        # ⚠️ 这里**只能看配置开关**, 不能调 `_keyword_enabled()` ——
+        # 后者**还要求 bag 已存在**, 而 bag 正是本方法要建的。
+        # 写成 `if not self._keyword_enabled(): return` 会得到鸡生蛋:
+        # bag 是 None -> `_keyword_enabled()` 假 -> 直接 return -> bag
+        # 永远是 None -> 生产**静默地**退回 classic, 且 `_bag_error` 为空
+        # (连"为什么降级"都没有日志)。
+        # 这个 bug 是 `test_g3_good_corpus_activates_bag` 抓出来的:
+        # 它注入一份**完好**的 corpus, 却发现 bag 没建起来。
+        if not bool(getattr(cfg, "pool_keyword_seed_enabled", True)):
+            return
+        try:
+            from .keyword_corpus import DEFAULT_CORPUS_PATH
+            from .keyword_seed import derive_session_seed, load_bag
+            path = str(getattr(cfg, "keyword_corpus_path", "")
+                       or DEFAULT_CORPUS_PATH)
+            ss = getattr(cfg, "keyword_session_seed", None)
+            if ss is None:
+                qseed = getattr(cfg, "quality_seed", None)
+                if qseed is not None:
+                    ss = derive_session_seed(qseed)
+                else:
+                    # ⚠️ 这一条**不能**用 self._rng: 那把 rng 服务 classic
+                    # 链的 pick_blueprint, 从它取数会改变 live 序列。
+                    # 用系统熵, 然后**立刻记进日志**。
+                    ss = random.SystemRandom().getrandbits(64)
+            self._bag, self._bag_meta = load_bag(path, ss)
+            self._keyword_session_seed = int(ss)
+            log.info("keyword2 bag 就绪: %s", self._bag_meta_line())
+        except Exception as e:                       # noqa: BLE001
+            # ---- §五: corpus 缺失 / 空 / 解析失败 => 显式降级 ----
+            self._bag = None
+            self._bag_meta = {}
+            self._keyword_session_seed = None
+            self._bag_error = "%s: %s" % (type(e).__name__, e)
+            log.error(
+                "keyword2 corpus 不可用, **本次配置整条 keyword2 链让位给 "
+                "classic Blueprint 链**(不会回退人工词库): %s",
+                self._bag_error)
+
+    def _bag_meta_line(self) -> str:
+        """§四 要求的那行 INFO 日志。抽成方法是为了让测试直接断言它。"""
+        from .keyword_seed import describe_bag
+        return describe_bag(self._bag_meta, self._keyword_session_seed)
+
     def _keyword_enabled(self) -> bool:
         """本条走不走 keyword2。**默认开**(§八), 关掉即 kill-switch。
 
@@ -869,8 +958,14 @@ class PoolPrefetcher:
         测试替身(writer 是假的)静默切到 classic 链 —— 那样测试就测不到
         keyword 路径, 而生产却是另一套行为("Fake 比 production 更完整"
         的反面)。writer 缺方法是**装配错误**, 该让它响亮地失败。
+
+        ⚠️ G3: 这里**还**要求 bag 存在。`_init_keyword_bag` 失败时
+        (corpus 缺失/空/损坏)bag 是 None, 于是这里返回 False, 整条链
+        安静但**有日志**地退回 classic —— 这是 §五 要的降级路径。
         """
-        return bool(getattr(self.cfg, "pool_keyword_seed_enabled", True))
+        if not bool(getattr(self.cfg, "pool_keyword_seed_enabled", True)):
+            return False
+        return self._bag is not None
 
     def _generate_keyword_one(self, inputs: dict) -> tuple:
         """G2: `2-key -> Stage A -> Stage B`, 之后与 classic 路径**完全共用**。
@@ -902,11 +997,12 @@ class PoolPrefetcher:
         avoid = inputs.get("avoid")
         extra: dict = {}
 
-        # ---- 抽词(程序抽, 不人工挑) ----
-        # rng 是本模块**自己**那个(`self._rng`), 与 live 出题分开 ——
-        # 所以开关补池不会改变 live 的 blueprint 序列。
-        from .keyword_seed import draw_two_keywords
-        keys = draw_two_keywords(self._rng)
+        # ---- 抽词(§三: 从真实 corpus 的 unique pair 里不放回地取) ----
+        #
+        # ⚠️ G3 起**不再**用 `self._rng` / `draw_two_keywords`。那把 rng 与
+        # 那个人工词库现在只服务 classic 链与 G1 实验。bag 有自己的
+        # `random.Random(session_seed)`。
+        keys = self._bag.draw()
         keywords = list(keys["keywords"])
 
         # ---- 让路检查 ①: Stage A 之前 ----
@@ -936,11 +1032,18 @@ class PoolPrefetcher:
             answer=idea["answer"], avoid=avoid, recent=recent,
             should_continue=self._should_continue)
 
-        # ---- provenance(§十一): 只进 metrics/archive/日志, 不进前端 ----
+        # ---- provenance(§十一 / §八): 只进 metrics/archive/日志 ----
+        #
+        # G3 增加 keyword seed / corpus version —— 复盘时要能回答
+        # "这对词是哪份 corpus 的哪个版本发的"。
         try:
             spec.metrics = dict(spec.metrics or {})
             spec.metrics["generation_mode"] = "keyword2"
             spec.metrics["keywords"] = keywords
+            spec.metrics["keyword_seed_version"] = KEYWORD_SEED_VERSION
+            spec.metrics["keyword_corpus_version"] = self._bag_meta.get(
+                "corpus_version", "")
+            spec.metrics["keyword_session_seed"] = self._keyword_session_seed
         except Exception:                       # noqa: BLE001
             log.exception("写 keyword2 provenance 失败(忽略)")
 

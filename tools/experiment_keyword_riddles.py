@@ -81,9 +81,18 @@ from story.config import Config  # noqa: E402
 #: G2: 抽词逻辑已经**搬进生产模块** `story/keyword_seed.py` —— 方向是
 #: `story/ <- tools/`, 绝不允许反过来。本脚本现在只是它的一个调用方,
 #: 所以"实验抽到的词"与"生产会抽到的词"永远是同一份实现, 不会漂。
+#:
+#: G3: 生产的词源从人工 `KEYWORD_BANK` 换成了真实 haiguitang corpus
+#: (`story/keyword_corpus.py` + `KeywordBag`)。本实验脚本**保留**
+#: `draw_keyword_groups` 路径 —— 它的 20 组是 G1-A/G1-B 报告里逐字列过的
+#: **历史数据**, 换掉就没法复现那两份报告了。
+#:
+#: ⚠️ 任务书 §九: 本脚本**不得**维护第二份 corpus / 第二份词库。它现在
+#: 只 import 生产实现, 自己一行词表都没有。要看 G3 的真实抽词, 用
+#: `--draw-corpus`(它直接调生产 `KeywordBag`, 见下)。
 from story.keyword_seed import (  # noqa: E402
-    KEYWORD_BANK, KEYWORD_SEED_VERSION, _SLOTS, draw_keyword_groups,
-    keywords_line,
+    KEYWORD_BANK, KEYWORD_BANK_VERSION, KEYWORD_SEED_VERSION, _SLOTS,
+    derive_session_seed, draw_keyword_groups, keywords_line, load_bag,
 )
 from story.llm import (  # noqa: E402
     AnthropicMessagesClient, PuzzleWriter, validate_spec,
@@ -800,6 +809,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "记到 B 组头上。"))
     ap.add_argument("--draw-only", action="store_true",
                     help="只打印抽到的关键词, 不调 LLM")
+    ap.add_argument("--draw-corpus", type=int, default=0, metavar="N",
+                    help=("G3: 打印**生产 corpus** 抽到的前 N 个 pair"
+                          "(不调 LLM)。走的是与生产完全相同的 `KeywordBag`,"
+                          " 所以这行输出就是实播会拿到的词。"))
+    ap.add_argument("--corpus", default="",
+                    help="corpus 路径(默认 data/keyword2_seed_pairs.json)")
+    ap.add_argument("--session-seed", type=int, default=None,
+                    help=("keyword session seed。默认由 --seed 派生"
+                          "(`derive_session_seed`), 与生产同一条路径。"))
     ap.add_argument("--report-only", default="",
                     help=("从已跑好的 items.json 重新生成报告(不调 LLM)。"
                           "传 items.json 的路径。用于提前收手后按已完成的"
@@ -865,6 +883,24 @@ def main(argv=None) -> int:
             print("  [%02d] %-5s %-28s %s"
                   % (g["index"], g["group"], "+".join(g["slots"]),
                      "，".join(g["keywords"])))
+        return 0
+
+    # ---- G3: 打印**生产 corpus** 的抽取序列(不调 LLM) ----
+    #
+    # 这一条走的是生产路径本身(`load_bag` + `KeywordBag.draw`), 不是副本
+    # —— 任务书 §九 要的就是"实验不再维护第二份关键词逻辑"。
+    if a.draw_corpus:
+        from story.keyword_corpus import DEFAULT_CORPUS_PATH
+        from story.keyword_seed import describe_bag
+        ss = (a.session_seed if a.session_seed is not None
+              else derive_session_seed(a.seed))
+        bag, meta = load_bag(a.corpus or DEFAULT_CORPUS_PATH, ss)
+        print(describe_bag(meta, ss))
+        print("seed=%s" % a.seed)
+        for _ in range(int(a.draw_corpus)):
+            d = bag.draw()
+            print("  [%02d] round %d  %s"
+                  % (d["index"], d["round"], "，".join(d["keywords"])))
         return 0
 
     if a.limit and a.limit > 0:
