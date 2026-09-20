@@ -232,6 +232,68 @@ _PUZZLE_TOUCH_MARK = "[需改谜面]"
 #: 断言把文案与记号钉在一起。
 _CORE_COUNT_MARK = "[只改分类]"
 
+#: G4-R2-R1 §二: 每种 fixable **各自**允许改哪些字段。
+#:
+#: ## 为什么需要它(以及为什么不能只有 core-count 那一条)
+#:
+#: R2 的第一版只给 core-count 装了字段守卫, 判据是"`own_fix_focus` 里
+#: **有没有** core-count"。那个判据在**混合修复**上会误伤: 若同一稿既有
+#: `core hidden=4` 又有"谜面缺结尾问句", 前者要求"一个字都不许动",
+#: 后者要求"必须补一个问句" —— 一刀切就会把**本来合法的**补问句判成越界。
+#:
+#: 正确做法是**每一种 fixable 只开放它自己的域**, 而不是"有 core-count
+#: 就全部冻结"。所以守卫变成"取并集": 本次点名要修的每一种, 各自贡献一组
+#: 允许改的字段, 落在并集之外才算越界。
+#:
+#: ## 词表
+#:
+#:   `puzzle` / `answer`         谜面 / 谜底文本
+#:   `facts_kind`                `facts[*].kind`(**只有它**是 core-count 的域)
+#:   `facts_other`               `facts[*]` 的其它属性(visibility / hintable /
+#:                               文本 / 集合)—— 没有任何一种 fixable 开放它
+#:   `core_answer` / `completion` / `atoms` / `clues` / `beats` / `signature`
+#:
+#: ⚠️ **认不出的 fixable 一律按最严处理**(不开放任何域)。这与
+#: `_FIX_REASON_PATTERNS` 的"认不出归 other"是**相反**的方向, 而这里
+#: 必须如此: 那边归类错了只是指标少一维, 这边放宽错了是**放一道被偷偷
+#: 改过的题进池**。宁可比需要的更严。
+#:
+#: ⚠️ 新增一条 `can_fix()` 时若它有正当的改内容理由, **必须**在这里加一
+#: 行 —— 忘了加不会漏放(仍然按最严), 但会把合法修复判成越界。
+FIX_DOMAINS = (
+    # 谜面类(puzzle 自身): 补问句 / 改第三人称 / 删 meta 文本。
+    (("谜面结尾不是问句", "谜面是第一人称叙事", "谜面混进了"), ("puzzle",)),
+    # 枚举填错 -> 只改那一个字段本身。
+    (("的 kind 非法",), ("facts_kind",)),
+    (("的 visibility 非法",), ("facts_other",)),
+    # core_answer 太长 -> 只压缩 core_answer(不动谜面, 见 G2-A)。
+    (("core_answer 有",), ("core_answer",)),
+    # G4-R2 §三: core 太多 -> **只**把多余 core 重标 support。
+    # ⚠️ 刻意**不含** `facts_other`: 改 visibility / hintable / 文本都不在
+    # 授权范围内, 尽管它们也是 "facts" 上的字段。
+    (("core hidden facts 有",), ("facts_kind",)),
+    # 连线漏了 -> 要动 atoms。
+    (("没有被任何 solve_atom 引用", "指向通关事实的推理路径"), ("atoms",)),
+    # quote 要重摘 -> 只动 fair_clues(且不得改谜面)。
+    (("fair_clue 缺 quote", "的 quote 不在谜面里"), ("clues",)),
+    # hint 超长 -> 只动 hints(不在上面的词表里, 也不该动别的)。
+    (("条提示超过",), ("hints",)),
+)
+
+
+def fix_domains_for(fixable) -> set:
+    """本次点名要修的 fixable **并集**开放的字段域(G4-R2-R1 §二)。
+
+    空集合 = "一个字都不许动"(认不出的 fixable, 或压根没有 fixable)。
+    """
+    out: set = set()
+    for f in (fixable or []):
+        for needles, fields in FIX_DOMAINS:
+            if any(n in f for n in needles):
+                out.update(fields)
+                break
+    return out
+
 
 # ======================================================================
 # 1. spec 结构校验(方案 §21)

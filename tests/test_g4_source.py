@@ -1347,7 +1347,12 @@ def _review_payload_retag(spec, retag: dict, **over):
         if f["id"] in retag:
             f["kind"] = retag[f["id"]]
     d.update({"decision": "fix", "note": "只重标了分类",
-              "observed_signature": sig_ok(),
+              # ⚠️ **回显这道题自己的** signature, 不是另造一个: 审稿人的
+              # `observed_signature` 是"我读完这题认为它是什么形状", 合法
+              # 修复时它与原稿一致。用 `sig_ok()`(夹具的通用指纹)会让
+              # time_shape/reveal_mode 凭空变化 —— 那是**夹具**在改内容,
+              # 守卫正确地拒了它(第一版就是这么挂的)。
+              "observed_signature": dict(spec.signature.to_dict()),
               "quality_checks": qc_ok(),
               "core_answer": spec.core_answer or "礁石标位",
               "completion_fact_ids": list(spec.completion_fact_ids),
@@ -1462,6 +1467,299 @@ def test_core_fix_must_not_change_content():
         check("**没修干净的稿子仍然不过门**",
               (not vr3.ok) or any("core hidden" in f for f in vr3.fixable),
               vr3.errors + vr3.fixable)
+
+
+def _retag_case(mutate, retag=None, extra_focus=None, **over):
+    """跑一次"core=4 送审 -> reviewer 回一份被改过的稿子"的完整调用。
+
+    `mutate(payload)` 在**合法重标**的基础上再做手脚(改合同 / 改
+    core_answer / 改 visibility / 改 atoms…)。返回
+    `(new_spec, why, ok)` —— `ok` 指"这次修复被收下了没有"。
+
+    ⚠️ 一份**合法**的 payload 由 `_review_payload_retag` 生成: 只改
+    `facts[*].kind`。所有越界用例都是"从合法出发再动一个字段", 这样
+    拒稿的原因只可能是那一处越界 —— 而不是夹具本来就残缺。
+    """
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from tests.test_llm import FakeClient
+    s = _core4_spec()
+    vr = validate_spec(s)
+    # ⚠️ `retag or {...}` 会把**显式传进来的空 dict** 也换成默认值 ——
+    # "什么都不改"这个用例正是靠空 dict 表达的, 所以要用 `is None` 判。
+    payload = _review_payload_retag(
+        s, {"f4": "support"} if retag is None else retag)
+    if mutate is not None:
+        mutate(payload)
+    focus = list(vr.fixable) + list(extra_focus or [])
+    w = PuzzleWriter(FakeClient([LLMResult(tool_input=payload)]))
+    new, why, _r, _t = w._review_spec(s, must_fix=vr.must_fix(),
+                                     own_fix_focus=focus)
+    return s, new, why
+
+
+def test_core_fix_field_diff_guard():
+    """**R1 §一**: core-count 修复除 `fact.kind` 外**逐项冻结**。
+
+    R2 的守卫只钉死了 puzzle/answer/fact.id/fact.text/数量/旧合同 core,
+    于是下面这七样都还能被顺手改掉, 而稿子照样满足 "core <= 3"、照样
+    被当成成功的修复收下。每一样都必须**单独**变红。
+    """
+    print("\n[G4-R2-R1-1] core-count 修复的字段 diff 守卫")
+
+    def _ok(label, mutate):
+        """越界改动必须被拒。"""
+        _s, new, why = _retag_case(mutate)
+        check(f"**拒: {label}**", new is None, (why or "")[:70])
+
+    # 1) 偷偷改 completion_fact_ids
+    def _m_comp(p):
+        p["completion_fact_ids"] = ["f2"]
+    _ok("改 completion_fact_ids", _m_comp)
+
+    # 2) 偷偷改 core_answer
+    def _m_core(p):
+        p["core_answer"] = "换一个核心答案"
+    _ok("改 core_answer", _m_core)
+
+    # 3) 偷偷改 fact.visibility
+    def _m_vis(p):
+        for f in p["facts"]:
+            if f["id"] == "f3":
+                f["visibility"] = "public"
+    _ok("改 fact.visibility", _m_vis)
+
+    # 4) 偷偷改 solve_atoms
+    def _m_atoms(p):
+        p["solve_atoms"] = [dict(a) for a in p["solve_atoms"]]
+        p["solve_atoms"][0]["text"] = "换了一条原子事实"
+    _ok("改 solve_atoms", _m_atoms)
+
+    # 5) 偷偷改 fair_clues
+    def _m_clues(p):
+        p["fair_clues"] = [{"quote": p["puzzle"][:6],
+                            "supports_atoms": ["a1"]}]
+    _ok("改 fair_clues", _m_clues)
+
+    # 6) 偷偷改 discovery_beats
+    def _m_beats(p):
+        p["discovery_beats"] = [
+            {"id": "b1", "text": "第一个发现", "fact_ids": ["f1"]},
+            {"id": "b2", "text": "第二个发现", "fact_ids": ["f2"]},
+        ]
+    _ok("改 discovery_beats", _m_beats)
+
+    # 7) 偷偷改 signature
+    def _m_sig(p):
+        sig = dict(p.get("observed_signature") or {})
+        sig["emotion_mode"] = "dark"        # 原稿是 neutral
+        p["observed_signature"] = sig
+    _ok("改 observed_signature", _m_sig)
+
+    # 8) 偷偷改 fact.hintable
+    def _m_hint(p):
+        for f in p["facts"]:
+            if f["id"] == "f3":
+                f["hintable"] = not f.get("hintable", True)
+    _ok("改 fact.hintable", _m_hint)
+
+    # 9) title —— 情况**不同**: `_apply_review` 重建 spec 时硬编码
+    #    `title=spec.title`, 所以 payload 里的 title 根本进不来。也就是说
+    #    它的不可变性是**结构性**的, 不是靠这条守卫。
+    #    这里断言那个**真正的**性质(改不动), 而不是断言"被拒" —— 后者会
+    #    变成一条永远为假的期望(第一版就是这么挂的)。
+    _s_t, new_t, _w_t = _retag_case(lambda p: p.__setitem__("title", "换标题"))
+    check("**title 改不动(结构性不可变)**",
+          new_t is None or new_t.title == _s_t.title,
+          (new_t.title if new_t is not None else None))
+
+
+def test_core_fix_only_kind_change_allowed():
+    """**R1 §一**: 合法 `core -> support` 通过; `support -> core` 换核心被拒。"""
+    print("\n[G4-R2-R1-2] 只允许 core -> support")
+    # ---- 合法: f4 core -> support ----
+    _s, new, why = _retag_case(None)
+    check("**合法重标被收下**", new is not None, (why or "")[:70])
+    if new is not None:
+        check("**core hidden <= 3**", len(new.core_hidden_facts()) <= 3,
+              len(new.core_hidden_facts()))
+        check("**f4 变成 support**",
+              [f.kind for f in new.facts if f.id == "f4"] == ["support"],
+              [f.kind for f in new.facts if f.id == "f4"])
+        check("**facts 条数没变**", len(new.facts) == 5, len(new.facts))
+    # ---- 越界: 把 support 升成 core(换核心) ----
+    def _m_promote(p):
+        for f in p["facts"]:
+            if f["id"] == "f5":            # f5 是 exclusion
+                f["kind"] = "core"
+    _s2, new2, why2 = _retag_case(_m_promote)
+    check("**拒: support/exclusion -> core(换核心)**", new2 is None,
+          (why2 or "")[:70])
+    # ---- 越界: 合同指向的 fact 被降级 ----
+    def _m_demote_comp(p):
+        for f in p["facts"]:
+            if f["id"] == "f1":            # f1 在 completion 里
+                f["kind"] = "support"
+    _s3, new3, why3 = _retag_case(_m_demote_comp)
+    check("**拒: 降级合同指向的 fact**", new3 is None, (why3 or "")[:70])
+
+
+def test_core_fix_coexists_with_other_fixable():
+    """**R1 §二**: core-count + 另一个合法 fixable 能同时修, 不误伤。
+
+    夹具: `core hidden=4` **且** 谜面缺结尾问句。Reviewer:
+
+        * 改谜面**只补问句**
+        * 把多余 core -> support
+
+    必须**收下**。一刀切(有 core-count 就冻结谜面)会把这次合法修复判成
+    越界 —— 那正是 R2 第一版的形状。
+    """
+    print("\n[G4-R2-R1-3] core-count + 补问句 同时修")
+    from story.llm import PuzzleWriter
+    from story.quality import validate_spec
+    from story.puzzle import FairClue
+    from tests.test_llm import FakeClient, clues_for, qc_ok
+    s = _core4_spec()
+    # 让谜面**缺结尾问句**(另一种 fixable)。
+    s.puzzle = s.puzzle.rstrip("?？").rstrip()
+    s.fair_clues = [FairClue(quote=c["quote"],
+                             supports_atoms=list(c["supports_atoms"]))
+                    for c in clues_for(s.puzzle)]
+    vr = validate_spec(s)
+    check("**同时有两种 fixable**",
+          any("core hidden" in f for f in vr.fixable)
+          and any("问句" in f for f in vr.fixable), vr.fixable)
+    # Reviewer: 补问句 + 重标 f4
+    new_puzzle = s.puzzle + " 为什么?"
+    payload = _review_payload_retag(s, {"f4": "support"})
+    payload["puzzle"] = new_puzzle
+    payload["fair_clues"] = clues_for(new_puzzle)
+    payload["quality_checks"] = qc_ok()
+    payload["observed_signature"] = dict(s.signature.to_dict())
+    w = PuzzleWriter(FakeClient([LLMResult(tool_input=payload)]))
+    new, why, _r, _t = w._review_spec(s, must_fix=vr.must_fix(),
+                                     own_fix_focus=list(vr.fixable))
+    check("**合法双重修复被收下(不误拒)**", new is not None,
+          (why or "")[:80])
+    if new is not None:
+        check("**问句补上了**", new.puzzle.rstrip().endswith("?"),
+              new.puzzle[-12:])
+        check("**core 降到 <= 3**", len(new.core_hidden_facts()) <= 3,
+              len(new.core_hidden_facts()))
+        vr2 = validate_spec(new)
+        check("**改后干净**", not vr2.errors, vr2.errors)
+    # ---- 但**借这个口子**改谜底仍然拒 ----
+    payload2 = _review_payload_retag(s, {"f4": "support"})
+    payload2["puzzle"] = new_puzzle
+    payload2["fair_clues"] = clues_for(new_puzzle)
+    payload2["quality_checks"] = qc_ok()
+    payload2["observed_signature"] = dict(s.signature.to_dict())
+    payload2["answer"] = "被顺手换掉的谜底"
+    w2 = PuzzleWriter(FakeClient([LLMResult(tool_input=payload2)]))
+    new2, why2, _r2, _t2 = w2._review_spec(s, must_fix=vr.must_fix(),
+                                          own_fix_focus=list(vr.fixable))
+    check("**拒: 借补问句之名改谜底**", new2 is None, (why2 or "")[:70])
+
+
+def test_core_fix_still_over_limit_rejected():
+    """**R1 §一**: 改后仍 >3 -> 继续拒(修复不是"不拒了")。"""
+    print("\n[G4-R2-R1-4] 改后仍 >3 -> 拒")
+    from story.quality import validate_spec
+    # 什么都不改 -> core 还是 4 -> 再校验一遍时必须仍不合格。
+    _s, new, _why = _retag_case(None, retag={})
+    if new is not None:
+        vr = validate_spec(new)
+        check("**改后仍然被判 fixable(core>3)**",
+              any("core hidden" in f for f in vr.fixable), vr.fixable)
+    # Reviewer 只降一条 -> 还剩 4 条(把 f4 降了但 f3 又升上来, 净不变)
+    def _m_noop(p):
+        for f in p["facts"]:
+            if f["id"] == "f4":
+                f["kind"] = "support"
+            if f["id"] == "f5":
+                f["kind"] = "core"          # 换一条上来, 净数不变
+    _s2, new2, why2 = _retag_case(_m_noop, retag={})
+    check("**拒: 升降相抵(净 core 没降)**", new2 is None, (why2 or "")[:70])
+
+
+def test_reviewer_technical_fail_distinct_label():
+    """**R1 §四**: 审稿技术失败记 `review_technical_fail`, 不再冒充结构失败。"""
+    print("\n[G4-R2-R1-5] 审稿技术失败独立分类")
+    from story.llm import PuzzleWriter
+    from tests.test_llm import FakeClient
+    _b = riddle()
+    # 结构成功 -> 审稿**技术**失败(两个空 tool_input, 重试也失败)
+    cli = FakeClient([LLMResult(tool_input=_b),
+                      LLMResult(tool_input={}, error=""),
+                      LLMResult(tool_input={}, error="")])
+    w = PuzzleWriter(cli)
+    s = w.structure_original_idea(title=_b["title"], puzzle=_b["puzzle"],
+                                 answer=_b["answer"],
+                                 should_continue=lambda: True, max_attempts=1)
+    check("**没有成题**", not s.puzzle, "")
+    check("**标为 review_technical_fail**",
+          s.metrics.get("reject") == "review_technical_fail",
+          s.metrics.get("reject"))
+    check("**不是 structure_technical_fail**",
+          s.metrics.get("reject") != "structure_technical_fail", "")
+
+
+def test_reject_ledger_has_six_buckets():
+    """**R1 §四**: 账本把三类技术失败与三类语义判定分开。"""
+    print("\n[G4-R2-R1-5b] 账本六格")
+    with tmpdir() as d:
+        cfg = mkcfg(d, pool_prefetch_enabled=True)
+        pf = _mk_bare_prefetcher(cfg)
+        pf._stock = lambda *a, **k: 3
+        pf._playable = lambda *a, **k: 2
+        for lbl in ("structure_technical_fail", "review_technical_fail",
+                    "truth_technical_fail", "review_rewrite",
+                    "truth_reject", "validation_reject"):
+            pf._apply_result("gen_fail", "x", {"reject": lbl}, 1000.0)
+        st = pf.stats()["reject"]
+        for lbl in ("structure_technical_fail", "review_technical_fail",
+                    "truth_technical_fail", "review_rewrite",
+                    "truth_reject", "validation_reject"):
+            check(f"**{lbl} 有独立一格**", lbl in st, sorted(st))
+        check("**结构失败与审稿失败不混**",
+              st["structure_technical_fail"] == 1
+              and st["review_technical_fail"] == 1, st)
+
+
+def test_core_guard_does_not_touch_other_fixables():
+    """**R1 §二 反证**: 没有 core-count 时, 这一层守卫**完全不生效**。
+
+    ⚠️ 这条是**为我自己刚犯的错**写的。R1 第一版把字段 diff 套在**所有**
+    `fix` 上, 于是"只压缩 core_answer"这种修复也被按"只许改 core_answer"
+    卡住 —— 而 `_apply_review` 的 v5 契约要求审稿人每次 `fix` 都**整套
+    同步**(puzzle/answer/facts/atoms/clues/beats/signature)。结果是
+    **每一份合法修复都被拒**, curated_compile / solve_ux / llm 三个套件
+    当场全红。
+
+    那一版之所以能"通过"我自己的新用例, 是因为它们**都带着 core-count**
+    —— 没有一个用例覆盖"守卫不该生效"的那一侧。这条补上那个空白。
+    """
+    print("\n[G4-R2-R1-6] 无 core-count 时守卫不生效")
+    from story.llm import _core_fix_scope_violation
+    from story.quality import validate_spec
+    from tests.test_llm import review_fix
+    s = _core4_spec()          # 4 条 core, 但**不**把 core-count 放进 focus
+    # focus 只含"core_answer 太长"那一类 —— 模拟另一个 fixable。
+    focus = ["core_answer 有 95 字, 超过 80: 压缩一下"]
+    # 一份合法修复: 它**有理由**改谜底与 facts(整套同步)。
+    merged_like = s.to_dict()
+    merged_like["answer"] = "改过的谜底"
+    merged_like["facts"] = [dict(f) for f in merged_like["facts"]]
+    merged_like["facts"][3]["kind"] = "support"
+    from story.puzzle import PuzzleSpec as _PS
+    new = _PS.from_dict(merged_like)
+    bad = _core_fix_scope_violation(s, new, {}, focus)
+    check("**没有 core-count -> 不拦(返回空)**", bad == "", bad)
+    # 反证: 一旦把 core-count 加进 focus, 同一份改动就被拦。
+    bad2 = _core_fix_scope_violation(
+        s, new, {}, focus + ["[只改分类] core hidden facts 有 4 条"])
+    check("**有 core-count -> 拦(返回原因)**", bad2 != "", "")
 
 
 def test_empty_pool_backoff_capped_at_60():
@@ -1648,6 +1946,14 @@ def main():
         test_answer_over_300_still_hard_rejected,
         test_core_hidden_4_can_be_rescued_by_reviewer,
         test_core_fix_must_not_change_content,
+        # ---- G4-R2-R1: 字段 diff 守卫 + 分类账修正 ----
+        test_core_fix_field_diff_guard,
+        test_core_fix_only_kind_change_allowed,
+        test_core_fix_coexists_with_other_fixable,
+        test_core_fix_still_over_limit_rejected,
+        test_core_guard_does_not_touch_other_fixables,
+        test_reviewer_technical_fail_distinct_label,
+        test_reject_ledger_has_six_buckets,
         test_empty_pool_backoff_capped_at_60,
         test_normal_stock_keeps_long_backoff,
         test_success_resets_fail_streak_empty_pool,

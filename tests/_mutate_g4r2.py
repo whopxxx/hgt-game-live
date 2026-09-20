@@ -122,6 +122,56 @@ MUTATIONS = [
      "            return _bail(\"结构不过: \" + vr.why(),\n"
      "                         \"structure_technical_fail\")",
      ["tests/test_g4_source.py"]),
+
+    # ================= G4-R2-R1 =================
+    ("M-R1-1", "core 守卫的字段 diff 整个去掉(改什么都收下)",
+     "story/llm.py",
+     "    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):\n"
+     "        return \"\"\n"
+     "    dom = fix_domains_for(own_fix_focus)",
+     "    if True:\n"
+     "        return \"\"\n"
+     "    dom = fix_domains_for(own_fix_focus)",
+     ["tests/test_g4_source.py"]),
+
+    ("M-R1-2", "守卫退回只看 puzzle/answer/fact.text(R2 第一版)",
+     "story/llm.py",
+     "    if (list(new.completion_fact_ids or [])\n"
+     "            != list(old.completion_fact_ids or [])):",
+     "    if False:",
+     ["tests/test_g4_source.py"]),
+
+    ("M-R1-3", "允许 support -> core(不查方向)",
+     "story/llm.py",
+     "            if not (of.kind == \"core\" and nk == \"support\"):",
+     "            if False:",
+     ["tests/test_g4_source.py"]),
+
+    ("M-R1-4", "守卫**误伤**其它 fixable(不判有没有 core-count)",
+     "story/llm.py",
+     "    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):\n"
+     "        return \"\"\n"
+     "    dom = fix_domains_for(own_fix_focus)",
+     "    dom = {\"facts_kind\"}",
+     ["tests/test_g4_source.py", "tests/test_llm.py",
+      "tests/test_solve_ux.py"]),
+
+    ("M-R1-5", "审稿技术失败退回冒充结构失败",
+     "story/llm.py",
+     "                return _bail(\"审稿技术失败: \" + str(why)[:120],\n"
+     "                             \"review_technical_fail\")",
+     "                return _bail(\"审稿技术失败: \" + str(why)[:120],\n"
+     "                             \"structure_technical_fail\")",
+     ["tests/test_g4_source.py"]),
+
+    ("M-R1-6", "core-count 与别的 fixable 并存时把域锁死(误伤)",
+     "story/quality.py",
+     "    ((\"core hidden facts 有\",), (\"facts_kind\",)),",
+     "    ((\"core hidden facts 有\",), (\"facts_kind\",)),\n"
+     "    ((\"谜面结尾不是问句\",), ()),\n"
+     "    ((\"core_answer 有\",), ()),\n"
+     "    ((\"的 quote 不在谜面里\",), ()),",
+     ["tests/test_g4_source.py"]),
 ]
 
 

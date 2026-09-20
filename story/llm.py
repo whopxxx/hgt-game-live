@@ -44,6 +44,9 @@ from .quality import (
     #: G4-R2 §三: 认出"这一次修复是 core 数量问题" —— 只有那一类修复才
     #: 执行"不许改内容"的硬检查(见 `_core_fix_scope_violation`)。
     _CORE_COUNT_MARK,
+    #: G4-R2-R1 §二: 每种 fixable 各自允许改哪些字段。守卫取**并集**,
+    #: 所以"core-count + 补问句"能同时成立而单一种仍然逐项冻结。
+    fix_domains_for,
     describe_constraints,
     saturated_constraints,
 )
@@ -604,60 +607,175 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
 
 def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
                               ti: dict, own_fix_focus) -> str:
-    """G4-R2 §三: `core hidden > 3` 的修复**只许改分类**。
+    """G4-R2-R1 §一/§二: 修复**只许改它被授权改的字段**。
 
-    这条约束写在 `validate_spec` 的 `can_fix()` 文案里, 而文案只是**请求**
-    —— 模型完全可能借这次修复顺手重写一条 fact / 换掉谜面, 而改后的稿子
-    仍然满足 "core <= 3", 于是它会被当成一次**成功的修复**收下。那就把
-    一次"重标标签"变成了"偷偷改题", 而且没有任何一层会看见。
+    ## 第一版为什么不够
 
-    所以这里把文案里的三条禁令**变成代码**:
+    R2 的守卫只钉死了 puzzle / answer / fact.id / fact.text / fact 数量,
+    于是 Reviewer 可以**同时**改 `completion_fact_ids` / `core_answer` /
+    `fact.visibility` / `fact.hintable` / `solve_atoms` / `fair_clues` /
+    `discovery_beats` / `signature`, 而改后的稿子照样满足 "core <= 3",
+    照样被当成一次成功的修复收下。契约是"唯一合法动作是把多余 fact.kind
+    从 core 改成 support", 那就得**逐项**比对, 不能只挑几样。
 
-        fact.id 不变       (改了 id 等于换了一条事实)
-        fact.text 不变     (改了文字等于换了事实本身)
-        谜面 / 谜底不变
+    ## 现在的形状: 字段域 diff
 
-    ## 只在**这一条**修复上生效
+    `quality.fix_domains_for(own_fix_focus)` 给出"本次点名要修的每一种
+    fixable 各自开放哪些字段"的**并集**。逐字段 diff 之后, 落在并集之外
+    的任何变化一律拒。
 
-    判据是 `own_fix_focus` 里有没有 core-count 那条(`_CORE_COUNT_MARK`)。
-    其余 fixable(core_answer 太长 / 重新摘 quote / 人称…)本来就有改内容
-    的正当理由, 对它们套这一层会**拒掉合法的修复** —— 那是另一类 bug。
+    ⚠️ 这样才**同时**满足两条要求:
 
-    ⚠️ **fact 数量的增减也算越界**(§三 明写"不得删除事实 / 创造新事实")。
-    不查这一条的话, "把一条 core 整条删掉"同样能让数字落到 3 —— 但那样
-    通关合同可能指向一条不存在的事实。
+        §一  只有 core-count 时 -> 域 = {facts_kind} -> 其余逐项冻结
+        §二  它和"补问句"一起出现 -> 域 = {facts_kind, puzzle}
+             -> 补问句不会被误判成越界, 而借机改谜底/合同仍然拒
+
+    一刀切(有 core-count 就全冻结)会误伤合法的补问句; 只看字段名不看
+    授权又会漏放。逐项 diff + 并集是唯一同时成立的做法。
 
     返回 `""` 表示没有越界; 否则返回给调用方的拒稿原因。
     """
-    _focus = " ".join(str(f) for f in (own_fix_focus or []))
-    if _CORE_COUNT_MARK not in _focus:
-        return ""
     if new is None:
         return ""
-    # ---- 谜面 / 谜底 ----
-    if (new.puzzle or "").strip() != (old.puzzle or "").strip():
-        return ("core 数量修复**不得改谜面**(只许重标 fact 分类) —— "
-                "审稿改动谜面, 拒绝这次修复")
-    if (new.answer or "").strip() != (old.answer or "").strip():
-        return ("core 数量修复**不得改谜底**(只许重标 fact 分类) —— "
-                "审稿改动谜底, 拒绝这次修复")
-    # ---- facts: id / text / 条数三样都不许动 ----
+    # ---- ⚠️ 只对"core 数量"这一类修复生效 ----
+    #
+    # 这一层是 R2-R1 新加的**窄**守卫, 它的存在理由是: core-count 修复的
+    # 唯一合法动作是"把多余 core 重标 support", 所以除 `facts[*].kind`
+    # 之外的一切变化都值得怀疑。
+    #
+    # 但**其余** fixable 不是这样: `_apply_review` 的 v5 契约要求审稿人
+    # 每次 `fix` 都**整套同步**(puzzle/answer/core_answer/completion/
+    # facts/atoms/clues/beats/signature) —— 那是它证明"我真的改过"的方式,
+    # 把一个只压缩 core_answer 的修复也按"只许改 core_answer"去卡, 会拒掉
+    # **每一份合法修复**(实测: 一次误伤 4 个套件 —— curated_compile /
+    # solve_ux / llm 全红)。那不是"更严", 那是把 Reviewer 弄坏。
+    #
+    # 所以判据是"**这一次**点名要修的东西里有没有 core-count", 而不是
+    # "有没有 fixable"。
+    if not any(_CORE_COUNT_MARK in str(f) for f in (own_fix_focus or [])):
+        return ""
+    dom = fix_domains_for(own_fix_focus)
+
+    # ---- 文本字段 ----
+    if "puzzle" not in dom and \
+            (new.puzzle or "").strip() != (old.puzzle or "").strip():
+        return ("本次修复**未授权改谜面** —— 只许改被点名的那一项, "
+                "拒绝这次修复")
+    if "answer" not in dom and \
+            (new.answer or "").strip() != (old.answer or "").strip():
+        return ("本次修复**未授权改谜底** —— 只许改被点名的那一项, "
+                "拒绝这次修复")
+    if "core_answer" not in dom and \
+            (new.core_answer or "").strip() != (old.core_answer or "").strip():
+        return ("本次修复**未授权改 core_answer** —— 只许改被点名的那一项, "
+                "拒绝这次修复")
+    # title 不参与任何修复: 它从来不是 fixable 的对象。
+    if (new.title or "").strip() != (old.title or "").strip():
+        return "本次修复**未授权改标题**, 拒绝这次修复"
+    # ---- 通关合同 ----
+    if (list(new.completion_fact_ids or [])
+            != list(old.completion_fact_ids or [])):
+        return ("本次修复**未授权改通关合同**(completion_fact_ids) —— "
+                "合同是这道题「怎么算通关」的定义, 不是修复对象, "
+                "拒绝这次修复")
+    # ---- facts: kind 之外的每一项都冻结 ----
     _old = {f.id: f for f in (old.facts or [])}
     _new = {f.id: f for f in (new.facts or [])}
-    if set(_old) != set(_new):
-        return ("core 数量修复**不得增删 fact**(只许把多余 core 改标 "
-                "support) —— 审稿改动了 fact 集合, 拒绝这次修复")
-    for fid, of in _old.items():
-        if (of.text or "").strip() != (_new[fid].text or "").strip():
-            return (f"core 数量修复**不得改 fact 文本**(fact {fid} 被改) "
-                    f"—— 只许把多余的 core 重标成 support, 拒绝这次修复")
-    # ---- 合同指向的 fact 必须仍然是 core(§三 明写) ----
-    for fid in (old.completion_fact_ids or []):
-        nf = _new.get(fid)
-        if nf is not None and nf.kind != "core":
-            return (f"core 数量修复**不得把通关合同指向的 fact({fid}) "
-                    f"降级** —— 那样观众再也建不出合同, 拒绝这次修复")
+    if [f.id for f in (new.facts or [])] != [f.id for f in (old.facts or [])]:
+        return ("本次修复**未授权增删/重排 fact** —— 只许改被点名的那一项, "
+                "拒绝这次修复")
+    if "facts_other" not in dom:
+        for fid, of in _old.items():
+            nf = _new[fid]
+            if (of.text or "").strip() != (nf.text or "").strip():
+                return (f"本次修复**未授权改 fact 文本**(fact {fid}) —— "
+                        f"拒绝这次修复")
+            if of.visibility != nf.visibility:
+                return (f"本次修复**未授权改 fact.visibility**(fact {fid}: "
+                        f"{of.visibility} -> {nf.visibility}) —— "
+                        f"拒绝这次修复")
+            if bool(of.hintable) != bool(nf.hintable):
+                return (f"本次修复**未授权改 fact.hintable**(fact {fid}) —— "
+                        f"拒绝这次修复")
+    if "facts_kind" not in dom:
+        for fid, of in _old.items():
+            if of.kind != _new[fid].kind:
+                return (f"本次修复**未授权改 fact.kind**(fact {fid}) —— "
+                        f"拒绝这次修复")
+    else:
+        # ---- `core -> support` 是唯一被授权的 kind 变化方向 ----
+        #
+        # `support/exclusion -> core` 是**反向**的: 它会把一道本来合格的
+        # 题"换一个核心"(合同指向的那条被挤掉, 观众要建的东西变了)。
+        # 那不是修复, 是改题 —— 而且它同样能让 "core <= 3" 成立。
+        for fid, of in _old.items():
+            nk = _new[fid].kind
+            if nk == of.kind:
+                continue
+            if not (of.kind == "core" and nk == "support"):
+                return (f"本次修复只允许 core -> support(fact {fid} 被改成 "
+                        f"{of.kind} -> {nk}), 拒绝这次修复")
+        # ---- 合同指向的 fact 必须继续是 core ----
+        for fid in (old.completion_fact_ids or []):
+            nf = _new.get(fid)
+            if nf is not None and nf.kind != "core":
+                return (f"本次修复**不得把通关合同指向的 fact({fid}) 降级** "
+                        f"—— 那样观众再也建不出合同, 拒绝这次修复")
+    # ---- 其余结构字段: 逐项冻结 ----
+    for field, label in (("solve_atoms", "solve_atoms"),
+                         ("fair_clues", "fair_clues"),
+                         ("discovery_beats", "discovery_beats"),
+                         ("signature", "signature")):
+        if label in dom:
+            continue
+        if not _same_struct(getattr(old, field, None),
+                            getattr(new, field, None)):
+            # ---- G4-R2-R1 §二: 改谜面**必然**要重摘 quote ----
+            #
+            # `fair_clues` 的每个 quote 必须逐字出自谜面(硬校验会查)。
+            # 所以只要这次修复被授权改谜面(补问句 / 改人称 / 删 meta),
+            # 重算 quote 就是那个授权的**必然结果**, 不是额外的越界。
+            #
+            # 判据用"谜面**确实**变了 且 puzzle 在域里", 而不是"谜面可能
+            # 会变": 前者是这次调用里真实发生的事, 后者会让"授权改谜面"
+            # 变成一张可随手改 clues 的空白支票。
+            if (label == "fair_clues" and "puzzle" in dom
+                    and (old.puzzle or "").strip()
+                    != (new.puzzle or "").strip()):
+                continue
+            return (f"本次修复**未授权改 {label}** —— 只许改被点名的那一项, "
+                    f"拒绝这次修复")
+    if "hints" not in dom and \
+            [str(h) for h in (old.hints or [])] != \
+            [str(h) for h in (new.hints or [])]:
+        return "本次修复**未授权改提示**, 拒绝这次修复"
     return ""
+
+
+def _same_struct(a, b) -> bool:
+    """两个结构字段(dataclass 列表 / signature)是不是**逐项相同**。
+
+    为什么用序列化比对而不是逐个字段写: 这些类型(atoms / clues / beats /
+    signature)各自有十几个字段, 手写比对必然会漏掉将来新增的那个 —— 而
+    漏掉的后果是"新字段可以被偷偷改"。序列化比对天然覆盖全部字段。
+
+    ⚠️ 用 `to_dict()` 而不是 `==`: dataclass 的 `==` 对 list 字段是逐元素
+    比较, 看起来等价, 但它**不包含**将来可能加的非 dataclass 字段; 而且
+    序列化之后比较的是"落盘形状", 与"这题会不会被改"更贴。
+    """
+    def _norm(x):
+        if x is None:
+            return None
+        if isinstance(x, list):
+            return [_norm(i) for i in x]
+        d = getattr(x, "to_dict", None)
+        if callable(d):
+            try:
+                return d()
+            except Exception:                   # noqa: BLE001
+                return repr(x)
+        return x
+    return _norm(a) == _norm(b)
 
 
 def _blueprint_block_for_review(bp) -> str:
@@ -4556,8 +4674,14 @@ class PuzzleWriter:
             # ---- 技术失败与语义拒绝分开记账(与 gen_spec 同一口径) ----
             if technical:
                 m["review_technical_fail"] = 1
+                # ---- G4-R2-R1 §四: 审稿技术失败**不是**结构技术失败 ----
+                #
+                # R2 把两者都记成 `structure_technical_fail`, 于是实播复盘
+                # 时"Stage B 工具调用没回来"与"审稿调用没回来"混成一个数 ——
+                # 而它们的**排查方向完全不同**: 前者是 Stage B 的工具网关,
+                # 后者是 Reviewer 那一侧。分不开就只能人工读日志。
                 return _bail("审稿技术失败: " + str(why)[:120],
-                             "structure_technical_fail")
+                             "review_technical_fail")
             # ---- §五: Reviewer 判 rewrite => **整道候选失败** ----
             #
             # 不去修它, 也不重出: 下一轮 prefetch 会**重新抽关键词**。
@@ -4590,7 +4714,7 @@ class PuzzleWriter:
                     m["truth_audit_technical"] = 1
                     return _bail("叙事真实性审计技术失败: "
                                  + str(ta.get("why") or "")[:120],
-                                 "structure_technical_fail")
+                                 "truth_technical_fail")
                 m["truth_audit_issues"] = list(ta.get("conflicts") or [])
                 return _bail("叙事真实性审计不过: "
                              + str(ta.get("why") or "")[:120],

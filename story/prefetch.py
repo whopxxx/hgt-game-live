@@ -319,19 +319,25 @@ class PoolPrefetcher:
         # 实播复盘时只有一个统一的 `keyword2 未成题` 计数, 于是"这轮为什么
         # 通过率低"只能人工逐行数日志。这五项正是**决策树上的五个出口**:
         #
-        #     structure_technical_fail  结构调用的**技术**失败(空 tool_input
-        #                               等, 已重试一次仍失败) —— 网关问题
+        #     structure_technical_fail  Stage B **结构调用**的技术失败
+        #                               (空 tool_input 等, 已重试一次仍失败)
+        #     review_technical_fail     **审稿**的技术失败(超时 / 截断 /
+        #                               空 tool_input) —— 与上面那个分开:
+        #                               排查方向不同(Stage B 网关 vs Reviewer)
+        #     truth_technical_fail      **truth audit** 的技术失败
         #     review_rewrite            Reviewer 读懂后要求重出 —— 内容问题
         #     truth_reject              truth audit 判叙事/机制不成立 —— 内容问题
         #     validation_reject         validate_spec 硬门不过 —— 结构问题
         #     success                   真正入池
         #
-        # 前两项与后两项的**处置完全不同**(前者值得重试/换网关, 后者
-        # 值得改 prompt/改创作), 所以必须分开。全部由 worker 线程的
+        # 前三项是**技术形状**(值得重试 / 换网关), 中间三项是**语义判定**
+        # (值得改 prompt / 改创作)。全部由 worker 线程的
         # `extra["reject"]` 单写, 与既有的 fail_streak 状态机正交 ——
         # 它们**不**参与退避决策, 只是账本。
         self.reject_count: dict = {
             "structure_technical_fail": 0,
+            "review_technical_fail": 0,
+            "truth_technical_fail": 0,
             "review_rewrite": 0,
             "truth_reject": 0,
             "validation_reject": 0,
