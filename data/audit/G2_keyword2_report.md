@@ -1,6 +1,8 @@
 # G2 —— keyword2 接入生产(AI-original 后台补池两阶段起题)
 
 **基线 main** `3e85e2960a3da2b0e460ef133fee315087d6eaac`(G1-B)
+**commit** `359132d`(主体)+ `225bb96`(修 CI 红, 见 §八)
+**exact-head CI** `offline-tests` on `225bb962ae7c` = **success**
 **生产链改动** `story/llm.py`(+694 行, **0 删除**)、`story/prefetch.py`、
 `story/config.py`、新增 `story/keyword_seed.py`
 **未改**: `RIDDLE_SYSTEM` / Reviewer / truth audit / `validate_spec` /
