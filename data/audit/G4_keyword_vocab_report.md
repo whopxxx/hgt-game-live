@@ -1,6 +1,8 @@
 # G4 —— keyword2 改为「独立词库 + 随机重新组合」+ 关键词清洗收紧
 
 **基线 main** `9e940b2d2c5bcf0afb033a3fb607ac5c784b8190`(G3, 未验收)
+**commit** `0da59e8`
+**exact-head CI** `offline-tests` on `0da59e84b0c5…` = **success**
 **本轮只修两处** `corpus = 独立词` / `sampler = 随机重新组合两个词`
 **未动** `KEYWORD_IDEA_SYSTEM`(`story/llm.py` 相对 G3 **零 diff**)
 
