@@ -180,6 +180,7 @@ def test_local_llm_config_covers_endpoint_credentials_models_and_budgets():
         "base_url": "http://llm-gateway.example:9000",
         "api_key": "secret-sentinel-123",
         "default": B,
+        "supported_models_extra": ["custom-local-model"],
         "puzzle.story": A,
         "qa.judge": A,
         "timeout": 42,
@@ -206,6 +207,9 @@ def test_local_llm_config_covers_endpoint_credentials_models_and_budgets():
             check("**local api_key 生效**",
                   cfg.api_key == payload["api_key"], cfg.api_key)
             check("**local default model 生效**", cfg.model == B, cfg.model)
+            check("**local supported_models_extra 生效**",
+                  "custom-local-model" in supported_models(),
+                  sorted(supported_models()))
             check("**local stage override 生效**",
                   cfg.model_for("puzzle.story") == A
                   and cfg.model_for("qa.judge") == A,
