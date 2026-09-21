@@ -637,26 +637,31 @@ def test_latch_walk_min2_target5():
 
 
 def test_latch_held_under_pressure():
-    """压力高时 latch 只是**被按住**, 不是被放弃 —— 压力一过接着补。"""
-    print("\n[B2] 压力高时 latch 保持")
+    """refill-to-target: latch 一旦启动，QA 忙也继续单飞补池。
+
+    旧契约是 pending>0 就按住补池；实播证明活跃房间会因此永远追不上
+    消耗。现在库存跌破低水位后，补池周期优先完成到高水位。
+    """
+    print("\n[B2] QA 压力下 refill latch 仍持续补")
     with tmpdir() as d:
         ex = _ManualExecutor()
         pool = PuzzlePool.open(mkcfg(d))
-        busy = {"v": False}
+        busy = {"v": True}
         pf = mkpf(d, pool=pool, executor=ex,
                   probe=lambda: {"phase": Phase.QA,
                                  "pending": 3 if busy["v"] else 0,
-                                 "inflight": 0, "hint_inflight": False,
+                                 "inflight": 1 if busy["v"] else 0,
+                                 "hint_inflight": bool(busy["v"]),
                                  "reveal_inflight": False, "stopped": False})
         fill(pool, 1)
-        busy["v"] = True
         pf.on_tick()
-        check("压力高 -> latch 仍 active", pf._refill_active is True)
-        check("压力高 -> 零提交", ex.total == 0, ex.total)
-        busy["v"] = False
+        check("缺货 -> latch active", pf._refill_active is True)
+        check("**QA 忙也照样提交 1 个后台任务**", ex.total == 1, ex.total)
         pf.on_tick()
-        check("压力过去 -> 恢复提交", ex.total == 1,
-              ex.total)
+        check("**单飞仍成立, 忙时不会并发堆任务**", ex.total == 1, ex.total)
+        ex.run_next()
+        pf.on_tick()
+        check("上一道完成后继续向 target 补", ex.total == 2, ex.total)
 
 
 def test_two_ticks_produce_one_task():
@@ -723,6 +728,63 @@ def test_max_workers_one_is_not_the_guard():
         check("**5 拍仍只起 1 个生成**", w.calls == 1, w.calls)
         release.set()
         pf._executor.shutdown(wait=True)
+
+
+def test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy():
+    """健康库存时仍不该无条件抢 QA；激进模式只属于 active refill cycle。"""
+    print("\n[refill-to-target] 健康库存 + QA 忙 -> 不启动")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pf = mkpf(
+            d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
+            probe=lambda: {"phase": Phase.QA, "pending": 4, "inflight": 2,
+                           "hint_inflight": True, "reveal_inflight": False,
+                           "stopped": False})
+        fill(pf.pool, 5)
+        pf.on_tick()
+        check("latch 没启动", pf._refill_active is False,
+              pf._refill_active)
+        check("零提交", ex.total == 0, ex.total)
+
+
+def test_semantic_reject_immediately_continues_refill():
+    """内容候选被淘汰不退避；下一拍应能立刻继续抽下一道。"""
+    print("\n[refill-to-target] 语义淘汰不退避")
+    with tmpdir() as d:
+        clk = _Clock()
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk, executor=ex)
+        fill(pf.pool, 1)
+        pf._refill_active = True
+        pf._apply_result(
+            "gen_fail", "审稿要求重出",
+            {"reject": "review_rewrite"}, clk())
+        check("不设 retry_at", pf._retry_at == 0.0, pf._retry_at)
+        check("不累积 fail_streak", pf._fail_streak == 0, pf._fail_streak)
+        check("review_rewrite 仍正常记账",
+              pf.reject_count["review_rewrite"] == 1,
+              pf.reject_count["review_rewrite"])
+        pf.on_tick()
+        check("下一拍立刻又能提交", ex.total == 1, ex.total)
+
+
+def test_technical_reject_still_backs_off():
+    """网关/工具技术失败仍退避，避免 outage 时热循环打爆接口。"""
+    print("\n[refill-to-target] 技术失败仍退避")
+    with tmpdir() as d:
+        clk = _Clock()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        fill(pf.pool, 1)
+        pf._refill_active = True
+        pf._apply_result(
+            "gen_fail", "工具调用返回空 input",
+            {"reject": "structure_technical_fail"}, clk())
+        check("技术失败设 retry_at", pf._retry_at > 0, pf._retry_at)
+        check("技术失败累积 fail_streak", pf._fail_streak == 1,
+              pf._fail_streak)
+        check("技术标签仍正常记账",
+              pf.reject_count["structure_technical_fail"] == 1,
+              pf.reject_count["structure_technical_fail"])
 
 
 def test_gen_failure_sets_backoff():
@@ -3686,6 +3748,9 @@ def main():
         # B. PoolPrefetcher 状态机
         test_latch_walk_min2_target5,
         test_latch_held_under_pressure,
+        test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy,
+        test_semantic_reject_immediately_continues_refill,
+        test_technical_reject_still_backs_off,
         test_two_ticks_produce_one_task,
         test_next_task_only_after_done,
         test_max_workers_one_is_not_the_guard,
