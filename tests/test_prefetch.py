@@ -3512,6 +3512,137 @@ def test_g4_provenance_records_vocab_and_seed():
                   m.get("keyword_session_seed") is not None, m)
 
 
+
+
+# ======================================================================
+# stable-refill: 直播 lease + 高水位 + 离线候选让路
+# ======================================================================
+def test_stable_refill_default_waterlines():
+    print("\n[stable-refill] 默认水位提前")
+    cfg = Config(sim_path="x")
+    check("低水位 = 8", cfg.pool_min_size == 8, cfg.pool_min_size)
+    check("高水位 = 12", cfg.pool_target_size == 12, cfg.pool_target_size)
+    check("至少 3 道可播", cfg.pool_playable_min == 3,
+          cfg.pool_playable_min)
+    check("揭晓窗口同样补到 12/3",
+          cfg.pool_reveal_target_size == 12
+          and cfg.pool_reveal_playable_target == 3,
+          (cfg.pool_reveal_target_size, cfg.pool_reveal_playable_target))
+    check("硬上限 = 16", cfg.pool_max_size == 16, cfg.pool_max_size)
+
+
+def test_stable_refill_live_heartbeat_expires():
+    print("\n[stable-refill] live heartbeat lease 会自然过期")
+    from story.live_heartbeat import (
+        clear_live_heartbeat, live_is_active, read_live_heartbeat,
+        write_live_heartbeat)
+    with tempfile.TemporaryDirectory(prefix="hgt-heartbeat-") as d:
+        path = os.path.join(d, "live.json")
+        check("写 heartbeat 成功",
+              write_live_heartbeat(path, phase="QA", session_id="s1"))
+        rec = read_live_heartbeat(path)
+        ts = float(rec.get("ts") or 0.0)
+        check("新鲜 heartbeat = live", live_is_active(path, 10.0, now=ts + 5))
+        check("超过 stale = idle",
+              not live_is_active(path, 10.0, now=ts + 10.1))
+        check("当前 pid 可以清自己的 lease", clear_live_heartbeat(path))
+        check("清掉后 = idle", not live_is_active(path, 10.0, now=ts + 5))
+
+
+def test_stable_refill_corrupt_heartbeat_is_idle():
+    print("\n[stable-refill] 损坏 heartbeat 不会永久卡死守护补池")
+    from story.live_heartbeat import live_is_active
+    with tempfile.TemporaryDirectory(prefix="hgt-heartbeat-bad-") as d:
+        path = os.path.join(d, "live.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not-json")
+        check("坏 heartbeat 按 stale/idle 处理",
+              not live_is_active(path, 10.0, now=100.0))
+
+
+def test_stable_refill_candidate_never_adds_after_live_appears():
+    """直播在候选完成后才出现，也必须在 pool.add 前最后让路。"""
+    print("\n[stable-refill] live 出现后候选绝不入池")
+    from prefill_pool import _PrefillSeeder, _one_keyword
+
+    class Bag:
+        def draw(self):
+            return {"keywords": ["门", "雨"], "index": 1}
+
+    class Writer:
+        def gen_keyword_story(self, keywords, lane, should_continue=None):
+            return {"answer": "完整背景使这个反常行为成立。"}
+
+        def gen_surface(self, answer, should_continue=None):
+            return {"puzzle": "他每天都把门打开，却不让任何人进来。"}
+
+        def structure_original_idea(self, **kw):
+            # 刻意不再调用 should_continue：模拟最后一个昂贵请求返回时，
+            # 直播恰好刚启动。最终 add 前那次复查必须兜住这个窗口。
+            return good_spec(puzzle=kw["puzzle"], answer=kw["answer"])
+
+    class Pool:
+        def __init__(self):
+            self.add_calls = 0
+
+        def add(self, spec, source=""):
+            self.add_calls += 1
+            return True
+
+    calls = [0]
+
+    def go():
+        calls[0] += 1
+        # keyword_spec 自己有 3 个阶段前检查；第 4 次就是 _one_keyword
+        # 在最终 pool.add 前的保险。
+        return calls[0] <= 3
+
+    pool = Pool()
+    seeder = _PrefillSeeder(
+        enabled=True, bag=Bag(), session_seed=20260921,
+        bag_meta={"corpus_version": "test"})
+    ok = _one_keyword(Writer(), pool, Config(sim_path="x"), None,
+                      seeder, [], should_continue=go)
+    check("候选被丢弃", ok is False, ok)
+    check("**pool.add 一次都没调用**", pool.add_calls == 0, pool.add_calls)
+
+
+def test_stable_refill_prefill_default_path_still_adds():
+    """没有守护谓词时，prefill 原有离线行为不应被改坏。"""
+    print("\n[stable-refill] 普通 prefill 默认路径仍可入池")
+    from prefill_pool import _PrefillSeeder, _one_keyword
+
+    class Bag:
+        def draw(self):
+            return {"keywords": ["门", "雨"], "index": 1}
+
+    class Writer:
+        def gen_keyword_story(self, keywords, lane, should_continue=None):
+            return {"answer": "完整背景使这个反常行为成立。"}
+
+        def gen_surface(self, answer, should_continue=None):
+            return {"puzzle": "他每天都把门打开，却不让任何人进来。"}
+
+        def structure_original_idea(self, **kw):
+            return good_spec(puzzle=kw["puzzle"], answer=kw["answer"])
+
+    class Pool:
+        def __init__(self):
+            self.add_calls = 0
+
+        def add(self, spec, source=""):
+            self.add_calls += 1
+            return True
+
+    pool = Pool()
+    seeder = _PrefillSeeder(
+        enabled=True, bag=Bag(), session_seed=20260921,
+        bag_meta={"corpus_version": "test"})
+    ok = _one_keyword(Writer(), pool, Config(sim_path="x"), None,
+                      seeder, [])
+    check("正常离线候选仍入池", ok is True, ok)
+    check("pool.add 恰好一次", pool.add_calls == 1, pool.add_calls)
+
 def main():
     tests = [
         # A. 库存与探针
@@ -3527,6 +3658,12 @@ def main():
         test_generation_inputs_shared_by_first_and_retry,
         test_inverted_hysteresis_is_flagged,
         test_cli_no_prefetch_is_wired,
+        # stable-refill
+        test_stable_refill_default_waterlines,
+        test_stable_refill_live_heartbeat_expires,
+        test_stable_refill_corrupt_heartbeat_is_idle,
+        test_stable_refill_candidate_never_adds_after_live_appears,
+        test_stable_refill_prefill_default_path_still_adds,
         # B. PoolPrefetcher 状态机
         test_latch_walk_min2_target5,
         test_latch_held_under_pressure,
