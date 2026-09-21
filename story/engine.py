@@ -951,9 +951,14 @@ class RoundEngine:
                 # `_reveal_contributors_locked` 里过滤是不够的: 那样 UI
                 # 不显示错误贡献, 但 `_established_fact_ids` 已经被污染,
                 # 题仍可能提前 solved。
+                #
+                # Task 0: `verdict` 必须传进去 —— completion fact 只有
+                # 「是」能建立。`不是` 仍能建立普通 support/exclusion fact,
+                # 但绝不能推进通关(否则"猜错"被判成"补齐谜底")。
                 safe_est = self._verified_established_locked(
                     r.established_fact_ids,
-                    r.completion_verified_fact_ids)
+                    r.completion_verified_fact_ids,
+                    verdict=r.verdict)
                 est = self._record_human_established_locked(
                     safe_est, verdict=r.verdict,
                     status=r.status)
@@ -2051,15 +2056,34 @@ class RoundEngine:
             out.add(fid)
         return out
 
-    def _verified_established_locked(self, raw_ids, verified_ids) -> list:
-        """J1-B: 把"自报的 established"过滤成"可以进房间共识的 established"。
+    def _verified_established_locked(self, raw_ids, verified_ids,
+                                     verdict: str = "") -> list:
+        """J1-B + Task 0: 把"自报的 established"过滤成"可以进房间共识的"。
 
-        ## 规则(只有一条)
+        ## 规则(两条)
 
-            completion fact  ->  必须同时出现在 completion_verified_fact_ids
-            其它 fact        ->  原样放行
+            completion fact  ->  必须**同时**满足:
+                                    ① 出现在 completion_verified_fact_ids
+                                    ② `verdict == 是`
+            其它 fact        ->  原样放行(普通 support/exclusion 不受影响)
 
-        ## 为什么 Engine 还要再做一遍
+        ## ⚠️ Task 0: 为什么 completion 还要卡「是」
+
+        `不是` 的语义是"**否定**这个说法"。它能建立**普通** fact ——
+        "衣柜里没有尸体"这种排除本身是有效的公开信息。但它**绝不能**
+        建立 completion fact:
+
+            观众: "不敢关灯是因为有高空坠落风险吗？"  ->  不是
+            而这一条若被上游/verifier 标成 completion
+            -> completion 进共识 -> 合同被覆盖 -> 题目**自解**
+
+        观众排除掉一个**错误**猜测, 系统却宣布他补齐了谜底最后一块。
+        这是把"猜错"判成了"通关"。
+
+        实播里这条靠一句"不是"就能触发, 成本极低、后果是整道题作废,
+        所以必须是**代码层的硬门**, 不能只靠上游记得别乱标。
+
+        ## 为什么引擎还要做这一遍(而不是只信 Writer)
 
         Writer 侧的 A1 已经强制复核 completion。但 Engine 是**通关状态的
         唯一写入口** —— 把胜负押在"每个上游 producer 都记得先复核"上,
@@ -2069,10 +2093,6 @@ class RoundEngine:
             adapter 错误地把 completion 塞进 `established_fact_ids`,
             Engine 也不会白送通关。
 
-        实播事故: 观众用"不是"排除了一个错误解释, 第一层却把真正的
-        hidden 原因(衣柜封门)标成 established。A1 复核该拦; 这一层
-        是它没拦住时的最后一道。
-
         ## 为什么不用 `_completion_fact_ids` 是否为空来短路
 
         legacy 题(无合同)本来就没有 completion 概念, 那条分支下
@@ -2081,9 +2101,10 @@ class RoundEngine:
 
         ## fail-closed 方向
 
-        `completion_verified_fact_ids` 缺失/None/类型不对 -> 视为**空**,
-        于是所有 completion id 全被丢弃。宁可少建立一条(观众多说一句),
-        不可多建立一条(题提前结束, 而且是以"没人真正想明白"的方式)。
+        `completion_verified_fact_ids` 缺失/None/类型不对 -> 视为**空**;
+        `verdict` 缺失/不是 `是` -> 一律**不**建立 completion。
+        宁可少建立一条(观众多说一句), 不可多建立一条(题提前结束,
+        而且是以"没人真正想明白"的方式)。
         """
         completion = {str(x).strip() for x in (self._completion_fact_ids or ())
                       if str(x).strip()}
@@ -2091,20 +2112,24 @@ class RoundEngine:
             return list(raw_ids or [])
         verified = {str(x).strip() for x in (verified_ids or ())
                     if str(x).strip()}
+        # ⚠️ Task 0: 只有「是」能建立 completion。`不是` 依旧能建立普通
+        # fact(见 `_record_human_established_locked`), 但 completion 不行。
+        yes_only = (verdict == P.YES)
         out: list = []
         dropped: list = []
         for x in (raw_ids or ()):
             fid = str(x).strip()
             if not fid:
                 continue
-            if fid in completion and fid not in verified:
+            if fid in completion and (fid not in verified or not yes_only):
                 dropped.append(fid)
                 continue
             out.append(fid)
         if dropped:
             # 只打 id, 不打文本 —— INFO 日志会进 data/run.log。
-            log.warning("J1: 未复核确认的 completion 被 Engine 拦下: %s",
-                        sorted(set(dropped)))
+            log.warning("J1/Task0: 未复核确认或非「是」的 completion "
+                        "被 Engine 拦下: %s (verdict=%r)",
+                        sorted(set(dropped)), verdict)
         return out
 
     def _record_human_established_locked(

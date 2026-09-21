@@ -5583,6 +5583,76 @@ def test_g2f_no_draft_requests_are_capped():
 
 
 
+def test_task0_reject_ledger_covers_every_emitted_label():
+    """**Task 0**: `reject_count` 的桶必须覆盖**所有**会发出的 reject 标签。
+
+    ## 这条守的是什么
+
+    线上刷过 "补池: 未知的 reject 标签" —— 因为 R7 加了
+    `safety_reject` / `safety_technical_fail` 两个出口, 却忘了往
+    `PoolPrefetcher.reject_count` 里加桶。
+
+    后果不是崩溃, 是**指标静默失真**: 安全门拒了多少、网关抖了多少
+    这两个**最该看得见**的数, 恰恰在账本里查不到 —— 而它们正是
+    "要不要放宽安全判据"的唯一依据。R8 要动 safety 语义, 没有这个数
+    就是盲改。
+
+    ## 为什么用 AST 扫而不是硬编码一张清单
+
+    硬编码清单只能证明"我写测试时记得这几项", 将来新增一个 `_bail`
+    出口它照样绿。这里直接从 `story/llm.py` 的源码里**现读现 parse**
+    `_bail(...)` 的第二个实参, 与 `prefetch.py` 的账本键求差 ——
+    差集非空就是有人加了出口没加桶。
+
+    ⚠️ 与 G2-F 的纪律一致: 源码现读, 不走 import 缓存。
+    """
+    print("\n[Task0] reject 账本覆盖所有出口标签")
+    import ast
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    llm_src = (root / "story" / "llm.py").read_text(encoding="utf-8")
+    pf_src = (root / "story" / "prefetch.py").read_text(encoding="utf-8")
+
+    # ---- ① llm 侧: 所有 _bail(..., "标签") 的第二参数 ----
+    labels: set = set()
+    tree = ast.parse(llm_src)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+        if name != "_bail":
+            continue
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                and isinstance(node.args[1].value, str):
+            labels.add(node.args[1].value)
+    check("**扫到了 _bail 的标签**(否则下面比的是空集)",
+          len(labels) >= 4, sorted(labels))
+
+    # ---- ② prefetch 侧: reject_count 的键 ----
+    m = re.search(r"self\.reject_count: dict = \{(.*?)\}", pf_src, re.S)
+    check("找到 reject_count 定义", m is not None, "")
+    ledger = set(re.findall(r'"([a-z_]+)":\s*0', m.group(1) if m else ""))
+
+    # ---- ③ 差集必须是空 ----
+    missing = labels - ledger
+    check("**每个 reject 标签都有桶**(差集为空)", not missing,
+          "缺: %s" % sorted(missing))
+
+    # ---- ④ 反向: 桶必须都在 llm 侧真的会发出 ----
+    #
+    # 恒为 0 的桶比"没有这个桶"更坏: 它看起来像"这个原因从来没发生",
+    # 实际是"根本没有出口会写它"。
+    stale = ledger - labels - {"success"}
+    check("**没有永不触发的僵尸桶**", not stale, "僵尸: %s" % sorted(stale))
+
+    # ---- ⑤ Task 0 点名的那两个必须在 ----
+    for k in ("safety_reject", "safety_technical_fail"):
+        check("**账本有 %s**" % k, k in ledger, sorted(ledger))
+
+
 def test_g4_repair_vs_hard_reject_counts():
     """**G4 可观测性**: 出题指标必须能回答"几次 repair 救回了几次硬拒"。
 
@@ -6052,7 +6122,9 @@ def main():
               test_g4a_fact_enum_misplacement_is_fixable_not_a_new_draft,
               test_g4a_enums_are_imported_for_the_swap,
               # ---- G4: 可观测性 ----
+              test_task0_reject_ledger_covers_every_emitted_label,
               test_g4_repair_vs_hard_reject_counts,
+
               test_g4e_repair_attempt_is_not_repair_success,
               test_g4e_archive_round_trip_keeps_g4_metrics,
               test_g4_fix_reasons_never_guesses,

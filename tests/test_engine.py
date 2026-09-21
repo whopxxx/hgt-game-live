@@ -3000,6 +3000,130 @@ def _answer_and_submit(eng, clk, uid, name, text, **kw):
                          expect_spec_key=p.get("expect_spec_key")), p
 
 
+def test_task0_no_verdict_never_completes_the_contract():
+    """**Task 0 (P0)**: 裁决为「不是」的发言**绝不能**推进通关。
+
+    ## 这个 bug 的真实形状
+
+    观众排除一个**错误**猜测, 系统却宣布他补齐了谜底最后一块:
+
+        观众: "不敢关灯是因为有高空坠落风险吗？"  ->  不是
+        而这一条被上游/verifier 标成 completion
+        -> completion 进房间共识 -> 合同被覆盖 -> 题目**自解**
+
+    成本极低(说一句"不是"), 后果是整道题作废。修之前
+    `_verified_established_locked` 只检查 `completion_verified_fact_ids`,
+    **完全不看 verdict** —— 只要 verifier 那份列表里有, 「不是」也能写。
+
+    ## 契约
+
+        verdict == 是   -> completion 可以进共识(仍需 verifier 确认)
+        verdict == 不是 -> completion **绝不**进共识;
+                          但**普通** support/exclusion fact 行为不变
+                          (「不是」完整公开地否定了一条, 那本身是有效信息)
+
+    所以这条要**同时**断言两件事: completion 被拦下, 且普通 fact 仍建立。
+    只测前者会得到一个"把「不是」整个禁掉"也能过的假保证。
+    """
+    print("\n[Task0] 「不是」不得推进通关")
+    from story.puzzle import PuzzleFact, SolveAtom, FairClue, PuzzleSpec
+
+    # 合同两条: f1 是 completion, f9 是**普通** support(不在合同里)。
+    sp = PuzzleSpec(
+        id="task0", title="Task0",
+        puzzle="他每天睡前都要检查三遍门锁, 却从不锁门。为什么?",
+        answer="锁坏了三年, 他检查的从来不是锁, 是门后有没有人。",
+        core_answer="他检查的是门后有没有人, 不是锁。",
+        completion_fact_ids=["f1", "f2"],
+        facts=[
+            PuzzleFact(id="f1", text="锁三年前就坏了", kind="core"),
+            PuzzleFact(id="f2", text="他在确认门后有没有人", kind="core"),
+            PuzzleFact(id="f9", text="他独居", kind="support"),
+        ],
+        solve_atoms=[SolveAtom(id="a1", role="cause", text="锁坏了",
+                               fact_ids=["f1"]),
+                     SolveAtom(id="a2", role="mechanism", text="确认门后",
+                               fact_ids=["f2"])],
+        fair_clues=[FairClue(quote="从不锁门", supports_atoms=["a1"])],
+        hints=["注意锁", "注意他看的方向", "注意门"],
+        prompt_version="riddle-v7", quality_policy_version="quality-v11")
+
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
+    eng.start()
+    eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints), spec=sp)
+    check("停在 QA", eng.phase == Phase.QA, eng.phase)
+
+    # ---- ① 「不是」+ verifier 确认了 completion -> 仍必须被拦 ----
+    #
+    # 这是**核心断言**: verifier 列表里**有** f1(模拟上游/verifier 判错),
+    # verdict 却是「不是」—— 旧实现会放行, 于是 f1 进共识。
+    acts = [a for a in say(eng, clk, "u1", "甲", "#锁是不是三年前就坏了")
+            if a.kind == ActionKind.ANSWER]
+    check("派发 ANSWER", len(acts) == 1, kinds(acts))
+    p = acts[0].payload
+    eng.submit_qa([QAResult(qid=p["qid"], verdict="不是",
+                            established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"])],
+                  expect_round=p.get("expect_round"),
+                  expect_spec_key=p.get("expect_spec_key"))
+
+    check("**「不是」的 completion 不进房间共识**",
+          "f1" not in eng._established_fact_ids,
+          sorted(eng._established_fact_ids))
+    check("**仍停在 QA, 没有 solved**", eng.phase == Phase.QA, eng.phase)
+    check("**没有被判 solved**", not eng._solved, eng._solved)
+
+    # ---- ② 反证: 同一句话改成「是」就该建立 ----
+    #
+    # ⚠️ 反证必不可少。若 ① 是因为别的原因(夹具坏了 / status 不对)而没
+    # 建立, 只测 ① 会得到一个"把所有都拦掉"也永远绿的假保证。
+    acts = [a for a in say(eng, clk, "u2", "乙", "#锁是不是坏的吗")
+            if a.kind == ActionKind.ANSWER]
+    p2 = acts[0].payload
+    eng.submit_qa([QAResult(qid=p2["qid"], verdict="是",
+                            established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"])],
+                  expect_round=p2.get("expect_round"),
+                  expect_spec_key=p2.get("expect_spec_key"))
+    check("**反证: 「是」确实建立了 f1**",
+          "f1" in eng._established_fact_ids, sorted(eng._established_fact_ids))
+    check("反证: 仍差一条, 仍在 QA", eng.phase == Phase.QA, eng.phase)
+
+    # ---- ③ 「不是」仍能建立**普通** fact(不能一刀切禁掉) ----
+    #
+    # f9 不在合同里。观众用「不是」排除它, 这是有效的公开信息, 必须照常
+    # 建立 —— 否则就是把"收紧通关入口"误做成"禁掉所有不是"。
+    check("前置: f9 还没建立", "f9" not in eng._established_fact_ids,
+          sorted(eng._established_fact_ids))
+    acts = [a for a in say(eng, clk, "u3", "丙", "#他是不是独居")
+            if a.kind == ActionKind.ANSWER]
+    p3 = acts[0].payload
+    eng.submit_qa([QAResult(qid=p3["qid"], verdict="不是",
+                            established_fact_ids=["f9"])],
+                  expect_round=p3.get("expect_round"),
+                  expect_spec_key=p3.get("expect_spec_key"))
+    check("**普通 support fact 仍能由「不是」建立**(没一刀切)",
+          "f9" in eng._established_fact_ids,
+          sorted(eng._established_fact_ids))
+
+    # ---- ④ 正常路径仍然通: 「是」补齐第二条 -> 通关 ----
+    #
+    # 修完之后通关**不能**被一起修坏。这一步证明门是收窄了, 不是关死了。
+    acts = [a for a in say(eng, clk, "u4", "丁", "#他在确认门后有没有人")
+            if a.kind == ActionKind.ANSWER]
+    p4 = acts[0].payload
+    eng.submit_qa([QAResult(qid=p4["qid"], verdict="是",
+                            established_fact_ids=["f2"],
+                            completion_verified_fact_ids=["f2"])],
+                  expect_round=p4.get("expect_round"),
+                  expect_spec_key=p4.get("expect_spec_key"))
+    check("**「是」补齐合同 -> REVEALING**(门没被关死)",
+          eng.phase == Phase.REVEALING, eng.phase)
+    check("确实判为 solved", eng._solved, eng._solved)
+    check("胜者是补齐者(丁)", eng._solved_by == "丁", eng._solved_by)
+
+
 def test_ux_a_collective_solve():
     """Case A: 集体身份题 —— 房间拼齐即通关, 不要求同一人复述。
 
@@ -3992,6 +4116,7 @@ def main():
              test_runtime_spec_key_is_stable_and_distinguishes,
              test_runtime_spec_key_includes_completion_contract,
              # ---- UX-2: 房间共同推理 ----
+             test_task0_no_verdict_never_completes_the_contract,
              test_ux_a_collective_solve,
              test_ux_b_second_fact_completes,
              test_ux_c_touched_is_not_established,
