@@ -2,7 +2,7 @@
 
 Issue #23「按调用阶段配置可插拔模型路由」的回归:
 
-    stage override  ->  AI_MODEL  ->  code default
+    stage override  ->  AI_MODEL  ->  config/models.json  ->  code default
 
 这个套件守的是**否定性**命题居多("配了 stage 不代表别的 stage 也跟着变"
 / "某个 stage 已警告过不代表别的 stage 的错配被吞掉"), 那类命题最容易
@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -166,6 +167,72 @@ def _call(c, fake, **kw):
     finally:
         urllib.request.urlopen = orig
     return r, (fake.bodies[-1] if fake.bodies else None)
+
+
+# ======================================================================
+# 0. 简单 models.json: 日常配置入口 + 优先级
+# ======================================================================
+def test_simple_models_json_config_and_precedence():
+    import story.config as C
+
+    payload = {
+        "default": A,
+        "puzzle.story": B,
+        "puzzle.surface": B,
+    }
+    fd, path = tempfile.mkstemp(prefix="hgt_models_", suffix=".json")
+    import os
+    os.close(fd)
+    old_path = C.MODEL_CONFIG_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        C.MODEL_CONFIG_PATH = path
+        _clean_env()
+
+        cfg = LLMConfig()
+        check("**models.json default 成为全局模型**", cfg.model == A, cfg.model)
+        check("**文件里的 puzzle.story override 生效**",
+              cfg.model_for("puzzle.story") == B, cfg.stage_models)
+        check("**没写的 stage 自动继承 default**",
+              cfg.model_for("qa.judge") == A, cfg.model_for("qa.judge"))
+
+        # env global 优先于文件: 表示“整场先全用 B”, 文件 stage 不再偷偷覆盖。
+        with _Env(AI_MODEL=B):
+            cfg2 = LLMConfig()
+            check("**AI_MODEL 覆盖 models.json default**", cfg2.model == B, cfg2.model)
+            check("**AI_MODEL 同时压掉文件 stage override**",
+                  cfg2.stage_models == {} and cfg2.model_for("puzzle.story") == B,
+                  cfg2.stage_models)
+
+        # 更具体的 env stage 仍然优先于 env global。
+        with _Env(AI_MODEL=B, AI_MODEL_PUZZLE_STORY=A):
+            cfg3 = LLMConfig()
+            check("**AI_MODEL_<STAGE> 高于 AI_MODEL**",
+                  cfg3.model_for("puzzle.story") == A,
+                  cfg3.model_for("puzzle.story"))
+
+        # CLI --model 仍然是整场强覆盖; --model-stage 再单独叠加。
+        c4 = from_args(["--sim", "x.jsonl", "--model", A,
+                        "--model-stage", f"puzzle.story={B}"])
+        check("**CLI 仍是最高优先级**",
+              c4.model_for("puzzle.story") == B if hasattr(c4, "model_for") else
+              c4.llm.model_for("puzzle.story") == B)
+
+        # 配置文件 typo 必须明确失败, 不能静默忽略。
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"default": A, "puzzle.stroy": B}, fh)
+        try:
+            C._load_model_config_file(path)
+            check("**models.json 未知 key 必须报错**", False, "未报错")
+        except ValueError as e:
+            check("**models.json 未知 key 明确报错**", "puzzle.stroy" in str(e), str(e))
+    finally:
+        C.MODEL_CONFIG_PATH = old_path
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ======================================================================
@@ -1147,6 +1214,7 @@ def main():
     print("=" * 64)
     _clean_env()
     for t in (
+        test_simple_models_json_config_and_precedence,
         test_global_model_only_all_stages_fall_back,
         test_single_stage_override_is_isolated,
         test_multiple_stage_overrides_do_not_cross_wires,
