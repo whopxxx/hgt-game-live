@@ -2382,7 +2382,7 @@ def test_r4_provenance_reaches_live_archive():
             "lane": "black",
             "keywords": ["新作", "掘坟"],
             "story_prompt_version": "keyword2-v7",
-            "surface_prompt_version": "surface-v1",
+            "surface_prompt_version": "surface-v2",
             "keyword_seed_version": "keyword2-vocab-v2",
             "keyword_corpus_version": "keyword2-vocab-v2",
             "keyword_session_seed": 14047211878561490874,
@@ -2403,7 +2403,7 @@ def test_r4_provenance_reaches_live_archive():
               m.get("story_prompt_version") == "keyword2-v7",
               m.get("story_prompt_version"))
         check("**archive.metrics.surface_prompt_version**",
-              m.get("surface_prompt_version") == "surface-v1",
+              m.get("surface_prompt_version") == "surface-v2",
               m.get("surface_prompt_version"))
         check("**archive.metrics.keyword_seed_version**",
               m.get("keyword_seed_version") == "keyword2-vocab-v2",

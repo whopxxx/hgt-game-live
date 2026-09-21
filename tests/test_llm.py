@@ -3936,6 +3936,54 @@ def test_r4_surface_prompt_has_no_question_requirement():
     check("说了'不是摘要'", "摘要" in SURFACE_SYSTEM)
 
 
+def test_r4r4_surface_hides_the_why():
+    """**R4-R4**: Surface 必须写**正向**的"藏起真相"规则, 不能只写否定句。
+
+    ## 这条守的是什么
+
+    复审看到一道 61 字汤面写着"祭祖**其实是把活人送进后山溶洞喂怪物**"
+    —— 短是短了, 但汤底核心答案就是这句, 谜底已经被讲掉大半。
+
+    旧措辞是"不解释原因" —— 一个**否定句**。它只否掉了**显式的因果
+    连接词**(因为/所以), 于是模型不写"因为", 但照样把真相**作为陈述
+    说出来**("其实是…")。否定句约束不了它没提到的那些写法。
+
+    ## 所以在测什么
+
+    判据必须**正向且可执行**: 只写角色当时能看到/听到/知道的表面事实,
+    把"为什么如此"的真相全部藏起来。这样模型每写一句都能自问"这是角色
+    当场感知到的, 还是叙述者知道的真相?"。
+
+    ⚠️ 同时**不能**退回"不解释原因"那种否定式 —— 所以这里既断言正向
+    措辞在场, 也断言旧否定句**不再单独承担**这条判据。
+    """
+    print("\n[R4-K2g] Surface 藏起'为什么如此'")
+    # ---- ① 正向规则在场 ----
+    check("说了'能看到、听到、知道'",
+          all(k in SURFACE_SYSTEM for k in ("看到", "听到", "知道")),
+          SURFACE_SYSTEM)
+    check("说了'表面事实'", "表面事实" in SURFACE_SYSTEM)
+    check("**说了把真相藏起来**",
+          "藏起来" in SURFACE_SYSTEM and "真相" in SURFACE_SYSTEM,
+          SURFACE_SYSTEM)
+    check("点名了'为什么如此'", "为什么如此" in SURFACE_SYSTEM)
+    # ---- ② 旧的否定式不再**单独**出现 ----
+    #
+    # ⚠️ 不是"必须删掉这四个字" —— 而是它**不能是唯一**的约束。
+    # 上面 ① 全过就说明正向规则已经写进去了; 这条只是防止有人把
+    # 正向那句删掉、只留回旧措辞。
+    check("**不是只靠'不解释原因'**",
+          ("看到" in SURFACE_SYSTEM) or ("不解释原因" not in SURFACE_SYSTEM),
+          SURFACE_SYSTEM)
+    # ---- ③ tool schema 也要说同一件事 ----
+    #
+    # ⚠️ schema 与 system 是**两份**给模型的指令。只改 system 会让模型
+    # 收到两个不一致的判据 —— 那比两份都旧更糟。
+    desc = _TOOL_SURFACE["input_schema"]["properties"]["puzzle"]["description"]
+    check("**schema 里也有藏真相的要求**",
+          "藏起来" in desc and "表面事实" in desc, desc)
+
+
 def test_r4_no_closing_question_contract():
     """**"谜面必须有结尾问句"整条已删** —— 这是 R4 的核心契约变更。"""
     print("\n[R4-K6] 无结尾问句已合法")
@@ -4041,8 +4089,8 @@ def test_r4_versions_bumped():
     import story.llm as L
     check("STORY_PROMPT_VERSION == keyword2-v7",
           STORY_PROMPT_VERSION == "keyword2-v7", STORY_PROMPT_VERSION)
-    check("SURFACE_PROMPT_VERSION == surface-v1",
-          SURFACE_PROMPT_VERSION == "surface-v1", SURFACE_PROMPT_VERSION)
+    check("SURFACE_PROMPT_VERSION == surface-v2",
+          SURFACE_PROMPT_VERSION == "surface-v2", SURFACE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v10",
           L.CHECK_PROMPT_VERSION == "check-v10", L.CHECK_PROMPT_VERSION)
     check("RIDDLE_PROMPT_VERSION 未动(riddle-v9)",
@@ -4103,7 +4151,7 @@ def test_r4_keyword_spec_runs_three_stages():
     m = spec.metrics or {}
     check("lane 落进 metrics", m.get("lane") in ("red", "black"), m.get("lane"))
     check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v7")
-    check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v1")
+    check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v2")
     check("keywords 落盘", m.get("keywords"), m.get("keywords"))
     check("draw_index 落盘", int(m.get("keyword_draw_index") or 0) >= 1,
           m.get("keyword_draw_index"))
@@ -5112,6 +5160,7 @@ def main():
               test_r4r3_story_has_safety_boundary,
               test_r4r3_livestream_safe_names_the_three_cases,
               test_r4r3_livestream_safe_false_rejects_free_gen,
+              test_r4r4_surface_hides_the_why,
               test_r4_story_schema_has_no_scaffold,
               test_r4_surface_stage_returns_puzzle_only,
               test_r4_surface_prompt_has_no_question_requirement,
