@@ -963,13 +963,26 @@ class LLMResult:
     usage: Optional[dict] = None
     model: Optional[str] = None       # 取自返回体 —— 用于发现静默错配
     tool_input: Optional[dict] = None  # 强制工具调用时, 结构化结果在这里
+    #: 本次调用属于哪个 stage, 以及请求体里**真正**写进去的模型名。
+    #:
+    #: 两个都是 Optional 且带默认值 —— 旧调用方(测试替身、工具脚本)按
+    #: 位置/关键字构造 `LLMResult` 时不受影响, 序列化也不会多出必填字段。
+    #: `model` 的语义**没变**: 它始终是"返回体里那个模型"。
+    stage: Optional[str] = None
+    requested_model: Optional[str] = None
 
 
 class AnthropicMessagesClient:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
         self._url = cfg.base_url.rstrip("/") + "/v1/messages"
-        self._warned_model_mismatch = False
+        # 错配按 (stage, requested, actual) 三元组去重。
+        #
+        # 为什么不能再用一个 bool: 多模型之后每个 stage 的 request/actual
+        # 组合是**独立**的。一个全局 bool 会让第一个错配把后面所有 stage
+        # 的错配全部吞掉 —— 换个模型重配好之后, 另一个 stage 还在错配,
+        # 而日志里一条都不剩。
+        self._warned_model_mismatches: set[tuple[str, str, str]] = set()
 
     # ------------------------------------------------------------------
     def messages(self, system: str, user: str,
@@ -977,8 +990,23 @@ class AnthropicMessagesClient:
                  tool: Optional[dict] = None,
                  temperature: Optional[float] = None,
                  timeout: Optional[float] = None,
-                 max_retries: Optional[int] = None) -> LLMResult:
+                 max_retries: Optional[int] = None,
+                 stage: Optional[str] = None,
+                 model: Optional[str] = None) -> LLMResult:
         """调用 /v1/messages。
+
+        stage: **生产调用必须显式传**。模型由 `cfg.model_for(stage)` 解析
+            (stage override -> 全局 -> 代码默认), 业务代码不决定具体模型名。
+            为什么是调用方传 stage 而不是读全局变量: 只有调用点知道
+            "这一环在干嘛", 而模型选择规则要能集中改。不传 stage 的调用
+            会落回全局模型 —— 那对生产链路是**静默失效**, 所以有一条
+            守卫测试禁止生产 `self.client.messages()` 不带 stage
+            (见 tests/test_llm.py)。
+
+            `None` 是允许的, 只给诊断/测试用(等同于纯全局模型)。
+
+        model: 低层逃生口, **只允许测试/诊断**使用 —— 直接指定模型名,
+            绕过 stage 路由。生产业务路径不应依赖它。
 
         tool: 传 {"name","description","input_schema"} 时, 用 tool_choice
             强制模型以**结构化 JSON** 返回。实测网关支持, 且这是唯一
@@ -1001,8 +1029,11 @@ class AnthropicMessagesClient:
         """
         to = self.cfg.timeout if timeout is None else timeout
         mr = self.cfg.max_retries if max_retries is None else max_retries
+        # 模型解析集中在配置层。传 stage -> 由 `model_for` 查表;
+        # 传 model -> 显式覆盖(测试/诊断)。两者都不传 -> 全局模型。
+        requested_model = model if model is not None else self.cfg.model_for(stage)
         body = {
-            "model": self.cfg.model,
+            "model": requested_model,
             "max_tokens": max_tokens or self.cfg.max_tokens,
             "system": system,
             "messages": [{"role": "user", "content": user}],
@@ -1024,8 +1055,10 @@ class AnthropicMessagesClient:
         last_err = "unknown"
         tool_name = tool["name"] if tool else "(文本)"
         t_call = time.monotonic()
-        _detail("→ LLM %s max_tokens=%s system=%d字 user=%d字\n      user=%s",
-                tool_name, max_tokens or self.cfg.max_tokens,
+        _detail("→ LLM %s stage=%s requested_model=%s max_tokens=%s "
+                "system=%d字 user=%d字\n      user=%s",
+                tool_name, stage or "(未标注)", requested_model,
+                max_tokens or self.cfg.max_tokens,
                 len(system), len(user), _clip(user, 500))
         for attempt in range(mr + 1):
             try:
@@ -1034,10 +1067,13 @@ class AnthropicMessagesClient:
                 with urllib.request.urlopen(req, timeout=to) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 r = self._parse(raw, want_tool=tool is not None,
-                                budget=body.get("max_tokens") or 0)
+                                budget=body.get("max_tokens") or 0,
+                                stage=stage, requested_model=requested_model)
                 u = r.usage or {}
-                _detail("← LLM %s %.1fs in=%s out=%s err=%s\n      结果=%s",
-                        tool_name, time.monotonic() - t_call,
+                _detail("← LLM %s stage=%s requested_model=%s actual_model=%s "
+                        "%.1fs in=%s out=%s err=%s\n      结果=%s",
+                        tool_name, stage or "(未标注)", requested_model,
+                        r.model or "(未回)", time.monotonic() - t_call,
                         u.get("input_tokens", "?"), u.get("output_tokens", "?"),
                         r.error or "无",
                         _clip(r.tool_input if r.tool_input is not None else r.text, 500))
@@ -1051,7 +1087,8 @@ class AnthropicMessagesClient:
                     pass
                 if code not in _RETRYABLE_STATUS:
                     log.warning("LLM HTTP %s (不重试): %s", code, snippet[:120])
-                    return LLMResult(error=f"HTTP {code}: {snippet}")
+                    return LLMResult(error=f"HTTP {code}: {snippet}",
+                                     stage=stage, requested_model=requested_model)
                 last_err = f"HTTP {code}: {snippet}"
                 log.warning("LLM HTTP %s, 第 %d 次重试…", code, attempt + 1)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -1062,7 +1099,8 @@ class AnthropicMessagesClient:
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
                 time.sleep(min(backoff, 8.0))
 
-        return LLMResult(error=f"重试耗尽: {last_err}")
+        return LLMResult(error=f"重试耗尽: {last_err}",
+                         stage=stage, requested_model=requested_model)
 
     # ------------------------------------------------------------------
     def probe_temperature(self) -> tuple[bool, str]:
@@ -1088,7 +1126,7 @@ class AnthropicMessagesClient:
         for t in (0.0, 1.0):
             try:
                 r = self.messages("只回一个数字。", "回 1。", max_tokens=64,
-                                  tool=probe_tool, temperature=t)
+                                  tool=probe_tool, temperature=t, stage="probe")
             except Exception as e:                       # noqa: BLE001
                 return False, f"temperature={t} 调用异常: {e}"
             if r.error:
@@ -1097,17 +1135,26 @@ class AnthropicMessagesClient:
 
     # ------------------------------------------------------------------
     def _parse(self, raw: str, want_tool: bool = False,
-               budget: int = 0) -> LLMResult:
+               budget: int = 0, stage: Optional[str] = None,
+               requested_model: Optional[str] = None) -> LLMResult:
         try:
             d = json.loads(raw)
         except json.JSONDecodeError as e:
-            return LLMResult(error=f"响应非 JSON: {e}: {raw[:200]}")
+            return LLMResult(error=f"响应非 JSON: {e}: {raw[:200]}",
+                             stage=stage, requested_model=requested_model)
 
         got_model = d.get("model")
-        if got_model and got_model != self.cfg.model and not self._warned_model_mismatch:
-            log.warning("模型错配! 请求 %r, 实际返回 %r —— 配置可能无效",
-                        self.cfg.model, got_model)
-            self._warned_model_mismatch = True
+        # 错配判据从 "返回体 != 全局模型" 改成 "返回体 != **本次请求的**模型"。
+        # 多模型下前者是错的: 配了 stage override 时, 网关正确返回 B 也会
+        # 被判成错配(因为 B != 全局 A) —— 那是假警报, 会淹没真警报。
+        req_model = requested_model
+        if (got_model and req_model and got_model != req_model
+                and (stage, req_model, got_model)
+                not in self._warned_model_mismatches):
+            log.warning("模型错配 stage=%s requested=%s actual=%s —— "
+                        "网关静默换了模型, 配置可能无效",
+                        stage or "(未标注)", req_model, got_model)
+            self._warned_model_mismatches.add((stage, req_model, got_model))
 
         text = None
         tool_input = None
@@ -1138,7 +1185,8 @@ class AnthropicMessagesClient:
                     error=f"输出触顶(max_tokens={b}, 实出 {out_tok}), "
                           f"工具调用没写完; 需要调大 max_tokens",
                     text=(text or "").strip()[:200] or None,
-                    model=got_model, usage=d.get("usage"))
+                    model=got_model, usage=d.get("usage"),
+                    stage=stage, requested_model=requested_model)
             # 没触顶却也空 -> 网关抖动, 同样报错(但原因不同)
             #
             # ⚠️ **G4-CF 记账, 本轮不修**: 2026-09-20 的 5 道真实 smoke 里,
@@ -1159,15 +1207,19 @@ class AnthropicMessagesClient:
             return LLMResult(
                 error=f"工具调用返回空 input (stop={stop or '?'})",
                 text=(text or "").strip()[:200] or None,
-                model=got_model, usage=d.get("usage"))
+                model=got_model, usage=d.get("usage"),
+                stage=stage, requested_model=requested_model)
 
         if tool_input is not None:
             return LLMResult(text=(text or "").strip() or None, tool_input=tool_input,
-                             usage=d.get("usage"), model=got_model)
+                             usage=d.get("usage"), model=got_model,
+                             stage=stage, requested_model=requested_model)
         if not text:
             return LLMResult(error=f"响应无文本: {raw[:200]}", model=got_model,
-                             usage=d.get("usage"))
-        return LLMResult(text=text.strip(), usage=d.get("usage"), model=got_model)
+                             usage=d.get("usage"),
+                             stage=stage, requested_model=requested_model)
+        return LLMResult(text=text.strip(), usage=d.get("usage"), model=got_model,
+                         stage=stage, requested_model=requested_model)
 
 
 # ======================================================================
@@ -5156,7 +5208,8 @@ class PuzzleWriter:
             res = self.client.messages(
                 system, text, max_tokens=1500, tool=_TOOL_STORY,
                 temperature=(temperature if temperature is not None
-                             else self._temperature("generate_temperature")))
+                             else self._temperature("generate_temperature")),
+                stage="puzzle.story")
             ti = res.tool_input
             if ti:
                 d = _unwrap_tool_input(ti)
@@ -5212,7 +5265,8 @@ class PuzzleWriter:
             res = self.client.messages(
                 SURFACE_SYSTEM, text, max_tokens=900, tool=_TOOL_SURFACE,
                 temperature=(temperature if temperature is not None
-                             else self._temperature("generate_temperature")))
+                             else self._temperature("generate_temperature")),
+                stage="puzzle.surface")
             ti = res.tool_input
             if ti:
                 d = _unwrap_tool_input(ti)
@@ -5366,7 +5420,8 @@ class PuzzleWriter:
                 return _bail()
             res = self.client.messages(
                 STRUCTURE_SYSTEM, user, max_tokens=4000, tool=_TOOL_STRUCTURE,
-                temperature=self._temperature("generate_temperature"))
+                temperature=self._temperature("generate_temperature"),
+                stage="puzzle.structure")
             if not res.tool_input:
                 last_err = res.error or "结构化没有 tool_input"
                 log.warning("Structurize 第 %d 稿没有 tool_input: %s",
@@ -5679,7 +5734,8 @@ class PuzzleWriter:
         res = self.client.messages(RIDDLE_SYSTEM, user, max_tokens=3500,
                                    tool=_TOOL_RIDDLE,
                                    temperature=self._temperature(
-                                       "generate_temperature"))
+                                       "generate_temperature"),
+                                   stage="puzzle.generate")
         if res.tool_input:
             d = _unwrap_tool_input(res.tool_input)
             spec = _spec_from_tool(d, blueprint=bp)
@@ -5766,7 +5822,8 @@ class PuzzleWriter:
                 + "\n\n【谜面(仅供理解语境, **不得改动**)】\n" + (spec.puzzle or "")
                 + "\n\n【谜底(仅供理解语境, **不得改动**)】\n" + (spec.answer or ""),
                 max_tokens=800, tool=_TOOL_HINT_FIX,
-                temperature=self._temperature("review_temperature"))
+                temperature=self._temperature("review_temperature"),
+                stage="puzzle.hint_repair")
             ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
             hs = ti.get("hints")
             if not isinstance(hs, list):
@@ -6111,7 +6168,8 @@ class PuzzleWriter:
                                    # 只问 curated 那一套(见 `check_tool`)。
                                    tool=check_tool(spec),
                                    temperature=self._temperature(
-                                       "review_temperature"))
+                                       "review_temperature"),
+                                   stage="puzzle.review")
         ti = _unwrap_tool_input(res.tool_input)
         if not isinstance(ti, dict) or not ti.get("decision"):
             # 老网关可能仍回 ok=bool —— 兼容一下, 别让整条链断掉。
@@ -6719,7 +6777,8 @@ class PuzzleWriter:
                                    temperature=self._temperature(
                                        "answer_temperature"),
                                    timeout=timeout,
-                                   max_retries=max_retries)
+                                   max_retries=max_retries,
+                                   stage="qa.answer")
         results: list[QAResult] = []
         if res.tool_input:
             for a in (_unwrap_tool_input(res.tool_input).get("answers") or []):
@@ -7007,7 +7066,8 @@ class PuzzleWriter:
                                        tool=_TOOL_CANDIDATE_RECHECK,
                                        temperature=0,
                                        timeout=timeout,
-                                       max_retries=max_retries)
+                                       max_retries=max_retries,
+                                       stage="qa.candidate_recheck")
             ti = (_unwrap_tool_input(res.tool_input) if res.tool_input
                   else {})
             v = str(ti.get("verdict", "") or "").strip()
@@ -7223,7 +7283,8 @@ class PuzzleWriter:
                                    max_tokens=200,
                                    tool=_TOOL_COMPLETION_VERIFY,
                                    temperature=0,
-                                   timeout=timeout, max_retries=max_retries)
+                                   timeout=timeout, max_retries=max_retries,
+                                   stage="qa.completion_verify")
         ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
         raw_ids = ti.get("matched_completion_fact_ids")
         if not isinstance(raw_ids, list):
@@ -7340,7 +7401,8 @@ class PuzzleWriter:
                 TRUTH_AUDIT_SYSTEM, user, max_tokens=800,
                 tool=_TOOL_TRUTH_AUDIT,
                 temperature=0,
-                timeout=timeout, max_retries=max_retries)
+                timeout=timeout, max_retries=max_retries,
+                stage="puzzle.truth_audit")
         except Exception as e:                  # noqa: BLE001
             log.exception("truth audit 调用异常")
             return self._audit_failed(f"调用异常: {e}")
@@ -7476,7 +7538,8 @@ class PuzzleWriter:
                 res = self.client.messages(
                     SAFETY_SYSTEM, user, max_tokens=400, tool=_TOOL_SAFETY,
                     temperature=0, timeout=timeout,
-                    max_retries=max_retries)
+                    max_retries=max_retries,
+                    stage="puzzle.safety")
             except Exception as e:              # noqa: BLE001
                 last_err = f"调用异常: {e}"
                 log.warning("安全复核第 %d 次调用异常: %s", attempt + 1, e)
@@ -7670,7 +7733,8 @@ class PuzzleWriter:
                                    temperature=self._temperature(
                                        "judge_temperature"),
                                    timeout=timeout,
-                                   max_retries=max_retries)
+                                   max_retries=max_retries,
+                                   stage="qa.judge")
         ti = _unwrap_tool_input(res.tool_input) if res.tool_input else None
         if isinstance(ti, dict) and "cause_hit" in ti:
             is_guess = bool(ti.get("is_guess", True))
@@ -7835,7 +7899,8 @@ class PuzzleWriter:
             res = self.client.messages(HINT_SYSTEM, user, max_tokens=1200,
                                        tool=_TOOL_HINT,
                                        temperature=self._temperature(
-                                           "hint_temperature"))
+                                           "hint_temperature"),
+                                       stage="hint")
             h = None
             if res.tool_input:
                 h = str(_unwrap_tool_input(res.tool_input).get("hint", "") or "").strip()[:60]
@@ -7879,7 +7944,7 @@ class PuzzleWriter:
             f"{who}请向观众揭晓谜底。"
         )
         res = self.client.messages(REVEAL_SYSTEM, user, max_tokens=1200,
-                                   tool=_TOOL_REVEAL)
+                                   tool=_TOOL_REVEAL, stage="reveal")
         if res.tool_input:
             t = str(_unwrap_tool_input(res.tool_input).get("reveal", "") or "").strip()
             return (t[:600] or None), res.error

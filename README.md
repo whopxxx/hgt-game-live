@@ -175,6 +175,48 @@ uv run tests/test_web.py       rem 无头 Chrome 验证布局, 截图 data/previ
 
 ## 配置
 
+### 模型配置（推荐：直接改文件）
+
+日常直播不需要先设置环境变量。直接编辑：
+
+`config/models.json`
+
+最简单只写默认模型：
+
+```json
+{
+  "default": "deepseek-v4.1-flash"
+}
+```
+
+如果只想把“出题创作”换成另一个模型，其余环节继续继承默认模型：
+
+```json
+{
+  "default": "deepseek-v4.1-flash",
+  "puzzle.story": "glm-5.3-flash",
+  "puzzle.surface": "glm-5.3-flash",
+  "puzzle.structure": "glm-5.3-flash"
+}
+```
+
+**不用把所有 stage 都写出来。** 没写的自动继承 `default`。
+
+常用 stage：
+- `puzzle.story` / `puzzle.surface` / `puzzle.structure`：出题创作链
+- `puzzle.review`：审题
+- `puzzle.truth_audit`：真相一致性检查
+- `qa.answer`：直播问答
+- `qa.judge`：猜中判定
+- `hint`：提示
+- `reveal`：揭晓
+
+高级覆盖优先级：
+
+`CLI > 环境变量 > config/models.json > 代码默认值`
+
+所以平时只改 JSON 即可；临时测试某个模型时再用 `--model` / `--model-stage`。
+
 环境变量：`AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` / `AI_TIMEOUT` / `AI_MAX_TOKENS` / `AI_MAX_RETRIES`
 
 常调 CLI 参数：

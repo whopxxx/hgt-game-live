@@ -2,13 +2,14 @@
 # coding: utf-8
 """配置: CLI + 环境变量 + 默认值。
 
-优先级: CLI > env > 默认值。
+优先级: CLI > env > config/models.json > 默认值。
 所有可调项集中在这里, 引擎/客户端只读不可变配置。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,7 +17,252 @@ from typing import Optional
 
 # 网关已知可用的模型。未列出的名字网关会静默 200 并用自己的默认模型回答,
 # 所以必须在启动时校验 —— 见 llm.py。
+#
+# 白名单**不是**"任何字符串都放行"那种摆设: 它挡的正是上面那个静默错模型
+# 的故障。要加新模型走 `AI_SUPPORTED_MODELS_EXTRA`(见 `supported_models()`),
+# 而不是把这个 frozenset 改成空集合 —— 那等于关掉校验。
 SUPPORTED_MODELS = frozenset({"deepseek-v4.1-flash", "glm-5.3-flash"})
+
+#: operator 扩展白名单的环境变量, 逗号分隔。
+#:
+#: 为什么需要它: 网关换模型/上新模型时, 让 operator 能**当场**配置,
+#: 不必改代码重新发版。但仍然必须显式声明 —— 放行任意字符串会把
+#: "静默用默认模型"这个故障重新引回来。
+AI_SUPPORTED_MODELS_EXTRA_ENV = "AI_SUPPORTED_MODELS_EXTRA"
+
+
+def supported_models() -> frozenset[str]:
+    """内置白名单 + `AI_SUPPORTED_MODELS_EXTRA`。
+
+    只做**并集扩展** —— 不能覆盖/收窄内置集合, 否则 operator 一次手滑
+    就能把 deepseek 这类默认模型判成未知, 启动时满屏 warning。
+    """
+    extra = os.environ.get(AI_SUPPORTED_MODELS_EXTRA_ENV) or ""
+    names = {x.strip() for x in extra.split(",") if x.strip()}
+    return SUPPORTED_MODELS | names
+
+
+# ======================================================================
+# LLM stage: "在哪一环调用"这个维度
+# ======================================================================
+# 为什么要有 stage: 以前所有调用共用 `LLMConfig.model`, 于是"创作型调用"
+# (出题/写故事)和"判定型调用"(审稿/裁判/安全)被绑死在同一个模型上。
+# 直播里这两类诉求是相反的 —— 创作要发散, 判定要稳/要低延迟。
+#
+# stage 名必须是**闭集**: 业务代码只传 stage 字符串, 由配置层决定用哪个
+# 模型。散落的裸字符串一旦拼错, 会静默回退到全局模型 —— 那意味着
+# "以为配了 A 模型, 实际整场都在用默认模型", 而且**没有任何地方会报错**。
+# 所以 `model_for()` 对未知 stage 直接抛错, 启动时也会校验 CLI/env 里的 stage 名。
+LLM_STAGES = frozenset({
+    # ---- 出题链(keyword2 + classic + curated) ----
+    "puzzle.story",          # keyword2 隐藏汤底/完整故事
+    "puzzle.surface",        # 从故事提炼谜面反常瞬间
+    "puzzle.structure",      # Story/Surface -> PuzzleSpec
+    "puzzle.generate",       # classic Blueprint 直接生成
+    "puzzle.hint_repair",    # 只修提示
+    "puzzle.review",         # Reviewer(curated 编译链共用这一环)
+    "puzzle.truth_audit",    # 真相/一致性审计
+    "puzzle.safety",         # 直播安全复核
+    # 公开玩家(PublicPlayerCore) —— Issue 的 stage 表里没有单列, 但它是
+    # **生产** LLM 调用(试玩链: director -> PublicPlayerCore.ask)。
+    # 不标 stage 就会静默落回全局模型, 而这条链恰恰是"判定型"调用
+    # (结论决定一道题能不能入池), 所以必须可独立路由。
+    "puzzle.public_player",
+    # ---- 直播 QA ----
+    "qa.answer",             # 问答第一层裁决
+    "qa.candidate_recheck",  # solution candidate 二次核对
+    "qa.completion_verify",  # completion facts 核验
+    "qa.judge",              # 最终猜中判定
+    # ---- 观众侧文案 ----
+    "hint",                  # 动态提示
+    "reveal",                # legacy/动态揭晓文本
+    # ---- 诊断 ----
+    "probe",                 # 启动能力探针; 默认只走 global model
+})
+
+#: stage -> 环境变量名。
+#:
+#: ⚠️ **必须逐条手写, 不得由 `stage.upper().replace(".", "_")` 现算。**
+#:
+#: 现算看着等价, 但它让"变量名"变成 stage 名的**派生值**: 谁改一个 stage
+#: 名, 环境变量名就跟着变。于是线上旧部署里那个手打配好的
+#: `AI_MODEL_PUZZLE_REVIEW` 仍然存在, 却**再也没人读** —— 路由静默退回
+#: 全局模型, 没有任何日志或报错。这正是本 Issue 要消灭的那类故障。
+#:
+#: 写成字面量之后, 改 stage 名会**先撞上这里的 key 对不上**
+#: (见 `_check_stage_env_vars()` 与 tests 里的固定映射断言), 逼人显式
+#: 决定"旧变量名要不要继续认" —— 那才是一个可以 review 的决定。
+STAGE_ENV_VARS: dict[str, str] = {
+    # ---- 出题链(keyword2 + classic + curated) ----
+    "puzzle.story": "AI_MODEL_PUZZLE_STORY",
+    "puzzle.surface": "AI_MODEL_PUZZLE_SURFACE",
+    "puzzle.structure": "AI_MODEL_PUZZLE_STRUCTURE",
+    "puzzle.generate": "AI_MODEL_PUZZLE_GENERATE",
+    "puzzle.hint_repair": "AI_MODEL_PUZZLE_HINT_REPAIR",
+    "puzzle.review": "AI_MODEL_PUZZLE_REVIEW",
+    "puzzle.truth_audit": "AI_MODEL_PUZZLE_TRUTH_AUDIT",
+    "puzzle.safety": "AI_MODEL_PUZZLE_SAFETY",
+    "puzzle.public_player": "AI_MODEL_PUZZLE_PUBLIC_PLAYER",
+    # ---- 直播 QA ----
+    "qa.answer": "AI_MODEL_QA_ANSWER",
+    "qa.candidate_recheck": "AI_MODEL_QA_CANDIDATE_RECHECK",
+    "qa.completion_verify": "AI_MODEL_QA_COMPLETION_VERIFY",
+    "qa.judge": "AI_MODEL_QA_JUDGE",
+    # ---- 观众侧文案 ----
+    "hint": "AI_MODEL_HINT",
+    "reveal": "AI_MODEL_REVEAL",
+    # ---- 诊断 ----
+    "probe": "AI_MODEL_PROBE",
+}
+
+
+def _check_stage_env_vars() -> None:
+    """`STAGE_ENV_VARS` 与 `LLM_STAGES` 必须严格一一对应。
+
+    这个检查在**导入时**跑, 所以忘加/多留一条会当场炸, 而不是等到
+    某天发现"某个 stage 的 env 变量名没人读"。
+
+    覆盖两个方向:
+      * 新增 stage 忘了加映射 -> 该 stage 永远读不到 env override;
+      * 删掉/改名 stage 却留着旧映射 -> 那条是死配置, 而且会让
+        `_env_stage_models()` 产出一个 `model_for()` 不认的 key。
+    """
+    missing = LLM_STAGES - set(STAGE_ENV_VARS)
+    extra = set(STAGE_ENV_VARS) - LLM_STAGES
+    if missing or extra:
+        raise RuntimeError(
+            f"STAGE_ENV_VARS 与 LLM_STAGES 不一致。"
+            f"缺少映射: {sorted(missing)}; 多余映射: {sorted(extra)}。"
+            f"新增/改名 stage 时**必须**在 STAGE_ENV_VARS 里显式加一行 —— "
+            f"不要改回自动推导(那会让环境变量名随 stage 名漂移, 旧部署的"
+            f"配置会静默失效)。")
+    # 名字重复会让两个 stage 抢同一个环境变量, 而两边都以为自己说了算。
+    dupes = {v for v in STAGE_ENV_VARS.values()
+             if list(STAGE_ENV_VARS.values()).count(v) > 1}
+    if dupes:
+        raise RuntimeError(f"STAGE_ENV_VARS 有重复的环境变量名: {sorted(dupes)}")
+
+
+_check_stage_env_vars()
+
+
+# ======================================================================
+# 日常运营用的简单模型配置文件
+# ======================================================================
+# 默认文件跟仓库一起提交。运营时通常只需要改它, 不必先 set 一堆环境变量。
+# 路径相对本文件解析, 所以从任意工作目录启动 director.py 都能找到。
+MODEL_CONFIG_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(__file__), "..", "config", "models.json"))
+
+
+def _load_model_config_file(path: Optional[str] = None) -> tuple[str, dict[str, str]]:
+    """读取 `config/models.json`。
+
+    格式故意保持扁平、可手改:
+
+        {
+          "default": "deepseek-v4.1-flash",
+          "puzzle.story": "glm-5.3-flash",
+          "qa.judge": "deepseek-v4.1-flash"
+        }
+
+    只写想覆盖的 stage; 没写的自动继承 `default`。未知 key / 空模型名
+    直接报错, 防止手滑后静默回退。
+
+    文件不存在时保持旧行为: 代码默认模型 + 没有 stage override。
+    """
+    p = path or MODEL_CONFIG_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return "deepseek-v4.1-flash", {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"模型配置文件 JSON 无效: {p}: {e}") from e
+    except OSError as e:
+        raise ValueError(f"无法读取模型配置文件: {p}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"模型配置文件必须是 JSON object: {p}")
+
+    allowed_keys = {"default"} | set(LLM_STAGES)
+    unknown = sorted(set(raw) - allowed_keys)
+    if unknown:
+        raise ValueError(
+            f"模型配置文件包含未知 key {unknown}; 已知 stage: {sorted(LLM_STAGES)}")
+
+    default = raw.get("default", "deepseek-v4.1-flash")
+    if not isinstance(default, str) or not default.strip():
+        raise ValueError("模型配置文件 default 必须是非空字符串")
+    default = default.strip()
+
+    stages: dict[str, str] = {}
+    for stage in sorted(LLM_STAGES):
+        if stage not in raw:
+            continue
+        model = raw[stage]
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"模型配置文件 {stage} 必须是非空字符串")
+        stages[stage] = model.strip()
+    return default, stages
+
+
+def _configured_global_model() -> str:
+    """AI_MODEL > models.json default > 代码默认值。"""
+    env = os.environ.get("AI_MODEL")
+    if env:
+        return env
+    default, _ = _load_model_config_file()
+    return default
+
+
+def _configured_stage_models() -> dict[str, str]:
+    """解析 stage override。
+
+    优先级: AI_MODEL_<STAGE> > AI_MODEL > 文件 stage > 文件 default。
+    显式 AI_MODEL 表示“整场先全用这个模型”, 因而压掉文件里的 stage
+    override; 更具体的 AI_MODEL_<STAGE> 仍可再次覆盖。
+    """
+    _, file_stages = _load_model_config_file()
+    out = {} if os.environ.get("AI_MODEL") else dict(file_stages)
+    out.update(_env_stage_models())
+    return out
+
+
+def _env_stage_models(environ: Optional[dict] = None) -> dict[str, str]:
+    """从环境变量读 stage override。没设的 stage 不出现在结果里。
+
+    `environ` 供测试注入; 默认读真实的 `os.environ`。
+    """
+    env = os.environ if environ is None else environ
+    out: dict[str, str] = {}
+    for stage, key in STAGE_ENV_VARS.items():
+        v = env.get(key)
+        if v and v.strip():
+            out[stage] = v.strip()
+    return out
+
+
+def parse_model_stage_arg(spec: str) -> tuple[str, str]:
+    """解析 `--model-stage STAGE=MODEL`。返回 (stage, model)。
+
+    校验放在这里(而不是等 `model_for` 兜底), 是为了让**拼错的 stage
+    在启动时就炸** —— 见 `LLM_STAGES` 上面的说明。
+    """
+    if "=" not in spec:
+        raise ValueError(
+            f"--model-stage 需要 STAGE=MODEL 形式, 收到 {spec!r}。"
+            f"例: --model-stage puzzle.story=glm-5.3-flash")
+    stage, _, model = spec.partition("=")
+    stage = stage.strip()
+    model = model.strip()
+    if stage not in LLM_STAGES:
+        raise ValueError(
+            f"未知 stage {stage!r}。已知 stage: {sorted(LLM_STAGES)}(拼错的 "
+            f"stage 会被静默忽略成全局模型, 所以这里直接报错而不是放过)")
+    if not model:
+        raise ValueError(f"--model-stage {stage} 的模型名为空")
+    return stage, model
 
 
 def _env_str(key: str, default: str) -> str:
@@ -82,16 +328,65 @@ class LLMConfig:
 
     base_url: str = field(default_factory=lambda: _env_str("AI_BASE_URL", "http://127.0.0.1:8080"))
     api_key: str = field(default_factory=lambda: _env_str("AI_API_KEY", "11"))
-    model: str = field(default_factory=lambda: _env_str("AI_MODEL", "deepseek-v4.1-flash"))
+    model: str = field(default_factory=_configured_global_model)
+    #: stage -> model 覆盖。**只放显式配过的 stage** —— 没配的走 `model`。
+    #:
+    #: 默认从 `AI_MODEL_<STAGE>` 读。保持"空 = 没配"的语义, 于是
+    #: `--model X` 清空它就能恢复"整场全用 X"的旧语义(见 `from_args`)。
+    stage_models: dict[str, str] = field(default_factory=_configured_stage_models)
     timeout: float = field(default_factory=lambda: _env_float("AI_TIMEOUT", 60.0))
     max_tokens: int = field(default_factory=lambda: _env_int("AI_MAX_TOKENS", 700))
     max_retries: int = field(default_factory=lambda: _env_int("AI_MAX_RETRIES", 3))
+
+    # ------------------------------------------------------------------
+    def model_for(self, stage: str) -> str:
+        """解析某个 stage 最终该用哪个模型。
+
+        未知 stage **抛错**, 不静默回退: 静默回退会让一个拼错的 stage
+        变成"这环用了全局模型", 而配置里明明写着别的模型 —— 那种故障
+        在行为层看不出来, 只能靠这里拦住。
+
+        `stage` 允许为 None(诊断/测试用的无标签调用), 此时直接给全局模型。
+        """
+        if stage is None:
+            return self.model
+        if stage not in LLM_STAGES:
+            raise ValueError(
+                f"未知 LLM stage {stage!r}。已知: {sorted(LLM_STAGES)}")
+        return self.stage_models.get(stage) or self.model
+
+    def resolved_models(self) -> dict[str, str]:
+        """所有 stage 的**最终**模型 —— 给启动日志用, 确认哪一环用了哪个。"""
+        return {s: self.model_for(s) for s in sorted(LLM_STAGES)}
+
+    def set_stage(self, stage: str, model: str) -> None:
+        """显式设置一个 stage 的模型(CLI 用)。stage 必须合法。"""
+        if stage not in LLM_STAGES:
+            raise ValueError(
+                f"未知 LLM stage {stage!r}。已知: {sorted(LLM_STAGES)}")
+        self.stage_models[stage] = model
+
+    def unknown_models(self) -> list[tuple[str, str]]:
+        """返回 [(stage, model), ...] 里模型不在白名单的项。
+
+        global model 用 stage `"(global)"` 表示 —— 让 warning 能说清
+        "是全局配错了"还是"某个 stage 配错了", 而不是笼统报一句"有未知模型"。
+        """
+        allowed = supported_models()
+        bad: list[tuple[str, str]] = []
+        if self.model not in allowed:
+            bad.append(("(global)", self.model))
+        for stage in sorted(LLM_STAGES):
+            m = self.stage_models.get(stage)
+            if m and m not in allowed:
+                bad.append((stage, m))
+        return bad
 
     def masked(self) -> dict[str, str]:
         """用于启动日志 —— key 打码。"""
         key = self.api_key
         shown = (key[:2] + "***") if len(key) > 2 else "***"
-        return {
+        out = {
             "base_url": self.base_url,
             "model": self.model,
             "api_key": shown,
@@ -99,6 +394,12 @@ class LLMConfig:
             "max_tokens": str(self.max_tokens),
             "max_retries": str(self.max_retries),
         }
+        # 只在真的配了 stage override 时才列出 —— 单模型部署的启动日志
+        # 保持旧样子(不然每行都会多出 15 行"和全局一样"的噪音)。
+        if self.stage_models:
+            out["stage_models"] = ", ".join(
+                f"{s}={m}" for s, m in sorted(self.stage_models.items()))
+        return out
 
 
 @dataclass
@@ -646,12 +947,21 @@ class Config:
             raise ValueError("必须指定输入源: --live <id> / --sim <path> / --stdin")
         if n_sources > 1:
             raise ValueError("--live / --sim / --stdin 三者互斥, 只能选一个")
-        if not self.no_llm and self.llm.model not in SUPPORTED_MODELS:
-            # 实测: 网关对未知模型静默返回 200, 所以这里必须显式警告
-            warns.append(
-                f"模型 '{self.llm.model}' 不在已知列表 {sorted(SUPPORTED_MODELS)} 中。"
-                f"网关对未知模型会静默用默认模型回答(HTTP 200), 配置可能是错的。"
-            )
+        if not self.no_llm:
+            # 实测: 网关对未知模型静默返回 200, 所以这里必须显式警告。
+            # 多模型之后**每一处**配置都要查 —— 只查 global 会漏掉
+            # "全局没问题, 但 puzzle.review 配了个错名字"这种情况,
+            # 而那恰恰是本 Issue 引入的新故障面。
+            bad = self.llm.unknown_models()
+            if bad:
+                allowed = sorted(supported_models())
+                where = ", ".join(f"{stage}={model!r}" for stage, model in bad)
+                warns.append(
+                    f"模型不在已知列表 {allowed} 中: {where}。"
+                    f"网关对未知模型会静默用默认模型回答(HTTP 200), "
+                    f"配置可能是错的。要放行新模型请设 "
+                    f"{AI_SUPPORTED_MODELS_EXTRA_ENV}=新模型名。"
+                )
         # 高水位低于低水位 -> 滞回是反的: 补池周期会在启动的那一拍
         # 立刻被判"已到高水位"而清掉, min/target 双双失效, 表现是
         # 池子永远补不起来。这不是"某种可用的配置", 是必然的误配置。
@@ -1025,7 +1335,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--no-llm", action="store_true",
                     help="不调 LLM, 用固定文案(用于快速测状态机)")
-    ap.add_argument("--model", default=None, help="覆盖 AI_MODEL")
+    ap.add_argument("--model", default=None,
+                    help="覆盖 AI_MODEL。**含义是整场全用这个模型** —— "
+                         "它同时清掉环境变量里的 stage override(否则旧脚本"
+                         "里写 --model X 会被某个遗留的 AI_MODEL_PUZZLE_* "
+                         "偷偷改掉)。")
+    ap.add_argument("--model-stage", dest="model_stage", action="append",
+                    default=None, metavar="STAGE=MODEL",
+                    help="按 stage 覆盖模型, 可重复。例: "
+                         "--model-stage puzzle.story=glm-5.3-flash "
+                         "--model-stage qa.answer=deepseek-v4.1-flash。"
+                         "优先级最高, 且**在 --model 之后仍可单独覆盖某个 "
+                         "stage**。stage 名必须是已知 stage, 拼错会启动报错。")
     ap.add_argument("--log-level", default="INFO",
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                     help="控制台日志级别, 默认 INFO")
@@ -1040,8 +1361,25 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
     a = ap.parse_args(argv)
 
     llm = LLMConfig()
-    if a.model:
+    # ---- 模型路由优先级: CLI stage > CLI --model > AI_MODEL_<STAGE> > AI_MODEL ----
+    #
+    # 顺序不能换, 两步都在表达同一件事:
+    #
+    #   1. `--model X` 是**整场强覆盖** —— 所以先清掉 env 里的 stage
+    #      override, 否则旧脚本 `--model X` 会被某个遗留的
+    #      `AI_MODEL_PUZZLE_STORY=Y` 改掉一部分 stage, 而用户看不出来。
+    #   2. `--model-stage` 再叠加上去 —— 于是
+    #      `--model X --model-stage puzzle.story=Y` 的语义是
+    #      "story 用 Y, 其余全用 X", 这正是 Issue 要求的组合。
+    #
+    # 注意 ①`a.model` 必须用 `is not None` 判空串意义上的"提供了": 这里
+    # CLI 只会给 None 或非空串, 但没有理由依赖那个细节。
+    if a.model is not None:
         llm.model = a.model
+        llm.stage_models.clear()          # 全局强覆盖 -> 清掉 env stage overrides
+    for spec in (a.model_stage or []):
+        stage, m = parse_model_stage_arg(spec)
+        llm.set_stage(stage, m)
 
     cfg = Config(
         live_id=a.live_id,

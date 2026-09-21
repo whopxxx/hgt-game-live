@@ -64,11 +64,13 @@ class FakeClient:
         self.cfg = _FakeLLMCfg()
 
     def messages(self, system, user, max_tokens=None, tool=None,
-                 temperature=None, timeout=None, max_retries=None):
+                 temperature=None, timeout=None, max_retries=None,
+                 stage=None, model=None):
         self.calls.append({"system": system, "user": user, "tool": tool,
                            "temperature": temperature,
                            "max_tokens": max_tokens,
-                           "timeout": timeout, "max_retries": max_retries})
+                           "timeout": timeout, "max_retries": max_retries,
+                           "stage": stage})
         name = (tool or {}).get("name")
         if name == "emit_truth_audit":
             # truth audit **不参与队列轮转**: 队列里只有测试**显式**放的
