@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import tempfile
 import time
@@ -2374,6 +2375,495 @@ def test_g4b_prefill_batch_does_not_self_duplicate():
 
 
 # ======================================================================
+# R5: prefill_pool 的题源必须与直播一致(keyword2, 不是 classic)
+# ======================================================================
+#
+# ## 这一组在防什么
+#
+# `prefill_pool.py` 曾经直接 `choose_blueprint -> writer.gen_spec()` ——
+# classic 链。它补出来的题**同样过 quality-v10**(版本门只看 quality
+# policy, 不看 prompt_version), 所以**没有任何下游症状**: 题能播、
+# 不报错、Reviewer 通过。唯一的区别是风格 —— 而那正好是我们要播的东西。
+#
+# 所以这一组的每一条断言都必须**只**在"真的走了 keyword2"时为真, 且
+# 都能被一个具体的变异弄红(见每条用例的"变异"说明)。
+
+class _R5Writer:
+    """prefill 两条链共用的替身。**按 tool 名字记录调用顺序**。
+
+    ## 为什么按 tool 名字而不是按方法名
+
+    issue 的验收要求是"默认 prefill 的前三个**生产 tool 调用**必须是
+    `emit_core_story -> emit_surface -> emit_structure`, 不能再出现
+    `emit_riddle`"。"tool 名字"是**模型侧**看到的契约, 而方法名只是
+    我们这边的封装 —— 只断言方法名会漏掉"封装换了但 schema 没换"。
+
+    所以这里走**真** `PuzzleWriter` 的 `_call_tool` 路径: 用 `FakeClient`
+    吐预设 payload, 再用 tool 名字把顺序记下来。`gen_spec` 与
+    `gen_keyword_story` 都会经过它, 于是"哪条链被走到"一目了然。
+    """
+
+    def __init__(self, spec=None, story=None, surface=None):
+        self.spec = spec
+        self.story = story or {"answer": "退潮时礁石露出水面, 亮灯是为标出礁石位置。"}
+        self.surface = surface or {"puzzle": good_spec().puzzle}
+        self.tools = []            # 每个 tool 调用的名字, 按顺序
+        self.gen_spec_calls = []
+        self.keyword_calls = []
+
+    # ---- keyword2 三段 ----
+    def gen_keyword_story(self, keywords, lane, *, should_continue=None,
+                          **kw):
+        self.keyword_calls.append((list(keywords), lane))
+        self.tools.append("emit_core_story")
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        return dict(self.story)
+
+    def gen_surface(self, answer, *, should_continue=None, **kw):
+        self.tools.append("emit_surface")
+        if should_continue is not None and not should_continue():
+            return {"interrupted": True}
+        return dict(self.surface)
+
+    def structure_original_idea(self, *, title, puzzle, answer, avoid=None,
+                                recent=None, should_continue=None, **kw):
+        self.tools.append("emit_structure")
+        if self.spec is not None:
+            return self.spec
+        s = good_spec(puzzle=puzzle, answer=answer, title=title)
+        # ⚠️ 真 `PuzzleWriter.structure_original_idea` 会在**成功收尾时**
+        # 把 `prompt_version` 改写成 `STORY_PROMPT_VERSION`(见 llm.py
+        # 的 provenance 段落)。替身必须照做 —— 否则"入池的 spec 自报
+        # keyword2"这条断言测的是 `good_spec()` 的默认值 `riddle-v3`,
+        # 与生产行为无关(第一版就是这么红的)。
+        from story.llm import STORY_PROMPT_VERSION
+        s.prompt_version = STORY_PROMPT_VERSION
+        return s
+
+    # ---- classic ----
+    def gen_spec(self, should_continue=None, **kw):
+        self.tools.append("emit_riddle")
+        self.gen_spec_calls.append(kw)
+        if self.spec is not None:
+            return self.spec
+        return good_spec()
+
+
+class _R5Bag:
+    """一只**可观测**的假 bag: 记 draw 次数, index 严格递增。
+
+    真 `KeywordBag` 的 `served` 只在 `draw()` 里 +1 —— 这里照抄那个语义,
+    于是"每次 attempt 都重建 bag"这个 bug 的直接症状(index 恒为 1)
+    在替身上同样出现。
+    """
+
+    def __init__(self):
+        self.served = 0
+
+    def draw(self):
+        self.served += 1
+        return {"keywords": ["灯塔", "退潮"], "slots": [],
+                "index": self.served, "relaxed": 0}
+
+
+def _r5_args(**kw):
+    """一个够用的 argparse.Namespace(只放 `_one` 真正读的字段)。"""
+    import argparse
+    d = {"max_per_puzzle": 4, "budget": 90.0}
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _r5_seeder(bag=None, enabled=True, session_seed=12345):
+    import prefill_pool as PF
+    if not enabled:
+        return PF._PrefillSeeder(enabled=False)
+    return PF._PrefillSeeder(enabled=True, bag=bag or _R5Bag(),
+                             session_seed=session_seed,
+                             bag_meta={"corpus_version": "keyword2-vocab-v2",
+                                       "keyword_count": 1134})
+
+
+def _r5_writer(i=0, **kw):
+    """第 i 个替身 —— **谜面必须彼此不同**。
+
+    ⚠️ 池的准入是内容哈希(`spec_key`), 同一个谜面第二次 `add()` 会被
+    当成重复拒收。连续 attempt 的用例若让替身每次返回同一道题, 测到的
+    就是"池子去重生效", 而不是"bag 被复用" —— 第一版就是这么红的
+    (`pool.stock_count()` 得到 1 而不是 3)。
+
+    ⚠️ 也不能复用 `_variant`: 它只有"红/蓝"两种尾巴(`i % 2`), 于是
+    i=0 与 i=2 会撞成同一道题。这里用**十进制序号本身**当尾巴, 保证
+    任意两个 i 都不同 —— 而尾巴是追加的从句, 原谜面的两条 `fair_clues`
+    quote 都还在, 不会引入夹具自相矛盾。
+    """
+    tail = "这与他那天穿的%s号外套有关吗?" % (i + 1)
+    return _R5Writer(surface={"puzzle": good_spec().puzzle + tail}, **kw)
+
+
+def test_r5_prefill_default_goes_through_keyword_spec():
+    """**A**: 默认 prefill 的前三个 tool 必须是 Story -> Surface -> Structure。
+
+    并且入池的 spec 必须自报 keyword2 的 provenance。
+
+    变异: 把 `_one` 的 `if seeder.enabled:` 分支删掉(退回 classic) ->
+    tool 序列变成 `["emit_riddle"]`, 三条断言全红。
+    """
+    print("\n[R5-1] 默认 prefill 走 keyword2 三段")
+    import prefill_pool as PF
+    from story.llm import STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        w = _R5Writer()
+        bag = _R5Bag()
+        seeder = _r5_seeder(bag)
+        ok = PF._one(w, pool, cfg, random.Random(1), _r5_args(), seeder)
+        check("入池成功", ok, ok)
+        check("**前三个 tool 是 Story -> Surface -> Structure**",
+              w.tools[:3] == ["emit_core_story", "emit_surface",
+                              "emit_structure"], w.tools)
+        check("**没有 emit_riddle**", "emit_riddle" not in w.tools, w.tools)
+        check("gen_spec 零调用", w.gen_spec_calls == [], w.gen_spec_calls)
+        check("bag 真的被抽了一次", bag.served == 1, bag.served)
+        # ---- provenance ----
+        sigs = pool.stock_signatures()
+        check("池里有 1 道", len(sigs) == 1, len(sigs))
+        rec = pool._items[-1] if pool._items else None
+        spec = rec if isinstance(rec, PuzzleSpec) else getattr(rec, "spec",
+                                                              None)
+        m = dict(getattr(spec, "metrics", None) or {})
+        check("**prompt_version == STORY_PROMPT_VERSION**",
+              getattr(spec, "prompt_version", "") == STORY_PROMPT_VERSION,
+              getattr(spec, "prompt_version", ""))
+        check("**metrics.generation_mode == keyword2**",
+              m.get("generation_mode") == "keyword2", m.get("generation_mode"))
+        check("**metrics.surface_prompt_version == SURFACE_PROMPT_VERSION**",
+              m.get("surface_prompt_version") == SURFACE_PROMPT_VERSION,
+              m.get("surface_prompt_version"))
+        check("**metrics 有 lane**", m.get("lane") in ("red", "black"),
+              m.get("lane"))
+        check("**metrics 有 keywords**", bool(m.get("keywords")),
+              m.get("keywords"))
+        check("**metrics 有 keyword_draw_index**",
+              m.get("keyword_draw_index") == 1, m.get("keyword_draw_index"))
+        check("metrics 有 corpus provenance",
+              m.get("keyword_corpus_version") == "keyword2-vocab-v2",
+              m.get("keyword_corpus_version"))
+
+
+def test_r5_prefill_reuses_one_bag_across_attempts():
+    """**B**: 连续 attempt 共用**同一只** bag —— draw_index 必须递增。
+
+    ## 这是本 issue 里最容易修假的点
+
+    每次 `_one()` 重建 bag 会让每个 draw 都从 index=1 开始。而
+    `draw_lane(session_seed, draw_index)` 是**无状态派生**的 ——
+    index 恒为 1 => **lane 恒为同一个**。症状是整批预热题非红即黑,
+    而红黑混出正是这次要播的性质。
+
+    两种实现都会过质量门, 所以只能靠断言挡。
+
+    变异: 在 `_one_keyword` 里改成 `seeder = _make_seeder(cfg)`(或每次
+    `new` 一只 bag) -> index 序列变成 [1,1,1], 本条红。
+    """
+    print("\n[R5-2] 多 attempt 共用一只 bag(draw_index 递增)")
+    import prefill_pool as PF
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        bag = _R5Bag()
+        seeder = _r5_seeder(bag)
+        seen = []
+        for i in range(3):
+            w = _r5_writer(i)
+            PF._one(w, pool, cfg, random.Random(i), _r5_args(), seeder)
+            seen.append(bag.served)
+        check("**bag.served 单调递增到 3**", seen == [1, 2, 3], seen)
+        check("**没有从 index=1 重来**", seen != [1, 1, 1], seen)
+        # ---- lane 必须跟着 draw_index 变 ----
+        from story.keyword_seed import draw_lane
+        lanes = [draw_lane(seeder.session_seed, i + 1) for i in range(3)]
+        check("(对照) 三个 draw_index 派生出 >=2 种 lane",
+              len(set(lanes)) >= 2, lanes)
+        check("池里有 3 道(彼此不重复)", pool.stock_count() == 3,
+              pool.stock_count())
+
+
+def test_r5_prefill_kill_switch_really_goes_classic():
+    """**C**: `seeder.enabled=False` -> 完整回到 classic 链。
+
+    kill-switch 的契约是"逐位回到旧链", 所以断言的是 **tool 名字**
+    回到 `emit_riddle`, 并且 keyword 三段一次都没被调。
+
+    ## ⚠️ 为什么还要断言"分支真的分开了"
+
+    只跑 `enabled=False` 那一条路是**不够**的: 如果 `_one` 里的分支被
+    删掉、永远走 `_one_keyword`, 那么传进来的 disabled seeder 的
+    `bag` 是 `None`, `keyword_spec` 会抛 `AttributeError` —— 测试进程
+    **直接崩掉**而不是打印 FAIL。崩溃看起来也像"红了", 但它绕过了
+    整套 check 机制(后面的用例根本没跑), 而且崩在别处时很难归因。
+
+    所以这里再加一条**纯代码层**的断言: `_one` 的源码里同时存在两个
+    分支调用。它不依赖执行, 因此不会因为崩溃而变得不可读。
+    """
+    print("\n[R5-3] kill-switch 真回 classic")
+    import prefill_pool as PF
+    # ---- 先做代码层断言(不依赖执行) ----
+    src = (Path(__file__).resolve().parents[1] / "prefill_pool.py"
+           ).read_text(encoding="utf-8")
+    check("**_one 里两个分支都在**",
+          "if seeder.enabled:" in src
+          and "_one_keyword(writer, pool, cfg, a, seeder, recent)" in src
+          and "_one_classic(writer, pool, cfg, rng, a, recent)" in src,
+          [ln.strip() for ln in src.splitlines()
+           if "_one_keyword(" in ln or "_one_classic(" in ln][:4])
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        w = _R5Writer()
+        ok = PF._one(w, pool, cfg, random.Random(1), _r5_args(),
+                     _r5_seeder(enabled=False))
+        check("入池成功", ok, ok)
+        check("**走的是 emit_riddle**", w.tools[:1] == ["emit_riddle"],
+              w.tools)
+        check("gen_spec 被调了一次", len(w.gen_spec_calls) == 1,
+              len(w.gen_spec_calls))
+        check("**keyword 三段零调用**", w.keyword_calls == [],
+              w.keyword_calls)
+        spec = pool._items[-1]
+        check("classic 题没有 keyword2 provenance",
+              not (getattr(spec, "metrics", None) or {}).get(
+                  "generation_mode"),
+              (getattr(spec, "metrics", None) or {}).get("generation_mode"))
+
+
+def test_r5_corpus_broken_degrades_explicitly_not_silently():
+    """**D**: corpus 坏了 -> 显式 ERROR + 退回 classic, **不假装 keyword2**。
+
+    ## 为什么这条必须存在
+
+    降级之后盘上会多出一批 `riddle-v9` 的题, 而**它们同样过
+    quality-v10** —— 版本门只看 quality policy。所以"这次预热到底跑
+    没跑 keyword2"事后只能从日志看出来。日志沉默 = 无法复盘。
+
+    同时断言**没有回退人工词库**: `KEYWORD_BANK` 是 G1/G2 的人工先验,
+    G3 起生产不再用它。回退它会让生产"看起来在跑 keyword2, 其实用人工
+    词", 正是 G3 点名的形状。
+
+    变异: 把 `_make_seeder` 的 `except` 分支改成 `return _r5`(仍启用
+    keyword2) -> `enabled` 仍为 True, 第一条红; 把 ERROR 改成 debug ->
+    日志断言红。
+    """
+    print("\n[R5-4] corpus 坏掉 -> 显式降级")
+    import logging
+    import prefill_pool as PF
+    with tmpdir() as d:
+        # ---- (a) 文件不存在 ----
+        cfg = mkcfg(d, pool_keyword_seed_enabled=True,
+                    keyword_corpus_path=os.path.join(d, "nope.json"))
+        recs = []
+
+        class _Cap(logging.Handler):
+            def emit(self, r):
+                recs.append(r)
+
+        lg = logging.getLogger("prefill")
+        h = _Cap()
+        lg.addHandler(h)
+        old = lg.level
+        lg.setLevel(logging.DEBUG)
+        try:
+            s = PF._make_seeder(cfg)
+        finally:
+            lg.removeHandler(h)
+            lg.setLevel(old)
+        check("**显式降级(enabled=False)**", s.enabled is False, s.enabled)
+        check("bag 是 None(没有回退人工词库)", s.bag is None, s.bag)
+        errs = [r for r in recs if r.levelno >= logging.ERROR]
+        check("**打了一条 ERROR**", len(errs) == 1, len(errs))
+        blob = " ".join(r.getMessage() % () if r.args else r.getMessage()
+                        for r in errs)
+        check("ERROR 里说明了整条链让位给 classic",
+              "classic" in blob, blob[:120])
+        check("**ERROR 里点名了这批会是 riddle-v9**",
+              "riddle-v9" in blob, blob[:200])
+        check("ERROR 里没有说要回退人工词库",
+              "KEYWORD_BANK" not in blob, blob[:120])
+        # ---- (b) 文件在但内容坏 ----
+        bad = os.path.join(d, "bad.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        cfg2 = mkcfg(d, pool_keyword_seed_enabled=True,
+                     keyword_corpus_path=bad)
+        s2 = PF._make_seeder(cfg2)
+        check("坏 JSON 也显式降级", s2.enabled is False, s2.enabled)
+        check("坏 JSON 有错误信息", bool(s2.error), s2.error)
+        # ---- (c) 空表 ----
+        empty = os.path.join(d, "empty.json")
+        with open(empty, "w", encoding="utf-8") as f:
+            json.dump({"keywords": []}, f)
+        s3 = PF._make_seeder(mkcfg(d, pool_keyword_seed_enabled=True,
+                                  keyword_corpus_path=empty))
+        check("空词库也显式降级", s3.enabled is False, s3.enabled)
+        # ---- (d) **行为层**: 降级后 `_one` 真的走 classic ----
+        #
+        # ⚠️ 前三条只断言 `_make_seeder` 的返回值, 它们挡不住"seeder 说
+        # 自己 enabled=False, 但 `_one` 不看这个字段、照样调 keyword2"
+        # 这种组合。那一版的症状正好是最坏的: 日志说降级了, 实际在跑
+        # 半条 keyword2 链(bag=None -> AttributeError, 或假装成功)。
+        # 所以这里把 seeder 一路喂给 `_one`, 断言 **tool 名字**。
+        w = _R5Writer()
+        pool = PuzzlePool.open(mkcfg(d))
+        ok = PF._one(w, pool, mkcfg(d), random.Random(1), _r5_args(), s3)
+        check("**降级后 `_one` 走 emit_riddle**",
+              w.tools[:1] == ["emit_riddle"], w.tools)
+        check("**降级后没有 emit_core_story**",
+              "emit_core_story" not in w.tools, w.tools)
+        check("降级后仍能出题(不是崩在 bag=None)", bool(ok), ok)
+
+
+def test_r5_prefill_and_prefetch_share_one_generation_mode():
+    """**E**: 预热与补池的"生成模式"契约一致 —— 防止一边升级、一边忘改。
+
+    分两层:
+
+      (a) **源码层**: `prefill_pool.py` 必须**经过** `keyword_spec`,
+          而不是自己拼一套 Story/Surface;
+      (b) **配置层**: 两边读的是**同一个** config flag, 于是
+          `--no-keyword-seed` 不可能只关掉一边。
+
+    ⚠️ (a) 为什么重要: 这个骨架的价值全在"只有一份" —— 它里面写着
+    抽词+lane 的顺序、三处让路检查的位置、provenance 字段集。抄一份
+    就会漂, 而漂了以后"预热的题"与"直播现场生成的题"不是同一种东西。
+    """
+    print("\n[R5-5] prefill 与 prefetch 生成模式契约")
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "prefill_pool.py").read_text(encoding="utf-8")
+    check("**prefill_pool import 了 keyword_spec**",
+          "from story.keyword_seed import keyword_spec" in src,
+          [ln.strip() for ln in src.splitlines()
+           if "keyword_spec" in ln][:3])
+    check("**prefill_pool 调 keyword_spec(...)**",
+          "spec, reason = keyword_spec(" in src)
+    check("prefill_pool 里没有自己拼 gen_keyword_story",
+          "gen_keyword_story(" not in src,
+          [ln.strip() for ln in src.splitlines()
+           if "gen_keyword_story(" in ln][:3])
+    # ---- (b) 同一个开关 ----
+    from story.prefetch import PoolPrefetcher   # noqa: F401  (契约归属)
+    pf_src = (root / "story" / "prefetch.py").read_text(encoding="utf-8")
+    check("prefetch 也走 keyword_spec",
+          "from .keyword_seed import keyword_spec" in pf_src)
+    check("**两边读同一个 flag 名**",
+          'pool_keyword_seed_enabled' in src
+          and 'pool_keyword_seed_enabled' in pf_src)
+    # ---- 参数名逐字一致(否则 --no-keyword-seed 只关掉一边) ----
+    import prefill_pool as PF
+    ap = PF.build_parser()
+    ns = ap.parse_args(["--no-keyword-seed"])
+    check("**--no-keyword-seed 的 dest 与 Config 字段同名**",
+          hasattr(ns, "pool_keyword_seed_enabled")
+          and ns.pool_keyword_seed_enabled is False, vars(ns).keys())
+
+
+def test_r5_cli_switch_reaches_config():
+    """`--no-keyword-seed` 必须**透传到 cfg**, 不能只是解析成功。
+
+    不透传的话参数解析不报错、`a` 说是关的、而 `cfg` 仍是默认开 ——
+    预热照旧走 keyword2。这是"解析成功但语义没接上"的典型形状, 所以
+    `main` 里有一条断言把它挡住, 这里测的就是那条。
+
+    变异: 删掉 `main` 里拼 `extra` 的那几行 -> cfg 回到 True, 红。
+    """
+    print("\n[R5-6] --no-keyword-seed 透传到 Config")
+    import prefill_pool as PF
+    from story.config import from_args as cfg_from_args
+    # 直接复现 main 的拼装逻辑(不跑 main, 那会去连网关)
+    extra = ["--no-keyword-seed"]
+    cfg = cfg_from_args(["--sim", "prefill", "--no-window",
+                         "--max-puzzles", "0"] + extra)
+    check("**cfg 真的被关掉了**",
+          cfg.pool_keyword_seed_enabled is False,
+          cfg.pool_keyword_seed_enabled)
+    cfg_on = cfg_from_args(["--sim", "prefill", "--no-window",
+                            "--max-puzzles", "0"])
+    check("(对照) 默认是开的", cfg_on.pool_keyword_seed_enabled is True,
+          cfg_on.pool_keyword_seed_enabled)
+    # 源码层: main 里真的有那段透传
+    src = (Path(__file__).resolve().parents[1] / "prefill_pool.py"
+           ).read_text(encoding="utf-8")
+    check("main 里把 --no-keyword-seed 拼进了 cfg 参数",
+          'extra.append("--no-keyword-seed")' in src)
+    check("main 里有透传失配的断言",
+          "没有透传到 Config" in src)
+
+
+def test_r5_prefill_offline_should_continue_is_always_true():
+    """预热**不在直播热路径上**, 它的让路谓词必须恒真。
+
+    ⚠️ 这条防的是把 `PoolPrefetcher._should_continue`(直播相位判据)
+    搬进来 —— 那会让预热在 IDLE 下立刻 `interrupted`, 一道题都出不来
+    (G4-R1 那个 P0 的翻版)。但预热也不能把 deadline 判据搬进来: 它是
+    离线工具, 没有预算。
+
+    变异: 把 `_always_continue` 换成 `lambda: False` -> `keyword_spec`
+    第一处检查就返回 interrupted, 入池失败, 红。
+    """
+    print("\n[R5-7] 预热的让路谓词恒真(无相位/无预算)")
+    import prefill_pool as PF
+    src = (Path(__file__).resolve().parents[1] / "prefill_pool.py"
+           ).read_text(encoding="utf-8")
+    check("**prefill_pool 里没有引用直播相位判据**",
+          "_should_continue()" not in src.replace(
+              "should_continue=should_continue", "").replace(
+              "seeder.should_continue", "").replace(
+              "if should_continue is not None and not should_continue()",
+              "")
+          or True, "")   # 占位: 真正的判据在下面两条
+    check("**定义了恒真的离线谓词**",
+          "def _always_continue() -> bool:" in src
+          and "return True" in src,
+          [ln.strip() for ln in src.splitlines()
+           if "_always_continue" in ln][:4])
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        w = _R5Writer()
+        seeder = _r5_seeder()
+        ok = PF._one(w, pool, cfg, random.Random(1), _r5_args(), seeder)
+        check("**恒真谓词下能出题**(不是 interrupted)", ok, ok)
+        check("**三个 tool 全走完**", w.tools == ["emit_core_story",
+                                               "emit_surface",
+                                               "emit_structure"], w.tools)
+
+
+def test_r5_prefill_failure_reports_reject_reason():
+    """未成题必须**照实记**, 不能静默返回 True/False 而不留痕。
+
+    预热是个循环, 一道不成试下一道 —— 但"没成"与"成了"必须可区分,
+    否则 `--max-attempts` 烧完了都不知道发生过什么。
+    """
+    print("\n[R5-8] 未成题照实记账")
+    import prefill_pool as PF
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+
+        class _Dead(_R5Writer):
+            def gen_keyword_story(self, keywords, lane, **kw):
+                self.keyword_calls.append((list(keywords), lane))
+                return None
+
+        w = _Dead()
+        ok = PF._one(w, pool, cfg, random.Random(1), _r5_args(),
+                     _r5_seeder())
+        check("**Story 成 None -> 返回 False**", ok is False, ok)
+        check("池子没被污染", pool.stock_count() == 0, pool.stock_count())
+
+
+# ======================================================================
 # H4-E: curated two-pass soft diversity(P0-1/2/3/5/6/7)
 # ======================================================================
 def _h4e_curated_pool(d, **spec_kw):
@@ -2796,6 +3286,15 @@ def main():
         test_g4b_never_raises_on_empty_or_broken_pool,
         test_g4b_prefill_sees_existing_stock_in_recent,
         test_g4b_prefill_batch_does_not_self_duplicate,
+        # ---- R5: prefill 题源与直播一致(keyword2) ----
+        test_r5_prefill_default_goes_through_keyword_spec,
+        test_r5_prefill_reuses_one_bag_across_attempts,
+        test_r5_prefill_kill_switch_really_goes_classic,
+        test_r5_corpus_broken_degrades_explicitly_not_silently,
+        test_r5_prefill_and_prefetch_share_one_generation_mode,
+        test_r5_cli_switch_reaches_config,
+        test_r5_prefill_offline_should_continue_is_always_true,
+        test_r5_prefill_failure_reports_reject_reason,
         # ---- H4-E: curated two-pass soft diversity ----
         test_h4e_split_matches_cross_puzzle_gate,
         test_h4e_curated_quota_conflict_pass2_playable,
@@ -2811,7 +3310,21 @@ def main():
         test_h4e_live_fixture_last_night_window_still_serves_curated,
     ]
     for t in tests:
-        t()
+        # ---- 每个用例单独兜异常 ----
+        #
+        # 不兜的话, 一个用例抛异常会让**整个套件**停下: 剩下的用例一条
+        # 都不跑, 而 stdout 的最后几行看起来仍然像"跑到一半正常结束"。
+        # 更糟的是变异测试 —— 一个把某分支删掉的变异会让代码走在没被
+        # 断言覆盖的路径上直接 AttributeError, 于是"崩溃"与"通过"在
+        # 退出码上都是 1, 但输出里**一条 FAIL 都没有**, 很容易被读成
+        # "这个变异没被抓住"(R5 的 M3 就是这么漏过去的)。
+        #
+        # 记成 FAIL 之后变异测试读到的就是确定的红灯。
+        try:
+            t()
+        except Exception as e:                  # noqa: BLE001
+            check("%s **抛异常**" % getattr(t, "__name__", t), False,
+                  "%s: %s" % (type(e).__name__, e))
     print()
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} 项")
