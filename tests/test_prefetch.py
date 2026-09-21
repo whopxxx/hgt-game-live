@@ -1680,10 +1680,12 @@ def test_prefetch_l1_c_max_size_stops_generation():
 
 
 def test_prefetch_l1_e_revealed_window():
-    """**L1-E**: REVEALED 允许补池; REVEALING / SETTING 禁止; QA busy 禁止。
+    """**L1-E + refill-to-target**: 缺货周期 QA busy 也持续补。
 
-    REVEALED 那 30 秒是**最好的**生成窗口 —— 引擎完全空闲, 而且有很大
-    概率赶在下一题就位之前完成(下一题于是直接 pop 池子瞬时切题)。
+    REVEALED 仍是最好的生成窗口；REVEALING / SETTING 仍禁止。
+    但本测试用的是空池，所以进入 QA 后 refill latch 会先启动——此时
+    pending / hint 不再把补池按停。健康库存下 QA busy 不启动由
+    test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy 覆盖。
     """
     print("\n[L1-E] REVEALED 允许补池, REVEALING/SETTING 禁止")
     with tmpdir() as d:
@@ -1719,14 +1721,15 @@ def test_prefetch_l1_e_revealed_window():
             pfi.on_tick()
             check(f"**{ph} -> 禁止**", exi.total == 0, exi.total)
 
-        # QA busy -> 禁止
+        # 空池 + QA busy -> latch 启动后仍持续单飞补池
         exq = _ManualExecutor()
         pfq = mkpf(d, pool=PuzzlePool.open(mkcfg(
             d, pool_path=os.path.join(d, "pq.jsonl"),
             pool_used_path=os.path.join(d, "uq.jsonl"))),
             executor=exq, probe=probe_for(Phase.QA, pending=2))
         pfq.on_tick()
-        check("QA busy -> 禁止", exq.total == 0, exq.total)
+        check("**空池 + QA busy -> 仍允许补池**",
+              exq.total == 1, exq.total)
 
         # QA idle -> 允许(原有行为不许被改坏)
         exi2 = _ManualExecutor()
@@ -1737,14 +1740,15 @@ def test_prefetch_l1_e_revealed_window():
         pfi2.on_tick()
         check("**QA idle -> 允许**", exi2.total == 1, exi2.total)
 
-        # QA + hint 在途 -> 禁止(hint 可能与出题抢配额)
+        # 空池 + QA hint 在途 -> 仍只开一个后台候选，补给优先
         exh = _ManualExecutor()
         pfh = mkpf(d, pool=PuzzlePool.open(mkcfg(
             d, pool_path=os.path.join(d, "ph.jsonl"),
             pool_used_path=os.path.join(d, "uh.jsonl"))),
             executor=exh, probe=probe_for(Phase.QA, hi=True))
         pfh.on_tick()
-        check("QA + hint 在途 -> 禁止", exh.total == 0, exh.total)
+        check("**空池 + QA hint 在途 -> 仍允许补池**",
+              exh.total == 1, exh.total)
 
 
 def test_prefetch_l1_f_current_puzzle_in_avoid():
