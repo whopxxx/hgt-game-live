@@ -334,7 +334,7 @@ def _make_seeder(cfg: Config) -> _PrefillSeeder:
 
 
 def _one(writer, pool: PuzzlePool, cfg: Config, rng, a,
-         seeder: _PrefillSeeder) -> bool:
+         seeder: _PrefillSeeder, should_continue=None) -> bool:
     """试生成一道并入池。返回是否真的进了池子。
 
     ⚠️ 失败**不抛** —— 预热是个循环, 一道不成就试下一道, 让
@@ -351,6 +351,10 @@ def _one(writer, pool: PuzzlePool, cfg: Config, rng, a,
 
     ⚠️ `seeder.bag` **不在这里建**。它由 `_make_seeder` 建一次然后跨
     所有 attempt 共用 —— 见 `_PrefillSeeder` 的说明。
+
+    `should_continue` 默认 None = 离线预热原行为；守护补池会传入
+    "直播 lease 仍未出现"谓词。它一路传到 keyword/classic 的昂贵调用，
+    并在最终 `pool.add` 前再查一次，避免直播启动瞬间的跨进程写竞争。
     """
     # 每一道都**重新读**库存签名 —— 刚补进去的那道必须立刻进入下一道
     # 的 recent, 否则同一个 pair 会连着补好几道(G4-B)。
@@ -359,12 +363,15 @@ def _one(writer, pool: PuzzlePool, cfg: Config, rng, a,
     recent = _recent_sigs(pool, cfg)
 
     if seeder.enabled:
-        return _one_keyword(writer, pool, cfg, a, seeder, recent)
-    return _one_classic(writer, pool, cfg, rng, a, recent)
+        return _one_keyword(writer, pool, cfg, a, seeder, recent,
+                            should_continue=should_continue)
+    return _one_classic(writer, pool, cfg, rng, a, recent,
+                        should_continue=should_continue)
 
 
 def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
-                 seeder: _PrefillSeeder, recent: list) -> bool:
+                 seeder: _PrefillSeeder, recent: list,
+                 should_continue=None) -> bool:
     """keyword2 链: 与 live / prefetch **同一个** `keyword_spec` 入口。
 
     ## 为什么是 import 而不是重写
@@ -390,13 +397,26 @@ def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
     def _always_continue() -> bool:
         return True
 
+    go = should_continue or _always_continue
+    if not go():
+        log.info("预热/守护补池让路: 生成前检测到直播已活跃")
+        return False
+
     spec, reason = keyword_spec(
         writer, seeder.bag, seeder.session_seed,
         avoid=[], recent=recent,
-        should_continue=_always_continue,
+        should_continue=go,
         corpus_version=seeder.corpus_version)
     if spec is None:
-        log.warning("keyword2 未成题(%s; 细因见 metrics.reject)", reason)
+        if reason == "interrupted":
+            log.info("预热/守护补池让路: keyword2 中途检测到直播已活跃")
+        else:
+            log.warning("keyword2 未成题(%s; 细因见 metrics.reject)", reason)
+        return False
+    # 最关键的一次复查：候选已经做完，但直播可能刚在最后一个 LLM
+    # 请求期间启动。此时宁可丢这一稿，也绝不与直播进程并发写 pool。
+    if not go():
+        log.info("预热/守护补池让路: 候选完成后直播已活跃，本稿不入池")
         return False
     if not pool.add(spec, source="prefill"):
         log.warning("入池被拒(继续下一道)")
@@ -405,7 +425,7 @@ def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
 
 
 def _one_classic(writer, pool: PuzzlePool, cfg: Config, rng, a,
-                 recent: list) -> bool:
+                 recent: list, should_continue=None) -> bool:
     """classic 链(逐位不变): `choose_blueprint -> gen_spec` -> riddle-v9。
 
     它是 `--no-keyword-seed` 的 kill-switch —— 不是"废弃路径", 所以
@@ -414,10 +434,15 @@ def _one_classic(writer, pool: PuzzlePool, cfg: Config, rng, a,
     from story.quality import Quotas, choose_blueprint
 
     bp = choose_blueprint(recent, rng=rng, quotas=Quotas.from_config(cfg))
+    go = should_continue or (lambda: True)
+    if not go():
+        log.info("预热/守护补池让路: classic 生成前直播已活跃")
+        return False
     try:
         spec = writer.gen_spec(
             avoid=[], blueprint=bp, recent=recent,
             max_attempts=a.max_per_puzzle, budget_s=a.budget,
+            should_continue=go,
             enforce_blueprint=bp is not None)
     except Exception:                           # noqa: BLE001
         log.exception("生成异常(继续下一道)")
@@ -425,6 +450,9 @@ def _one_classic(writer, pool: PuzzlePool, cfg: Config, rng, a,
     if spec is None or not getattr(spec, "puzzle", "") or spec.error:
         log.warning("生成失败: %s",
                     (spec.error if spec is not None else "spec=None"))
+        return False
+    if not go():
+        log.info("预热/守护补池让路: classic 候选完成后直播已活跃，本稿不入池")
         return False
     if not pool.add(spec, source="prefill"):
         log.warning("入池被拒(继续下一道)")
