@@ -451,7 +451,7 @@ class LLMConfig:
     """LLM 客户端配置。"""
 
     base_url: str = field(default_factory=_configured_base_url)
-    api_key: str = field(default_factory=_configured_api_key)
+    api_key: str = field(default_factory=_configured_api_key, repr=False)
     model: str = field(default_factory=_configured_global_model)
     #: stage -> model 覆盖。**只放显式配过的 stage** —— 没配的走 `model`。
     #:
