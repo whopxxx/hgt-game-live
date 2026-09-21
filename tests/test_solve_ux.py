@@ -751,7 +751,7 @@ def test_closeout_b2_v5_must_have_contract():
     ]
     vr3 = validate_spec(sp3)
     check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
-    check("版本常量确实是 v11", _Q == "quality-v11", _Q)
+    check("版本常量确实是 v12", _Q == "quality-v12", _Q)
     # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
     check("has_completion_contract 仍是运行时判据",
           ident_spec().has_completion_contract())
@@ -813,12 +813,16 @@ def test_closeout_b3_irrelevant_never_establishes():
 
 
 def test_closeout_b3_verdict_matrix():
-    """Blocker 3: verdict/status 矩阵 —— 只有 是/不是 能建立。"""
+    """Blocker 3 + Task 0: completion 只有「是」能建立。
+
+    「不是」仍可建立普通 support/exclusion fact；这里的 f1/f2 都是
+    completion，所以必须被 Engine 的胜利状态硬门拦下。
+    """
     print("\n[B3] established 的 verdict 矩阵")
     from story.parser import NO, UNAVAILABLE, YES
     cases = [
-        (YES, "ok", True, "「是」可以建立"),
-        (NO, "ok", True, "「不是」也可以建立"),
+        (YES, "ok", True, "「是」可以建立 completion"),
+        (NO, "ok", False, "「不是」不能建立 completion"),
         ("无关", "ok", False, "「无关」不能建立"),
         (UNAVAILABLE, "unavailable", False, "「未判定」不能建立"),
         ("揭晓", "ok", False, "「揭晓」不能建立"),
@@ -1239,12 +1243,17 @@ def test_final_closeout_legacy_fallback_still_works():
 
 
 def test_final_closeout_status_must_be_ok():
-    """P1: established 的 status 必须**明确是 ok**(fail closed)。"""
+    """P1 + Task 0: status=ok 是必要条件；completion 还必须 verdict=是。
+
+    这里喂的 f1/f2 都属于 completion contract，所以「不是 + ok」也不得
+    推进胜利状态。普通非 completion fact 的「不是」语义由 Task 0 的
+    Engine 回归单独覆盖。
+    """
     print("\n[final] status 必须明确 ok")
     from story.parser import NO, UNAVAILABLE, YES
     cases = [
-        (YES, "ok", True, "是 + ok -> 建立"),
-        (NO, "ok", True, "不是 + ok -> 建立"),
+        (YES, "ok", True, "是 + ok -> 建立 completion"),
+        (NO, "ok", False, "不是 + ok -> 不建立 completion"),
         ("无关", "ok", False, "无关 + ok -> 不建立"),
         (UNAVAILABLE, "unavailable", False, "未判定 + unavailable -> 不建立"),
         (YES, "unavailable", False, "是 + unavailable -> 不建立"),
@@ -1381,12 +1390,12 @@ def test_v6_versions_bumped():
     from story.llm import (ANSWER_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            RIDDLE_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
-    check("QUALITY_POLICY_VERSION == quality-v11",
-          QUALITY_POLICY_VERSION == "quality-v11", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION == quality-v12",
+          QUALITY_POLICY_VERSION == "quality-v12", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v10",
-          CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v11",
+          CHECK_PROMPT_VERSION == "check-v11", CHECK_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION == answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
     # v8 bump 到 4: discovery_beats 改了 PuzzleSpec 的 schema。
@@ -3493,27 +3502,32 @@ def test_j1_3_and_4_real_core_facts_do_establish():
           rev[0].payload.get("core_answer") if rev else None)
 
 
-def test_j1_5_legitimate_no_still_completes():
-    """J1-5(反向必测): 合法 NO 不能被误杀。
+def test_j1_5_legitimate_no_does_not_complete():
+    """J1-5 + Task 0: 即使 NO 与某条 completion 逻辑等价，也不直接通关。
 
-    completion 就是"飞机没有机械故障", 而观众问"飞机有机械故障吗?",
-    "不是"**直接等价于**该 fact —— 必须建立、必须能通关。
+    Task 0 把胜利状态收窄成一个更保守、可观察的产品契约:
+    **只有公开裁决「是」才能推进 completion**。所以这里即使上游认为
+    "飞机有机械故障吗?" -> "不是" 等价于 hidden completion，Engine
+    仍必须挡住这条胜利贡献。
 
-    这条与 J1-1 一起构成"不是禁止 NO, 而是禁止 hidden-truth leap"。
+    这不会禁掉 NO 的普通信息价值：support/exclusion 的 NO 仍可建立，
+    由 test_j1_b_noncompletion_ids_pass_through 单独覆盖。
     """
-    print("\n[J1-5] 合法 NO 仍能建立事实")
+    print("\n[J1-5/Task0] 合法 NO 仍不推进 completion")
     sp = plane_spec()
     eng, clk = boot(sp)
     ask(eng, clk, "u1", "甲", "飞机有机械故障吗", verdict="不是",
         established_fact_ids=["f1"])
-    check("**f1 被建立**", eng._established_fact_ids == {"f1"},
+    check("**f1 completion 未被建立**", eng._established_fact_ids == set(),
           eng._established_fact_ids)
-    check("直接通关(合同只有 1 条)",
-          eng.phase == Phase.REVEALING, eng.phase)
-    check("胜者是甲", eng._solved_by == "甲", eng._solved_by)
+    check("合同只有 1 条也**不能**由 NO 直接通关",
+          eng.phase == Phase.QA, eng.phase)
+    check("没有胜者", not eng._solved_by, eng._solved_by)
     c = eng._reveal_contributors_locked()
-    check("贡献链 1 条且 is_final", len(c) == 1 and c[0]["is_final"] is True, c)
-    check("裁决显示为'不是'", c and c[0]["verdict"] == "不是", c)
+    check("NO 不进入 completion 贡献链", c == [], c)
+    qa = [x for x in eng._qa_archive if x.kind == "qa"]
+    check("公开裁决仍正常记录为'不是'",
+          qa and qa[-1].verdict == "不是", qa[-1].verdict if qa else None)
 
 
 def test_j1_6_keyword_hit_is_not_proposition():
@@ -3768,7 +3782,7 @@ def main():
         test_j1_1_wrong_exclusion_is_not_a_completion,
         test_j1_2_verifier_must_reject_the_no_leap,
         test_j1_3_and_4_real_core_facts_do_establish,
-        test_j1_5_legitimate_no_still_completes,
+        test_j1_5_legitimate_no_does_not_complete,
         test_j1_6_keyword_hit_is_not_proposition,
         test_j1_b_invariant_contribution_subset_of_verified,
         test_j1_b_noncompletion_ids_pass_through,

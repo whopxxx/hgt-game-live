@@ -2042,7 +2042,7 @@ def test_archive_reveal_carries_quality_and_safety_evidence():
                            "core_answer_direct": True},
         "safety_verified": False,
         "safety_reason": "血腥细节",
-        "safety_prompt_version": "safety-v1",
+        "safety_prompt_version": "safety-v2",
         "safety_verify_calls": 2,
         "safety_technical_fail": 0,
     }
@@ -2061,7 +2061,7 @@ def test_archive_reveal_carries_quality_and_safety_evidence():
     check("**safety_reason 进了真文件**",
           m.get("safety_reason") == "血腥细节", m.get("safety_reason"))
     check("**safety_prompt_version 进了真文件**",
-          m.get("safety_prompt_version") == "safety-v1",
+          m.get("safety_prompt_version") == "safety-v2",
           m.get("safety_prompt_version"))
     check("**safety_verify_calls 进了真文件(且是 2)**",
           m.get("safety_verify_calls") == 2, m.get("safety_verify_calls"))
@@ -3046,7 +3046,7 @@ def test_task0_no_verdict_never_completes_the_contract():
                                fact_ids=["f2"])],
         fair_clues=[FairClue(quote="从不锁门", supports_atoms=["a1"])],
         hints=["注意锁", "注意他看的方向", "注意门"],
-        prompt_version="riddle-v7", quality_policy_version="quality-v11")
+        prompt_version="riddle-v7", quality_policy_version="quality-v12")
 
     clk = FakeClock()
     eng = RoundEngine(mkcfg(), clock=clk)

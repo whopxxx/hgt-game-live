@@ -672,8 +672,13 @@ def test_apply_review_end_to_end_with_false_signals():
     # `tests/test_curated_compile.py` 的 33 条测试覆盖。这里补的是
     # **一个静态事实** —— 调用点读的是契约函数, 不是某个常量清单。
     src = inspect.getsource(_llm)
-    check("**`_apply_review` 用 `_quality_check_contract(spec)` 取清单**",
-          "for n in _quality_check_contract(spec)" in src)
+    # ⚠️ R8-A: 调用点从 `_quality_check_contract` 改成 `_gate_fields` ——
+    # 前者是"索要清单"(9 项, 含 3 个 signal), 后者是"拒稿判据"(6 项)。
+    # 两者从 R8-A 起**不再相等**, 而"拿索要清单当门"正是 R8-A 要修的 bug。
+    check("**`_apply_review` 用 `_gate_fields(spec)` 取拒稿判据**",
+          "for n in _gate_fields(spec)" in src)
+    check("**`_apply_review` 不再用索要清单当门**",
+          "for n in _quality_check_contract(spec)" not in src)
     check("**`_apply_review` 不再直接遍历 `_QUALITY_CHECK_FIELDS`**",
           "for n in _QUALITY_CHECK_FIELDS" not in src)
     # 反向: Reviewer 的 prompt 分派也必须按题, 否则 curated 题会被按
@@ -746,11 +751,21 @@ def test_h4d1_section5_boundary_product_rulings():
     # 死亡作为普通剧情事实 = 可以 —— 断言的是"没有 death 这条门"
     check("**② 没有一条门叫 death**(死亡本身不是拒绝理由)",
           "death" not in _llm._CURATED_HARD_CHECK_FIELDS)
-    check("**② livestream_safe 的判据写明了'普通死亡可以'**",
-          # ⚠️ R4-R3 把措辞从"死亡作为普通剧情事实"改成"**普通死亡**(不涉及
-          # 下面三类的)作为剧情事实" —— 因为旧措辞太宽, 自伤/性暴力/血腥
-          # 那三类也算"死亡", 于是从它底下漏了过去。这里钉的是**新**措辞。
-          "普通死亡" in _llm.check_tool(
+    check("**② livestream_safe 的判据写明了'普通非血腥死亡可以'**",
+          # ⚠️ 措辞演进:
+          #   R4-R3 从"死亡作为普通剧情事实"改成"**普通死亡**(不涉及下面
+          #     三类的)作为剧情事实" —— 旧措辞太宽, 自伤/性暴力/血腥那三类
+          #     也算"死亡", 于是从它底下漏过去了。
+          #   R8-A 再改成"**普通、非血腥**的死亡 / 犯罪 / 谋杀 / 亡魂 /
+          #     鬼怪 / 恐怖氛围 —— 即使它是谜底核心 —— 都不因此判 false"。
+          #     原因是上一版仍有泛化措辞("会不会变成拿惨案当乐子"), 模型
+          #     自行扩张成"死亡/亡魂/犯罪是核心 = 不安全", 把大量可播题判死。
+          # 这里钉**当前**措辞的核心语义: 非血腥 + 死亡。
+          "非血腥" in _llm.check_tool(
+              type("S", (), {"source_type": "curated"})()
+          )["input_schema"]["properties"]["quality_checks"]
+          ["properties"]["livestream_safe"]["description"]
+          and "死亡" in _llm.check_tool(
               type("S", (), {"source_type": "curated"})()
           )["input_schema"]["properties"]["quality_checks"]
           ["properties"]["livestream_safe"]["description"])
