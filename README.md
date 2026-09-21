@@ -212,6 +212,8 @@ copy config\llm.example.json config\llm.local.json
 - `default`：所有未单独配置 stage 的默认模型
 - `puzzle.story` 等：只覆盖指定环节；**不用把 16 个 stage 全写出来**
 - `timeout / max_tokens / max_retries`：全局 LLM 调用默认预算，可省略
+- 如果要用内置白名单之外的新模型，可选加：
+  `"supported_models_extra": ["你的新模型名"]`
 
 如果你只想换默认模型，甚至可以只写：
 
