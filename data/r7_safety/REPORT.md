@@ -13,6 +13,32 @@
 | 1 | `quality_checks` / `safety_*` 只在 `spec.metrics`, **正式直播 `puzzle.jsonl` 会丢** | 补进 `director._round_metrics()` 白名单 |
 | 2 | `safety_verify_calls` 恒记 1, 但技术重试时实际调用 2 次 | `verify_safety` 回传真实 `calls`; 两处调用点照抄 |
 | 3 | 技术失败后、重试前直播变忙 -> `interrupted` 被误记成 `safety_technical_fail` | `interrupted` 独立成字段, **优先于** `technical` 被读; gen_spec 走 `break`(让路不是失败, 换稿只会再撞) |
+| 4 | `int(sv.get("calls") or 1)` 会把 **0 次调用的即时让路**虚记成 1 | 两处调用点改 `or 0`(见下) |
+| 5 | 只测了 `_round_metrics()`, 没守住完整正式归档链 | 补 `test_archive_reveal_carries_quality_and_safety_evidence`(见下) |
+
+### 4) `or 0` 而不是 `or 1`
+
+`verify_safety` 的 `calls` **确实是 0 或 1 或 2**。`calls == 0` 的语义是
+"进了复核、但循环开头那道 `_stop()` 就命中了, 一次都没发出去" ——
+这正是**直播最忙**的场景, 也是最该在复盘里看出"复核根本没跑"的时候。
+用 `or 1` 恰好把它虚记成"跑了一次"。
+
+⚠️ **变异测试的诚实记录**: 把消费端那行从 `or 0` 改回 `or 1`,
+`(a)`/`(b)` 两条断言**都抓不住** —— 因为 `calls == 0` 的返回**走不到**
+那一行(外层那道 `_stop()` 闸先 `break` 了), 而 `(b)` 直接调
+`verify_safety`, 绕过了消费端。所以补了一条 `(c)`: 把 `verify_safety`
+换成桩、直接喂 `calls == 0` 的返回值, 单独钉住那一行。改回 `or 1` 后
+`(c)` 变红(其余仍绿) —— 这才算真的守住了。
+
+### 5) 完整归档链回归(`test_engine.py`)
+
+`_round_metrics` 只是"算一份 dict"; 决定**直播 `puzzle.jsonl` 里到底有
+什么**的是 `_archive_reveal` -> `json.dumps` -> 写文件这一整条。中间任何
+一步漏字段, 单测 `_round_metrics` 都看不见。新用例真写临时文件、真读回
+JSON, 断言的就是下一轮复盘会拿到的那份。
+
+变异验证: 把 `"quality_checks": dict(gen.get(...))` 改成 `{}` -> 红;
+把 `"safety_verified"` 写死 `None` -> 红。
 
 rebase 后 `git diff --stat origin/main...HEAD` **不再含** `prefill_pool.py` /
 `data/r5_prefill/*` —— 那是第 0 项的验收。

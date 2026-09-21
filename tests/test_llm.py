@@ -4304,6 +4304,85 @@ def test_r7_safety_verify_calls_counts_real_attempts():
     check("**重试后放行, 题是成的**", bool(s2.puzzle or ""),
           (s2.puzzle or "")[:40])
 
+    # ---- ③ **0 次调用**的让路 -> 绝不能虚记成 1 ----
+    #
+    # ⚠️ 这一条是复审点出来的: `calls` 用 `or 1` 兜底时, "复核一次都没
+    # 发出去"会被记成"发了 1 次"。而这恰恰是**直播最忙**的场景 —— 也就
+    # 是最该在复盘里看出"复核根本没跑"的时候, 指标反而说它跑了一次。
+    #
+    # 0 次有**两个**入口, 都要钉:
+    #   (a) `gen_spec` 外层那道 `_stop()` 闸先命中 -> `verify_safety`
+    #       根本没进, **不该**留下任何计数(不是 0, 是"没有这个键")。
+    #       这与 `safety_verified` 的缺省约定一致: 没发生 ≠ 发生了且为 0。
+    #   (b) 进了 `verify_safety`、循环开头那道闸命中 -> 返回 `calls == 0`,
+    #       此时才该**显式**记 0。这一条直接调 `verify_safety` 验,
+    #       因为它在外层闸放行之后才可能出现, 用 `gen_spec` 驱动没法
+    #       稳定地把谓词翻转卡在两道闸之间。
+    base3 = review_ok()
+    base3["decision"] = "pass"
+    base3["quality_checks"]["livestream_safe"] = True
+
+    # ---- (a) 外层闸命中: 不留幻影计数 ----
+    fc3 = FakeClient([LLMResult(tool_input=riddle()),
+                      LLMResult(tool_input=base3)])
+    w3 = PuzzleWriter(client=fc3, runtime_cfg=fc3.runtime_cfg)
+    with _ctx.suppress(Exception):
+        s3 = w3.gen_spec(blueprint=fc3.default_blueprint, max_attempts=1,
+                         should_continue=lambda: False)
+    m3 = s3.metrics or {}
+    sent3 = sum(1 for c in fc3.calls
+                if (c.get("tool") or {}).get("name") == "emit_safety_check")
+    check("**外层让路: 复核一次都没发出去**", sent3 == 0, sent3)
+    check("**外层让路: 不留 safety_verify_calls(没发生 ≠ 记 0)**",
+          "safety_verify_calls" not in m3, m3.get("safety_verify_calls"))
+    check("**外层让路: 顶层 interrupted 立起来**",
+          m3.get("interrupted") is True, m3.get("interrupted"))
+
+    # ---- (b) 复核内部闸命中: 显式返回 calls == 0 ----
+    w4 = PuzzleWriter(client=FakeClient([]), runtime_cfg=getattr(w3, "runtime_cfg", None))
+    sv0 = w4.verify_safety(puzzle="谜面在。", answer="谜底。",
+                           should_continue=lambda: False)
+    check("**内部让路: verify_safety 回传 calls == 0(不是 1)**",
+          (sv0 or {}).get("calls") == 0, (sv0 or {}).get("calls"))
+    check("**内部让路: 标成 interrupted, 不是内容判定**",
+          (sv0 or {}).get("interrupted") is True
+          and (sv0 or {}).get("technical") is True, sv0)
+
+    # ---- (c) 消费端那一行: `or 0` 不能被改成 `or 1` ----
+    #
+    # ⚠️ (a)/(b) 都守不住这一行 —— 变异实测:
+    #     把 `int(sv.get("calls") or 0)` 改成 `or 1`  ->  **全绿**
+    #   因为 `calls == 0` 的返回**走不到**这一行(外层那道 `_stop()` 闸先
+    #   break 了), 而 (b) 直接调 `verify_safety`, 绕过了消费端。所以这里
+    #   把 `verify_safety` 换成桩, 直接喂一个 `calls == 0` 的返回值, 把这
+    #   一行单独钉住。
+    base5 = review_ok()
+    base5["decision"] = "pass"
+    base5["quality_checks"]["livestream_safe"] = True
+    fc5 = FakeClient([LLMResult(tool_input=riddle()),
+                      LLMResult(tool_input=base5),
+                      _truth_tool()])
+    w5 = PuzzleWriter(client=fc5, runtime_cfg=fc5.runtime_cfg)
+    _real_vs = PuzzleWriter.verify_safety
+
+    def _vs_zero(self, *a, **kw):
+        return {"livestream_safe": False, "technical": True,
+                "why": "让路", "interrupted": True, "calls": 0}
+
+    PuzzleWriter.verify_safety = _vs_zero
+    try:
+        with _ctx.suppress(Exception):
+            s5 = w5.gen_spec(blueprint=fc5.default_blueprint, max_attempts=1)
+    finally:
+        PuzzleWriter.verify_safety = _real_vs
+    m5 = s5.metrics or {}
+    check("**消费端: calls=0 的返回必须记成 0**",
+          m5.get("safety_verify_calls") == 0,
+          m5.get("safety_verify_calls"))
+    check("**消费端: 让路仍然不记 safety_technical_fail**",
+          m5.get("safety_technical_fail") is None,
+          m5.get("safety_technical_fail"))
+
 
 def test_r7_interrupted_is_not_a_technical_fail():
     """**R7 复审**: 复核让路(直播变忙)**不得**记成 `safety_technical_fail`。

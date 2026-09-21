@@ -4747,9 +4747,15 @@ class PuzzleWriter:
                 break
             sv = self.verify_safety(spec=spec, should_continue=should_continue)
             if sv is not None:
+                # ⚠️ `or 0`, **不是** `or 1`。`verify_safety` 在"进了循环
+                # 但一次都没发出去就 _stop()"时返回 `calls == 0` —— 那是
+                # 真实发生过的状态(复核内部第一道闸命中), 用 `or 1` 会把它
+                # 虚记成"跑了一次"。缺省用 0 是防御性的: 正常返回路径一定
+                # 带 `calls`, 真到了缺省就说明返回形状坏了, 记 0 比记 1
+                # 更接近"没有证据说明它跑了"。
                 m["safety_verify_calls"] = (
                     m.get("safety_verify_calls", 0)
-                    + int(sv.get("calls") or 1))
+                    + int(sv.get("calls") or 0))
                 m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
                 if sv.get("interrupted"):
                     log.info("出题第 %d 稿: 安全复核让路(直播变忙)",
@@ -5363,7 +5369,7 @@ class PuzzleWriter:
             return _bail()
         sv = self.verify_safety(spec=spec, should_continue=should_continue)
         if sv is not None:
-            m["safety_verify_calls"] = int(sv.get("calls") or 1)
+            m["safety_verify_calls"] = int(sv.get("calls") or 0)
             m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
             if sv.get("interrupted"):
                 # ⚠️ `_bail()` 是靠 `interrupted["v"]` 决定走让路出口的
@@ -7265,6 +7271,18 @@ class PuzzleWriter:
                 调用方必须据 `interrupted` 走让路那条路(不记
                 `safety_technical_fail`、不退避), 见下。
             None  输入本身为空(上游硬校验已经拒了, 不该走到这)
+
+        ## ⚠️ `calls` 可能是 **0**
+
+        让路有**两个**时机, 别把"0 次"当成"没数据":
+
+            进入循环前就 _stop()  -> calls == 0(一次都没发出去)
+            第 1 次发完才 _stop() -> calls == 1(发了 1 次, 没发第 2 次)
+
+        两种都是让路, 但对"这一轮到底花了多少次复核调用"来说差别是实打实
+        的。所以调用方**必须**写 `int(sv.get("calls") or 0)`: 用 `or 1`
+        会把第一次即时让路虚记成 1 次, 而那正好是直播最忙、最该看得出
+        "复核根本没跑"的场景。
 
         ## 为什么它只看 puzzle + answer
 
