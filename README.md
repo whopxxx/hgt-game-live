@@ -177,7 +177,7 @@ uv run tests/test_web.py       rem 无头 Chrome 验证布局, 截图 data/previ
 
 ### LLM 配置（推荐：只改一个本地文件）
 
-第一次配置时，把示例复制成你的本地配置：
+第一次配置时，把安全示例复制成你的本地配置：
 
 ```bat
 copy config\llm.example.json config\llm.local.json
@@ -187,7 +187,29 @@ copy config\llm.example.json config\llm.local.json
 
 `config/llm.local.json`
 
-完整但仍然很简单：
+默认模板不会改变当前模型路由，只需要填 API 地址和 key：
+
+```json
+{
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "你的 API key",
+  "default": "deepseek-v4.1-flash",
+  "timeout": 60,
+  "max_tokens": 700,
+  "max_retries": 3
+}
+```
+
+含义：
+
+- `base_url`：Anthropic-compatible API 根地址；程序会自己拼 `/v1/messages`
+- `api_key`：API key
+- `default`：所有未单独配置 stage 的默认模型
+- `timeout / max_tokens / max_retries`：全局 LLM 调用默认预算，可省略
+- 如果要用内置白名单之外的新模型，可选加：
+  `"supported_models_extra": ["你的新模型名"]`
+
+如果只想把“出题创作”换成另一个模型，再额外加这几行即可：
 
 ```json
 {
@@ -197,33 +219,11 @@ copy config\llm.example.json config\llm.local.json
 
   "puzzle.story": "glm-5.3-flash",
   "puzzle.surface": "glm-5.3-flash",
-  "puzzle.structure": "glm-5.3-flash",
-
-  "timeout": 60,
-  "max_tokens": 700,
-  "max_retries": 3
+  "puzzle.structure": "glm-5.3-flash"
 }
 ```
 
-含义：
-
-- `base_url`：Anthropic-compatible API 地址
-- `api_key`：API key
-- `default`：所有未单独配置 stage 的默认模型
-- `puzzle.story` 等：只覆盖指定环节；**不用把 16 个 stage 全写出来**
-- `timeout / max_tokens / max_retries`：全局 LLM 调用默认预算，可省略
-- 如果要用内置白名单之外的新模型，可选加：
-  `"supported_models_extra": ["你的新模型名"]`
-
-如果你只想换默认模型，甚至可以只写：
-
-```json
-{
-  "base_url": "http://127.0.0.1:8080",
-  "api_key": "你的 API key",
-  "default": "deepseek-v4.1-flash"
-}
-```
+**不用把 16 个 stage 全写出来。** 没写的自动继承 `default`。
 
 常用 stage：
 
