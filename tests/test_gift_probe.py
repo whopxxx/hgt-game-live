@@ -495,23 +495,30 @@ def test_three_layer_counts_are_distinguishable():
     check("一层: 见到 2 条 Gift-family method",
           c.gift_method_seen == 2, c.summary())
     check("二层: primary 解析成功 1 条", c.parsed_gift_count == 1)
-    check("三层: 业务回调 1 次", c.emitted_gift_count == 1)
-    check("回调真的被调用", len(emitted) == 1, len(emitted))
+    check("三层: dry-run 回调 1 次", c.emitted_gift_count == 1)
+    # ⚠️ 这里**不**断言测试自己的 `emitted` 记录器被调用 —— 诊断模式走的
+    # 是**干跑 handler**, 它不经过 `_on_gift`。断言那个记录器等于在测一条
+    # 诊断模式根本不走的路(那正是上一版假绿的形式)。真正要验的是
+    # `emitted_gift_count`(见 GP-11 的干跑段落与 GP-20 的端到端)。
     check("未处理计数单独存在", c.unhandled_counts.get(
         "WebcastGiftSortMessage") == 1, c.unhandled_counts)
     check("三层不是同一个数(可区分)",
           len({c.gift_method_seen, c.parsed_gift_count,
                c.emitted_gift_count}) > 1)
 
-    # --- parsed=0 且 seen>0: 走 unhandled 分支 ---
+    # --- 诊断模式的两个业务开关都关时, Gift **仍然要走完整链路** ---
     #
-    # 诊断模式把两个业务开关**都关**(它不接业务链), 于是基线根本不注册
-    # Gift handler, `WebcastGiftMessage` 会走 `unhandled`。这是诊断模式的
-    # 真实处境 —— 判据必须指向 **dispatch 层**, 而不是假装"没有 Gift"。
+    # ⚠️ 这是 Blocker 2 的回归测试, 也是本套件最要紧的一条。
     #
-    # 同时: 语义采样仍然发生(探针独立解析), 否则诊断模式在生产配置下
-    # 什么都看不到。但那**不**推进 `parsed_gift_count` —— 那个计数属于
-    # proto 层判据, 参见过滤说明。
+    # 诊断连接不接业务回调(免得污染 SummonLedger / Engine), 所以
+    # `keep_all` 与 `interaction_enabled` **都是 False**。上一版就是止步于
+    # 此: 基线于是根本不注册 `WebcastGiftMessage`, 每一份礼物都掉进
+    # `unhandled` -> `verdict()` 恒为 `dispatch` -> proto 层与 callback 层
+    # **永远不可达**。真实直播里那条链等于答不了 Issue #17 的第 3~5 问。
+    #
+    # 修法是给诊断连接一条自己的**干跑链路**(注册 handler -> 真解析 ->
+    # 只写诊断 sink 的回调)。这里就在**两开关都关**的配置下验证那条链路
+    # 真的贯通 —— 与真实 runner 的配置完全一致。
     d0 = mkdtemp()
     c0 = ProfileCounters(PROFILE_A)
     st0 = RawCaptureStore(d0, "s", PROFILE_A, max_per_method=50)
@@ -520,45 +527,57 @@ def test_three_layer_counts_are_distinguishable():
                        interaction_enabled=False, base=CallbackFetcher2())
     f0._wsOnMessage(None, _frame([("WebcastGiftMessage", gp, 5)]))
     check("诊断(两开关都关): seen=1", c0.gift_method_seen == 1, c0.summary())
-    check("诊断: unhandled=1(handler 未注册)",
-          c0.unhandled_counts.get("WebcastGiftMessage") == 1, c0.summary())
-    check("诊断: parsed=0(没走业务解析路径)", c0.parsed_gift_count == 0,
-          c0.summary())
-    check("诊断: emitted=0(没接业务链)", c0.emitted_gift_count == 0,
-          c0.summary())
-    check("诊断: 判据指向 dispatch 层",
-          c0.verdict() == "dispatch", c0.verdict())
-    check("诊断: 语义仍被采样(否则生产配置下什么都看不到)",
+    check("诊断: **不**落进 unhandled(干跑 handler 已注册)",
+          c0.unhandled_counts == {}, c0.summary())
+    check("诊断: parsed=1(干跑链路真的解析了)",
+          c0.parsed_gift_count == 1, c0.summary())
+    check("诊断: emitted=1(干跑回调在链路末端被调用)",
+          c0.emitted_gift_count == 1, c0.summary())
+    check("诊断: 判据不是 dispatch(那条链已经可达)",
+          c0.verdict() != "dispatch", c0.verdict())
+    check("诊断: 语义被写进 JSONL",
           os.path.isfile(os.path.join(sem0, "gift_semantic.jsonl")))
+    # 语义只写一次(计数与语义分开推进, 不能重复落两行)
+    sem_lines = [l for l in io.open(os.path.join(sem0, "gift_semantic.jsonl"),
+                                    encoding="utf-8").read().splitlines()
+                 if l.strip()]
+    check("语义 JSONL 恰好一行(没有重复落)", len(sem_lines) == 1,
+          len(sem_lines))
 
-    # --- seen>0, handler 注册了但解析炸了 -> proto 层 ---
+    # --- seen>0 但解析炸了 -> proto 层 ---
     #
-    # 这是**真正的 proto 层故障**: handler 进了(所以不进 unhandled), 但
-    # 解析抛了。此时 parsed=0、parse_error=1、emitted=0, 判据指向 proto。
+    # 这是**真正的 proto 层故障**: 消息进了 handler(所以不进 unhandled),
+    # 但解析抛了。此时 parsed=0、parse_error=1、emitted=0, 判据指向 proto。
+    #
+    # ⚠️ 破坏点必须打在**干跑 handler 真正会调**的那个东西上。诊断模式下
+    # 走的是 `_gift_probe_parse_gift_dry_run`(它内部 `GiftMessage().parse`),
+    # 而不是基线的 `_parseGiftMsg` —— 打错了地方会得到"测试通过但链路上
+    # 什么都没发生"的假绿。
     d2 = mkdtemp()
     c2 = ProfileCounters(PROFILE_B)
     st2 = RawCaptureStore(d2, "s", PROFILE_B, max_per_method=50)
     f2 = _make_fetcher(c2, st2, os.path.join(d2, "s", PROFILE_B), emitted=[],
-                       base=CallbackFetcher2())  # 会注册 Gift handler
+                       keep_all=False, interaction_enabled=False,
+                       base=CallbackFetcher2())
 
-    def boom(self, payload, envelope_msg_id=0):
+    def boom(payload, envelope_msg_id=0):
         raise ValueError("boom")
-    f2._parseGiftMsg = boom.__get__(f2, type(f2))
+    f2._gift_probe_parse_gift_dry_run = boom
     import contextlib
     with contextlib.redirect_stderr(io.StringIO()):
         f2._wsOnMessage(None, _frame([("WebcastGiftMessage", gp, 1)]))
-    check("handler 抛异常: seen=1", c2.gift_method_seen == 1, c2.summary())
-    check("handler 抛异常: parsed=0", c2.parsed_gift_count == 0, c2.summary())
-    check("handler 抛异常: emitted=0", c2.emitted_gift_count == 0)
-    check("handler 抛异常: 不进 unhandled(handler 是注册了的)",
+    check("解析炸了: seen=1", c2.gift_method_seen == 1, c2.summary())
+    check("解析炸了: parsed=0", c2.parsed_gift_count == 0, c2.summary())
+    check("解析炸了: emitted=0", c2.emitted_gift_count == 0)
+    check("解析炸了: 不进 unhandled(handler 是注册了的)",
           c2.unhandled_counts == {}, c2.unhandled_counts)
-    check("handler 抛异常: parse_error=1",
+    check("解析炸了: parse_error=1",
           c2.parse_error_counts.get("WebcastGiftMessage") == 1,
           c2.parse_error_counts)
     # 这条消息被 capture 了**两次**是刻意的: 一次是"Gift-family 命中规则",
     # 一次是"parse_error 留证据"(Issue §E 两条规则各自成立, 不该互相去重
     # —— 去重会让 index 里看不出这条同时满足两个条件)。
-    check("handler 抛异常: payload 被 capture(两条规则各留一份)",
+    check("解析炸了: payload 被 capture(两条规则各留一份)",
           c2.captured_payload_count == 2, c2.summary())
     check("判据指向 proto 层", c2.verdict() == "proto", c2.verdict())
     check("proto 层样本: parsed 与 parse_error 不自相矛盾",
@@ -611,6 +630,26 @@ def test_runner_arms_have_isolated_counters_and_dirs():
     check("每路 counter 的 profile_id 是自己的",
           [a.counters.profile_id for a in arms]
           == [p.profile_id for p in r.profiles])
+    # ---- Blocker 1 的装配层断言: bootstrap 模式必须真的落到 counter 上 ----
+    #
+    # 这条守的是"runner 有没有把 profile 的 bootstrap 选择传下去"。少了
+    # 它, `bootstrap_mode` 会永远为空串 —— 而摘要里那一列看起来只是"没
+    # 数据", 不会有人注意到 reference 臂压根没生效。
+    check("每路 counter 的 bootstrap_mode 与 profile 一致",
+          [a.counters.bootstrap_mode for a in arms]
+          == [p.bootstrap for p in r.profiles],
+          ([a.counters.bootstrap_mode for a in arms],
+           [p.bootstrap for p in r.profiles]))
+    check("C 的 counter 记的是 reference",
+          [a.counters.bootstrap_mode for a in arms
+           if a.profile.profile_id == PROFILE_C] == [BOOTSTRAP_REFERENCE],
+          [a.counters.bootstrap_mode for a in arms])
+    # fetcher 侧也要真的按这个模式分派(元数据 -> 连接层)
+    for a in arms:
+        f = a.build_fetcher(None)
+        check(f"{a.profile.profile_id} 的 fetcher 按 profile 分派 bootstrap",
+              f._gift_probe_bootstrap_mode == a.profile.bootstrap,
+              (f._gift_probe_bootstrap_mode, a.profile.bootstrap))
 
     # 真的往其中一路喂一条 Gift, 其余两路必须纹丝不动。
     from story.gift_probe.hooks import make_gift_capture_fetcher
@@ -634,6 +673,497 @@ def test_runner_arms_have_isolated_counters_and_dirs():
         else:
             check(f"{a.profile.profile_id} 目录没有别人的样本",
                   bins == [], bins)
+
+
+def _capture_arm_url(profile, *, user_unique_id=None, now_ms=1789000000000,
+                     room_id="6746053408656034572", cfg=None):
+    """让一路诊断连接**真的**构造出它的 WSS URL 并返回。
+
+    ## 为什么必须有这条测试(而不是继续断言 profile 元数据)
+
+    上一版被 review 打回的第一个 blocker 就是这类假绿:
+
+        测试断言 `Profile C.bootstrap == "reference"` —— 绿;
+        但连接层从来没读过那个字段, 运行时 C 与 B 的 URL **完全相同**。
+
+    也就是说测的是"意图", 而不是"实际连出去的那个 URL"。真实直播里这会让
+    我们得出"reference 方案也没用"的**错误结论**。
+
+    这里改成**在生产真实会走的那条路径上**取 URL:
+    `_connectWebSocket()` 会 `websocket.WebSocketApp(url, ...)`, 于是把
+    `WebSocketApp` 换成一个只记录 URL、然后抛异常中止的替身 —— 这样既拿到
+    了真实的 URL 字符串(含 cursor / internal_ext / user_unique_id), 又
+    不会真的去连网络。
+    """
+    import websocket as _ws_mod
+    from story.config import Config
+    from story.gift_probe.capture import RawCaptureStore
+    from story.gift_probe.profile import ProfileCounters
+    from story.gift_probe.runner import make_diagnostic_fetcher
+
+    cfg = cfg or Config(live_id="123456")
+    d = mkdtemp()
+    counters = ProfileCounters(profile.profile_id,
+                               bootstrap_mode=profile.bootstrap)
+    store = RawCaptureStore(d, "s", profile.profile_id)
+    f = make_diagnostic_fetcher(
+        cfg,
+        user_unique_id if user_unique_id is not None
+        else profile.user_unique_id())
+    f.attach_gift_probe(profile=profile, counters=counters, store=store,
+                        semantic_dir=os.path.join(d, "s", profile.profile_id))
+
+    # 房间号与时钟都固定, 让两次调用的差异**只能**来自 profile 本身。
+    f.__dict__["_DouyinLiveWebFetcher__room_id"] = room_id
+
+    captured = {"url": None, "headers": None}
+
+    class _StopHere(Exception):
+        pass
+
+    def _fake_app(url, header=None, *a, **kw):
+        captured["url"] = url
+        captured["headers"] = header
+        raise _StopHere()
+
+    real_app = _ws_mod.WebSocketApp
+    _ws_mod.WebSocketApp = _fake_app
+    import contextlib
+    try:
+        # 固定时钟 —— `_connectWebSocket` 里是 time.time()。
+        import time as _time
+        real_time = _time.time
+        _time.time = lambda: now_ms / 1000.0
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                f._connectWebSocket()
+        except _StopHere:
+            pass
+        finally:
+            _time.time = real_time
+    finally:
+        _ws_mod.WebSocketApp = real_app
+    return captured, counters
+
+
+def _url_params(url):
+    """`...?a=1&b=2` -> `{"a": "1", "b": "2"}`(已 urldecode)。"""
+    from urllib.parse import parse_qs, urlparse
+    return {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+
+
+def test_actual_wss_urls_differ_as_intended():
+    """GP-18: 抓**真实构造出来的 WSS URL** 做断言(Blocker 1 的回归测试)。
+
+    三条纪律, 全部对着 URL 说, 而不是对着 profile 元数据说:
+
+        A vs B : 除 `user_unique_id` 外**完全一致**
+        A vs C : 在 bootstrap 上**真的不同**(身份/时间字段按 reference 走)
+        B vs C : 真的不同 —— 这条最关键, 上一版它们其实是同一个 URL
+    """
+    print("\n[GP-18] 真实 WSS URL:A/B/C 的差异")
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    a, b, c = DEFAULT_PROFILES
+
+    cap_a, _ = _capture_arm_url(a)
+    cap_b, _ = _capture_arm_url(b)
+    cap_c, _ = _capture_arm_url(c)
+    url_a, url_b, url_c = cap_a["url"], cap_b["url"], cap_c["url"]
+    check("三路都真的构造出了 URL",
+          all(u and u.startswith("wss://") for u in (url_a, url_b, url_c)),
+          [bool(url_a), bool(url_b), bool(url_c)])
+
+    pa, pb, pc = (_url_params(url_a), _url_params(url_b), _url_params(url_c))
+
+    def _ext_deterministic(ext):
+        """去掉 `wrds_v` 的随机低位, 只留可比较的**结构 + 身份/时间**部分。
+
+        `wrds_v` 的低位由生产生成器每次连接随机取(那是它本来的行为),
+        所以两路之间必然不同 —— 把它算进差异会让"只差 uid"这条断言永远
+        为红, 从而掩盖真正的差异。
+        """
+        parts = [p for p in ext.split("|") if not p.startswith("wrds_v:")]
+        return "|".join(parts)
+
+    def _cursor_deterministic(cur):
+        """cursor 里 `r`/`h` 的随机低位同理, 只留 `t-`/`d-1`/`u-1` 骨架。"""
+        return re.sub(r"_r-\d+|_h-\d+", "", cur)
+
+    # ---- A vs B: 唯一变量是 user_unique_id ----
+    #
+    # ⚠️ 比的是**确定性部分**: identity/时间字段与 URL 骨架。随机低位
+    # (r/h/wrds_v/signature)本来就该不同 —— 那是生产生成器的既有行为,
+    # 不是 profile 差异。
+    diff_ab = {k for k in set(pa) | set(pb) if pa.get(k) != pb.get(k)}
+    check("A/B 的差异只出现在随机低位与 uid 上",
+          diff_ab <= {"user_unique_id", "cursor", "internal_ext", "signature"},
+          diff_ab)
+    check("A/B 的 external_ext 结构部分只差 did",
+          _ext_deterministic(pa["internal_ext"])
+          .replace(pa["user_unique_id"], "<UID>")
+          == _ext_deterministic(pb["internal_ext"])
+          .replace(pb["user_unique_id"], "<UID>"),
+          (_ext_deterministic(pa["internal_ext"]),
+           _ext_deterministic(pb["internal_ext"])))
+    check("A/B 的 cursor 骨架一致",
+          _cursor_deterministic(pa["cursor"])
+          == _cursor_deterministic(pb["cursor"]),
+          (_cursor_deterministic(pa["cursor"]),
+           _cursor_deterministic(pb["cursor"])))
+    check("A 用固定 uid",
+          pa.get("user_unique_id") == CURRENT_USER_UNIQUE_ID,
+          pa.get("user_unique_id"))
+    check("B 的 uid 是随机值(且格式合法)",
+          pb.get("user_unique_id") != CURRENT_USER_UNIQUE_ID
+          and bool(re.fullmatch(r"[78]\d{18}",
+                                pb.get("user_unique_id") or "")),
+          pb.get("user_unique_id"))
+
+    # ---- A vs C: bootstrap 真的不同 ----
+    check("A/C URL **确实不同**", url_a != url_c, "URL 相同 = Blocker 1 复发")
+    check("A/C 的 internal_ext 结构部分**确实不同**",
+          _ext_deterministic(pa["internal_ext"])
+          != _ext_deterministic(pc["internal_ext"]),
+          (_ext_deterministic(pa["internal_ext"])[:80],
+           _ext_deterministic(pc["internal_ext"])[:80]))
+    # C 的 did 是"按连接派生"的: 含 uid 且以 now_ms 结尾
+    did_c = pc["internal_ext"].split("wss_push_did:")[1].split("|")[0]
+    did_a = pa["internal_ext"].split("wss_push_did:")[1].split("|")[0]
+    check("A 的 did 就是固定 uid", did_a == CURRENT_USER_UNIQUE_ID, did_a)
+    check("C 的 did 是按连接派生的(含 uid + 本次 now_ms)",
+          did_c != did_a and did_c.endswith(str(1789000000000)),
+          did_c)
+
+    # ---- B vs C: 上一版它们其实是同一个 URL ----
+    check("B/C URL **确实不同**(上一版这里是同一个)",
+          url_b != url_c, "B 与 C 的 URL 相同 = reference 臂没生效")
+    check("B/C 的 internal_ext 结构部分不同",
+          _ext_deterministic(pb["internal_ext"])
+          != _ext_deterministic(pc["internal_ext"]),
+          (_ext_deterministic(pb["internal_ext"])[:80],
+           _ext_deterministic(pc["internal_ext"])[:80]))
+    check("B/C 的 did 不同",
+          pb["internal_ext"].split("wss_push_did:")[1].split("|")[0]
+          != pc["internal_ext"].split("wss_push_did:")[1].split("|")[0],
+          (pb["internal_ext"].split("wss_push_did:")[1].split("|")[0],
+           pc["internal_ext"].split("wss_push_did:")[1].split("|")[0]))
+
+    # ---- C 用 fresh now_ms ----
+    check("C 的 cursor 用本次 now_ms", "t-1789000000000_" in pc["cursor"],
+          pc["cursor"][:40])
+    check("C 不含写死的 2024 时间",
+          "1721106114633" not in pc["cursor"]
+          and "1721106114633" not in pc["internal_ext"])
+    check("三路都不含 2024 写死值",
+          all("1721106114633" not in u for u in (url_a, url_b, url_c)))
+
+    # ---- 其余连接参数三路一致(不是"随手改了点别的")----
+    for key in ("app_name", "version_code", "webcast_sdk_version", "compress",
+                "device_platform", "identity", "room_id", "aid", "live_id",
+                "im_path"):
+        same = pa.get(key) == pb.get(key) == pc.get(key)
+        if not check(f"三路的 {key} 一致", same,
+                     (pa.get(key), pb.get(key), pc.get(key))):
+            break
+    # 而且 signature 都在(签名链没被绕过)
+    check("三路都带 signature",
+          all("signature" in p for p in (pa, pb, pc)))
+
+    # ---- C 的 bootstrap_mode 真的传到了 counters ----
+    _, counters_c = _capture_arm_url(c)
+    check("C 的 counters 记录了 bootstrap_mode=reference",
+          counters_c.bootstrap_mode == "reference",
+          counters_c.bootstrap_mode)
+
+
+def test_reference_bootstrap_is_deterministic_per_connection():
+    """GP-19: reference bootstrap 的 did 由 (uid, now_ms) 唯一决定。
+
+    这条钉住的是"派生 did"的性质: 同样的输入 -> 同样的 did(测试可复现,
+    线上可重放); 时间变了 -> did 变(每连接不同)。
+
+    ⚠️ 只断言 `did`, **不**断言整条 URL: cursor/internal_ext 里的
+    `r`/`h`/`wrds_v` 随机低位由生产生成器的 RNG 每次连接新取(那是它本来
+    的行为), 拿它们做确定性断言会让这条测试 flaky。要验的"确定性"是
+    **C 自己引入的那部分**。
+    """
+    print("\n[GP-19] reference bootstrap 的 did 确定性")
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    c = DEFAULT_PROFILES[2]
+
+    def did_of(now_ms):
+        cap, _ = _capture_arm_url(c, now_ms=now_ms, user_unique_id="U1")
+        return _url_params(cap["url"])["internal_ext"] \
+            .split("wss_push_did:")[1].split("|")[0]
+
+    check("同一 (uid, now_ms) -> 同一 did",
+          did_of(1789000000000) == did_of(1789000000000),
+          (did_of(1789000000000), did_of(1789000000000)))
+    check("不同 now_ms -> 不同 did",
+          did_of(1789000000000) != did_of(1789000000001),
+          (did_of(1789000000000), did_of(1789000000001)))
+    check("did 以 uid 开头(身份来自本连接)",
+          did_of(1789000000000).startswith("U1"),
+          did_of(1789000000000))
+    check("did 以 now_ms 结尾(时间来自本连接)",
+          did_of(1789000000000).endswith("1789000000000"),
+          did_of(1789000000000))
+
+
+def test_end_to_end_runner_reaches_all_four_verdict_layers():
+    """GP-20: 用**真实 runner 的配置**跑通四层判据(Blocker 2 的回归测试)。
+
+    ## 为什么这条必须是"端到端 runner"而不是"另一个 helper 配置"
+
+    上一版被 review 打回的第二个 blocker 就是这类假绿:
+
+        GP-11 用 `interaction_enabled=True` 构造出三层计数 —— 绿;
+        但真实 runner 强制两个开关都关, 于是真实直播里每一份礼物都落成
+        `unhandled` -> `verdict()` 恒为 `dispatch`。
+
+    也就是说: **测试路径与生产诊断路径不是同一条**。测试证明的是"那套配置
+    下能分层", 而真实跑的是另一套配置。
+
+    所以这里不自己拼配置, 而是拿 `run_gift_capture_diagnostic` 真正会用的
+    那个 fetcher 构造入口(`make_diagnostic_fetcher` + `attach_gift_probe`)
+    来跑四种输入, 逐条断言 `verdict()` 落在正确的层:
+
+        seen=0                                   -> transport_or_auth
+        seen>0, 有 Gift-family 没 handler        -> dispatch
+        seen>0, handler 抛异常                   -> proto
+        seen>0, 解析成功但没走到回调             -> callback_or_ingest
+        seen>0, 全程走通                         -> ok
+    """
+    print("\n[GP-20] 端到端 runner 配置下的四层判据")
+    from story.config import Config
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    from story.gift_probe.runner import GiftProbeArm
+
+    cfg = Config(live_id="123456")
+    profile = DEFAULT_PROFILES[0]
+
+    def build():
+        """与 `GiftCaptureDiagnosticRunner.start()` 完全同一条构造路径。"""
+        arm = GiftProbeArm(profile, cfg, "sess",
+                           probe_root=mkdtemp(),
+                           now_fn=lambda: 1789996800.0)
+        f = arm.build_fetcher(None)     # base_cls=None -> 真实用的 DanmakuFetcher
+        return arm, f
+
+    def feed(f, items):
+        import contextlib
+        with contextlib.redirect_stderr(io.StringIO()):
+            f._wsOnMessage(None, _frame(items))
+
+    # (a) 完全没有 Gift -> transport_or_auth
+    arm, f = build()
+    feed(f, [("WebcastChatMessage", b"", 1)])
+    check("无 Gift -> transport_or_auth",
+          arm.counters.verdict() == "transport_or_auth", arm.counters.verdict())
+
+    # (b) Gift 来了但 handler 被摘掉 -> dispatch(必须**能**观测到这一层)
+    arm, f = build()
+    from story.gift_probe.hooks import GiftProbeMixin
+    f._gift_probe_register_dry_run_handlers = lambda handlers: None
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 2)])
+    check("Gift 无 handler -> seen>0",
+          arm.counters.gift_method_seen == 1, arm.counters.summary())
+    check("Gift 无 handler -> unhandled>0",
+          arm.counters.unhandled_counts.get("WebcastGiftMessage") == 1,
+          arm.counters.unhandled_counts)
+    check("Gift 无 handler -> dispatch",
+          arm.counters.verdict() == "dispatch", arm.counters.verdict())
+
+    # (c) 解析抛异常 -> proto
+    arm, f = build()
+
+    def _boom(payload, envelope_msg_id=0):
+        raise ValueError("boom")
+    f._gift_probe_parse_gift_dry_run = _boom
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 3)])
+    check("解析炸了 -> parse_error>0",
+          arm.counters.parse_error_counts.get("WebcastGiftMessage") == 1,
+          arm.counters.parse_error_counts)
+    check("解析炸了 -> proto",
+          arm.counters.verdict() == "proto", arm.counters.verdict())
+
+    # (d) 解析成功但干跑回调没跑 -> callback_or_ingest
+    #
+    # 这条正是 Issue §D 的第四层判据: "parse 成功, emitted=0"。它必须
+    # **可达** —— 若 seen/parsed/emitted 被合并成一个数, 这一层永远测不出来。
+    arm, f = build()
+    f._gift_probe_dry_run_gift = lambda m, envelope_msg_id=0: None
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 4)])
+    check("回调没跑 -> parsed>0",
+          arm.counters.parsed_gift_count == 1, arm.counters.summary())
+    check("回调没跑 -> emitted=0",
+          arm.counters.emitted_gift_count == 0, arm.counters.summary())
+    check("回调没跑 -> callback_or_ingest",
+          arm.counters.verdict() == "callback_or_ingest",
+          arm.counters.verdict())
+
+    # (e) 全程走通 -> ok
+    arm, f = build()
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 5)])
+    check("走通 -> ok", arm.counters.verdict() == "ok",
+          arm.counters.verdict())
+    check("走通 -> parsed=1 且 emitted=1",
+          arm.counters.parsed_gift_count == 1
+          and arm.counters.emitted_gift_count == 1, arm.counters.summary())
+    # 端到端下 envelope_msg_id 必须真的被传下去(Issue §G 要求)
+    sem = arm.semantic_dir
+    rec = json.loads(io.open(os.path.join(sem, "gift_semantic.jsonl"),
+                             encoding="utf-8").read().splitlines()[0])
+    check("端到端: envelope_msg_id 被传递(非空)",
+          rec["envelope_msg_id"] == "5", rec["envelope_msg_id"])
+    check("端到端: envelope 与 common 分开记录",
+          rec["envelope_msg_id"] != rec["common_msg_id"],
+          (rec["envelope_msg_id"], rec["common_msg_id"]))
+    # 诊断 fetcher 的业务隔离: 没有业务回调被接上
+    check("端到端: 诊断 fetcher 不接业务回调",
+          f._on_interaction is None, f._on_interaction)
+
+
+def test_dry_run_handler_does_not_swallow_parse_errors():
+    """GP-22: 干跑 handler **绝不能**吞掉解析异常(Blocker 2 的判据根基)。
+
+    这条单独成篇, 因为它是 proto 层判据能以成立的**唯一**前提:
+
+        `parse_error_counts` 是在基线 `_wsOnMessage` 的 `except` 分支里
+        推进的。若干跑 handler 自己 `try/except` 把异常吞掉, 那个分支
+        永远不会走到 —— 计数恒为 0, `verdict()` 永远不会是 `proto`,
+        而**表面上一切正常**(没有任何报错)。
+
+    也就是说: "解析失败"在日志里会彻底消失。这正是 Issue #17 要找的
+    那类故障(handler 接到了但 protobuf parse 失败), 却在诊断里变成不可见。
+
+    所以这里直接对着**行为**断言: 喂一个必然解析失败的 payload, 干跑
+    handler 必须把异常抛出去(而不是返回 None)。
+    """
+    print("\n[GP-22] 干跑 handler 不吞解析异常")
+    from story.config import Config
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    from story.gift_probe.runner import GiftProbeArm
+
+    cfg = Config(live_id="123456")
+    arm = GiftProbeArm(DEFAULT_PROFILES[0], cfg, "sess",
+                       probe_root=mkdtemp(), now_fn=lambda: 1789996800.0)
+    f = arm.build_fetcher(None)
+
+    # 一个几乎必然解析失败的 payload: 声明了畸形的 proto 字段长度。
+    bad = b"\xff\xff\xff\xff\xff\xff\xff\xff"
+    raised = None
+    try:
+        f._gift_probe_parse_gift_dry_run(bad, envelope_msg_id=1)
+    except Exception as e:                      # noqa: BLE001
+        raised = e
+    check("干跑 handler 把解析异常抛出去了(不吞)", raised is not None,
+          type(raised).__name__ if raised else "没抛 -> parse_error 永远不会被记")
+
+    # 端到端: 走完整帧路径, parse_error 必须真的被记下
+    import contextlib
+    with contextlib.redirect_stderr(io.StringIO()):
+        f._wsOnMessage(None, _frame([("WebcastGiftMessage", bad, 9)]))
+    check("端到端: parse_error_counts 记到了",
+          arm.counters.parse_error_counts.get("WebcastGiftMessage") == 1,
+          arm.counters.parse_error_counts)
+    check("端到端: parsed 没有被误推进",
+          arm.counters.parsed_gift_count == 0, arm.counters.summary())
+    check("端到端: emitted 没有被误推进",
+          arm.counters.emitted_gift_count == 0, arm.counters.summary())
+    check("端到端: 判据指向 proto",
+          arm.counters.verdict() == "proto", arm.counters.verdict())
+
+
+def test_safe_error_never_carries_credential():
+    """GP-21: `_safe_error` 是**真脱敏**, 不是字符过滤(Blocker 3 回归)。
+
+    上一版是 `f"{type(e).__name__}: {e}"` 然后替换非法字符 —— 那**不是**
+    脱敏: cookie 的字符集(字母/数字/下划线/等号/短横)本来就全在保留范围内,
+    于是 `sessionid=...` 会几乎原样进 WARN 日志 / `arm.error` /
+    `session_summary.json`。
+
+    这里直接把**带哨兵的 cookie** 放进异常正文, 然后断言哨兵在**所有**出口
+    (函数返回值、WARN 日志、arm 摘要、session summary)里出现 **0 次**。
+    """
+    print("\n[GP-21] _safe_error 真脱敏(哨兵出现 0 次)")
+    from story.gift_probe.runner import _safe_error
+
+    cookie = f"sessionid={SENTINEL}; sid_tt={SENTINEL}; ttwid={SENTINEL}"
+
+    class WebSocketBadStatusException(Exception):
+        pass
+
+    class _FakeHandshakeError(Exception):
+        pass
+
+    excs = [
+        # 最常见的形状: 握手失败, 异常正文里带着请求头
+        WebSocketBadStatusException(f"Handshake status 403; Cookie: {cookie}"),
+        ConnectionResetError(f"reset by peer; cookie={cookie}"),
+        TimeoutError(f"timed out after 3s; cookie={cookie}"),
+        FileNotFoundError(f"'/tmp/{cookie}'"),
+        ValueError(f"bad cookie {cookie}"),
+        RuntimeError(cookie),
+        _FakeHandshakeError(cookie),
+    ]
+    for e in excs:
+        out = _safe_error(e)
+        check(f"{type(e).__name__}: 输出不含哨兵", SENTINEL not in out, out)
+        check(f"{type(e).__name__}: 输出不含 cookie 片段",
+              "sessionid" not in out and "sid_tt" not in out
+              and "ttwid" not in out, out)
+        check(f"{type(e).__name__}: 输出是个短类别词",
+              len(out) < 80 and "(" in out, out)
+
+    # ---- 走完整条真实路径: 异常 -> arm.error -> 日志 -> session summary ----
+    from story.config import Config
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    from story.gift_probe.runner import GiftCaptureDiagnosticRunner
+
+    cfg = Config(live_id="123")
+    r = GiftCaptureDiagnosticRunner(cfg, probe_root=mkdtemp(),
+                                    base_cls=object,
+                                    now_fn=lambda: 1789996800.0)
+    from story.gift_probe.runner import GiftProbeArm
+    arm = GiftProbeArm(DEFAULT_PROFILES[0], cfg, r.session_id,
+                       probe_root=r.probe_root, now_fn=lambda: 1789996800.0)
+    r.arms = [arm]
+    # 模拟"启动时握手异常, 正文带 cookie"
+    arm.error = _safe_error(
+        WebSocketBadStatusException(f"handshake failed Cookie: {cookie}"))
+    check("arm.error 不含哨兵", SENTINEL not in arm.error, arm.error)
+
+    # WARN 日志路径
+    buf = io.StringIO()
+    import logging as _logging
+    h = _logging.StreamHandler(buf)
+    lg = _logging.getLogger("story.gift_probe.runner")
+    old_level, old_prop = lg.level, lg.propagate
+    lg.addHandler(h)
+    lg.setLevel(_logging.DEBUG)
+    lg.propagate = False
+    try:
+        lg.warning("gift probe 路 %s 退出: %s",
+                   arm.profile.profile_id, arm.error)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+        lg.propagate = old_prop
+    check("WARN 日志不含哨兵", SENTINEL not in buf.getvalue(),
+          buf.getvalue()[:200])
+
+    # session summary 落盘路径
+    p = r.write_session_summary()
+    check("session summary 写出来了", bool(p), p)
+    blob = io.open(p, encoding="utf-8").read()
+    check("session_summary.json 不含哨兵", SENTINEL not in blob, blob[:300])
+    check("session_summary.json 不含 cookie 片段",
+          "sessionid" not in blob and "sid_tt" not in blob, blob[:300])
+    # 反向验证: 证明上面不是空断言 —— 摘要里**确实**写了 error 字段
+    check("摘要里确实有 error 字段(不是被整个删掉)",
+          '"error"' in blob, blob[:200])
 
 
 def test_diagnostic_start_does_not_touch_production_files():
@@ -824,35 +1354,92 @@ def test_diagnostic_off_preserves_production_behaviour():
     with contextlib.redirect_stderr(io.StringIO()):
         df._wsOnMessage(None, frame)
 
-    for attr in ("ws_frame_count", "ws_message_count", "method_counts",
-                 "unhandled_method_counts", "parse_error_counts"):
+    for attr in ("ws_frame_count", "ws_message_count"):
         check(f"{attr} 与基线逐字相同",
               getattr(bf, attr) == getattr(df, attr),
               (getattr(bf, attr), getattr(df, attr)))
-    check("业务回调次数相同", len(base_emitted) == len(diag_emitted),
-          (len(base_emitted), len(diag_emitted)))
-    check("业务回调类型序列相同",
-          [k for k, _ in base_emitted] == [k for k, _ in diag_emitted],
-          ([k for k, _ in base_emitted], [k for k, _ in diag_emitted]))
-    # 业务回调收到的对象字段也要一致(不只是"调了几次")
-    for (kb, mb), (kd, md) in zip(base_emitted, diag_emitted):
-        if not check(f"回调类型一致 {kb}", kb == kd):
+    # ---- method / unhandled / parse_error: 除 Gift 外逐字相同 ----
+    #
+    # ⚠️ Gift 这一条**故意**不同: Blocker 2 的修法就是让诊断连接用**自己
+    # 的干跑 handler** 处理 `WebcastGiftMessage`, 而不是让基线按业务开关
+    # 决定注册与否。所以:
+
+    #   - 诊断: Gift 永远有 handler(干跑), 永远不会落进 unhandled;
+    #   - 基线: Gift 的注册取决于 keep_all/interaction_enabled。
+    #
+    # 这正是我们要的行为差异 —— 但它是**受控的**: 除了 Gift, 其余每一个
+    # method 的计数都必须逐字相同, 否则诊断就改变了生产的观测面。
+    non_gift_bf = {k: v for k, v in bf.method_counts.items()
+                   if not is_gift_family_method(k)}
+    non_gift_df = {k: v for k, v in df.method_counts.items()
+                   if not is_gift_family_method(k)}
+    check("method_counts 除 Gift 外与基线逐字相同",
+          non_gift_bf == non_gift_df, (non_gift_bf, non_gift_df))
+    check("Gift-family 计数两者都看到了同一条",
+          bf.method_counts.get("WebcastGiftMessage")
+          == df.method_counts.get("WebcastGiftMessage") == 1,
+          (bf.method_counts.get("WebcastGiftMessage"),
+           df.method_counts.get("WebcastGiftMessage")))
+    # 非 Gift 的 unhandled 必须一致(这才是"诊断不改生产观测面"的判据)
+    u_bf = {k: v for k, v in bf.unhandled_method_counts.items()
+            if not is_gift_family_method(k)}
+    u_df = {k: v for k, v in df.unhandled_method_counts.items()
+            if not is_gift_family_method(k)}
+    check("非 Gift 的 unhandled 与基线一致", u_bf == u_df, (u_bf, u_df))
+    check("非 Gift 的 parse_error 与基线一致",
+          {k: v for k, v in bf.parse_error_counts.items()
+           if not is_gift_family_method(k)}
+          == {k: v for k, v in df.parse_error_counts.items()
+              if not is_gift_family_method(k)},
+          (bf.parse_error_counts, df.parse_error_counts))
+    # ---- 业务回调: 除 Gift 外必须一模一样 ----
+    #
+    # `like` 是关键的对照项: 它在两边的注册条件相同, 所以次数与对象都必须
+    # 逐字相等。`gift` 在诊断侧**不进**业务回调 —— 那是有意的(诊断不接
+    # 业务链), 也正是 Issue non-goals 要求的隔离。
+    base_kinds = [k for k, _ in base_emitted]
+    diag_kinds = [k for k, _ in diag_emitted]
+    check("业务回调类型序列 除 Gift 外相同",
+          [k for k in base_kinds if k != "gift"]
+          == [k for k in diag_kinds if k != "gift"],
+          (base_kinds, diag_kinds))
+    check("诊断侧**没有**把 Gift 送进业务回调(业务隔离)",
+          "gift" not in diag_kinds, diag_kinds)
+    check("基线侧**有** Gift 业务回调(证明对照不是空的)",
+          base_kinds.count("gift") == 1, base_kinds)
+    # like 回调收到的对象字段也要一致(不只是"调了几次")
+    for (kb, mb), (kd, md) in zip(
+            [x for x in base_emitted if x[0] == "like"],
+            [x for x in diag_emitted if x[0] == "like"]):
+        if not check(f"like 回调类型一致 {kb}", kb == kd):
             break
-        if not check(f"回调对象 gift_id 一致 {kb}",
-                     getattr(mb, "gift_id", None) == getattr(md, "gift_id",
-                                                             None)):
+        if not check("like 回调对象字段一致",
+                     getattr(mb, "count", None) == getattr(md, "count", None)):
             break
-    # 落库内容也要一致 —— 诊断开着不该改变 production 落库行为。
+    # 落库内容: 除 Gift 外必须逐字一致。
     #
     # 诊断侧用的是 `_NoProductionSink`(什么都不写), 所以这里比的是
     # **基线写了什么** 与 **诊断本该写什么** —— 后者由 sink 记录下来的
-    # 调用序列给出。两条都不为空且逐字相同才算通过。
+    # 调用序列给出。
+    #
+    # ⚠️ Gift 行**故意**不在诊断侧: 诊断用自己的干跑 handler, 不落
+    # production 弹幕文件(那是 Issue 测试点 10 的要求)。所以逐字比对只对
+    # 非 Gift 行成立 —— 那才是"诊断不改生产观测面"的判据。
     check("基线确实落了库(否则对照是空的)", bool(bf._fp.getvalue()),
           repr(bf._fp.getvalue())[:120])
     written = "".join(df._fp.written)
-    check("诊断侧落库调用与基线逐字一致",
-          written == bf._fp.getvalue(), (written[:200],
-                                         bf._fp.getvalue()[:200]))
+
+    def _non_gift_lines(text):
+        return [l for l in text.splitlines()
+                if l.strip() and '"kind": "gift"' not in l]
+
+    check("诊断侧落库调用与基线 除 Gift 行外逐字一致",
+          _non_gift_lines(written) == _non_gift_lines(bf._fp.getvalue()),
+          (_non_gift_lines(written), _non_gift_lines(bf._fp.getvalue())))
+    check("基线落库里有 gift 行", '"kind": "gift"' in bf._fp.getvalue())
+    check("诊断落库里**没有** gift 行(不写 production 落库)",
+          '"kind": "gift"' not in written, written[:200])
+
     check("诊断侧**没有**把内容写到真实文件",
           getattr(df._fp, "wrote_to_disk", False) is False)
     # (d) 诊断没往 production 落库文件写任何东西
@@ -1039,6 +1626,11 @@ def main():
         test_three_layer_counts_are_distinguishable,
         test_profiles_do_not_share_counters,
         test_runner_arms_have_isolated_counters_and_dirs,
+        test_actual_wss_urls_differ_as_intended,
+        test_reference_bootstrap_is_deterministic_per_connection,
+        test_end_to_end_runner_reaches_all_four_verdict_layers,
+        test_dry_run_handler_does_not_swallow_parse_errors,
+        test_safe_error_never_carries_credential,
         test_diagnostic_start_does_not_touch_production_files,
         test_diagnostic_off_preserves_production_behaviour,
         test_summary_log_is_safe_and_bounded,

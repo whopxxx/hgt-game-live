@@ -56,7 +56,8 @@ import sys
 import threading
 from typing import Optional
 
-from .probe import CaptureProbe, GiftSemanticProbe, TransportSummaryProbe
+from .probe import (CaptureProbe, GiftSemanticProbe, TransportSummaryProbe,
+                    sanitize_method)
 from .profile import ProfileCounters
 
 #: 基线的分发循环要用到的 proto 类型。**只读**用途 —— 与 `danmaku.py`
@@ -77,6 +78,94 @@ class _NullLock:
 
 
 _NULL_LOCK = _NullLock()
+
+
+def _reference_bootstrap(fetcher, now_ms: int) -> dict:
+    """`reference-2026` 臂的 `cursor` / `internal_ext`。
+
+    ## 为什么需要单独一条路径(而不是直接复用生产生成器)
+
+    本项目的生产生成器(`vendor/.../ws_bootstrap.generate_ws_bootstrap`)
+    **本来就已经**是照公开参考实现 `JaneEyre3007/douyin-js` 的
+    `genCursorInternalExt` 写的 —— 形状一模一样。所以"C 只是换个标签"完全
+    没有意义: 真实直播里 B/C 都会失败, 而我们无法区分"reference 方案无效"
+    与"reference 方案根本没跑"。
+
+    这一臂真正复现的是参考实现里**随连接变化**的那组身份/时间字段, 特别是
+    `wss_push_did`:
+
+        A(current-auth-control)  did 是全场固定的生产常量
+        B(random-uid-only)       did 每连接随机, 但用的是生产生成器
+        C(reference-2026)        did 每连接随机, 且**显式**走这条 reference
+                                 路径(时间字段取本次连接的 fresh now_ms)
+
+    A 与 C 在 `wss_push_did` 上的差异是**可被 URL 断言验证**的 —— 这正是
+    `tests/test_gift_probe.py` 里那条"抓真实 WSS URL"的测试所钉住的东西。
+
+    ## 与生产生成器的实际差别
+
+    参考实现在 `internal_ext` 里带 `internal_src:dim`, 生产生成器同样如此
+    (它就是这么写的)。两者在**结构上等价**, 差异只在身份与时间的取值方式。
+    所以本函数:
+
+    1. 用**本 profile 的 uid**(A 固定 / C 随机)填 `wss_push_did`;
+    2. 用**本次调用的 now_ms**(基线每次连接新取)填所有时间字段;
+    3. 其余字段与生产生成器逐字一致 —— 不做任何没有证据支撑的协议猜测。
+
+    ## 边界
+
+    ⚠️ 这**不是**抖音官方协议, 也**不是**参考实现的逐字移植。参考实现的具体
+    取值无法在此刻离线验证, 所以这里只对齐**可观察到的结构性质**: 身份字段
+    随连接变化 + 时间字段是 fresh 的。
+
+    本轮能证明的是"C 与 B 在连接参数上真的不同, 且 C 确实跑过"; 至于 C 是否
+    更接近平台, 那是真实直播验收要回答的事, 不是这里能断言的。
+
+    room / host / signature / handler / proto 一概不动。
+    """
+    from ws_bootstrap import generate_ws_bootstrap
+
+    uid = str(getattr(fetcher, "user_unique_id", "") or "")
+    room = _safe_room_id(fetcher)
+    # 参考实现的 `wss_push_did` 用的是**它自己**连接级的身份, 而不是
+    # 生产那份固定的 `user_unique_id`。这正是 A 与 C 在 URL 上的真实差异点:
+    # A 的 did 是全场常量, C 的 did 每连接变。
+    #
+    # 取值方式(重要): 参考实现是"每次连接生成一个新的会话身份"。这里用
+    # **本次连接的 now_ms + uid** 派生一个稳定的会话级 id —— 它随连接变化,
+    # 但在同一次连接内可复现(测试能确定性验证), 也**不引入新的随机源**。
+    did = f"{uid}{now_ms}" if uid else str(now_ms)
+
+    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,
+                                 now_ms=now_ms)
+    return {
+        "cursor": base["cursor"],
+        "internal_ext": base["internal_ext"],
+        "reference_did": did,
+    }
+
+
+def _safe_room_id(fetcher) -> str:
+    """取真实房间号, 只读**已缓存**的值。
+
+    ⚠️ 诊断探针绝不能因为"房间号还没解析出来"就把整路连接炸掉 —— 而
+    `room_id` 是个 property, 未解析时它会去打 HTTP(可能超时/被风控)。
+    这里只读私有缓存字段, 不触发网络; 拿不到就交给生成器退化成空串。
+
+    ⚠️ 但**走到这一步时房间号必然已经解析过了**: `_connectWebSocket` 在
+    调 `_local_bootstrap` 之前就用 `self.room_id` 拼过 URL。所以正常情况下
+    这里一定能拿到值 —— 拿不到说明调用顺序变了, 那才是需要注意的信号
+    (因此空串不是"静默成功", 而是一个可见的异常形状)。
+    """
+    try:
+        raw = fetcher.__dict__.get("_DouyinLiveWebFetcher__room_id")
+        if raw:
+            return str(raw)
+        # 兜底: 有些测试会直接注入 `room_id` 这个公开属性。
+        raw = getattr(fetcher, "room_id", None)
+        return str(raw) if raw else ""
+    except Exception:                           # noqa: BLE001
+        return ""
 
 
 class GiftProbeMixin:
@@ -104,12 +193,18 @@ class GiftProbeMixin:
     # ------------------------------------------------------------------
     def attach_gift_probe(self, *, profile, counters, store, semantic_dir,
                           interval_seconds: float = 25.0,
-                          logger=None) -> None:
+                          logger=None, bootstrap_mode: str = None) -> None:
         """把三个探针装上。必须在 `start()` **之前**调用。
 
         线程安全: WS 回调线程与摘要线程会同时碰 counters, 所以所有对
         counters 的读改写都在 `_gift_probe_lock` 下 —— `+= 1` 不是原子
         操作, 漏锁会让计数随机少几条, 而少的那几条**没有任何症状**。
+
+        `bootstrap_mode` 决定 `_local_bootstrap` 覆写走哪条路径(见那条
+        方法的说明)。**默认从 profile 取**, 调用方通常不必显式传 —— 但
+        显式参数存在是有意的: 它让"这一路的 bootstrap 是哪一种"在调用点
+        就看得见, 而不是散落在 profile 元数据里等着被忘记接线(Blocker 1
+        就是这么发生的)。
         """
         self._gift_probe_counters = counters
         self._gift_probe_capture = CaptureProbe(
@@ -120,6 +215,12 @@ class GiftProbeMixin:
         self._gift_probe_semantic = GiftSemanticProbe(
             semantic_dir, counters.profile_id, counters, logger=logger)
         self._gift_probe_lock = threading.Lock()
+        # ---- Blocker 1: bootstrap 分派必须真的接上 ----
+        if bootstrap_mode is None:
+            bootstrap_mode = getattr(profile, "bootstrap", None)
+        from .profile import BOOTSTRAP_LOCAL
+        self._gift_probe_bootstrap_mode = (
+            str(bootstrap_mode) if bootstrap_mode else BOOTSTRAP_LOCAL)
 
     # ---- 给 runner 读的只读出口 ---------------------------------------
     def gift_probe_summary(self) -> Optional[dict]:
@@ -199,86 +300,137 @@ class GiftProbeMixin:
             pass
 
     def _gift_probe_after_parse_success(self, payload) -> None:
-        """primary GiftMessage 的**业务解析路径**成功 —— 二层计数 + 语义落盘。
+        """primary GiftMessage 的**解析路径**成功 —— 推进二层计数。
 
         调用点必须满足两个条件, 缺一不可:
 
         1. 该 method 就是 `WebcastGiftMessage`;
-        2. 基线的 handler 已经**成功返回**(没有抛)。
+        2. handler 已经**成功返回**(没有抛)。
 
         只有这两条同时成立, `parsed_as_primary_gift` 的含义才是确定的:
         "这条 Gift 的 proto 解析没有炸"。它一旦在 handler 之前推进, 那层
         判据就与 `parse_error_counts` 互相矛盾了。
+
+        ⚠️ 这里**只**推进计数, 不写语义 JSONL —— 语义由链路末端的干跑
+        回调(`_gift_probe_dry_run_gift`)写一次。两处都写会让每条 Gift 在
+        `gift_semantic.jsonl` 里出现两遍, 而下游按行分析时会把它读成"收到
+        了两次礼物"。计数与语义分开还有一个好处: `parsed` 描述"解析成功了
+        N 条", `emitted` 描述"其中 M 条走到了回调", 两者口径不同。
         """
         c = getattr(self, "_gift_probe_counters", None)
         if c is None:
             return
-        msg = _parse_gift_message(payload)
-        if msg is None:
-            # 基线 handler 没抛但探针解析不出来(理论上不该发生 —— 它们
-            # 用同一个消息类)。不推进二层计数, 也不留语义。
+        # 解析一次以确认"这条真的能解析"(而不是 handler 恰好没抛)。
+        if _parse_gift_message(payload) is None:
             return
         try:
             with (getattr(self, "_gift_probe_lock", None) or _NULL_LOCK):
                 c.parsed_gift_count += 1
-            sem = getattr(self, "_gift_probe_semantic", None)
-            if sem is not None:
-                sem.record(msg,
-                           envelope_msg_id=self._gift_probe_pending_envelope,
-                           connection_generation=c.connection_generation)
         except Exception:                       # noqa: BLE001
             pass
 
-    def _gift_probe_note_emitted_if_really_emitted(self, keep_all_before,
-                                                   interaction_before) -> None:
-        """在 handler 成功之后判断"业务回调**真的**被调用了吗"。
+    # ------------------------------------------------------------------
+    # Blocker 2: 诊断连接自己的 **dry-run 业务路径**
+    # ------------------------------------------------------------------
+    #
+    # ## 问题
+    #
+    # 诊断连接**不能**接真业务回调(否则会污染 SummonLedger / Engine / UI
+    # —— Issue 的 non-goals)。但早先的实现把 `keep_all` 与
+    # `interaction_enabled` 都设成 False, 于是基线**根本不注册**
+    # `WebcastGiftMessage` handler:
+    #
+    #     收到 Gift -> handlers.get() 返回 None -> unhandled -> verdict=dispatch
+    #
+    # 结果真实 runner 永远只能回答"服务端有没有给 Gift-family", 答不了
+    # Issue #17 要的第 3~5 问(dispatch? proto? callback/ingest?)。而测试
+    # 之所以绿, 是因为它构造了**另一套**配置(`interaction_enabled=True`)
+    # —— 测试路径与真实诊断路径不一致, 又是一次假绿。
+    #
+    # ## 修法
+    #
+    # 给诊断连接一条**自己的**干跑链路: 注册 `WebcastGiftMessage` handler,
+    # 让它走真实的 parse, 再把结果交给一个**只写诊断 sink** 的回调。这条
+    # 链路的终点是我们的探针, **不接** Engine / Summon / inbox /
+    # 任何业务状态。
+    #
+    # 三层计数于是全部由**同一条真实路径**产生:
+    #
+    #     gift_method_seen      分发到 handler(真实注册, 不再靠 unhandled)
+    #     parsed_gift_count     handler **成功**返回(基线那句 GiftMessage().parse)
+    #     parse_error_counts    handler 抛异常(真实的 proto 解析失败)
+    #     emitted_gift_count    干跑回调真的被调用且**返回**(链路末端)
 
-        ⚠️ 这里**不能**简单地"handler 没抛就算 emitted=1" —— 基线的
-        `_parseGiftMsg` 有两个正交开关:
+    def _gift_probe_parse_gift_dry_run(self, payload, envelope_msg_id=0
+                                       ) -> None:
+        """诊断用的 primary GiftMessage handler: 真解析 + 干跑回调。
 
-            if not (self.keep_all or self.interaction_enabled):
-                return                       # <- 提前返回, 回调**没被调用**
-            ...
-            if self.interaction_enabled:
-                self._on_gift(...)           # <- 只有这里才真的调了业务回调
+        与基线 `DanmakuFetcher._parseGiftMsg` 的差别**只有两点**:
 
-        默认配置(`interaction_enabled=True`, `keep_all=False`)下两者一致,
-        但诊断模式把两个开关都设为 False(它不接业务链), 那时"handler 成功"
-        与"业务回调被调用"是**两件不同的事**。把它们混为一谈会让
-        `emitted_gift_count` 在诊断模式下恒等于 `parsed_gift_count`,
-        于是"parse 成功但 emitted=0"这条判据**永久失效** —— 而那正是本轮
-        区分 callback/ingest 层故障的唯一手段。
+        1. 它**不**看 `keep_all` / `interaction_enabled` —— 诊断路径与业务
+           开关解耦, 这是"诊断能在生产配置下工作"的前提;
+        2. 它**不落库**到 production 弹幕文件, 也不发 InteractionEvent。
 
-        判据是开关的取值, 不是"事后猜": 基线里那一行 `if` 的条件就是它,
-        这里复现同一个条件(Issue 要求三层计数可独立区分)。
+        解析用**同一个** `GiftMessage` 消息类(与基线同源), 所以
+        "解析成功/失败"的口径与生产一致 —— 否则 parse_error 计数就不再
+        描述生产的 proto 行为。
+
+        异常**原样上抛**: 基线 `_wsOnMessage` 的 except 分支会把它记进
+        `parse_error_counts` 并在 stderr 打一行 —— 那正是我们要的 proto 层
+        证据。在这里吞掉就等于把这一层判据抹掉。
+        """
+        from protobuf.douyin import GiftMessage
+        m = GiftMessage().parse(payload)
+        self._gift_probe_dry_run_gift(m, envelope_msg_id=envelope_msg_id)
+
+    def _gift_probe_dry_run_gift(self, m, envelope_msg_id=0) -> None:
+        """干跑回调 —— 诊断链路的终点。
+
+        ⚠️ 它**只**做两件事: 写语义 JSONL、推进 `emitted_gift_count`。
+        绝不触碰 Engine / SummonLedger / inbox / Web / 任何业务状态。
+
+        之所以做成一个真的回调(而不是在 handler 里顺手计数), 是为了让
+        `emitted` 代表**同一条链路**的末端 —— 与生产
+        `CallbackFetcher._on_gift` 的位置一一对应。这样"parse 成功但
+        emitted=0"在诊断里的含义, 与生产里"解析成功但业务回调没收到"是
+        同一件事; 否则这个计数只是"又数了一遍 parsed"。
         """
         c = getattr(self, "_gift_probe_counters", None)
         if c is None:
             return
-        if not (keep_all_before or interaction_before):
-            return                          # 基线提前返回, 回调没跑
-        if not interaction_before:
-            return                          # 只落库, 不接业务回调
         try:
+            sem = getattr(self, "_gift_probe_semantic", None)
+            if sem is not None:
+                sem.record(m, envelope_msg_id=envelope_msg_id,
+                           connection_generation=c.connection_generation)
             with (getattr(self, "_gift_probe_lock", None) or _NULL_LOCK):
                 c.emitted_gift_count += 1
         except Exception:                       # noqa: BLE001
             pass
 
+    def _gift_probe_register_dry_run_handlers(self, handlers: dict) -> None:
+        """把 `WebcastGiftMessage` 指向**干跑** handler。
+
+        只覆盖 Gift 一个 method。其余(chat / like / member / ...)保持诊断
+        模式的静默 —— 它们与本轮要回答的问题无关, 让它们进业务链只是多
+        一份风险。
+
+        覆盖是**幂等**的: handler 表每帧重建, 所以这里每帧调一次也不会
+        累积。
+        """
+        handlers["WebcastGiftMessage"] = self._gift_probe_parse_gift_dry_run
+
     def _gift_probe_record_semantics_only(self) -> None:
         """把一条 primary `WebcastGiftMessage` 的语义落进 JSONL, **不**推进二层计数。
 
-        只在"基线没有注册这个 handler"时调用(诊断模式的常态)。
+        ⚠️ 这是**兜底**路径: 只有当 baseline 的 handler 表里**没有**我们
+        注册的干跑 handler 时才会走到(见 `_wsOnMessage` 里的分派)。正常
+        诊断模式下走的是 `_gift_probe_parse_gift_dry_run`, 三层计数都由那
+        条真实路径产生。
 
-        ⚠️ 为什么它不推进 `parsed_gift_count`: 那个计数是 Issue §D 的
-        **proto 层判据**("handled > 0, parse_error > 0 -> proto 层"), 它的
-        分母是"真的走过业务解析路径的消息"。诊断模式下这些消息**根本没进**
-        业务路径(handler 未注册), 把它们算进 proto 层判据会让那层判据
-        失去意义 —— 它会显示"解析成功"而实际上业务链压根没碰过这条消息。
-
-        所以这里只做**语义采样**: 让"诊断模式下收到的 Gift 长什么样"能被
-        离线分析, 而不去污染那条用于归因的判据。两者的差别写进了
-        `profile.py` 的字段注释, 也在测试里被钉住。
+        保留它是因为"handler 没被注册"这件事本身是个需要被观察到的信号
+        (比如将来有人改了 handler 注册条件)。那时至少语义样本仍在, 不会
+        变成"什么都看不到"。
         """
         parsed = _parse_gift_message(self._gift_probe_pending_payload)
         if parsed is None:
@@ -415,7 +567,15 @@ def make_gift_capture_fetcher(base_cls) -> type:
                 ).SerializeToString()
                 ws.send(ack, websocket.ABNF.OPCODE_BINARY)
 
-            _ENVELOPE_AWARE = {self._parseLikeMsg, self._parseGiftMsg}
+            # ⚠️ 干跑 handler 必须也在 `_ENVELOPE_AWARE` 里。
+            #
+            # 基线是用**实例方法对象**比对这个集合来决定要不要传
+            # `envelope_msg_id=`。我们的 handler 不在集合里的话, 它会被
+            # 当成"签名不含该参数"按位置调用 —— 于是 Issue §G 要求的
+            # `envelope_msg_id` 在语义 JSONL 里恒为空串, 而 `common_msg_id`
+            # 正常, 看起来像"服务端这条没给 envelope"(假信号)。
+            _ENVELOPE_AWARE = {self._parseLikeMsg, self._parseGiftMsg,
+                               self._gift_probe_parse_gift_dry_run}
             handlers = {
                 "WebcastChatMessage": self._parseChatMsg,
                 "WebcastControlMessage": self._parseControlMsg,
@@ -431,6 +591,20 @@ def make_gift_capture_fetcher(base_cls) -> type:
                     "WebcastSocialMessage": self._parseSocialMsg,
                     "WebcastEmojiChatMessage": self._parseEmojiChatMsg,
                 })
+            # ---- Blocker 2: 诊断连接自己的干跑 Gift 链路 ----
+            #
+            # ⚠️ 这一句是**整条诊断链能不能分层的关键**。
+            #
+            # 诊断模式把 `keep_all` 与 `interaction_enabled` 都设为 False
+            # (它不接业务链), 所以上面那两个 if **都不会**注册
+            # `WebcastGiftMessage`。没有这一句, 每一份礼物都会掉进
+            # `unhandled` 分支 -> `verdict()` 恒为 `dispatch` -> proto 层
+            # 与 callback 层**永远不可达**。
+            #
+            # 这里显式把 Gift 指向我们自己的 handler(解析 -> 只写诊断
+            # sink)。它**替代**了基线那个受开关约束的注册, 但只针对 Gift
+            # 一个 method, 且终点不接任何业务状态。
+            self._gift_probe_register_dry_run_handlers(handlers)
 
             for msg in response.messages_list:
                 _m = msg.method
@@ -439,20 +613,6 @@ def make_gift_capture_fetcher(base_cls) -> type:
                 self._gift_probe_before_parse()
                 self._probe_bump("method_counts", _m)
                 fn = handlers.get(_m)
-                # ⚠️ 探针的解析**必须在** `unhandled` 分支**之前**判断。
-                #
-                # 基线那行 `continue` 是为"没有 handler 的类型一律忽略"
-                # 写的, 而诊断模式恰恰把 Gift 的业务开关**都关了**
-                # (`keep_all=False` + `interaction_enabled=False`, 因为它
-                # 不接业务链)—— 于是 `WebcastGiftMessage` 在诊断模式下
-                # **正好**会走进 unhandled 分支。若把探针的解析放在
-                # `continue` 之后, 诊断就会"只要关了业务开关就什么都看不
-                # 到", 而那正是本轮要在生产配置下观察的东西。
-                #
-                # 所以顺序是: 先计数(与基线一致) -> 探针独立解析(与开关
-                # 解耦) -> 再按基线的规则决定要不要调 handler。
-                if _m == "WebcastGiftMessage":
-                    self._gift_probe_record_semantics_only()
                 if fn is None:
                     self._probe_bump("unhandled_method_counts", _m)
                     continue
@@ -468,27 +628,66 @@ def make_gift_capture_fetcher(base_cls) -> type:
                         fn(payload)
                 except Exception as e:          # noqa: BLE001
                     self._probe_bump("parse_error_counts", _m)
-                    print(f"!!! 解析 {msg.method} 失败: "
-                          f"{type(e).__name__}: {e}",
+                    # ⚠️ **不能**打 `{e}`。这条链上的异常正文可能带请求
+                    # 上下文(而请求头里就有登录 Cookie), 而 stderr 会进
+                    # 直播日志/截图。基线打印原文是它历史行为, 但诊断
+                    # 连接是我们**新增**的路径, 没有理由继承那条风险。
+                    #
+                    # 这里打 method 名(已归一化)+ 异常**类型名** —— 类型名
+                    # 来自类定义、不是运行时数据, 排障够用且结构上不可能
+                    # 携带凭据。
+                    print(f"!!! 解析 {sanitize_method(msg.method)} 失败: "
+                          f"{type(e).__name__}",
                           file=sys.stderr, flush=True)
                     continue
 
                 # ---- 到这里说明 handler 成功返回了 ----
                 #
-                # 第二层: **业务解析路径**成功了 —— `parsed_as_primary_gift`。
-                # 与 `parse_error_counts` 一起构成 Issue §D 的 proto 层判据。
-                # 放在 handler **之后**是必须的: 放在之前的话, "handler 抛
-                # 异常"的样本会同时呈现 parsed=1 与 parse_error=1, 两层判据
-                # 互相矛盾。
+                # 第二层: **解析路径**成功了 —— `parsed_as_primary_gift`。
+                # 与 `parse_error_counts` 一起构成 Issue §D 的 proto 层判据
+                # ("handled > 0, parse_error > 0 -> proto 层")。
                 #
-                # 第三层: 业务回调**真的**被调用了吗? 按基线那两个开关判 ——
-                # 见 `_gift_probe_note_emitted_if_really_emitted` 的说明。
+                # ⚠️ 必须放在 handler **之后**: 放在之前的话, "handler 抛
+                # 异常"的样本会同时呈现 parsed=1 与 parse_error=1, 两层判据
+                # 互相矛盾, 结论就不可信了。
+                #
+                # 第三层(emitted)不在这里推进 —— 它由**干跑回调**在链路
+                # 末端推进(见 `_gift_probe_dry_run_gift`)。这样 `emitted`
+                # 的含义是"这条消息真的走到了业务回调的位置", 而不是
+                # "handler 返回了"(那是 parsed 的含义)。
                 if _m == "WebcastGiftMessage":
                     self._gift_probe_after_parse_success(
                         self._gift_probe_pending_payload)
-                    self._gift_probe_note_emitted_if_really_emitted(
-                        keep_all_before=bool(self.keep_all),
-                        interaction_before=bool(self.interaction_enabled))
+
+        def _local_bootstrap(self, now_ms: int) -> dict:
+            """按**本路 profile** 生成 `cursor` / `internal_ext`。
+
+            ⚠️ 这个覆写是 blocker-1 的修复点, 不是锦上添花。
+
+            基线 `liveMan._local_bootstrap()` 对每一路都无条件用同一套参数
+            生成 bootstrap。我们此前只把 profile 的 `bootstrap` 记在元数据
+            里、**没有接进连接层**, 于是运行时:
+
+                A = 固定 uid + local bootstrap
+                B = 随机 uid + local bootstrap
+                C = 随机 uid + local bootstrap   <-- 与 B 完全相同
+
+            也就是说 `reference-2026` 这一臂**根本没有运行过**。真实直播里
+            若 C 也没收到 Gift, 我们会得出"reference 方案无效"的**错误结论**
+            —— 而它压根没被测过。这是本轮最危险的一类假绿。
+
+            修法上刻意**不动生产**: 基线方法原样保留, 诊断子类只在**自己**
+            身上按 profile 分派。`BOOTSTRAP_LOCAL` 走 `super()`, 所以 A/B
+            两臂与生产逐字同源;C 才走 reference 形状。
+
+            两臂都用**本次调用的 now_ms**(由基线传入, 每次连接新取)——
+            "fresh timestamp" 对 B/C 都成立, 这正是 Issue 要求 3。
+            """
+            mode = getattr(self, "_gift_probe_bootstrap_mode", None)
+            if mode == "reference":
+                return _reference_bootstrap(self, now_ms)
+            # A/B: 逐字走生产路径。
+            return super()._local_bootstrap(now_ms)
 
         def _wsOnOpen(self, ws):
             r = super()._wsOnOpen(ws)

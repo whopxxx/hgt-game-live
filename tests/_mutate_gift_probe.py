@@ -35,17 +35,17 @@ NEIGHBOUR_SUITES = ("tests/test_ws_cookie.py", "tests/test_ws_bootstrap.py")
 #: (编号, 说明, 文件, 原文, 变异后, 期望变红的套件)
 MUTATIONS = [
     # ---- 1. Gift method 在 handler 前被 continue ----
+    #
+    # 锚点跟着 Blocker 2 的修复换了位置: 现在"Gift 有没有 handler"由
+    # `_gift_probe_register_dry_run_handlers` 决定。把它整个去掉, 就回到
+    # 了"诊断模式下 Gift 全部落 unhandled"的旧行为。
     (
         "M-GP-1",
-        "Gift method 在 handler 前被 continue(dispatch 层断掉)",
+        "Gift handler 不注册(dispatch 层断掉, 回到 Blocker 2 旧行为)",
         "story/gift_probe/hooks.py",
-        "                if _m == \"WebcastGiftMessage\":\n"
-        "                    self._gift_probe_record_semantics_only()\n"
-        "                if fn is None:",
-        "                if _m == \"WebcastGiftMessage\":\n"
-        "                    self._probe_bump(\"unhandled_method_counts\", _m)\n"
-        "                    continue\n"
-        "                if fn is None:",
+        "        handlers[\"WebcastGiftMessage\"] = "
+        "self._gift_probe_parse_gift_dry_run",
+        "        pass",
         [SUITE],
     ),
     # ---- 2. authenticated summary 打出原始 cookie ----
@@ -126,11 +126,24 @@ MUTATIONS = [
         "        self.counters = ProfileCounters(\n"
         "            profile.profile_id,\n"
         "            auth=auth_state[\"auth\"],\n"
-        "            config_state=auth_state[\"config_state\"])",
+        "            config_state=auth_state[\"config_state\"],",
         "        _g = globals().setdefault(\"_SHARED_PC\", ProfileCounters(\n"
         "            profile.profile_id, auth=auth_state[\"auth\"],\n"
-        "            config_state=auth_state[\"config_state\"]))\n"
-        "        self.counters = _g",
+        "            config_state=auth_state[\"config_state\"],\n"
+        "            bootstrap_mode=profile.bootstrap))\n"
+        "        self.counters = _g\n"
+        "        _unused = (lambda: ProfileCounters(\n"
+        "            profile.profile_id,\n"
+        "            auth=auth_state[\"auth\"],\n"
+        "            config_state=auth_state[\"config_state\"],",
+        [SUITE],
+    ),
+    (
+        "M-GP-4b",
+        "runner 不把 profile 的 bootstrap 记进 counter(回到元数据)",
+        "story/gift_probe/runner.py",
+        "            bootstrap_mode=profile.bootstrap)",
+        "            bootstrap_mode=\"\")",
         [SUITE],
     ),
     # ---- 附加: 三层计数被合并 / cap 失效 / 预警 ----
@@ -187,6 +200,129 @@ MUTATIONS = [
         "story/gift_probe/capture.py",
         "        fname = f\"{safe_method}-{self._seq:04d}.bin\"",
         "        fname = f\"{safe_method}-{self._seq:04d}.jsonl\"",
+        [SUITE],
+    ),
+
+    # ================================================================
+    # 复审 blocker 的回归变异(每条对应一个 blocker)
+    # ================================================================
+    #
+    # 这三条的存在意义是: blocker 修好之后, **任何一次回退都会被抓住**。
+    # 没有它们的话, 那些修复只是一次性的, 下一个人重构时很容易再犯同样
+    # 的错误 —— 而症状(真实直播里 C 也没收到 / 永远 dispatch / 凭据泄漏)
+    # 都不会在 CI 里出现。
+
+    # ---- Blocker 1: profile 的 bootstrap 没有接进连接层 ----
+    (
+        "M-GP-11",
+        "profile 的 bootstrap 不接进连接层(reference 臂形同虚设)",
+        "story/gift_probe/hooks.py",
+        "            mode = getattr(self, \"_gift_probe_bootstrap_mode\", None)\n"
+        "            if mode == \"reference\":\n"
+        "                return _reference_bootstrap(self, now_ms)\n"
+        "            # A/B: 逐字走生产路径。\n"
+        "            return super()._local_bootstrap(now_ms)",
+        "            # A/B: 逐字走生产路径。\n"
+        "            return super()._local_bootstrap(now_ms)",
+        [SUITE],
+    ),
+    (
+        "M-GP-11b",
+        "reference bootstrap 退化成与 local 完全相同(不派生 did)",
+        "story/gift_probe/hooks.py",
+        "    did = f\"{uid}{now_ms}\" if uid else str(now_ms)\n"
+        "\n"
+        "    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,\n"
+        "                                 now_ms=now_ms)",
+        "    did = uid\n"
+        "\n"
+        "    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,\n"
+        "                                 now_ms=now_ms)",
+        [SUITE],
+    ),
+    (
+        "M-GP-11c",
+        "attach_gift_probe 不接收 profile 的 bootstrap 模式(回到元数据)",
+        "story/gift_probe/hooks.py",
+        "        if bootstrap_mode is None:\n"
+        "            bootstrap_mode = getattr(profile, \"bootstrap\", None)",
+        "        if bootstrap_mode is None:\n"
+        "            bootstrap_mode = None",
+        [SUITE],
+    ),
+
+    # ---- Blocker 2: 诊断链路断了 dispatch/proto/callback 三层 ----
+    (
+        "M-GP-12",
+        "取消干跑 handler 注册(礼物全部落成 unhandled)",
+        "story/gift_probe/hooks.py",
+        "        handlers[\"WebcastGiftMessage\"] = "
+        "self._gift_probe_parse_gift_dry_run",
+        "        return",
+        [SUITE],
+    ),
+    (
+        "M-GP-12b",
+        "干跑 handler 吞掉解析异常(proto 层判据失效)",
+        "story/gift_probe/hooks.py",
+        "        from protobuf.douyin import GiftMessage\n"
+        "        m = GiftMessage().parse(payload)\n"
+        "        self._gift_probe_dry_run_gift(m, envelope_msg_id=envelope_msg_id)",
+        "        from protobuf.douyin import GiftMessage\n"
+        "        try:\n"
+        "            m = GiftMessage().parse(payload)\n"
+        "        except Exception:\n"
+        "            return\n"
+        "        self._gift_probe_dry_run_gift(m, envelope_msg_id=envelope_msg_id)",
+        [SUITE],
+    ),
+    (
+        "M-GP-12c",
+        "干跑回调不推 emitted(第三层计数失效)",
+        "story/gift_probe/hooks.py",
+        "            sem = getattr(self, \"_gift_probe_semantic\", None)\n"
+        "            if sem is not None:\n"
+        "                sem.record(m, envelope_msg_id=envelope_msg_id,\n"
+        "                           connection_generation=c.connection_generation)\n"
+        "            with (getattr(self, \"_gift_probe_lock\", None) or _NULL_LOCK):\n"
+        "                c.emitted_gift_count += 1",
+        "            sem = getattr(self, \"_gift_probe_semantic\", None)\n"
+        "            if sem is not None:\n"
+        "                sem.record(m, envelope_msg_id=envelope_msg_id,\n"
+        "                           connection_generation=c.connection_generation)",
+        [SUITE],
+    ),
+    (
+        "M-GP-12d",
+        "干跑 handler 不进 _ENVELOPE_AWARE(envelope 静默丢失)",
+        "story/gift_probe/hooks.py",
+        "            _ENVELOPE_AWARE = {self._parseLikeMsg, self._parseGiftMsg,\n"
+        "                               self._gift_probe_parse_gift_dry_run}",
+        "            _ENVELOPE_AWARE = {self._parseLikeMsg, self._parseGiftMsg}",
+        [SUITE],
+    ),
+
+    # ---- Blocker 3: _safe_error 不是真脱敏 ----
+    (
+        "M-GP-13",
+        "_safe_error 退回 str(e) 字符过滤(凭据泄漏)",
+        "story/gift_probe/runner.py",
+        "    try:\n"
+        "        return f\"{_error_category(e)}({type(e).__name__})\"",
+        "    try:\n"
+        "        import re as _re\n"
+        "        return _re.sub(r\"[^A-Za-z0-9_.\\-:/=, ()']\", \"?\",\n"
+        "                       f\"{type(e).__name__}: {e}\")[:200]",
+        [SUITE],
+    ),
+    (
+        "M-GP-13b",
+        "错误类别里带上异常正文",
+        "story/gift_probe/runner.py",
+        "    try:\n"
+        "        return f\"{_error_category(e)}({type(e).__name__})\"",
+        "    try:\n"
+        "        return f\"{_error_category(e)}({type(e).__name__}): {e}\"",
         [SUITE],
     ),
 ]

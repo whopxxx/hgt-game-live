@@ -53,6 +53,7 @@ from ws_cookie import WS_AUTH_ANONYMOUS, WS_AUTH_AUTHENTICATED
 #: 摘要日志允许出现的字段。**显式白名单** —— 见模块 docstring。
 _SUMMARY_LOG_FIELDS = (
     "profile", "connection_generation", "auth", "config_state",
+    "bootstrap_mode",
     "ws_frames", "ws_messages", "gift_method_seen", "parsed_gift_count",
     "emitted_gift_count", "captured_payload_count", "capture_skipped_count",
 )

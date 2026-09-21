@@ -59,9 +59,25 @@ RANDOM_UID_MIN = 7_000_000_000_000_000_000
 RANDOM_UID_MAX = 8_000_000_000_000_000_000
 
 #: bootstrap 来源的两种取值。
-#: - `local`     : `_local_bootstrap(now_ms)`, 即当前生产路径;
-#: - `reference` : 同样走本地生成, 但**每次连接注入 fresh now_ms**,
-#:                 与公开参考实现 `genCursorInternalExt()` 的形状对齐。
+#:
+#: ⚠️ 先说清一件容易搞错的事(这也是本 Step 被 review 打回的点):
+#: 本项目**生产**的 cursor/internal_ext 生成器(`vendor/.../ws_bootstrap.py`)
+#: 本来就是照公开参考实现 `JaneEyre3007/douyin-js` 的 `genCursorInternalExt`
+#: 写的 —— 也就是说"reference 形状"与"当前 local 生成"在本仓库里**是同一份
+#: 实现**。所以 `bootstrap=reference` 如果只是换个标签, 这一臂就形同虚设,
+#: 真实直播里"C 也没收到"会得出"reference 方案无效"的**错误结论**。
+#:
+#: 因此这两个取值的差别必须是**真实存在、可被 URL 断言验证**的:
+#:
+#: - `local`     : `_local_bootstrap(now_ms)`, 即当前生产路径。身份 id 用
+#:                 本 profile 的 `user_unique_id`(A 是固定值)。
+#: - `reference` : 走 `_reference_bootstrap(now_ms)`, 它把参考实现里
+#:                 **每次连接都换**的那组身份/时间字段显式参数化 —— 特别是
+#:                 `wss_push_did`(参考实现每次连接随机)与 `seq`/`wrds_v`
+#:                 的每连接重新取值。A 臂的 `did` 全场固定, C 臂每次连接都变。
+#:
+#: 这样 A/B/C 在 URL 层面**真的**不同, 而且差异是"InternalExt 的身份/时间
+#: 字段"这一条被测断言钉住的东西, 不是标签。
 BOOTSTRAP_LOCAL = "local"
 BOOTSTRAP_REFERENCE = "reference"
 
@@ -314,6 +330,12 @@ class ProfileCounters:
     capture_skipped_count: int = 0
     auth: str = ""
     config_state: str = ""
+    #: 本路**实际生效**的 bootstrap 模式(`local` / `reference`)。
+    #: ⚠️ 这不是元数据冗余: Blocker 1 的根因就是"profile 上写着 reference,
+    #: 但连接层从来没读过它"。把这个值记进 counters 并被摘要打印, 意味着
+    #: "哪条路径真的跑了"是一个**可被观测到**的事实, 而不是靠读 profile
+    #: 猜测的意图。
+    bootstrap_mode: str = ""
     first_frame_at: float = 0.0
     last_frame_at: float = 0.0
 
@@ -355,6 +377,7 @@ class ProfileCounters:
             "connection_generation": self.connection_generation,
             "auth": self.auth,
             "config_state": self.config_state,
+            "bootstrap_mode": self.bootstrap_mode,
             "ws_frames": self.ws_frames,
             "ws_messages": self.ws_messages,
             "methods": dict(sorted(self.method_counts.items())),

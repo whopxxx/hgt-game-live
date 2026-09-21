@@ -106,7 +106,11 @@ class GiftProbeArm:
         self.counters = ProfileCounters(
             profile.profile_id,
             auth=auth_state["auth"],
-            config_state=auth_state["config_state"])
+            config_state=auth_state["config_state"],
+            # Blocker 1: 把**实际会生效**的 bootstrap 模式记进 counters。
+            # 它是 arm 与 fetcher 之间唯一的一致性凭证 —— 测试与摘要有它
+            # 才能断言"reference 真的跑了", 而不是"profile 上写着 reference"。
+            bootstrap_mode=profile.bootstrap)
         self.store = RawCaptureStore(
             probe_root, session_id, profile.profile_id,
             max_per_method=max_per_method,
@@ -198,17 +202,85 @@ class GiftProbeArm:
         return format_profile_log(self.profile, self.auth_state())
 
 
-def _safe_error(e: BaseException) -> str:
-    """异常 -> 一行安全的文本。
+#: 允许出现在日志/摘要里的**错误类别**。闭集 —— 见 `_safe_error`。
+ERR_HANDSHAKE = "handshake_failed"
+ERR_RESOLVE = "room_resolve_failed"
+ERR_NETWORK = "network_error"
+ERR_TIMEOUT = "timeout"
+ERR_AUTH = "auth_error"
+ERR_OS = "os_error"
+ERR_VALUE = "value_error"
+ERR_UNKNOWN = "unknown_error"
 
-    ⚠️ **不能**用 `repr(e)` / `traceback.format_exc()`: 这条链上的异常可能
-    携带请求上下文, 而请求头里就有登录 Cookie。这里只取"异常类型 + 消息
-    的前若干字符", 并对字符集做一次过滤 —— 与 `sanitize_method` 同一思路。
+
+def _error_category(e: BaseException) -> str:
+    """异常 -> 一个**固定类别词**。
+
+    ⚠️ 这份映射是 `_safe_error` 的核心, 不是"给异常起个好听名字"。
+
+    之前那版 `_safe_error` 用 `f"{type(e).__name__}: {e}"` 然后只替换非法
+    字符 —— 那**不是脱敏**。凭据的字符集(字母/数字/下划线/短横/等号)本来
+    就全在被保留的范围内, 于是形如
+
+        handshake failed Cookie: sessionid=TEST_SECRET_DO_NOT_LOG
+
+    的异常正文会把 `TEST_SECRET_DO_NOT_LOG` 几乎原样带进 WARN 日志、
+    `arm.error`、以及落盘的 `session_summary.json`。Issue #17 明确要求
+    登录 Cookie **绝不能**进入日志与诊断摘要。
+
+    正确做法是**根本不保留 `str(e)`** —— 只保留"哪一类错误"。分类信息对
+    排障足够(是该查网络、该查房间号、还是该查签名/握手), 而它**结构上
+    不可能**携带凭据, 因为输出是一个来自闭集的常量。
+
+    分类顺序有意从"最具体"到"最泛": 握手类异常往往是网络类的子类, 先判
+    具体的那个才能给出有用的类别。
     """
-    import re
-    txt = f"{type(e).__name__}: {e}"
-    txt = re.sub(r"[^A-Za-z0-9_.\-:/=, ()']", "?", txt)
-    return txt[:200]
+    name = type(e).__name__
+    # 按类名匹配(而不是 import websocket 的异常类): 这里要能在
+    # websocket-client 缺席/版本变化的场景下仍然工作 —— 诊断不该因为
+    # 一个第三方库的导入问题就崩。
+    if "SSLError" in name or "Certificate" in name:
+        return ERR_NETWORK
+    if "Timeout" in name or "timeout" in str(getattr(e, "args", ("",))[0]):
+        return ERR_TIMEOUT
+    if "BadStatus" in name or "Handshake" in name or "HandshakeStatus" in name:
+        return ERR_HANDSHAKE
+    if "WebSocket" in name:
+        return ERR_HANDSHAKE
+    if "Connection" in name or "Proxy" in name or "DNS" in name \
+            or "gaierror" in name:
+        return ERR_NETWORK
+    if isinstance(e, (TimeoutError,)):
+        return ERR_TIMEOUT
+    if isinstance(e, ConnectionError):
+        return ERR_NETWORK
+    if isinstance(e, (FileNotFoundError, PermissionError, IsADirectoryError,
+                      NotADirectoryError, OSError)):
+        return ERR_OS
+    if isinstance(e, (TypeError, ValueError, KeyError, AttributeError)):
+        return ERR_VALUE
+    return ERR_UNKNOWN
+
+
+def _safe_error(e: BaseException) -> str:
+    """异常 -> **一行安全文本**。绝不包含异常正文。
+
+    ⚠️ 返回的是 `f"{类别}({异常类型名})"`, 例如
+    `handshake_failed(WebSocketBadStatusException)`。
+
+    为什么连类型名都保留: 类型名来自 Python 的类定义, **不是**运行时数据
+    —— 它不可能包含某个具体的 cookie 值。而它对排障很有用("是
+    BadStatus 还是 Timeout")。反之, 异常**正文**几乎总是运行时拼出来的,
+    也就几乎总是有机会带上请求上下文(而请求头里就有登录 Cookie)。
+
+    也不要在这里加"截断到 N 字符"的折中: 截断只缩短泄漏, 不消除泄漏,
+    而半个凭据与整个凭据在安全上是同一件事(它同样是账号的一部分)。
+    """
+    try:
+        return f"{_error_category(e)}({type(e).__name__})"
+    except Exception:                           # noqa: BLE001
+        # 连分类都失败时也不能把原异常带出去。
+        return ERR_UNKNOWN
 
 
 def make_diagnostic_fetcher(cfg, user_unique_id, base_cls=None,

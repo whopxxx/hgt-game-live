@@ -408,6 +408,10 @@ class Config:
     # WS 连接去采集"哪种连接画像能收到 Gift"的原始证据, 每路写进
     # `data/gift_probe/<session>/<profile>/`。
     #
+    # ⚠️ 它还是**独占会话**: 打开后 Director **不会启动** —— 本进程只跑
+    # 采集, 跑完退出。这不是"游戏照常直播 + 后台旁路探针"那种模式(那需要
+    # 单独的生命周期接线, 不在本轮范围内)。见 `director._run_gift_capture_diagnostic`。
+    #
     # 它**不**接前端公告、不感谢礼物、不做打赏榜、不改 SummonLedger ——
     # 诊断连接不接任何业务回调(`make_diagnostic_fetcher` 会对传回调的
     # 调用直接报错)。详见 `story/gift_probe/`。
@@ -991,10 +995,11 @@ def build_parser() -> argparse.ArgumentParser:
     # 在 `--help` 里看不出来。
     ap.add_argument("--gift-capture-diagnostic", dest="gift_capture_diagnostic",
                     action="store_true",
-                    help="**诊断模式**: 额外开 1~3 路受控 WS 连接采集"
-                         " Gift 原始证据(多连接画像对照), 每路写独立目录。"
-                         "不接公告/不感谢礼物/不改 SummonLedger —— 诊断连接"
-                         "不接任何业务回调。默认关闭。")
+                    help="**独占诊断会话**(不是直播旁路): 本进程只跑采集, "
+                         "额外开 1~3 路受控 WS 连接抓 Gift 原始证据, 每路写"
+                         "独立目录, 跑完即退出 —— Director 不会启动。"
+                         "不接公告/不感谢礼物/不改 SummonLedger(诊断连接不接"
+                         "任何业务回调)。默认关闭。")
     ap.add_argument("--gift-probe-profiles", dest="gift_probe_profiles",
                     default="",
                     help=("要开的画像名, 逗号分隔。可选: "
