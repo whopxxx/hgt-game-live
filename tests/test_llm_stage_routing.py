@@ -222,6 +222,8 @@ def test_local_llm_config_covers_endpoint_credentials_models_and_budgets():
             check("**启动日志不会吐出完整 API key**",
                   payload["api_key"] not in json.dumps(cfg.masked(), ensure_ascii=False),
                   cfg.masked())
+            check("**LLMConfig repr 也不会吐出完整 API key**",
+                  payload["api_key"] not in repr(cfg), repr(cfg))
 
         # env 仍然是高级覆盖。
         with _Env(AI_BASE_URL="http://env-gateway:8088",
