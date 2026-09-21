@@ -813,12 +813,16 @@ def test_closeout_b3_irrelevant_never_establishes():
 
 
 def test_closeout_b3_verdict_matrix():
-    """Blocker 3: verdict/status 矩阵 —— 只有 是/不是 能建立。"""
+    """Blocker 3 + Task 0: completion 只有「是」能建立。
+
+    「不是」仍可建立普通 support/exclusion fact；这里的 f1/f2 都是
+    completion，所以必须被 Engine 的胜利状态硬门拦下。
+    """
     print("\n[B3] established 的 verdict 矩阵")
     from story.parser import NO, UNAVAILABLE, YES
     cases = [
-        (YES, "ok", True, "「是」可以建立"),
-        (NO, "ok", True, "「不是」也可以建立"),
+        (YES, "ok", True, "「是」可以建立 completion"),
+        (NO, "ok", False, "「不是」不能建立 completion"),
         ("无关", "ok", False, "「无关」不能建立"),
         (UNAVAILABLE, "unavailable", False, "「未判定」不能建立"),
         ("揭晓", "ok", False, "「揭晓」不能建立"),
@@ -1239,12 +1243,17 @@ def test_final_closeout_legacy_fallback_still_works():
 
 
 def test_final_closeout_status_must_be_ok():
-    """P1: established 的 status 必须**明确是 ok**(fail closed)。"""
+    """P1 + Task 0: status=ok 是必要条件；completion 还必须 verdict=是。
+
+    这里喂的 f1/f2 都属于 completion contract，所以「不是 + ok」也不得
+    推进胜利状态。普通非 completion fact 的「不是」语义由 Task 0 的
+    Engine 回归单独覆盖。
+    """
     print("\n[final] status 必须明确 ok")
     from story.parser import NO, UNAVAILABLE, YES
     cases = [
-        (YES, "ok", True, "是 + ok -> 建立"),
-        (NO, "ok", True, "不是 + ok -> 建立"),
+        (YES, "ok", True, "是 + ok -> 建立 completion"),
+        (NO, "ok", False, "不是 + ok -> 不建立 completion"),
         ("无关", "ok", False, "无关 + ok -> 不建立"),
         (UNAVAILABLE, "unavailable", False, "未判定 + unavailable -> 不建立"),
         (YES, "unavailable", False, "是 + unavailable -> 不建立"),
