@@ -36,15 +36,9 @@ def supported_models() -> frozenset[str]:
 
     只做**并集扩展** —— 不能覆盖/收窄内置集合。
     """
-    local_names: set[str] = set()
-    try:
-        local = _load_llm_local_config()
-        raw_local = local.get("supported_models_extra", [])
-        if isinstance(raw_local, list):
-            local_names = {str(x).strip() for x in raw_local if str(x).strip()}
-    except NameError:
-        # 模块导入期间函数定义先于 loader；真正调用发生在模块加载完成后。
-        pass
+    local = _load_llm_local_config()
+    raw_local = local.get("supported_models_extra", [])
+    local_names = {str(x).strip() for x in raw_local if str(x).strip()}
     extra = os.environ.get(AI_SUPPORTED_MODELS_EXTRA_ENV) or ""
     env_names = {x.strip() for x in extra.split(",") if x.strip()}
     return SUPPORTED_MODELS | local_names | env_names
