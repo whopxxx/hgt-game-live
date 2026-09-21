@@ -541,7 +541,7 @@
     const ai = s.ai_player || {};
     const parts = [];
     if (s.ai_player) {
-      parts.push(ai.in_flight ? "🤖 AI玩家正在推理…" : "👍 点赞可以召唤 AI 玩家");
+      parts.push(ai.in_flight ? "AI玩家正在推理…" : "每100点赞可以召唤 AI 玩家");
     }
     if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
     if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
@@ -696,8 +696,8 @@
       if (pendingAI) {
         const delta = pendingAI;
         pendingAI = 0;
-        show(delta > 1 ? "🤖 AI玩家已获得新的出手机会"
-          : "🤖 AI玩家已被召唤！正在准备出手…", "ai");
+        show(delta > 1 ? "AI玩家已被触发"
+          : "AI玩家已被召唤！正在思考…", "ai");
         return;
       }
       if (pendingHints.length) {
