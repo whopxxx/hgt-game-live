@@ -32,14 +32,22 @@ AI_SUPPORTED_MODELS_EXTRA_ENV = "AI_SUPPORTED_MODELS_EXTRA"
 
 
 def supported_models() -> frozenset[str]:
-    """内置白名单 + `AI_SUPPORTED_MODELS_EXTRA`。
+    """内置白名单 + 本地配置 + `AI_SUPPORTED_MODELS_EXTRA`。
 
-    只做**并集扩展** —— 不能覆盖/收窄内置集合, 否则 operator 一次手滑
-    就能把 deepseek 这类默认模型判成未知, 启动时满屏 warning。
+    只做**并集扩展** —— 不能覆盖/收窄内置集合。
     """
+    local_names: set[str] = set()
+    try:
+        local = _load_llm_local_config()
+        raw_local = local.get("supported_models_extra", [])
+        if isinstance(raw_local, list):
+            local_names = {str(x).strip() for x in raw_local if str(x).strip()}
+    except NameError:
+        # 模块导入期间函数定义先于 loader；真正调用发生在模块加载完成后。
+        pass
     extra = os.environ.get(AI_SUPPORTED_MODELS_EXTRA_ENV) or ""
-    names = {x.strip() for x in extra.split(",") if x.strip()}
-    return SUPPORTED_MODELS | names
+    env_names = {x.strip() for x in extra.split(",") if x.strip()}
+    return SUPPORTED_MODELS | local_names | env_names
 
 
 # ======================================================================
@@ -183,19 +191,27 @@ def _load_llm_local_config(path: Optional[str] = None) -> dict:
         raise ValueError(f"LLM 本地配置必须是 JSON object: {p}")
 
     allowed = {
-        "base_url", "api_key", "default",
+        "base_url", "api_key", "default", "supported_models_extra",
         "timeout", "max_tokens", "max_retries",
     } | set(LLM_STAGES)
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(
             f"LLM 本地配置包含未知 key {unknown}; "
-            f"已知字段: base_url/api_key/default/timeout/max_tokens/max_retries "
+            f"已知字段: base_url/api_key/default/supported_models_extra/"
+            f"timeout/max_tokens/max_retries "
             f"+ {sorted(LLM_STAGES)}")
 
     for key in ("base_url", "api_key", "default"):
         if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
             raise ValueError(f"LLM 本地配置 {key} 必须是非空字符串")
+
+    if "supported_models_extra" in raw:
+        extras = raw["supported_models_extra"]
+        if (not isinstance(extras, list)
+                or any(not isinstance(x, str) or not x.strip() for x in extras)):
+            raise ValueError(
+                "LLM 本地配置 supported_models_extra 必须是非空字符串数组")
 
     if "timeout" in raw:
         if not isinstance(raw["timeout"], (int, float)) or raw["timeout"] <= 0:
