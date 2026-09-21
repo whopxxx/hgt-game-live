@@ -150,6 +150,9 @@ class RoundEngine:
         # ---- 揭晓 ----
         self._solved = False
         self._solved_by = ""
+        self._leaderboard: dict[str, dict] = {}
+        self._win_sequence = 0
+        self._scored_round = None
         self._revealed = ""
         self._reveals = 0
         self._reveal_deadline: Optional[float] = None
@@ -1038,6 +1041,7 @@ class RoundEngine:
                         <= self._established_fact_ids):
                     log.info("第 %d 题的合同被补齐(由 %s): %s",
                              self._puzzle_index, q.user_name, q.text[:30])
+                    self._record_winner_locked(q)
                     acts.extend(self._solve_by_contract_locked(now, q.user_name))
                     return acts
                 # ---- legacy: P.SOLVE 直接通关(仅限**无合同**的题) ----
@@ -1057,6 +1061,7 @@ class RoundEngine:
                         and self._reveals < self.cfg.max_reveals_per_puzzle):
                     log.info("第 %d 题被 %s 猜中: %s", self._puzzle_index,
                              q.user_name, q.text[:30])
+                    self._record_winner_locked(q)
                     acts.extend(self._enter_revealing_locked(now, "solved",
                                                              q.user_name))
                     return acts
@@ -2211,6 +2216,20 @@ class RoundEngine:
                     len(self._established_fact_ids))
         return out
 
+    def _record_winner_locked(self, q: PendingQ) -> None:
+        """Session-only final human winner; callers already verified the solve."""
+        if self._scored_round == self.round_index:
+            return
+        self._scored_round = self.round_index
+        self._win_sequence += 1
+        key = str(q.user_id)
+        previous = self._leaderboard.get(key, {})
+        self._leaderboard[key] = {
+            "user_name": q.user_name,
+            "solved_count": previous.get("solved_count", 0) + 1,
+            "win_sequence": self._win_sequence,
+        }
+
     def _solve_by_contract_locked(self, now: float,
                                   winner: str) -> list[EngineAction]:
         """v5 通关: 合同已被房间共识覆盖。
@@ -2473,6 +2492,13 @@ class RoundEngine:
                 reveal_stage=reveal_stage,
                 solved=self._solved,
                 solved_by=self._solved_by,
+                leaderboard=[
+                    {"rank": i + 1, "user_name": row["user_name"],
+                     "solved_count": row["solved_count"]}
+                    for i, row in enumerate(sorted(
+                        self._leaderboard.values(),
+                        key=lambda row: (-row["solved_count"], row["win_sequence"])
+                    )[:3])],
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
                 qa_archive=[r.to_archive() for r in self._qa_archive],
                 # R2: 只在揭晓阶段下发。QA 阶段这些文本虽然已经公开过,

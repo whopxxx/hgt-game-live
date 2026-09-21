@@ -617,6 +617,145 @@
     el.debugBody.innerHTML = L.join("\n");
   }
 
+  // Session-local presentation only: one active item + one merged AI notice.
+  const announcer = (() => {
+    const box = $("announcer"), text = $("announcer-text");
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let config = null, phase = "", earned = null, pendingAI = 0;
+    let active = "", defaultText = "", lastPresetId = null;
+    let nextPreset = Infinity, timer = null, animation = null;
+
+    function cancel() {
+      clearTimeout(timer);
+      if (animation) animation.cancel();
+      animation = null;
+      text.style.transform = "";
+      active = "";
+    }
+    function interval() { return (config ? config.interval_seconds : 90) * 1000; }
+    function show(message, kind) {
+      cancel();
+      active = kind;
+      box.dataset.kind = kind;
+      text.textContent = message;
+      const width = box.clientWidth, length = text.scrollWidth;
+      const hold = (config ? config.hold_seconds : 4) * 1000;
+      function done() { cancel(); pump(); }
+      if (length > width && reduced.matches) {
+        // Measure each static page using the same rendered font, not char counts.
+        const pages = [];
+        let page = "";
+        for (const char of Array.from(message)) {
+          text.textContent = page + char;
+          if (text.scrollWidth > width && page) { pages.push(page); page = char; }
+          else page += char;
+        }
+        pages.push(page);
+        let index = 0;
+        function next() {
+          text.textContent = pages[index++];
+          box.dataset.motion = "pages";
+          timer = setTimeout(index < pages.length ? next : done, hold);
+        }
+        next();
+      } else if (length > width) {
+        const duration = (width + length) / (config ? config.long_text_speed_px_s : 80) * 1000;
+        box.dataset.motion = "marquee";
+        animation = text.animate([
+          {transform: `translateX(${width}px)`},
+          {transform: `translateX(${-length}px)`},
+        ], {duration, easing: "linear", fill: "forwards"});
+        timer = setTimeout(done, duration);
+      } else {
+        box.dataset.motion = reduced.matches ? "static" : "slide";
+        if (!reduced.matches) {
+          animation = text.animate([
+            {transform: `translateX(${width}px)`, offset: 0},
+            {transform: "translateX(0)", offset: 300 / (hold + 600)},
+            {transform: "translateX(0)", offset: (hold + 300) / (hold + 600)},
+            {transform: `translateX(${-width}px)`, offset: 1},
+          ], {duration: hold + 600, fill: "forwards"});
+        }
+        timer = setTimeout(done, hold + (reduced.matches ? 0 : 600));
+      }
+    }
+    function pump() {
+      if (phase !== "qa" || active) return;
+      if (pendingAI) {
+        const delta = pendingAI;
+        pendingAI = 0;
+        show(`📢 点赞召唤成功，AI玩家提问次数 +${delta}`, "ai");
+        return;
+      }
+      const items = config && config.enabled ? config.items.filter(x => x.enabled) : [];
+      if (items.length && performance.now() >= nextPreset) {
+        const index = (items.findIndex(x => x.id === lastPresetId) + 1) % items.length;
+        lastPresetId = items[index].id; // Advance even when interrupted by AI.
+        nextPreset = performance.now() + interval();
+        show("📢 游戏公告 " + items[index].text, "preset");
+      } else show(defaultText, "leaderboard");
+    }
+    function update(s) {
+      const value = (s.ai_player || {}).questions_earned;
+      if (Number.isSafeInteger(value) && value >= 0) {
+        if (earned !== null && value > earned) pendingAI += value - earned;
+        earned = value; // First valid snapshot (and a server reset) is a baseline.
+      }
+      const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
+      const nextDefault = rows.length
+        ? "📢 本场解谜榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
+        : "📢 游戏公告 猜中谜底即可登上本场解谜榜";
+      const changed = nextDefault !== defaultText;
+      defaultText = nextDefault;
+      if (phase !== s.phase) {
+        phase = s.phase;
+        cancel();
+        nextPreset = performance.now() + interval();
+      }
+      box.classList.toggle("hidden", phase !== "qa");
+      if (phase !== "qa") return;
+      if ((pendingAI && active !== "ai") || (changed && active === "leaderboard")) cancel();
+      pump();
+    }
+    async function reload() {
+      try {
+        const response = await fetch("/announcements.json", {cache: "no-store"});
+        if (!response.ok) throw new Error("announcement HTTP error");
+        const c = await response.json();
+        if (!c || typeof c.enabled !== "boolean" || !Array.isArray(c.items)
+            || !Number.isFinite(c.interval_seconds) || c.interval_seconds <= 0
+            || !Number.isFinite(c.hold_seconds) || c.hold_seconds < 3 || c.hold_seconds > 5
+            || !Number.isFinite(c.long_text_speed_px_s) || c.long_text_speed_px_s <= 0) {
+          throw new Error("invalid announcement config");
+        }
+        const ids = new Set();
+        for (const item of c.items) {
+          if (!item || typeof item.id !== "string" || !item.id || ids.has(item.id)
+              || typeof item.enabled !== "boolean" || typeof item.text !== "string") {
+            throw new Error("invalid announcement item");
+          }
+          ids.add(item.id);
+        }
+        c.items = c.items.filter(x => Array.from(x.text).length <= 160 && x.text.trim());
+        const first = config === null;
+        const anchor = nextPreset - interval();
+        config = c;
+        if (first && phase === "qa") nextPreset = performance.now() + interval();
+        else if (!first) nextPreset = anchor + interval();
+      } catch (_) { /* Keep last-known-good; config availability never blocks WS. */ }
+    }
+    reload();
+    setInterval(reload, 15000);
+    setInterval(() => {
+      if (phase === "qa" && active === "leaderboard" && config && config.enabled
+          && config.items.some(x => x.enabled) && performance.now() >= nextPreset) {
+        cancel(); pump();
+      }
+    }, 250);
+    reduced.addEventListener("change", () => { cancel(); pump(); });
+    return {update};
+  })();
+
   // ================= WebSocket =================
   let ws = null, retry = 800;
   function connect() {
@@ -645,6 +784,7 @@
     renderStats(s);
     renderDebug(s);
     layout();
+    announcer.update(s);
     puzzleScroller.update(
       JSON.stringify([s.puzzle_index, s.puzzle || "", s.phase || ""]),
       s.phase === "qa", true);

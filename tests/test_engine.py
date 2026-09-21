@@ -3848,6 +3848,7 @@ def test_ai_player_solve_wrong_and_right_are_independent():
         judge["token"], judge["expect_round"], judge["expect_spec_key"],
         "solve", judge["text"], solved=True)
     sr = right.snapshot()
+    check("AI 真正 solve 不加真人榜", sr.leaderboard == [])
     check("猜中 -> solved_by=AI玩家",
           sr.solved and sr.solved_by == "AI玩家", (sr.solved, sr.solved_by))
     check("猜中进入 REVEALING", right.phase == Phase.REVEALING, right.phase)
@@ -4008,8 +4009,53 @@ def test_ai_player_public_snapshot_only_contains_public_transcript():
                                       "SECRET_ATOM", "同伴的肉汤骗局")), blob)
 
 
+def test_session_leaderboard():
+    from story import parser as P
+    from story.state import PendingQ
+
+    eng, clk, sp = boot_v5()
+    check("新 session 空榜", eng.snapshot().leaderboard == [])
+    _answer_and_submit(eng, clk, "u1", "Alice", "身份正确",
+                       verdict="是", established_fact_ids=["f1"])
+    check("非最终贡献不记分", eng.snapshot().leaderboard == [])
+    _, payload = _answer_and_submit(eng, clk, "u2", "Bob", "时间正确",
+                                    verdict="是", established_fact_ids=["f2"])
+    expected = [{"rank": 1, "user_name": "Bob", "solved_count": 1}]
+    check("contract 最终补齐者 +1", eng.snapshot().leaderboard == expected)
+    eng.submit_qa([QAResult(qid=payload["qid"], verdict=P.SOLVE)])
+    with eng._lock:
+        # Explicit defense-in-depth: even abnormal same-round re-entry cannot score.
+        eng._record_winner_locked(PendingQ(999, "u2", "Bob", "重复"))
+        eng._record_winner_locked(PendingQ(1000, "u3", "Eve", "迟到"))
+        eng._enter_revealing_locked(clk(), "solved", "Bob")
+    check("重复 callback/reveal 同题只计一次", eng.snapshot().leaderboard == expected)
+
+    for uid, name in [("u1", "Alice"), ("u3", "Bob"), ("u4", "Dana"),
+                      ("u2", "Robert"), ("u1", "Alice")]:
+        eng.submit_reveal("合成谜底")
+        clk.advance(31)
+        eng.tick()
+        eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints))
+        _answer_and_submit(eng, clk, uid, name, "正确答案", verdict=P.SOLVE)
+    rows = eng.snapshot().to_json()["leaderboard"]
+    check("legacy 跨题累计/改名/同分先达到者优先", rows == [
+        {"rank": 1, "user_name": "Robert", "solved_count": 2},
+        {"rank": 2, "user_name": "Alice", "solved_count": 2},
+        {"rank": 3, "user_name": "Bob", "solved_count": 1},
+    ], rows)
+    check("同名不同 uid 独立", len(eng._leaderboard) == 4)
+    check("最多 Top3 且严格公开字段", len(rows) == 3 and all(
+        set(r) == {"rank", "user_name", "solved_count"} for r in rows))
+    check("新 engine 不继承旧榜", boot_v5()[0].snapshot().leaderboard == [])
+    for reason in ("giveup", "timeout", "skip", "ai_solved"):
+        other, clock, _ = boot_v5()
+        with other._lock:
+            other._enter_revealing_locked(clock(), reason, "AI玩家")
+        check(reason + " 不记真人分", other.snapshot().leaderboard == [])
+
+
 def main():
-    tests = [test_start_and_riddle,
+    tests = [test_start_and_riddle, test_session_leaderboard,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
              test_ai_player_solve_wrong_and_right_are_independent,

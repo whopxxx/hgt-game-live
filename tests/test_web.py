@@ -1196,7 +1196,245 @@ window.addEventListener("load", async () => {
 '''
 
 
+ANNOUNCER_CHECK = r'''
+window.addEventListener('error', e => {
+  const result=document.createElement('pre'); result.id='test-result';
+  result.textContent=JSON.stringify([String(e.message)]); document.body.appendChild(result);
+});
+window.socket = null;
+window.WebSocket = class { constructor() { window.socket = this; } };
+// Drive real application timers deterministically; layout/font/WAAPI are real Chrome.
+let clock = 0, serial = 0;
+const tasks = new Map();
+performance.now = () => clock;
+window.setTimeout = (fn, delay=0) => {
+  const id = ++serial; tasks.set(id, {fn, at: clock + delay}); return id;
+};
+window.clearTimeout = id => tasks.delete(id);
+window.setInterval = (fn, delay) => {
+  const id = ++serial; tasks.set(id, {fn, at: clock + delay, interval: delay}); return id;
+};
+window.clearInterval = window.clearTimeout;
+const tick = async ms => {
+  const end = clock + ms;
+  for (;;) {
+    const next = [...tasks].filter(([,t]) => t.at <= end).sort((a,b) => a[1].at-b[1].at)[0];
+    if (!next) break;
+    const [id,t] = next; clock = t.at;
+    if (t.interval) t.at += t.interval; else tasks.delete(id);
+    t.fn(); await Promise.resolve(); await Promise.resolve();
+  }
+  clock = end; await Promise.resolve(); await Promise.resolve();
+};
+let cfg = null, failure = 'missing', fetchCount = 0;
+window.fetch = async (url, options) => {
+  if (url !== '/announcements.json' || options.cache !== 'no-store') throw Error('bad fetch');
+  fetchCount++;
+  return {ok: failure !== 'missing', json: async () => {
+    if (failure === 'json') throw SyntaxError('synthetic invalid JSON');
+    return structuredClone(cfg);
+  }};
+};
+const media = window.matchMedia.bind(window);
+let reduced = false;
+const listeners = [];
+window.matchMedia = query => query === '(prefers-reduced-motion: reduce)' ? {
+  get matches() { return reduced; },
+  addEventListener: (_, fn) => listeners.push(fn),
+} : media(query);
+window.addEventListener('load', async () => {
+  await document.fonts.ready;
+  const errors = [];
+  const check = (ok, message) => { if (!ok) errors.push(message); };
+  const box = document.getElementById('announcer'), text = document.getElementById('announcer-text');
+  const qa = document.getElementById('qa');
+  let state = {phase:'qa', puzzle_index:1, puzzle:'合成题面。为什么？', qa_log:[], qa_total:0,
+               ai_player:{questions_earned:20}, leaderboard:[]};
+  const send = extra => { Object.assign(state, extra); socket.onmessage({data:JSON.stringify(state)}); };
+  const notice = () => text.textContent;
+  const anim = () => text.getAnimations()[0];
+  const rect = id => document.getElementById(id).getBoundingClientRect();
+  const config = (items, extra={}) => Object.assign({enabled:true, interval_seconds:90,
+    hold_seconds:4, long_text_speed_px_s:80, items:items.map((text,i) => ({id:String(i),enabled:true,text}))}, extra);
+  const reload = async c => { cfg=c; failure=''; await tick(15000); };
+  const finish = async () => {
+    const duration = anim() ? anim().effect.getTiming().duration : 4000;
+    await tick(duration + 1);
+  };
+  try {
+    send();
+    check(box.dataset.kind === 'leaderboard' && notice().includes('猜中谜底'), 'A16 baseline must not replay 20 historical summons');
+    check(!qa.contains(box) && !document.getElementById('stats').contains(box), 'A16 announcer outside QA/stats');
+    const geometry = () => {
+      const b=box.getBoundingClientRect(), q=rect('qa'), p=rect('puzzle-viewport');
+      const scale=rect('stage').width/1080;
+      const workspace=parseFloat(getComputedStyle(document.getElementById('content')).getPropertyValue('--workspace-top'));
+      check(b.top >= rect('content').top + workspace*scale - 1 && b.top >= p.bottom-1,
+            'A16 announcer below puzzle and workspace top');
+      check(b.bottom <= q.top && b.bottom < rect('prompt').top && b.bottom < rect('stats').top,
+            'A16 announcer above QA/prompt/stats, not bottom');
+      check(b.bottom < rect('stage').top + 1400*scale && b.height > 0,
+            'A16 announcer in safe upper workspace');
+    };
+    geometry();
+    const before=box.getBoundingClientRect().top;
+    send({qa_log:Array.from({length:70},(_,i)=>({qid:i+1,user_name:'Alice',text:'合成问题'+i,verdict:'是',kind:'qa'})),qa_total:70});
+    qa.scrollTop=qa.scrollHeight;
+    check(box.getBoundingClientRect().top === before, 'A16 QA append/scroll must not move announcer');
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'})); geometry();
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
+    send({ai_player:{questions_earned:21}});
+    check(box.dataset.kind==='ai' && notice().includes('+1'), 'A16 +1 summon interrupts default');
+    const first=anim();
+    for(let i=0;i<20;i++) send();
+    check(anim()===first, 'A16 repeated snapshots do not restart animation');
+    socket.onclose(); await tick(801); send();
+    check(anim()===first, 'A16 reconnect retains baseline');
+    await finish();
+    check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not queue old AI');
+    send({ai_player:{questions_earned:24}});
+    check(notice().includes('+3'), 'A16 delta >1 merged');
+    send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
+    await finish(); check(notice().includes('+3'), 'A16 pending AI events coalesce');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
+    send({leaderboard:[{rank:1,user_name:'Alice',solved_count:5}]});
+    check(box.dataset.kind==='leaderboard' && notice().includes('Alice 5题'), 'A16 Top3 updates default only');
+
+    await reload(config(['预设甲','禁用','预设乙'])); cfg.items[1].enabled=false;
+    await tick(15000); // reload disabled item
+    send({phase:'setting'}); await tick(300000); send({phase:'qa'});
+    await tick(89999); check(box.dataset.kind==='leaderboard', 'A16 no preset debt / interval before due');
+    await tick(251); check(notice().includes('预设甲'), 'A16 first enabled preset due');
+    const short=anim(), timing=short.effect.getTiming(), frames=short.effect.getKeyframes();
+    for(let i=0;i<20;i++) send();
+    check(anim()===short, 'A16 repeated snapshots do not restart or enqueue preset');
+    check(box.dataset.motion==='slide' && timing.duration===4600 && frames.length===4,
+          'A16 short enters / holds 4s / exits');
+    short.currentTime=1000;
+    check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
+          && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
+          'A16 short hold fully visible');
+    send({ai_player:{questions_earned:28}});
+    check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
+    await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
+    await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
+
+    // Bad JSON / bad types / HTTP failure each retain the last-good two items.
+    for (const bad of ['json','types','missing']) {
+      failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
+      await tick(90000);
+      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
+      send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
+    }
+    await reload(config(['更新公告']));
+    send({phase:'setting'}); send({phase:'qa'});
+    await tick(90250); check(notice().includes('更新公告'), 'A16 hot update replaces items');
+    await reload(config(['不该播放'],{enabled:false}));
+    await tick(90000); check(box.dataset.kind==='leaderboard', 'A16 global disable');
+
+    const long='长公告含空格 和标点，'.repeat(12)+'末尾可读';
+    await reload(config(['😀'.repeat(161),long]));
+    send({phase:'setting'}); send({phase:'qa'}); await tick(90250);
+    check(notice()==='📢 游戏公告 '+long, 'A16 >160 Unicode item skipped, not truncated; valid item retained');
+    check(box.dataset.motion==='marquee', 'A16 long uses marquee');
+    const moving=anim(), duration=moving.effect.getTiming().duration;
+    check(Math.abs(duration-(box.clientWidth+text.scrollWidth)/80*1000)<1 && duration>4600,
+          'A16 long duration is full measured distance / speed (not fixed 4s)');
+    check(getComputedStyle(text).textOverflow!=='ellipsis' && getComputedStyle(text).fontSize==='28px'
+          && text.offsetHeight===58 && box.clientHeight===58, 'A16 no ellipsis/shrink/wrap');
+    moving.currentTime=duration-100;
+    const tail=text.getBoundingClientRect().right, left=box.getBoundingClientRect().left;
+    check(tail>=left-1 && tail<left+20, 'A16 final characters travel completely across viewport');
+    await tick(5000); check(notice().endsWith('末尾可读'), 'A16 long item not removed after 4s');
+    send({phase:'revealed',revealed_answer:'合成谜底',revealed_core_answer:'合成核心答案',reveal_stage:'core'});
+    check(box.getBoundingClientRect().height===0 && !anim(), 'A16 reveal hides/cancels announcer');
+    await tick(300000); send({phase:'qa',revealed_answer:''});
+    check(box.dataset.kind==='leaderboard', 'A16 QA returns to default, no accumulated presets');
+
+    reduced=true; listeners.forEach(fn=>fn());
+    await tick(90250);
+    let pages='', count=0;
+    while(box.dataset.kind==='preset' && count++<30) {
+      pages+=notice();
+      check(!anim() && text.scrollWidth<=box.clientWidth, 'A16 reduced motion pages fully fit without motion');
+      await tick(4000);
+    }
+    check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
+    send({leaderboard:[1,2,3].map(rank=>({rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:4-rank}))});
+    const board='📢 本场解谜榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    let boardPages='';
+    for(let i=0;i<20 && boardPages.length<board.length;i++) {
+      boardPages+=notice();
+      check(text.scrollWidth<=box.clientWidth, 'A16 long nicknames fit static pages');
+      await tick(4000);
+    }
+    check(boardPages===board, 'A16 all Top3 long nicknames readable without truncation');
+    check(fetchCount>10, 'A16 periodic hot reload actually runs');
+  } catch(e) { errors.push(e.stack); }
+  const result=document.createElement('pre'); result.id='test-result'; result.hidden=true;
+  result.textContent=JSON.stringify(errors); document.body.appendChild(result);
+});
+'''
+
+
+def test_announcement_http():
+    import socket
+    from http.client import HTTPConnection
+    from unittest.mock import patch
+    sys.path.insert(0, str(ROOT))
+    from story.server import RenderServer, StateHub
+
+    with tempfile.TemporaryDirectory() as tmp, patch("story.server._WEB_DIR", tmp):
+        (Path(tmp) / "index.html").write_text("synthetic page", encoding="utf-8")
+        config_path = Path(tmp) / "announcements.json"
+        config_path.write_bytes((ROOT / "web/announcements.json").read_bytes())
+        hub = StateHub()
+        hub.publish({"leaderboard": []})
+        server = RenderServer(hub, "127.0.0.1", 0)
+        server.start()
+        port = server._httpd.server_port
+
+        def get(path, method="GET"):
+            conn = HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                conn.request(method, path)
+                response = conn.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                conn.close()
+
+        try:
+            status, headers, body = get("/announcements.json")
+            assert status == 200 and json.loads(body)["enabled"] is True
+            assert headers["Content-Type"] == "application/json; charset=utf-8"
+            assert headers["Cache-Control"] == "no-store"
+            assert get("/announcements.json", "POST")[0] == 501
+            for mode in ("missing", "invalid"):
+                if mode == "missing":
+                    config_path.unlink()
+                    assert get("/announcements.json")[0] == 404
+                else:
+                    config_path.write_text("{invalid", encoding="utf-8")
+                    assert get("/announcements.json")[2] == b"{invalid"
+                assert get("/")[0] == 200
+                assert json.loads(get("/state")[2]) == {"leaderboard": []}
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    client.sendall(b"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+                                   b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                                   b"Sec-WebSocket-Key: c3ludGhldGljLWZpeHR1cmU=\r\n\r\n")
+                    data = b""
+                    while b'"leaderboard": []' not in data:
+                        data += client.recv(4096)
+                    assert b"101 Switching Protocols" in data
+                    client.sendall(b"\x88\x00")
+        finally:
+            server.stop()
+            server._httpd.server_close()
+    print("PASS: readonly announcement HTTP / no-store / missing-invalid config preserves page + WS")
+
+
 def main():
+    test_announcement_http()
     if not CHROME:
         # 找不到浏览器时**默认失败**, 不静默跳过 —— 静默跳过会让这个
         # 套件在 CI 上"一直绿", 而它验的正是真实布局, 恰恰是最该跑的。
@@ -1207,17 +1445,22 @@ def main():
             return
         sys.exit(1)
     print(f"(使用浏览器: {CHROME})")
+    for script in (CHECK, ANNOUNCER_CHECK):
+        run_browser(script)
+
+
+def run_browser(script):
     source = (ROOT / "web/index.html").read_text(encoding="utf-8")
     source = source.replace('href="/style.css"', 'href="' + (ROOT / "web/style.css").as_uri() + '"')
     source = source.replace('<script src="/app.js"></script>',
-                            "<script>" + CHECK + "</script><script src=\"" +
+                            "<script>" + script + "</script><script src=\"" +
                             (ROOT / "web/app.js").as_uri() + '\"></script>')
     # data/ 在干净 checkout 上可能不存在(它只靠两个 .md 撑着)。
     (ROOT / "data").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=ROOT / "data") as tmp:
         page = Path(tmp) / "test.html"
         page.write_text(source, encoding="utf-8")
-        result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu",
+        result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu", "--enable-logging=stderr",
                                  "--no-first-run", "--hide-scrollbars",
                                  "--user-data-dir=" + str(Path(tmp) / "profile"),
                                  "--window-size=1080,1920", "--virtual-time-budget=15000",
@@ -1225,9 +1468,12 @@ def main():
                                  "--dump-dom", page.as_uri()], capture_output=True, timeout=45)
         dom = result.stdout.decode("utf-8", errors="replace")
         match = re.search(r'<pre id="test-result"[^>]*>(.*?)</pre>', dom, re.S)
-        assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
+        assert match, dom[-4000:] + result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
         assert not errors, errors
+    if script == ANNOUNCER_CHECK:
+        print("PASS: A16 baseline/delta/queue/presets/hot reload/geometry/marquee/reduced-motion")
+        return
     print("PASS: 问答追加/提示行/思考中/揭晓三阶段/U4 长文本自动滚动/"
           "贡献链/换题清空/调试宽度/长流可滚/无补题文案；data/preview.png")
 

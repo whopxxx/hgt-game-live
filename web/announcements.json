@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "interval_seconds": 90,
+  "hold_seconds": 4,
+  "long_text_speed_px_s": 80,
+  "items": [
+    {
+      "id": "ai-quality-notice",
+      "enabled": true,
+      "text": "本海龟汤由 AI 生成，质量可能存在差异，请见谅，我们正在不断优化中。"
+    }
+  ]
+}
