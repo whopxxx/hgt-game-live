@@ -55,29 +55,33 @@ CURRENT_USER_UNIQUE_ID = "7319483754668557238"
 
 #: 随机 uid 的取值范围(Issue 指定 7e18 ~ 8e18)。抖音的 uid 是 64 位
 #: 无符号整数, 这个区间落在真实 uid 的常见量级内。
+#:
+#: ⚠️ B 臂(`random-uid-only`)用这个区间 —— Issue 对它的要求就是"7e18~8e18"。
+#: C 臂则用**参考实现自己的**区间(`reference_bootstrap.REFERENCE_UID_*`,
+#: 上界是 `7.999...e18`), 因为 Issue 要求 C "逐字段对齐参考实现"。
+#: 两者差一点, 而"差一点"正是上一轮 review 打回的那类问题。
 RANDOM_UID_MIN = 7_000_000_000_000_000_000
 RANDOM_UID_MAX = 8_000_000_000_000_000_000
 
 #: bootstrap 来源的两种取值。
 #:
-#: ⚠️ 先说清一件容易搞错的事(这也是本 Step 被 review 打回的点):
-#: 本项目**生产**的 cursor/internal_ext 生成器(`vendor/.../ws_bootstrap.py`)
-#: 本来就是照公开参考实现 `JaneEyre3007/douyin-js` 的 `genCursorInternalExt`
-#: 写的 —— 也就是说"reference 形状"与"当前 local 生成"在本仓库里**是同一份
-#: 实现**。所以 `bootstrap=reference` 如果只是换个标签, 这一臂就形同虚设,
-#: 真实直播里"C 也没收到"会得出"reference 方案无效"的**错误结论**。
+#: ⚠️ 这两个取值背后是**两个不同的外部参考实现**, 形状并不相同 ——
+#: 这是本 Step 被 review 连续打回两次的点, 值得写清楚:
 #:
-#: 因此这两个取值的差别必须是**真实存在、可被 URL 断言验证**的:
+#: - `local` : 当前**生产**路径, 照 `JaneEyre3007/douyin-js` 的
+#:   `genCursorInternalExt` 写(`vendor/.../ws_bootstrap.py`)。
+#:     cursor       = t-{now}_r-{r}_d-1_u-1_h-{h}
+#:     internal_ext = ...|seq:1|wss_info:0-{now}-0-0|wrds_v:{wrds_v}
 #:
-#: - `local`     : `_local_bootstrap(now_ms)`, 即当前生产路径。身份 id 用
-#:                 本 profile 的 `user_unique_id`(A 是固定值)。
-#: - `reference` : 走 `_reference_bootstrap(now_ms)`, 它把参考实现里
-#:                 **每次连接都换**的那组身份/时间字段显式参数化 —— 特别是
-#:                 `wss_push_did`(参考实现每次连接随机)与 `seq`/`wrds_v`
-#:                 的每连接重新取值。A 臂的 `did` 全场固定, C 臂每次连接都变。
+#: - `reference` : Issue #17 点名的 `chuanyue98/douyin-live-toolkit`
+#:   @4b4b7c1e 的形状(见 `reference_bootstrap.py`)。
+#:     cursor       = d-1_u-1_fh-{硬编码}_t-{now_ms}_r-1
+#:     internal_ext = ...|seq:1|wss_info:0-{now_ms}-0-0   (**无** wrds_v)
+#:     wss_push_did = user_unique_id                       (**不拼 now_ms**)
 #:
-#: 这样 A/B/C 在 URL 层面**真的**不同, 而且差异是"InternalExt 的身份/时间
-#: 字段"这一条被测断言钉住的东西, 不是标签。
+#: 上一轮曾把 C 实现成"复用生产生成器 + did 拼 now_ms" —— 那不是任何一个
+#: 参考实现的形状, 于是"C 没收到 Gift"只能说明"我们编的那个形状不行",
+#: 回答不了 Issue 的问题。现在 C 走**逐字段复现**的那条路径。
 BOOTSTRAP_LOCAL = "local"
 BOOTSTRAP_REFERENCE = "reference"
 
@@ -137,12 +141,19 @@ class GiftProbeProfile:
     def user_unique_id(self, rng: Optional[random.Random] = None) -> str:
         """本连接该用的 `user_unique_id`。
 
-        `random_user_unique_id=False` 时**逐字**返回生产画像的常量 ——
-        A 臂必须是"当前行为"的忠实复现, 否则它就没有资格当控制组。
+        - `random_user_unique_id=False` -> **逐字**返回生产画像的常量。
+          A 臂必须是"当前行为"的忠实复现, 否则它就没有资格当控制组。
+        - `random_user_unique_id=True` 且本臂是 reference -> 用**参考实现
+          自己的**区间与生成方式(`reference_bootstrap.reference_user_unique_id`)。
+          Issue 要求 C "逐字段对齐参考实现", 其中就包含 uid 的取法。
+        - 其余 -> Issue 指定的 7e18~8e18 区间(B 臂)。
         """
-        if self.random_user_unique_id:
-            return generate_random_user_unique_id(rng)
-        return CURRENT_USER_UNIQUE_ID
+        if not self.random_user_unique_id:
+            return CURRENT_USER_UNIQUE_ID
+        if self.bootstrap == BOOTSTRAP_REFERENCE:
+            from .reference_bootstrap import reference_user_unique_id
+            return reference_user_unique_id(rng)
+        return generate_random_user_unique_id(rng)
 
     def describe(self) -> dict:
         """可安全落盘 / 打日志的画像描述(**绝不含凭据**)。"""
@@ -154,18 +165,22 @@ class GiftProbeProfile:
         }
 
 
-#: 默认三臂。A/B 只差 `user_unique_id`, C 额外把 bootstrap 换成
-#: reference 形状并且每次连接都用 fresh now_ms。
+#: 默认三臂。
+#:
+#: A vs B 只差 `user_unique_id`(单变量)。
+#: C 是 Issue 允许的 "reference matching" 臂: 它同时改 uid 取法与
+#: cursor/internal_ext 形状, 价值不是单变量归因, 而是"先复现对方结果"。
 DEFAULT_PROFILES = (
     GiftProbeProfile(
         PROFILE_A, random_user_unique_id=False, bootstrap=BOOTSTRAP_LOCAL,
-        label="当前生产画像(控制组): 固定 uid + 当前 bootstrap + 登录态"),
+        label="当前生产画像(控制组): 固定 uid + 生产 bootstrap + 登录态"),
     GiftProbeProfile(
         PROFILE_B, random_user_unique_id=True, bootstrap=BOOTSTRAP_LOCAL,
         label="单变量: 与 A 完全相同, 只把 user_unique_id 换成每连接随机"),
     GiftProbeProfile(
         PROFILE_C, random_user_unique_id=True, bootstrap=BOOTSTRAP_REFERENCE,
-        label="reference matching: 登录态 + 随机 uid + fresh now_ms bootstrap"),
+        label=("reference matching(chuanyue98/douyin-live-toolkit @4b4b7c1e): "
+               "登录态 + 参考实现的随机 uid + 参考实现的 cursor/internal_ext")),
 )
 
 

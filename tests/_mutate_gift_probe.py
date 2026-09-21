@@ -179,10 +179,10 @@ MUTATIONS = [
         "M-GP-8",
         "随机 uid 臂退化成固定 uid(A/B 不再有差异)",
         "story/gift_probe/profile.py",
-        "        if self.random_user_unique_id:\n"
-        "            return generate_random_user_unique_id(rng)\n"
-        "        return CURRENT_USER_UNIQUE_ID",
-        "        return CURRENT_USER_UNIQUE_ID",
+        "        if not self.random_user_unique_id:\n"
+        "            return CURRENT_USER_UNIQUE_ID",
+        "        if True:\n"
+        "            return CURRENT_USER_UNIQUE_ID",
         [SUITE],
     ),
     (
@@ -228,16 +228,68 @@ MUTATIONS = [
     ),
     (
         "M-GP-11b",
-        "reference bootstrap 退化成与 local 完全相同(不派生 did)",
+        "C 复用生产生成器(丢掉 reference 形状)",
         "story/gift_probe/hooks.py",
-        "    did = f\"{uid}{now_ms}\" if uid else str(now_ms)\n"
+        "    from .reference_bootstrap import build_reference_bootstrap\n"
         "\n"
-        "    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,\n"
-        "                                 now_ms=now_ms)",
-        "    did = uid\n"
+        "    uid = str(getattr(fetcher, \"user_unique_id\", \"\") or \"\")\n"
+        "    return build_reference_bootstrap(\n"
+        "        room_id=_safe_room_id(fetcher), user_unique_id=uid, now_ms=now_ms)",
+        "    from ws_bootstrap import generate_ws_bootstrap\n"
         "\n"
-        "    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,\n"
-        "                                 now_ms=now_ms)",
+        "    uid = str(getattr(fetcher, \"user_unique_id\", \"\") or \"\")\n"
+        "    return generate_ws_bootstrap(\n"
+        "        room_id=_safe_room_id(fetcher), user_unique_id=uid,\n"
+        "        now_ms=now_ms)",
+        [SUITE],
+    ),
+    (
+        "M-GP-11d",
+        "reference did 拼上 now_ms(回到上一版的错误形状)",
+        "story/gift_probe/reference_bootstrap.py",
+        "    internal_ext = REFERENCE_INTERNAL_EXT_TEMPLATE.format(\n"
+        "        room_id=room_id if room_id is not None else \"\",\n"
+        "        user_unique_id=user_unique_id if user_unique_id is not None else \"\",\n"
+        "        now_ms=now_ms,\n"
+        "    )",
+        "    internal_ext = REFERENCE_INTERNAL_EXT_TEMPLATE.format(\n"
+        "        room_id=room_id if room_id is not None else \"\",\n"
+        "        user_unique_id=(f\"{user_unique_id}{now_ms}\"\n"
+        "                        if user_unique_id is not None else \"\"),\n"
+        "        now_ms=now_ms,\n"
+        "    )",
+        [SUITE],
+    ),
+    (
+        "M-GP-11e",
+        "reference cursor 换成生产骨架(形状漂移)",
+        "story/gift_probe/reference_bootstrap.py",
+        "REFERENCE_CURSOR_TEMPLATE = (\n"
+        "    \"d-1_u-1_fh-\" + REFERENCE_FH + \"_t-{now_ms}_r-1\"\n"
+        ")",
+        "REFERENCE_CURSOR_TEMPLATE = \"t-{now_ms}_r-1_d-1_u-1_h-1\"",
+        [SUITE],
+    ),
+    (
+        "M-GP-11f",
+        "reference internal_ext 加回 wrds_v(与生产混淆)",
+        "story/gift_probe/reference_bootstrap.py",
+        "    \"|wss_info:0-{now_ms}-0-0\"\n"
+        ")",
+        "    \"|wss_info:0-{now_ms}-0-0\"\n"
+        "    \"|wrds_v:12345\"\n"
+        ")",
+        [SUITE],
+    ),
+    (
+        "M-GP-11g",
+        "C 的 uid 用回 8e18 上界(不复现参考区间)",
+        "story/gift_probe/profile.py",
+        "        if self.bootstrap == BOOTSTRAP_REFERENCE:\n"
+        "            from .reference_bootstrap import reference_user_unique_id\n"
+        "            return reference_user_unique_id(rng)\n"
+        "        return generate_random_user_unique_id(rng)",
+        "        return generate_random_user_unique_id(rng)",
         [SUITE],
     ),
     (

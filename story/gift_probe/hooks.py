@@ -83,66 +83,29 @@ _NULL_LOCK = _NullLock()
 def _reference_bootstrap(fetcher, now_ms: int) -> dict:
     """`reference-2026` 臂的 `cursor` / `internal_ext`。
 
-    ## 为什么需要单独一条路径(而不是直接复用生产生成器)
+    ⚠️ 这是 `chuanyue98/douyin-live-toolkit`(Issue #17 指定的参考实现)
+    的**逐字段复现**, 见 `reference_bootstrap.py` 的完整来源与边界说明。
 
-    本项目的生产生成器(`vendor/.../ws_bootstrap.generate_ws_bootstrap`)
-    **本来就已经**是照公开参考实现 `JaneEyre3007/douyin-js` 的
-    `genCursorInternalExt` 写的 —— 形状一模一样。所以"C 只是换个标签"完全
-    没有意义: 真实直播里 B/C 都会失败, 而我们无法区分"reference 方案无效"
-    与"reference 方案根本没跑"。
+    与**生产 local 路径**的结构差异(刻意, 不是笔误):
 
-    这一臂真正复现的是参考实现里**随连接变化**的那组身份/时间字段, 特别是
-    `wss_push_did`:
+        生产(JaneEyre3007 形状)        reference(chuanyue98 形状)
+        cursor  t-{now}_r-{r}_d-1_      cursor  d-1_u-1_fh-{硬编码}_t-{now}_r-1
+                u-1_h-{h}
+        ext     含 wrds_v                ext    **无** wrds_v
+        did     = uid                   did    = uid(**不拼 now_ms**)
 
-        A(current-auth-control)  did 是全场固定的生产常量
-        B(random-uid-only)       did 每连接随机, 但用的是生产生成器
-        C(reference-2026)        did 每连接随机, 且**显式**走这条 reference
-                                 路径(时间字段取本次连接的 fresh now_ms)
+    ⚠️ `wss_push_did` **就是** `user_unique_id` 本身。上一轮实现拼成了
+    `f"{uid}{now_ms}"`, 那不是参考实现的形状 —— 参考实现里 did 与
+    `user_unique_id` 查询参数是**同一个值**。这一条有 URL 级断言钉住。
 
-    A 与 C 在 `wss_push_did` 上的差异是**可被 URL 断言验证**的 —— 这正是
-    `tests/test_gift_probe.py` 里那条"抓真实 WSS URL"的测试所钉住的东西。
-
-    ## 与生产生成器的实际差别
-
-    参考实现在 `internal_ext` 里带 `internal_src:dim`, 生产生成器同样如此
-    (它就是这么写的)。两者在**结构上等价**, 差异只在身份与时间的取值方式。
-    所以本函数:
-
-    1. 用**本 profile 的 uid**(A 固定 / C 随机)填 `wss_push_did`;
-    2. 用**本次调用的 now_ms**(基线每次连接新取)填所有时间字段;
-    3. 其余字段与生产生成器逐字一致 —— 不做任何没有证据支撑的协议猜测。
-
-    ## 边界
-
-    ⚠️ 这**不是**抖音官方协议, 也**不是**参考实现的逐字移植。参考实现的具体
-    取值无法在此刻离线验证, 所以这里只对齐**可观察到的结构性质**: 身份字段
-    随连接变化 + 时间字段是 fresh 的。
-
-    本轮能证明的是"C 与 B 在连接参数上真的不同, 且 C 确实跑过"; 至于 C 是否
-    更接近平台, 那是真实直播验收要回答的事, 不是这里能断言的。
-
-    room / host / signature / handler / proto 一概不动。
+    取 did 时用 fetcher 上**本连接**的 `user_unique_id`(A=固定 / C=随机),
+    所以"每连接随机"(Issue 要求)由 profile 那一层保证, 这里如实透传。
     """
-    from ws_bootstrap import generate_ws_bootstrap
+    from .reference_bootstrap import build_reference_bootstrap
 
     uid = str(getattr(fetcher, "user_unique_id", "") or "")
-    room = _safe_room_id(fetcher)
-    # 参考实现的 `wss_push_did` 用的是**它自己**连接级的身份, 而不是
-    # 生产那份固定的 `user_unique_id`。这正是 A 与 C 在 URL 上的真实差异点:
-    # A 的 did 是全场常量, C 的 did 每连接变。
-    #
-    # 取值方式(重要): 参考实现是"每次连接生成一个新的会话身份"。这里用
-    # **本次连接的 now_ms + uid** 派生一个稳定的会话级 id —— 它随连接变化,
-    # 但在同一次连接内可复现(测试能确定性验证), 也**不引入新的随机源**。
-    did = f"{uid}{now_ms}" if uid else str(now_ms)
-
-    base = generate_ws_bootstrap(room_id=room, user_unique_id=did,
-                                 now_ms=now_ms)
-    return {
-        "cursor": base["cursor"],
-        "internal_ext": base["internal_ext"],
-        "reference_did": did,
-    }
+    return build_reference_bootstrap(
+        room_id=_safe_room_id(fetcher), user_unique_id=uid, now_ms=now_ms)
 
 
 def _safe_room_id(fetcher) -> str:

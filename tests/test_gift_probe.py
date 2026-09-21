@@ -759,10 +759,21 @@ def test_actual_wss_urls_differ_as_intended():
     三条纪律, 全部对着 URL 说, 而不是对着 profile 元数据说:
 
         A vs B : 除 `user_unique_id` 外**完全一致**
-        A vs C : 在 bootstrap 上**真的不同**(身份/时间字段按 reference 走)
-        B vs C : 真的不同 —— 这条最关键, 上一版它们其实是同一个 URL
+        A vs C : C 是**参考实现**的形状, A 是**生产**的形状, 两者结构不同
+        B vs C : 真的不同 —— 曾经它们其实是同一个 URL
+
+    ⚠️ 关于 C 的断言方式(这是本测试被 review 打回过的点):
+
+    上一版 C 被实现成"复用生产生成器 + `did = uid + now_ms`", 于是测试把
+    `uid+now_ms` 当成预期值 —— 那等于**验我们自己新发明的实现**, 而 Issue
+    要的是"对齐 `chuanyue98/douyin-live-toolkit` 的形状"。
+
+    现在 C 的断言是拿**参考实现的模板**逐字段比对的(见
+    `reference_bootstrap.REFERENCE_CURSOR_TEMPLATE` /
+    `REFERENCE_INTERNAL_EXT_TEMPLATE`), 并且显式断言"**没有**生产形状的
+    特征"(无 `wrds_v`、cursor 不是 `t-..._r-{r}_..._h-{h}` 骨架)。
     """
-    print("\n[GP-18] 真实 WSS URL:A/B/C 的差异")
+    print("\n[GP-18] 真实 WSS URL:A/B/C 的差异与 C 的 reference 形状")
     from story.gift_probe.profile import DEFAULT_PROFILES
     a, b, c = DEFAULT_PROFILES
 
@@ -819,46 +830,103 @@ def test_actual_wss_urls_differ_as_intended():
           and bool(re.fullmatch(r"[78]\d{18}",
                                 pb.get("user_unique_id") or "")),
           pb.get("user_unique_id"))
+    # A/B 都走生产路径 -> 都带 wrds_v
+    check("A/B 都是生产形状(带 wrds_v)",
+          "wrds_v:" in pa["internal_ext"] and "wrds_v:" in pb["internal_ext"])
 
-    # ---- A vs C: bootstrap 真的不同 ----
+    # ================================================================
+    # C == 参考实现(chuanyue98/douyin-live-toolkit @4b4b7c1e)的**逐字段**形状
+    # ================================================================
+    from story.gift_probe.reference_bootstrap import (
+        REFERENCE_CURSOR_TEMPLATE,
+        REFERENCE_FH,
+        REFERENCE_INTERNAL_EXT_TEMPLATE,
+    )
+    from story.gift_probe.hooks import _safe_room_id
+
+    now_ms = 1789000000000
+    room_id = "6746053408656034572"
+
+    # (1) cursor 与参考实现的模板**逐字**相同
+    expected_cursor = REFERENCE_CURSOR_TEMPLATE.format(now_ms=now_ms)
+    check("C 的 cursor 逐字等于参考实现模板",
+          pc["cursor"] == expected_cursor,
+          (pc["cursor"], expected_cursor))
+    check("C 的 cursor 含参考实现的硬编码 fh 段",
+          f"fh-{REFERENCE_FH}" in pc["cursor"], pc["cursor"])
+    check("C 的 cursor 是 d-1_u-1 开头(参考实现的骨架)",
+          pc["cursor"].startswith("d-1_u-1_"), pc["cursor"][:40])
+    # 反向: 不能是生产那种 t-..._r-{random}_d-1_u-1_h-{random} 骨架
+    check("C 的 cursor **不是**生产骨架(无 _h- 段)",
+          "_h-" not in pc["cursor"], pc["cursor"])
+    check("C 的 cursor 的 r 段是字面量 1(参考实现)",
+          pc["cursor"].endswith("_r-1"), pc["cursor"][-12:])
+
+    # (2) internal_ext 与参考实现的模板**逐字**相同
+    expected_ext = REFERENCE_INTERNAL_EXT_TEMPLATE.format(
+        room_id=room_id, user_unique_id=pc["user_unique_id"], now_ms=now_ms)
+    check("C 的 internal_ext 逐字等于参考实现模板",
+          pc["internal_ext"] == expected_ext,
+          (pc["internal_ext"], expected_ext))
+    # (3) 参考实现**没有** wrds_v —— 这条是"没在复用生产生成器"的硬证据
+    check("C 的 internal_ext **没有** wrds_v(参考实现无此段)",
+          "wrds_v" not in pc["internal_ext"], pc["internal_ext"])
+    check("A 的 internal_ext **有** wrds_v(生产生成器仍有, 未被改动)",
+          "wrds_v:" in pa["internal_ext"])
+
+    # (4) wss_push_did == user_unique_id(**不拼 now_ms**)
+    did_c = pc["internal_ext"].split("wss_push_did:")[1].split("|")[0]
+    check("C 的 wss_push_did == user_unique_id",
+          did_c == pc["user_unique_id"], (did_c, pc["user_unique_id"]))
+    check("C 的 wss_push_did **不**以 now_ms 结尾(上一版是错的)",
+          not did_c.endswith(str(now_ms)), did_c)
+    check("C 的 did 不是 uid+now_ms 的拼接",
+          did_c != f"{pc['user_unique_id']}{now_ms}",
+          (did_c, f"{pc['user_unique_id']}{now_ms}"))
+
+    # (5) C 用 fresh now_ms
+    check("C 的 cursor 用本次 now_ms", f"t-{now_ms}_" in pc["cursor"],
+          pc["cursor"][:40])
+    check("C 的 internal_ext 用本次 now_ms",
+          f"first_req_ms:{now_ms}" in pc["internal_ext"]
+          and f"fetch_time:{now_ms}" in pc["internal_ext"]
+          and f"wss_info:0-{now_ms}-0-0" in pc["internal_ext"],
+          pc["internal_ext"])
+    check("三路都不含写死的 2024 时间",
+          all("1721106114633" not in u for u in (url_a, url_b, url_c)))
+
+    # (6) C 的 uid 用参考实现自己的区间(上界 7.999...e18)
+    from story.gift_probe.reference_bootstrap import (
+        REFERENCE_UID_MAX, REFERENCE_UID_MIN,
+    )
+    check("C 的 uid 落在参考实现的区间内",
+          bool(re.fullmatch(r"\d+", pc["user_unique_id"]))
+          and REFERENCE_UID_MIN <= int(pc["user_unique_id"])
+          <= REFERENCE_UID_MAX,
+          (pc["user_unique_id"], REFERENCE_UID_MIN, REFERENCE_UID_MAX))
+    check("C 的 uid 每次都变",
+          len({_capture_arm_url(c)[0]["url"] for _ in range(3)}) == 3)
+
+    # ---- A vs C / B vs C: 结构上确实不同 ----
     check("A/C URL **确实不同**", url_a != url_c, "URL 相同 = Blocker 1 复发")
+    check("A/C 的 cursor 结构不同(生产骨架 vs reference 骨架)",
+          _cursor_deterministic(pa["cursor"]) != pc["cursor"],
+          (_cursor_deterministic(pa["cursor"]), pc["cursor"]))
     check("A/C 的 internal_ext 结构部分**确实不同**",
           _ext_deterministic(pa["internal_ext"])
           != _ext_deterministic(pc["internal_ext"]),
           (_ext_deterministic(pa["internal_ext"])[:80],
            _ext_deterministic(pc["internal_ext"])[:80]))
-    # C 的 did 是"按连接派生"的: 含 uid 且以 now_ms 结尾
-    did_c = pc["internal_ext"].split("wss_push_did:")[1].split("|")[0]
-    did_a = pa["internal_ext"].split("wss_push_did:")[1].split("|")[0]
-    check("A 的 did 就是固定 uid", did_a == CURRENT_USER_UNIQUE_ID, did_a)
-    check("C 的 did 是按连接派生的(含 uid + 本次 now_ms)",
-          did_c != did_a and did_c.endswith(str(1789000000000)),
-          did_c)
-
-    # ---- B vs C: 上一版它们其实是同一个 URL ----
-    check("B/C URL **确实不同**(上一版这里是同一个)",
+    check("A 的 did 就是固定 uid",
+          pa["internal_ext"].split("wss_push_did:")[1].split("|")[0]
+          == CURRENT_USER_UNIQUE_ID)
+    check("B/C URL **确实不同**(曾经这里是同一个)",
           url_b != url_c, "B 与 C 的 URL 相同 = reference 臂没生效")
-    check("B/C 的 internal_ext 结构部分不同",
-          _ext_deterministic(pb["internal_ext"])
-          != _ext_deterministic(pc["internal_ext"]),
-          (_ext_deterministic(pb["internal_ext"])[:80],
-           _ext_deterministic(pc["internal_ext"])[:80]))
-    check("B/C 的 did 不同",
-          pb["internal_ext"].split("wss_push_did:")[1].split("|")[0]
-          != pc["internal_ext"].split("wss_push_did:")[1].split("|")[0],
-          (pb["internal_ext"].split("wss_push_did:")[1].split("|")[0],
-           pc["internal_ext"].split("wss_push_did:")[1].split("|")[0]))
+    check("B/C 的 cursor 结构不同",
+          _cursor_deterministic(pb["cursor"]) != pc["cursor"],
+          (_cursor_deterministic(pb["cursor"]), pc["cursor"]))
 
-    # ---- C 用 fresh now_ms ----
-    check("C 的 cursor 用本次 now_ms", "t-1789000000000_" in pc["cursor"],
-          pc["cursor"][:40])
-    check("C 不含写死的 2024 时间",
-          "1721106114633" not in pc["cursor"]
-          and "1721106114633" not in pc["internal_ext"])
-    check("三路都不含 2024 写死值",
-          all("1721106114633" not in u for u in (url_a, url_b, url_c)))
-
-    # ---- 其余连接参数三路一致(不是"随手改了点别的")----
+    # ---- 其余连接参数三路一致(不是"随手改了点别的") ----
     for key in ("app_name", "version_code", "webcast_sdk_version", "compress",
                 "device_platform", "identity", "room_id", "aid", "live_id",
                 "im_path"):
@@ -877,38 +945,221 @@ def test_actual_wss_urls_differ_as_intended():
           counters_c.bootstrap_mode)
 
 
-def test_reference_bootstrap_is_deterministic_per_connection():
-    """GP-19: reference bootstrap 的 did 由 (uid, now_ms) 唯一决定。
+def test_reference_bootstrap_matches_reference_source():
+    """GP-19: C 的 bootstrap 是参考实现的**逐字复现**(而不是自创形状)。
 
-    这条钉住的是"派生 did"的性质: 同样的输入 -> 同样的 did(测试可复现,
-    线上可重放); 时间变了 -> did 变(每连接不同)。
+    这是本测试被 review 打回过的点的直接回归:
 
-    ⚠️ 只断言 `did`, **不**断言整条 URL: cursor/internal_ext 里的
-    `r`/`h`/`wrds_v` 随机低位由生产生成器的 RNG 每次连接新取(那是它本来
-    的行为), 拿它们做确定性断言会让这条测试 flaky。要验的"确定性"是
-    **C 自己引入的那部分**。
+        上一版 C 用 `did = f"{uid}{now_ms}"` 并复用生产生成器 —— 测试还把
+        `uid+now_ms` 当成预期值。那等于在验**我们自己新发明的实现**, 而
+        Issue 要的是"对齐 `chuanyue98/douyin-live-toolkit` 的形状"。
+
+    现在的断言方式: 拿参考实现的**模板字符串**渲染出期望值, 再与我的实现
+    输出逐字比对。模板本身在 `reference_bootstrap.py` 里, 其上游出处
+    (repo / commit / 文件 / 行号)也写在那个模块的 docstring 里, 便于复核。
+
+    ⚠️ 这里**不**断言"did 以 now_ms 结尾"那类自创性质 —— 参考实现的 did
+    就是 `user_unique_id`, 与时间无关。上一版正是因为把自创性质当预期,
+    才让这条测试绿着通过了一个不符合 Issue 的实现。
     """
-    print("\n[GP-19] reference bootstrap 的 did 确定性")
-    from story.gift_probe.profile import DEFAULT_PROFILES
+    print("\n[GP-19] C 的 bootstrap == 参考实现的模板")
+    from story.gift_probe.reference_bootstrap import (
+        REFERENCE_CURSOR_TEMPLATE,
+        REFERENCE_INTERNAL_EXT_TEMPLATE,
+        build_reference_bootstrap,
+    )
+
+    now_ms, room, uid = 1789000000000, "6746053408656034572", "U1"
+    got = build_reference_bootstrap(room, uid, now_ms)
+
+    check("cursor == 参考实现模板渲染结果",
+          got["cursor"] == REFERENCE_CURSOR_TEMPLATE.format(now_ms=now_ms),
+          (got["cursor"], REFERENCE_CURSOR_TEMPLATE.format(now_ms=now_ms)))
+    check("internal_ext == 参考实现模板渲染结果",
+          got["internal_ext"] == REFERENCE_INTERNAL_EXT_TEMPLATE.format(
+              room_id=room, user_unique_id=uid, now_ms=now_ms),
+          got["internal_ext"])
+    # 结构性质(逐条对应参考实现源码里的字面量)
+    check("cursor 以 d-1_u-1_fh- 开头",
+          got["cursor"].startswith("d-1_u-1_fh-"), got["cursor"])
+    check("cursor 以 _r-1 结尾(参考实现写死 r-1)",
+          got["cursor"].endswith("_r-1"), got["cursor"])
+    check("internal_ext 无 wrds_v",
+          "wrds_v" not in got["internal_ext"], got["internal_ext"])
+    check("internal_ext 的 did == uid(不拼 now_ms)",
+          got["internal_ext"].split("wss_push_did:")[1].split("|")[0] == uid)
+    # 确定性(测试可复现): 同输入同输出。且**没有**共享随机状态 ——
+    # 参考形状里根本没有随机段, 所以两次调用必须**完全**相同。
+    check("同输入完全可复现(参考形状里没有随机段)",
+          build_reference_bootstrap(room, uid, now_ms) == got)
+    check("now_ms 变 -> cursor/ext 变",
+          build_reference_bootstrap(room, uid, now_ms + 1) != got)
+
+    # ---- 与**生产**形状必须不同(那条路走的是另一个参考实现)----
+    from ws_bootstrap import generate_ws_bootstrap
+    import random as _r
+    prod = generate_ws_bootstrap(room, uid, now_ms, _r.Random(1))
+    check("C 的 cursor 与生产形状不同",
+          got["cursor"] != prod["cursor"],
+          (got["cursor"], prod["cursor"]))
+    check("生产形状有 wrds_v, C 没有",
+          "wrds_v:" in prod["internal_ext"]
+          and "wrds_v" not in got["internal_ext"])
+    check("生产形状是 t-..._r-{数字}_.._h-{数字}, C 不是",
+          bool(re.match(r"^t-\d+_r-\d+_d-1_u-1_h-\d+$", prod["cursor"]))
+          and not re.match(r"^t-\d+_r-\d+", got["cursor"]),
+          (prod["cursor"], got["cursor"]))
+
+
+def test_reference_uid_range_matches_reference():
+    """GP-19b: C 的 uid 用参考实现自己的区间(上界 7.999...e18)。
+
+    Issue 要求 C "逐字段对齐", 而 uid 的取法是其中一项。参考实现是
+    `randint(7e18, 7_999_999_999_999_999_999)`, 本项目 B 臂用的区间上界是
+    `8e18` —— 差一点。既然要求对齐, 就按参考实现来, 并把这个差别钉住,
+    免得以后有人"顺手统一成 8e18"。
+    """
+    print("\n[GP-19b] C 的 uid 区间")
+    import random as _r
+    from story.gift_probe.reference_bootstrap import (
+        REFERENCE_UID_MAX, REFERENCE_UID_MIN, reference_user_unique_id,
+    )
+    from story.gift_probe.profile import DEFAULT_PROFILES, PROFILE_B
+
+    check("参考实现区间上界是 7.999...e18",
+          REFERENCE_UID_MAX == 7_999_999_999_999_999_999,
+          REFERENCE_UID_MAX)
+    vals = [reference_user_unique_id(_r.Random(i)) for i in range(200)]
+    check("全部落在 [7e18, 7.999...e18]",
+          all(re.fullmatch(r"\d+", v)
+              and REFERENCE_UID_MIN <= int(v) <= REFERENCE_UID_MAX
+              for v in vals))
+    check("取值有变化(没有退化成常量)", len(set(vals)) > 190, len(set(vals)))
+    check("同 seed 可复现",
+          reference_user_unique_id(_r.Random(7))
+          == reference_user_unique_id(_r.Random(7)))
+
+    # C 走参考区间; B 仍走 Issue 指定的 7e18~8e18
     c = DEFAULT_PROFILES[2]
+    b = DEFAULT_PROFILES[1]
 
-    def did_of(now_ms):
-        cap, _ = _capture_arm_url(c, now_ms=now_ms, user_unique_id="U1")
-        return _url_params(cap["url"])["internal_ext"] \
-            .split("wss_push_did:")[1].split("|")[0]
+    # ⚠️ 怎么才算"确定性地"钉住 C 用的是参考生成器?
+    #
+    # 试过但**不行**的两种做法(都真的让一个变异逃掉了, 记在这里免得有人
+    # 再退回其中任何一种):
+    #
+    #   1. **抽样在范围内** —— 两个区间几乎重合, 抽样落在参考区间内的概率
+    #      接近 1, 所以它区分不出两者。
+    #   2. **比对同 seed 的输出** —— 两个生成器共用 `random.Random` 的取值
+    #      序列, 只是边界不同; 同 seed 下它们**输出完全相同的值**。也就是说
+    #      值相等这件事对两者都成立, 断言它等于什么都没验。
+    #
+    # 能真正区分的只有**上界本身**: 参考是 `randint(7e18, 7.999...e18)`,
+    # 生产是 `randrange(7e18, 8e18 + 1)`。两者上界差 1, 且**只有**上界不同。
+    # 所以断言必须落在"区间定义"上, 而不是落在"抽样结果"上。
+    from story.gift_probe.profile import (RANDOM_UID_MAX as PROD_UID_MAX,
+                                          RANDOM_UID_MIN as PROD_UID_MIN)
+    check("参考区间上界 == 7.999...e18",
+          REFERENCE_UID_MAX == 7_999_999_999_999_999_999, REFERENCE_UID_MAX)
+    check("生产区间上界 == 8e18(Issue 对 B 的要求)",
+          PROD_UID_MAX == 8_000_000_000_000_000_000, PROD_UID_MAX)
+    check("两个区间上界**确实不同**(差 1)",
+          PROD_UID_MAX - REFERENCE_UID_MAX == 1,
+          (PROD_UID_MAX, REFERENCE_UID_MAX))
+    check("参考区间下界与生产相同",
+          REFERENCE_UID_MIN == PROD_UID_MIN,
+          (REFERENCE_UID_MIN, PROD_UID_MIN))
 
-    check("同一 (uid, now_ms) -> 同一 did",
-          did_of(1789000000000) == did_of(1789000000000),
-          (did_of(1789000000000), did_of(1789000000000)))
-    check("不同 now_ms -> 不同 did",
-          did_of(1789000000000) != did_of(1789000000001),
-          (did_of(1789000000000), did_of(1789000000001)))
-    check("did 以 uid 开头(身份来自本连接)",
-          did_of(1789000000000).startswith("U1"),
-          did_of(1789000000000))
-    check("did 以 now_ms 结尾(时间来自本连接)",
-          did_of(1789000000000).endswith("1789000000000"),
-          did_of(1789000000000))
+    # C 的 uid 必须来自**参考那个**生成器 —— 用函数的**身份**判定,
+    # 而不是用它的输出。这是唯一能区分两个共用 RNG 序列的生成器的判据。
+    from story.gift_probe import reference_bootstrap as _rb
+    from story.gift_probe import profile as _pf
+    check("C 走过的生成器是 reference_user_unique_id",
+          c.bootstrap == "reference"
+          and _rb.reference_user_unique_id is not None,
+          c.bootstrap)
+    # 端到端: 直接调 profile 的分派, 确认它调的是 reference 那个函数。
+    # 用 monkeypatch 记录被调用的函数(输出相同, 只能靠调用点区分)。
+    calls = []
+    real_ref = _rb.reference_user_unique_id
+    real_prod = _pf.generate_random_user_unique_id
+    try:
+        _rb.reference_user_unique_id = lambda rng=None: (
+            calls.append("reference"), real_ref(rng))[1]
+        _pf.generate_random_user_unique_id = lambda rng=None: (
+            calls.append("production"), real_prod(rng))[1]
+        c.user_unique_id(_r.Random(3))
+        check("C 调的是 reference 生成器(不是 production)",
+              calls == ["reference"], calls)
+        calls.clear()
+        b.user_unique_id(_r.Random(3))
+        check("B 调的是 production 生成器(不是 reference)",
+              calls == ["production"], calls)
+    finally:
+        _rb.reference_user_unique_id = real_ref
+        _pf.generate_random_user_unique_id = real_prod
+
+    c_val = c.user_unique_id(_r.Random(3))
+    check("C 的 uid 在参考区间内",
+          REFERENCE_UID_MIN <= int(c_val) <= REFERENCE_UID_MAX, c_val)
+    check("B 的 profile 仍是 local bootstrap(所以走生产 uid 生成器)",
+          b.bootstrap == "local", b.bootstrap)
+
+
+def test_reference_templates_are_recorded_with_provenance():
+    """GP-23: 参考形状的来源必须可复核(不是"凭印象抄的")。
+
+    C 臂的全部价值在于"它跑的是**别人**的实现", 而不是我们编的形状。
+    所以 `reference_bootstrap.py` 必须写清上游出处, 且模板里的每个字面量
+    都能在"来源"里对上。
+
+    这条测试做两件事:
+
+    1. 断言模块 docstring 里记录了 repo / commit / 文件路径 —— 将来有人
+       问"这个 fh-7392... 是哪来的", 答案在代码里, 不在某人的记忆里;
+    2. 断言模板里的硬编码字面量与来源声明一致 —— 防止有人改了模板却忘了
+       改出处(那种情况下出处就成了误导)。
+
+    ⚠️ 这里**不**联网核对上游。CI 是离线的, 而一个会打网络的测试既慢又
+    flaky。可复核性通过"出处写在代码里 + 字面量被钉住"来保证。
+    """
+    print("\n[GP-23] reference 形状的来源可复核")
+    import story.gift_probe.reference_bootstrap as rb
+    doc = rb.__doc__ or ""
+
+    check("docstring 记录了参考仓库",
+          "chuanyue98/douyin-live-toolkit" in doc, doc[:200])
+    check("docstring 记录了 commit",
+          "4b4b7c1e09adf7e8a62b232f2768484836f070f7" in doc)
+    check("docstring 记录了文件路径",
+          "ws_client.py" in doc)
+    check("docstring 记录了 uid 的取法来源",
+          "randint" in doc or "_connect_once" in doc)
+
+    # 字面量必须与出处声明一致
+    check("fh 字面量是参考实现里的那个",
+          rb.REFERENCE_FH == "7392091211001140287", rb.REFERENCE_FH)
+    check("cursor 模板含该 fh",
+          f"fh-{rb.REFERENCE_FH}" in rb.REFERENCE_CURSOR_TEMPLATE,
+          rb.REFERENCE_CURSOR_TEMPLATE)
+    check("cursor 模板是 d-1_u-1 骨架",
+          rb.REFERENCE_CURSOR_TEMPLATE.startswith("d-1_u-1_fh-"))
+    check("cursor 模板以 _r-1 结尾",
+          rb.REFERENCE_CURSOR_TEMPLATE.endswith("_r-1"))
+    check("internal_ext 模板**没有** wrds_v",
+          "wrds_v" not in rb.REFERENCE_INTERNAL_EXT_TEMPLATE)
+    check("internal_ext 模板含参考实现的全部段",
+          all(seg in rb.REFERENCE_INTERNAL_EXT_TEMPLATE for seg in
+              ("internal_src:dim", "wss_push_room_id:", "wss_push_did:",
+               "first_req_ms:", "fetch_time:", "seq:1", "wss_info:0-")),
+          rb.REFERENCE_INTERNAL_EXT_TEMPLATE)
+    check("参考实现 docstring 写明了边界(不是官方协议)",
+          "官方协议" in doc and "参考实现" in doc)
+    # 上游出处与实际取值的对应关系: did 必须直接来自 user_unique_id
+    out = rb.build_reference_bootstrap("ROOM", "UID999", 123)
+    check("did 直接取自传入的 user_unique_id(无加工)",
+          "wss_push_did:UID999|" in out["internal_ext"],
+          out["internal_ext"])
 
 
 def test_end_to_end_runner_reaches_all_four_verdict_layers():
@@ -1627,7 +1878,9 @@ def main():
         test_profiles_do_not_share_counters,
         test_runner_arms_have_isolated_counters_and_dirs,
         test_actual_wss_urls_differ_as_intended,
-        test_reference_bootstrap_is_deterministic_per_connection,
+        test_reference_bootstrap_matches_reference_source,
+        test_reference_uid_range_matches_reference,
+        test_reference_templates_are_recorded_with_provenance,
         test_end_to_end_runner_reaches_all_four_verdict_layers,
         test_dry_run_handler_does_not_swallow_parse_errors,
         test_safe_error_never_carries_credential,
