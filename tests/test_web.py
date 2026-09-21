@@ -1357,7 +1357,7 @@ window.addEventListener('load', async () => {
           'A16 timer label passes through verbatim: '
           + document.getElementById('puzzle-timer').textContent);
 
-    await reload(config(['预设甲','禁用','预设乙'])); cfg.items[1].enabled=false;
+    await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15})); cfg.items[1].enabled=false;
     await tick(15000); // reload disabled item
     send({phase:'setting'}); await tick(300000); send({phase:'qa'});
     await tick(89999); check(box.dataset.kind==='leaderboard', 'A16 no preset debt / interval before due');
@@ -1365,16 +1365,20 @@ window.addEventListener('load', async () => {
     const short=anim(), timing=short.effect.getTiming(), frames=short.effect.getKeyframes();
     for(let i=0;i<20;i++) send();
     check(anim()===short, 'A16 repeated snapshots do not restart or enqueue preset');
-    check(box.dataset.motion==='slide' && timing.duration===4600 && frames.length===4,
-          'A16 short enters / holds 4s / exits');
+    check(box.dataset.motion==='slide' && timing.duration===15600 && frames.length===4,
+          'A16 preset short enters / holds configured 15s / exits');
     short.currentTime=1000;
     check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
           && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
           'A16 short hold fully visible');
     send({hint_count:9,hint_text:'提示应抢占预设公告'});
     check(box.dataset.kind==='hint', 'A16 hint preempts preset without waiting for interval');
+    check(anim().effect.getTiming().duration===5600,
+          'A16 15s preset hold must not make short hint last 15s');
     send({ai_player:{questions_earned:29}});
     check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
+    check(anim().effect.getTiming().duration===5600,
+          'A16 15s preset hold must not make short AI notice last 15s');
     await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
