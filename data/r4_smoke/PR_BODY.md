@@ -138,14 +138,22 @@ Stage B 之前就已经 78~136 字，而 Stage B 冻结 puzzle，所以不是它
 
 ### 仍然存在的噪声
 
-4 条失败里 **3 条是网关技术抖动**（空 `tool_input` / 结构调用失败），
-1 条 `review_rewrite`。这个抖动在 R2/R3 也出现过，不是本轮引入的 ——
-但它会让 `structure_technical_fail` 的计数偏噪；若要把它当指标看，得先处理掉。
+**6 条未成题**，其中：
 
-> ⚠️ 另注：与上一轮一样，本批 `truth_audit_ok` 在多条未成题的记录上是 `None`
-> —— 那些条目**根本没走到审稿**。所以 `livestream_safe` 的线上判定行为主要
-> 由离线回归（走完整 `gen_spec`，含审稿与 truth audit）保证，不是由这批
-> smoke 保证。
+| 拒因 | 条数 |
+|---|---|
+| `truth_reject` | 2 |
+| `review_rewrite` | 2 |
+| `validation_reject` | 1 |
+| `structure_technical_fail` | 1 |
+
+也就是说 **6 条里只有 1 条是网关技术抖动**（空 `tool_input` / 结构调用失败），
+**其余 5 条都是内容判定**。这个抖动在 R2/R3 也出现过，不是本轮引入的。
+
+> ⚠️ 但要注意这 5 条内容判定**不等于**"这 5 道题都该拒" —— 它们里的
+> `truth_audit_ok` 是 `None`，即**根本没走到审稿**就被挡下了（见下）。
+> 所以本批**没有**验证到 `livestream_safe` 的线上判定行为；那条门本轮的
+> 保证完全来自离线回归（它走完整 `gen_spec`，含审稿与 truth audit）。
 
 ## 部署代价（不要让它悄悄发生）
 
