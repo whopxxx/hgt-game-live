@@ -2613,12 +2613,14 @@ def test_r5_prefill_kill_switch_really_goes_classic():
     # ---- 先做代码层断言(不依赖执行) ----
     src = (Path(__file__).resolve().parents[1] / "prefill_pool.py"
            ).read_text(encoding="utf-8")
-    check("**_one 里两个分支都在**",
+    check("**_one 里两个分支都在，且共用让路谓词**",
           "if seeder.enabled:" in src
-          and "_one_keyword(writer, pool, cfg, a, seeder, recent)" in src
-          and "_one_classic(writer, pool, cfg, rng, a, recent)" in src,
+          and "_one_keyword(writer, pool, cfg, a, seeder, recent," in src
+          and "_one_classic(writer, pool, cfg, rng, a, recent," in src
+          and src.count("should_continue=should_continue") >= 2,
           [ln.strip() for ln in src.splitlines()
-           if "_one_keyword(" in ln or "_one_classic(" in ln][:4])
+           if "_one_keyword(" in ln or "_one_classic(" in ln
+           or "should_continue=should_continue" in ln][:8])
     with tmpdir() as d:
         cfg = mkcfg(d)
         pool = PuzzlePool.open(cfg)

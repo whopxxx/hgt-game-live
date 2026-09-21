@@ -262,22 +262,24 @@ class Config:
     #   补池周期一直补到 库存 >= pool_target_size 才结束
     # 必须是**真正的滞回**, 不是每个 tick 判一次 `stock < min` ——
     # 否则 1 补成 2 就停了, pool_target_size 永远没有意义。
-    pool_target_size: int = 5
-    pool_min_size: int = 2
+    # stable-refill: 不再等到只剩 1~2 道才救火。低于 8 就开始补，
+    # 一次补到 12；即便单候选通过率只有四成，也还有足够缓冲吸收连续失败。
+    pool_target_size: int = 12
+    pool_min_size: int = 8
     # 下一题**此刻能不能播**的最低要求(与长期库存分开, 见 pool.py)。
     # 实播踩到的坑: 池里 6 道候选全被当前窗口挡住 -> 回落现场生成,
     # 观众干等 10–40 秒; 而 stock=6 让补池认为健康, 一道都不补。
     # 所以补池要同时看 playable —— `stock >= target` 但 `playable <
     # playable_min` 时**仍然**补。
-    pool_playable_min: int = 1
+    pool_playable_min: int = 3
     # ---- 揭晓窗口专用目标(60 秒是**最富裕**的补池窗口) ----
-    # QA 期间补池必须和直播抢网关, 所以目标保守(target=5/playable=1)。
+    # QA 期间仍然单飞让路，但库存水位已前移(target=12/playable=3)。
     # REVEALED 是引擎**完全空闲**的 60 秒 —— 观众在看答案, 没有任何
     # 在途请求。这时把目标抬高, 让"看答案 -> 下一题直接出现"真正成立
     # (而不是 60 秒后又回到现场生成、观众干等)。
     # 仍然单飞串行 + 受 pool_max_size 约束, 不并行生成多个。
-    pool_reveal_target_size: int = 7
-    pool_reveal_playable_target: int = 2
+    pool_reveal_target_size: int = 12
+    pool_reveal_playable_target: int = 3
     # 距下一题不足这个秒数就不再**启动**新请求(在途的不用强杀)。
     #
     # ⚠️ G1: 它必须**至少覆盖一轮补池的完整预算**(prefetch budget +
@@ -304,7 +306,7 @@ class Config:
     # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
     # 没有上限就是无限生成 + 无限烧网关配额, 而 playable 永远不动。
     # 到顶只 warning, 让运维看见"补了但没用", 不是静默空转。
-    pool_max_size: int = 10
+    pool_max_size: int = 16
     # 补池总开关。**与 pool_enabled 解耦**: 关掉它 = 不后台生成, 但
     # 手工/脚本灌进池子的存量题**照常用**。网关故障时就是靠这一条
     # 停掉后台生成、同时继续播已有的题(pool_enabled=False 做不到 ——
