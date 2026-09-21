@@ -1,6 +1,6 @@
 # R8-A 验收报告
 
-**分支** `feat/r8a-freegen-policy` · **base** `main @ 9b12f81`
+**分支** `feat/r8a-freegen-policy` · **stacked base** `Task 0 @ 9be24e3`
 **不做** 伪控制(不跑"红汤 5 + 黑汤 5"), lane 按真实 draw 报告
 
 ---
@@ -96,18 +96,19 @@ safety_reject       0   ← 见下
 
 注意: 0 不等于"门失效"。边界仍然 fail closed, 只是这一批没撞上。
 
-### 关键观察 2: 三项 signal 不再杀人
+### 关键观察 2: signal 降级由代码 + 回归测试确认；本轮 smoke 未直接命中反例
 
-两道入池题的 `quality_checks` 都是 **`single_trick=false`**:
+这 10 次 smoke 的两道成功样本里，报告到的 `single_trick=false`
+**不是** v11 自由生成九项 hard gate 的成员，因此不能据此声称
+“这两道在 v11 一定会被拒”。
 
-| 题 | lane | 字数 | 未过项 |
-|---|---|---|---|
-| 瓜田持枪 | black | 49 | `single_trick` |
-| 废弃医院举报信 | red | 72 | `single_trick` |
+本轮 smoke **没有恰好出现**“`clue_recontextualized` /
+`dramatic_payoff` / `reasoning_beats_nonredundant` 中某项为 false，
+但六项硬门全部为 true 并成功入池”的可直接对照样本。
 
-在 v11 的九项门下这两道**都会被整稿丢掉**。现在它们进来了, 而
-`safety` / `narrator_truthful` / `mechanism_consistent` 全过 ——
-正是 R8-A 想要的形状: 轻量单点题不再因为"不够戏剧化"被淘汰。
+所以这里不做过度推断。R8-A 的 signal 降级由代码契约与
+`test_r8a_three_checks_are_signal_only` 回归确认：
+Reviewer 仍索要 9 项，拒稿只看 6 项，差集恰好是上述三项。
 
 ### 关键观察 3: 该 fail closed 的仍然 fail closed
 
