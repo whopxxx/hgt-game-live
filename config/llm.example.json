@@ -1,0 +1,11 @@
+{
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "填你自己的 API key",
+  "default": "deepseek-v4.1-flash",
+  "puzzle.story": "glm-5.3-flash",
+  "puzzle.surface": "glm-5.3-flash",
+  "puzzle.structure": "glm-5.3-flash",
+  "timeout": 60,
+  "max_tokens": 700,
+  "max_retries": 3
+}
