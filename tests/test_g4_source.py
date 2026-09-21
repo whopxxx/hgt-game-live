@@ -1294,7 +1294,7 @@ def test_stage_a_prompt_carries_answer_length():
           "念" in STORY_SYSTEM, "缺少理由说明")
     _d = _TOOL_STORY["input_schema"]["properties"]["answer"]["description"]
     check("**tool schema 的 answer 也写了 260**", "260" in _d, _d[:60])
-    check("**版本号 bump 了**", STORY_PROMPT_VERSION == "keyword2-v6",
+    check("**版本号 bump 了**", STORY_PROMPT_VERSION == "keyword2-v7",
           STORY_PROMPT_VERSION)
     # ---- 反证: §二 明写**只加这一条**, v1 那些被 G3 拿掉的规范不回来 ----
     for banned, why in (("第一人称", "v1 人称硬限制"),
@@ -2376,12 +2376,12 @@ def test_r4_provenance_reaches_live_archive():
         dr.engine.start()
         # 造一个**带全套 R4 provenance** 的 spec(模拟 keyword2 成功产物)。
         sp = _good_gen_spec()
-        sp.prompt_version = "keyword2-v6"
+        sp.prompt_version = "keyword2-v7"
         sp.metrics = {
             "generation_mode": "keyword2", "ok": True,
             "lane": "black",
             "keywords": ["新作", "掘坟"],
-            "story_prompt_version": "keyword2-v6",
+            "story_prompt_version": "keyword2-v7",
             "surface_prompt_version": "surface-v1",
             "keyword_seed_version": "keyword2-vocab-v2",
             "keyword_corpus_version": "keyword2-vocab-v2",
@@ -2400,7 +2400,7 @@ def test_r4_provenance_reaches_live_archive():
         check("**archive.metrics.keywords**",
               list(m.get("keywords") or []) == ["新作", "掘坟"], m.get("keywords"))
         check("**archive.metrics.story_prompt_version**",
-              m.get("story_prompt_version") == "keyword2-v6",
+              m.get("story_prompt_version") == "keyword2-v7",
               m.get("story_prompt_version"))
         check("**archive.metrics.surface_prompt_version**",
               m.get("surface_prompt_version") == "surface-v1",
@@ -2417,7 +2417,7 @@ def test_r4_provenance_reaches_live_archive():
         check("**archive.metrics.keyword_draw_index**",
               m.get("keyword_draw_index") == 7, m.get("keyword_draw_index"))
         check("spec.prompt_version 也在顶层",
-              rec.get("prompt_version") == "keyword2-v6",
+              rec.get("prompt_version") == "keyword2-v7",
               rec.get("prompt_version"))
         # ---- 反证: 老题(无 provenance)不会写出 null ----
         sp2 = _good_gen_spec()

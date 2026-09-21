@@ -6,6 +6,7 @@
 不联网: 用一个假的 client 顶替 AnthropicMessagesClient。
 """
 import ast
+import io
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,8 @@ from story.llm import (  # noqa: E402
     STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION,
     STORY_SYSTEM, SURFACE_SYSTEM, _TOOL_STORY, _TOOL_SURFACE,
     _TOOL_STRUCTURE, check_tool, _story_system,
+    # R4-R3: livestream_safe 的三份判据措辞都要钉住。
+    CHECK_SYSTEM, _TOOL_CHECK,
 )
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.puzzle import FairClue, PuzzleSpec  # noqa: E402
@@ -1459,8 +1462,8 @@ def test_v4_prompt_versions_bumped():
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
     check("RIDDLE_PROMPT_VERSION 仍 == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v9",
-          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v10",
+          CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1623,8 +1626,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v9",
-          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v10",
+          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -3026,7 +3029,7 @@ def test_truth5_v6_pool_quarantined_but_v7_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v9", QUALITY_POLICY_VERSION == "quality-v9",
+    check("当前政策是 v10", QUALITY_POLICY_VERSION == "quality-v10",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q1pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -3106,7 +3109,7 @@ def test_q2_discovery_beats_schema_and_prompts():
 
 
 def test_q2_v7_pool_quarantined_but_v8_eligible():
-    """**Q2-K**: 旧 quality-v7 库存被隔离; v8 正常 eligible。
+    """**Q2-K**: 旧 quality-v7 库存被隔离; 当前政策正常 eligible。
 
     实播冒烟的日志里能看到这一条真的在生产路径上生效:
 
@@ -3116,7 +3119,7 @@ def test_q2_v7_pool_quarantined_but_v8_eligible():
     隔离靠 `_validate_pool_spec` 既有那一扇门自动生效 —— **不迁移 /
     不伪装 / 不删旧行**。
     """
-    print("\n[Q2-K] v7 quarantine / v8 eligible")
+    print("\n[Q2-K] v7 quarantine / current eligible")
     import os
     import json
     import tempfile
@@ -3130,7 +3133,7 @@ def test_q2_v7_pool_quarantined_but_v8_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v9", QUALITY_POLICY_VERSION == "quality-v9",
+    check("当前政策是 v10", QUALITY_POLICY_VERSION == "quality-v10",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q2pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -3257,12 +3260,12 @@ def test_q2_versions_bumped():
                            ANSWER_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
     from story.puzzle import PuzzleSpec
-    check("QUALITY_POLICY_VERSION = quality-v9",
-          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION = quality-v10",
+          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION = riddle-v8",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION = check-v9",
-          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v10",
+          CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
     # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
     check("ANSWER_PROMPT_VERSION 仍是 C0 升的 answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
@@ -3641,6 +3644,243 @@ def test_r4_story_schema_has_no_scaffold():
         check(f"schema 不提 {k}", k not in blob)
 
 
+def test_r4r3_livestream_safe_false_rejects_free_gen():
+    """**R4-R3**: 自由生成链上 `livestream_safe=false` **必须**拒稿。
+
+    ## 为什么单加这一条
+
+    这条链上"安全内容不得漏过"的**底线保证**是: 那道门真的是 fail-closed
+    的。措辞写对了(见 R4-K2e)不等于门有效 —— 一个把 `livestream_safe`
+    从硬门清单里挪出去、或者把方向读反的改动, 会让**判据说得再清楚也
+    照样放行**。
+
+    curated 侧早有等价的回归(`test_curated_v2` 的 §十); **自由生成侧
+    之前没有** —— 而这正是本轮出问题的那条链。
+
+    ## 为什么走 `gen_spec` 而不是直接调 `_apply_review`
+
+    `_apply_review` 是 `structure_original_idea` 里的**闭包**, 直接调需要
+    把 `bp` / `new_puzzle` 都拼出来 —— 那就变成"我在测我自己拼的调用"。
+    走真实入口 `gen_spec` 才是端到端的那条路径。
+
+    ## 断言的是"这一稿被拒", 而不是"gen_spec 返回 None"
+
+    ⚠️ `gen_spec` 在**所有稿都被拒**时会**回落到内置兜底题**并返回它 ——
+    所以"返回值不是 None"**不等于**"没被拒"。第一版就是这么写错的:
+    它拿 `is None` 当拒稿判据, 于是无论门有没有生效都恒绿。
+
+    真正的信号是**日志里的拒稿原因**(以及这次调用没有产出正式 spec)。
+    这里同时钉两条, 谁坏了都看得出来。
+    """
+    print("\n[R4-K2f] livestream_safe=false -> 自由生成链拒稿")
+    import logging as _logging
+    import contextlib as _ctx
+
+    def _run(live: bool):
+        """跑一次真实链, 返回 (日志全文, 审稿调用次数)。"""
+        base = review_ok()
+        base["decision"] = "pass"
+        base["quality_checks"]["livestream_safe"] = live
+        fc = FakeClient([
+            LLMResult(tool_input=riddle()),
+            LLMResult(tool_input=base),
+            # ⚠️ `_truth_tool()` 返回的**已经是** LLMResult —— 再套一层
+            # 会让 FakeClient 按标记取不到它, truth audit 于是 fail closed
+            # 把**两条**都判死, 连反证那条也过不了。
+            _truth_tool(),
+        ])
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        buf = io.StringIO()
+        h = _logging.StreamHandler(buf)
+        lg = _logging.getLogger("story.llm")
+        lg.addHandler(h)
+        try:
+            with _ctx.suppress(Exception):
+                w.gen_spec(blueprint=fc.default_blueprint, max_attempts=1)
+        finally:
+            lg.removeHandler(h)
+        n_review = sum(1 for c in fc.calls
+                       if (c.get("tool") or {}).get("name") == "emit_review")
+        return buf.getvalue(), n_review
+
+    # ---- ① false -> 那一次审稿被判不合格 ----
+    log_bad, n_bad = _run(False)
+    check("**审稿确实跑到了**(否则下面查的是空日志)",
+          n_bad == 1, f"emit_review 调用 {n_bad} 次")
+    check("**拒因点名 livestream_safe**",
+          "livestream_safe" in log_bad,
+          [ln for ln in log_bad.splitlines() if "不合格" in ln][:2])
+    check("**整稿被要求重出**(没有直接采纳)",
+          "被要求重出" in log_bad or "未通过" in log_bad,
+          [ln for ln in log_bad.splitlines() if "重出" in ln][:2])
+    # ---- ② 反证: 只把这一项翻回 true, 同样的稿子就**不再被拒** ----
+    #
+    # ⚠️ 反证必不可少: 若 ① 是因为别的原因(夹具坏了 / 版本不匹配)而拒,
+    # 只测 ① 会得到一个"永远绿"的假保证。② 证明差别**确实**在这一项。
+    log_ok, n_ok = _run(True)
+    check("**改回 true 后不再因 livestream_safe 被拒**",
+          "livestream_safe" not in log_ok,
+          [ln for ln in log_ok.splitlines() if "不合格" in ln][:2])
+
+
+
+def test_r4r3_story_has_safety_boundary():
+    """**R4-R3**: Story 有一条安全边界, 且**只有**一条。
+
+    ## 这条守的是什么
+
+    smoke 里出现了自伤主题与以性暴力为核心情节的题, 而它们**通过了
+    Stage B** —— 旧 `livestream_safe` 的概括措辞挡不住。创作侧要少产出
+    这类题, 所以 Story 加一句边界。
+
+    ## 为什么断言"只有一条"而不是"包含三类"
+
+    与红黑那段同一条理由: 复审明确**不继续堆规则**。堆规则会把输出
+    推成规范手册, 而且挡不住换说法绕过去。所以这里钉的是**形状** ——
+    一句话、带"安全边界"前缀、三类各出现一次, 不是一张清单。
+
+    ## 反向断言: 普通死亡**仍然**可以
+
+    这是最容易被"顺手写严"的一条。若边界写成"不写死亡", 那会把海龟汤
+    的主流题材整个杀掉 —— 而 review 明确说"普通非血腥死亡仍然可以"。
+    所以这里**必须**存在那句许可。
+    """
+    print("\n[R4-K2d] Story 有一条安全边界")
+    # ---- ① 有"安全边界"这一句 ----
+    check("**有安全边界一句**", "安全边界" in STORY_SYSTEM,
+          [ln for ln in STORY_SYSTEM.splitlines() if "安全" in ln])
+    # ---- ② 三类情形各出现 ----
+    for kw, name in (("自伤", "自伤"), ("性暴力", "性暴力"),
+                     ("血腥", "血腥细节")):
+        check(f"边界提到{name}", kw in STORY_SYSTEM)
+    # ---- ③ 正向许可: 普通死亡仍然可以 ----
+    check("**明确普通死亡仍然可以**",
+          "普通的" in STORY_SYSTEM and "死亡" in STORY_SYSTEM,
+          [ln for ln in STORY_SYSTEM.splitlines() if "死亡" in ln])
+    # ---- ④ 形状: 一句话, 不是清单 ----
+    line = next((ln for ln in STORY_SYSTEM.splitlines()
+                 if "安全边界" in ln), "")
+    check("**是一个自然段(单行)**", line.strip() and "\n" not in line.strip())
+    check("**别的行不再重复这三类**(只有一处边界)",
+          sum(1 for ln in STORY_SYSTEM.splitlines() if "自伤" in ln) == 1,
+          [ln for ln in STORY_SYSTEM.splitlines() if "自伤" in ln])
+
+
+def _curated_checklist_text():
+    """把 `_review_spec` 里 **curated 分支**那段 user 文本还原出来。
+
+    ## 为什么需要它
+
+    `livestream_safe` 的判据在**三处**独立写着, 第三处是 `_review_spec`
+    内部 `if _is_curated(spec):` 分支里拼的 `user` 串。它**不是**模块级
+    常量, 所以 `vars()` 扫不到 —— 第一版用例就是这么漏掉它的。
+
+    ## 为什么不写死字符串
+
+    写死会把"排版改了"也算成失败(假红), 而且下次再改一处仍然要靠人记得
+    同步。这里**从源码 AST 取那段真实的隐式拼接字面量**, 所以:
+
+      * 拿到的是**真正发给模型的那段文本**(不是副本);
+      * 排版变化(换行/缩进/相邻字面量合并)**不影响**结果 ——
+        `ast.Constant` 合并后就是最终字符串。
+
+    ## 定位方式
+
+    找到 `_review_spec` 函数体里那个 `_is_curated` 的 `if`, 收集它
+    `body` 中所有对 `user` 的 `+=` 拼接, 把右值里的字符串常量按顺序
+    接起来。找不到就返回空串 —— 调用方会因此报 FAIL(而不是静默通过),
+    这正是我们要的: **结构变了必须有人看一眼**。
+    """
+    import inspect as _insp
+    import ast as _ast
+    import story.llm as _L
+    tree = _ast.parse(_insp.getsource(_L.PuzzleWriter._review_spec).lstrip())
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.If):
+            continue
+        # 判据: `if _is_curated(...)`
+        t = node.test
+        if not (isinstance(t, _ast.Call)
+                and getattr(t.func, "id", "") == "_is_curated"):
+            continue
+        out = []
+        for stmt in _ast.walk(node):
+            # 只要 `user += <字面量...>` 这一类
+            if not isinstance(stmt, _ast.AugAssign):
+                continue
+            if getattr(stmt.target, "id", "") != "user":
+                continue
+            # 右值可能是单个 Constant, 也可能是隐式拼接(仍是 Constant)
+            for sub in _ast.walk(stmt.value):
+                if isinstance(sub, _ast.Constant) \
+                        and isinstance(sub.value, str):
+                    out.append(sub.value)
+        return "".join(out)
+    return ""
+
+
+def test_r4r3_livestream_safe_names_the_three_cases():
+    """**R4-R3**: `livestream_safe` 的判据要**指名**那三类情形。
+
+    ## 为什么这条是本轮的核心回归
+
+    上一版判据是"重口、过度刺激、以极端伤害本身作为噱头 -> false" ——
+    一句**概括**。实测它漏过: 自伤主题的题、以性暴力为核心情节的题
+    都判成了 true(所以它们通过了 Stage B, 进了 smoke 报告)。
+
+    一个概括性判据的问题是**它把归类责任推给了模型**: "自伤算不算重口?"
+    从措辞里读不出来。所以修法是**把它读出来** —— 逐条列明三类。
+
+    ## 覆盖面: **三处**措辞, 一处都不能漏
+
+    `livestream_safe` 的判据实际写在**三个**地方, 而且三处都会被模型读到:
+
+      1. `_TOOL_CHECK` 里 `quality_checks.livestream_safe.description`
+         (工具 schema —— **两条链共用**);
+      2. `CHECK_SYSTEM`(人读的硬门清单);
+      3. `_review_spec` 里 **curated 分支**的 `user` 段(另一份独立措辞)。
+
+    ⚠️ 这条用例第一版只查了 1 与 2, 于是**漏掉第 3 处**。变异实测:
+    把第 3 处改回旧概括, 测试**照样全绿** —— 而那正是外部题库题会读到
+    的那一份。现在三处都覆盖。
+
+    第 3 处**不写死字符串**, 而是**渲染出真实的 user 文本**再断言 ——
+    写死字符串会在下次改排版时假红。
+    """
+    print("\n[R4-K2e] livestream_safe 指名三类情形")
+    from story.llm import _TOOL_CHECK, CHECK_SYSTEM
+    THREE = ("自伤", "性暴力", "血腥")
+
+    def _assert_all(src, name):
+        # ⚠️ `extra` 会被 `print()` 出来, 而 CI/本地的 Windows 控制台是
+        # **GBK** —— 那几行里含 `⚠️`(U+26A0), 直接塞进去会在**报 FAIL 的
+        # 那一刻**再抛 UnicodeEncodeError, 于是"断言不成立"退化成"崩溃"。
+        # 崩溃也算红, 但掩盖了真正的失败原因。所以这里只留 ASCII + 常用
+        # 汉字, 把非 GBK 字符剔掉。
+        def _safe(lines):
+            return [str(ln).encode("gbk", "replace").decode("gbk")
+                    for ln in lines][:3]
+
+        for kw in THREE:
+            check(f"[{name}] 指名「{kw}」", kw in src,
+                  _safe([ln.strip()[:70] for ln in src.splitlines()
+                         if "livestream" in ln or "死亡" in ln]))
+        check(f"[{name}] **普通死亡仍然可以**",
+              "普通的" in src or "普通死亡" in src,
+              _safe([ln.strip()[:70] for ln in src.splitlines()
+                     if "普通" in ln]))
+
+    # ---- ① 工具 schema(两条链共用) ----
+    # ⚠️ `livestream_safe` 嵌在 `quality_checks` 里, 不是顶层属性。
+    desc = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"][
+        "properties"]["livestream_safe"]["description"]
+    _assert_all(desc, "schema")
+    # ---- ② CHECK_SYSTEM 的硬门清单 ----
+    _assert_all(CHECK_SYSTEM, "CHECK_SYSTEM")
+    # ---- ③ `_review_spec` 里 curated 分支那份**独立**措辞 ----
+    _assert_all(_curated_checklist_text(), "curated 段")
+
+
 def test_r4_surface_stage_returns_puzzle_only():
     """Surface: **只**返回 puzzle, 且**不**收到任何线索。"""
     print("\n[R4-K4] Surface: 只截反常瞬间")
@@ -3799,16 +4039,16 @@ def test_r4_versions_bumped():
     """R4 的版本身份。"""
     print("\n[R4-K10] 版本号")
     import story.llm as L
-    check("STORY_PROMPT_VERSION == keyword2-v6",
-          STORY_PROMPT_VERSION == "keyword2-v6", STORY_PROMPT_VERSION)
+    check("STORY_PROMPT_VERSION == keyword2-v7",
+          STORY_PROMPT_VERSION == "keyword2-v7", STORY_PROMPT_VERSION)
     check("SURFACE_PROMPT_VERSION == surface-v1",
           SURFACE_PROMPT_VERSION == "surface-v1", SURFACE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v9",
-          L.CHECK_PROMPT_VERSION == "check-v9", L.CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v10",
+          L.CHECK_PROMPT_VERSION == "check-v10", L.CHECK_PROMPT_VERSION)
     check("RIDDLE_PROMPT_VERSION 未动(riddle-v9)",
           L.RIDDLE_PROMPT_VERSION == "riddle-v9", L.RIDDLE_PROMPT_VERSION)
-    check("QUALITY_POLICY_VERSION == quality-v9",
-          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION == quality-v10",
+          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
     check("KEYWORD_IDEA_PROMPT_VERSION 已删除",
           not hasattr(L, "KEYWORD_IDEA_PROMPT_VERSION"))
     check("gen_keyword_idea 已删除",
@@ -3862,13 +4102,13 @@ def test_r4_keyword_spec_runs_three_stages():
           [c["tool"]["name"] for c in fc.calls])
     m = spec.metrics or {}
     check("lane 落进 metrics", m.get("lane") in ("red", "black"), m.get("lane"))
-    check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v6")
+    check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v7")
     check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v1")
     check("keywords 落盘", m.get("keywords"), m.get("keywords"))
     check("draw_index 落盘", int(m.get("keyword_draw_index") or 0) >= 1,
           m.get("keyword_draw_index"))
-    check("spec.prompt_version == keyword2-v6",
-          spec.prompt_version == "keyword2-v6", spec.prompt_version)
+    check("spec.prompt_version == keyword2-v7",
+          spec.prompt_version == "keyword2-v7", spec.prompt_version)
 
 
 def test_r4_lane_varies_across_real_keyword_spec_calls():
@@ -4869,6 +5109,9 @@ def main():
               test_r4_story_lane_direction_is_short,
               test_r4_story_center_is_anomaly_not_darkness,
               test_r4_story_prompt_does_not_suppress_background,
+              test_r4r3_story_has_safety_boundary,
+              test_r4r3_livestream_safe_names_the_three_cases,
+              test_r4r3_livestream_safe_false_rejects_free_gen,
               test_r4_story_schema_has_no_scaffold,
               test_r4_surface_stage_returns_puzzle_only,
               test_r4_surface_prompt_has_no_question_requirement,

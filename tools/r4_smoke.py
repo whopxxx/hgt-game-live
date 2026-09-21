@@ -4,7 +4,7 @@
 
 ## 这是 smoke, 不是实验
 
-任务书 R4 §5 明确: 实现完后只做一个 **5 红 + 5 黑**的 smoke, 走**真实**
+任务书 R4 §5 明确: 实现完后只做一个 **10 draws**(两组 seed)的 smoke, 走**真实**
 production 链, 看它跑不跑得通、产出什么样。所以:
 
     * 完全走生产入口 `keyword_spec()`(不经任何替身);
@@ -48,12 +48,18 @@ REPORT_MD = os.path.join(OUT_DIR, "report.md")
 TAG = "R4-SMOKE"
 log = logging.getLogger(TAG)
 
-#: 每类固定条数(**跑之前写死**)。
+#: 每组 seed 跑几次(**跑之前写死**)。两组共 10 draws。
+#:
+#: ⚠️ **不是"5 红 + 5 黑"** —— lane 由 `(session_seed, draw_index)` 无状态
+#: 派生, 与这里的组名**无关**。SEED_A / SEED_B 只是两组不同的抽词序列,
+#: 每组内部会红黑混出(实测如此)。把它叫成"红组/黑组"会让报告读起来像
+#: "这一组应该是红的", 而生产上根本不是那样 —— 那正是 R4-R1 那个
+#: "整场只出一个 lane" bug 的思维残留。
 N_PER_TYPE = 5
 
-#: 两类的 base seed(生产同款 `derive_session_seed` 派生)。
-SEED_RED = 20260925
-SEED_BLACK = 20260926
+#: 两组的 base seed(生产同款 `derive_session_seed` 派生)。
+SEED_A = 20260925
+SEED_B = 20260926
 
 
 class ObservingPuzzleWriter:
@@ -229,7 +235,7 @@ def _write_report(records: list) -> None:
     ok = [r for r in records if r["ok"]]
     P("# R4 production smoke —— Story -> Surface -> Structure")
     P("")
-    P("真实生产链(`keyword_spec`)跑 5 红 + 5 黑。")
+    P("真实生产链(`keyword_spec`)跑 **10 draws** —— 两组 seed 各 5 次。")
     P("**不重抽、不评分、不排名** —— 直接读原文。")
     P("")
     P(f"- 共 `{len(records)}` 道, 成题 `{len(ok)}`")
@@ -350,7 +356,7 @@ def main() -> int:
     log.info("model=%s", client.cfg.model)
 
     records = []
-    for kind, base in (("red", SEED_RED), ("black", SEED_BLACK)):
+    for kind, base in (("A", SEED_A), ("B", SEED_B)):
         ss = derive_session_seed(base)
         bag, meta = load_bag(str(DEFAULT_CORPUS_PATH), ss)
         log.info("=== %s: session_seed=%s corpus=%s ===",

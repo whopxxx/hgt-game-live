@@ -2939,7 +2939,7 @@ def test_g2_keyword_provenance():
                   (s.metrics or {}).get("lane") in ("red", "black"),
                   (s.metrics or {}).get("lane"))
             check("**story/surface 两个 prompt version 都落盘**",
-                  (s.metrics or {}).get("story_prompt_version") == "keyword2-v6"
+                  (s.metrics or {}).get("story_prompt_version") == "keyword2-v7"
                   and (s.metrics or {}).get("surface_prompt_version")
                   == "surface-v1", s.metrics)
             check("**source_type 为空(是 generated, 不是 curated)**",

@@ -479,7 +479,7 @@ def test_puzzle_format_checks():
     check("引用缺失的 fact 仍是 error", not r4.ok, r4.errors)
     # 低层 helper
     # R4: has_closing_question **已删除** —— 无结尾问句现在是合法的,
-    # 见 `story/quality.py` 的 quality-v9 说明。
+    # 见 `story/quality.py` 的 quality-v10 说明。
     check("is_first_person 引语里的我不算",
           not is_first_person('男人对酒保说：「请给我一杯水。」为什么?'))
 
@@ -2270,10 +2270,10 @@ def test_g3_riddle_version_bumped_but_policy_unchanged():
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION = answer-v7(未动)",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
-    check("**QUALITY_POLICY_VERSION = quality-v9**",
-          QUALITY_POLICY_VERSION == "quality-v9", QUALITY_POLICY_VERSION)
-    check("CHECK_PROMPT_VERSION = check-v9",
-          CHECK_PROMPT_VERSION == "check-v9", CHECK_PROMPT_VERSION)
+    check("**QUALITY_POLICY_VERSION = quality-v10**",
+          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v10",
+          CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
 
 
 def main():
