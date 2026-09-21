@@ -108,6 +108,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_file("app.js", "application/javascript; charset=utf-8")
         elif path == "/style.css":
             self._serve_file("style.css", "text/css; charset=utf-8")
+        elif path == "/announcements.json":
+            self._serve_file("announcements.json", "application/json; charset=utf-8")
         elif path == "/state":
             body = (self.hub.last() if self.hub else "{}").encode("utf-8")
             self._respond(200, "application/json; charset=utf-8", body)

@@ -251,6 +251,16 @@ html, body {
    边缘"可露; 但 display:none 仍然保留 —— 它让"下半部此刻不存在"
    这件事在 DOM 层就是真的, 而不是靠另一个元素遮挡来实现的。 */
 #bottom.hidden { display: none; }
+#announcer {
+  flex: 0 0 58px; height: 58px; min-width: 0;
+  overflow: hidden; white-space: nowrap;
+  background: rgba(212,175,110,.12); border-radius: 10px;
+  color: #ffe1a0; font-size: 28px; line-height: 58px;
+}
+#announcer-text {
+  display: inline-block; width: max-content; white-space: nowrap;
+}
+#announcer.hidden { display: none; }
 #qa-title {
   flex: 0 0 auto;
   display: flex; align-items: center; gap: 20px;

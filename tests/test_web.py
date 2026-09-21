@@ -189,7 +189,7 @@ window.addEventListener("load", async () => {
     check(document.querySelector(".qa-row .q .who").textContent.includes("观众0"),
           "缺少发言者名字");
 
-    // AI 玩家次数与普通 QA 行：轻量展示，不新增面板、不遮挡谜面。
+    // AI 玩家只显示状态，token 数值不进入观众 UI。
     send({puzzle_index: 2, story_index: 2, puzzle: "AI 玩家布局测试。",
           ai_player: {questions_available: 3, questions_earned: 7,
                       questions_used: 4, likes_progress: 23,
@@ -198,8 +198,8 @@ window.addEventListener("load", async () => {
                     verdict: "是", comment: "", kind: "ai_player"}],
           qa_total: 1});
     check(document.getElementById("stats").textContent
-            .includes("AI玩家提问次数 3"),
-          "应完整显示 AI玩家提问次数 3: "
+            .includes("每100点赞可以召唤 AI 玩家"),
+          "应显示 AI 玩家常态而非 token 数值: "
           + document.getElementById("stats").textContent);
     const aiRow = document.querySelector(".qa-row.kind-ai_player");
     check(aiRow && aiRow.textContent.includes("AI玩家：地点重要吗？")
@@ -515,15 +515,19 @@ window.addEventListener("load", async () => {
     check(!prompt.classList.contains("hidden"), "**揭晓阶段提示条不应隐藏**");
     check(prompt.textContent.includes("新谜题"),
           "揭晓阶段应说明即将换题: " + prompt.textContent);
-    // 系统行(非 QA 阶段 #问题 的反馈)要能上屏
+    // 系统行(非 QA 阶段 #问题 的反馈)要能上屏。
+    // 文案用 engine._ACK_BY_PHASE[SETTING] 的当前取值: 系统固定 copy 用汤面/汤底。
     send({phase: "setting", puzzle_index: 6, story_index: 6, puzzle: "",
-          qa_log: [{qid: -1, user_name: "系统", text: "正在准备新题，谜面出现后再发 #问题。",
+          qa_log: [{qid: -1, user_name: "系统", text: "正在准备新题，汤面出现后再发 #问题。",
                     verdict: "", comment: "", kind: "system"}],
           qa_total: 0});
     const sysRows = [...document.querySelectorAll(".qa-row.kind-system")];
     check(sysRows.length === 1, "系统行应渲染 1 条, 实际 " + sysRows.length);
     check(sysRows.length && sysRows[0].textContent.includes("正在准备新题"),
           "系统行内容: " + (sysRows[0] && sysRows[0].textContent));
+    check(sysRows.length && sysRows[0].textContent.includes("汤面")
+          && !sysRows[0].textContent.includes("谜面"),
+          "系统固定文案应用汤面而非谜面: " + (sysRows[0] && sysRows[0].textContent));
     check(sysRows.length && !sysRows[0].textContent.includes("系统："),
           "系统行**不该**带观众名前缀: " + (sysRows[0] && sysRows[0].textContent));
 
@@ -598,8 +602,8 @@ window.addEventListener("load", async () => {
     const cb = document.getElementById("reveal-contrib");
     check(!cb.classList.contains("hidden"), "有贡献链时应显示该块");
     check(document.getElementById("reveal-contrib-title").textContent
-          === "共同解谜",
-          "solved=true 标题应为'共同解谜', 实际 "
+          === "共同猜汤",
+          "solved=true 标题应为'共同猜汤', 实际 "
           + document.getElementById("reveal-contrib-title").textContent);
     const cRows = [...document.querySelectorAll(".reveal-contrib-row")];
     check(cRows.length === 2, "应渲染 2 条贡献, 实际 " + cRows.length);
@@ -1196,7 +1200,332 @@ window.addEventListener("load", async () => {
 '''
 
 
+ANNOUNCER_CHECK = r'''
+window.addEventListener('error', e => {
+  const result=document.createElement('pre'); result.id='test-result';
+  result.textContent=JSON.stringify([String(e.message)]); document.body.appendChild(result);
+});
+window.socket = null;
+window.WebSocket = class { constructor() { window.socket = this; } };
+// Drive real application timers deterministically; layout/font/WAAPI are real Chrome.
+let clock = 0, serial = 0;
+const tasks = new Map();
+performance.now = () => clock;
+window.setTimeout = (fn, delay=0) => {
+  const id = ++serial; tasks.set(id, {fn, at: clock + delay}); return id;
+};
+window.clearTimeout = id => tasks.delete(id);
+window.setInterval = (fn, delay) => {
+  const id = ++serial; tasks.set(id, {fn, at: clock + delay, interval: delay}); return id;
+};
+window.clearInterval = window.clearTimeout;
+const tick = async ms => {
+  const end = clock + ms;
+  for (;;) {
+    const next = [...tasks].filter(([,t]) => t.at <= end).sort((a,b) => a[1].at-b[1].at)[0];
+    if (!next) break;
+    const [id,t] = next; clock = t.at;
+    if (t.interval) t.at += t.interval; else tasks.delete(id);
+    t.fn(); await Promise.resolve(); await Promise.resolve();
+  }
+  clock = end; await Promise.resolve(); await Promise.resolve();
+};
+let cfg = null, failure = 'missing', fetchCount = 0;
+window.fetch = async (url, options) => {
+  if (url !== '/announcements.json' || options.cache !== 'no-store') throw Error('bad fetch');
+  fetchCount++;
+  return {ok: failure !== 'missing', json: async () => {
+    if (failure === 'json') throw SyntaxError('synthetic invalid JSON');
+    return structuredClone(cfg);
+  }};
+};
+const media = window.matchMedia.bind(window);
+let reduced = false;
+const listeners = [];
+window.matchMedia = query => query === '(prefers-reduced-motion: reduce)' ? {
+  get matches() { return reduced; },
+  addEventListener: (_, fn) => listeners.push(fn),
+} : media(query);
+window.addEventListener('load', async () => {
+  await document.fonts.ready;
+  const errors = [];
+  const check = (ok, message) => { if (!ok) errors.push(message); };
+  const box = document.getElementById('announcer'), text = document.getElementById('announcer-text');
+  const qa = document.getElementById('qa');
+  let state = {phase:'qa', puzzle_index:1, puzzle:'合成题面。为什么？', qa_log:[], qa_total:0,
+               hint_count:2, hint_text:'历史提示',
+               ai_player:{questions_earned:20}, leaderboard:[]};
+  const send = extra => { Object.assign(state, extra); socket.onmessage({data:JSON.stringify(state)}); };
+  const notice = () => text.textContent;
+  const anim = () => text.getAnimations()[0];
+  const rect = id => document.getElementById(id).getBoundingClientRect();
+  const config = (items, extra={}) => Object.assign({enabled:true, interval_seconds:90,
+    hold_seconds:4, long_text_speed_px_s:80, items:items.map((text,i) => ({id:String(i),enabled:true,text}))}, extra);
+  const reload = async c => { cfg=c; failure=''; await tick(15000); };
+  const finish = async () => {
+    const duration = anim() ? anim().effect.getTiming().duration : 4000;
+    await tick(duration + 1);
+  };
+  try {
+    send();
+    check(box.dataset.kind === 'leaderboard' && notice()==='' && !anim(),
+          'A16 empty leaderboard is quiet and must not replay historical summons/hints');
+    check(!qa.contains(box) && !document.getElementById('stats').contains(box), 'A16 announcer outside QA/stats');
+    const geometry = () => {
+      const b=box.getBoundingClientRect(), q=rect('qa'), p=rect('puzzle-viewport');
+      const scale=rect('stage').width/1080;
+      const workspace=parseFloat(getComputedStyle(document.getElementById('content')).getPropertyValue('--workspace-top'));
+      check(b.top >= rect('content').top + workspace*scale - 1 && b.top >= p.bottom-1,
+            'A16 announcer below puzzle and workspace top');
+      check(b.bottom <= q.top && b.bottom < rect('prompt').top && b.bottom < rect('stats').top,
+            'A16 announcer above QA/prompt/stats, not bottom');
+      check(b.bottom < rect('stage').top + 1400*scale && b.height > 0,
+            'A16 announcer in safe upper workspace');
+    };
+    geometry();
+    const before=box.getBoundingClientRect().top;
+    send({qa_log:Array.from({length:70},(_,i)=>({qid:i+1,user_name:'Alice',text:'合成问题'+i,verdict:'是',kind:'qa'})),qa_total:70});
+    qa.scrollTop=qa.scrollHeight;
+    check(box.getBoundingClientRect().top === before, 'A16 QA append/scroll must not move announcer');
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'})); geometry();
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
+    send({ai_player:{questions_earned:21,questions_available:0,questions_used:21}});
+    check(box.dataset.kind==='ai' && notice().includes('已被召唤'), 'A16 earned delta summons even if available already 0');
+    const first=anim();
+    for(let i=0;i<20;i++) send();
+    check(anim()===first, 'A16 repeated snapshots do not restart animation');
+    send({ai_player:{questions_earned:21,questions_available:1,questions_used:20,in_flight:true}});
+    check(document.getElementById('stats').textContent==='AI玩家正在推理…', 'A16 AI in-flight shows reasoning state only');
+    send({ai_player:{questions_earned:21,questions_available:0,questions_used:21,in_flight:false}});
+    check(document.getElementById('stats').textContent==='每100点赞可以召唤 AI 玩家', 'A16 available 1 -> 0 shows no numeric flicker');
+    check(anim()===first && !/\d/.test(notice()), 'A16 consumed token does not interrupt or number summon');
+    socket.onclose(); await tick(801); send();
+    check(anim()===first, 'A16 reconnect retains baseline');
+    await tick(3000);
+    check(box.dataset.kind==='ai' && anim()===first, 'A16 summon survives token consumption for full hold');
+    await finish();
+    check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not queue old AI');
+    send({ai_player:{questions_earned:24}});
+    check(notice().includes('AI玩家已被触发') && !/\d/.test(notice()), 'A16 delta >1 merged without numbers');
+    send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
+    await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
+    send({leaderboard:[{rank:1,user_name:'Alice',solved_count:5}]});
+    check(box.dataset.kind==='leaderboard' && notice().includes('Alice 5题'), 'A16 Top3 updates default only');
+
+    const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
+    send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
+    check(box.dataset.kind==='hint' && notice()==='💡 提示：注意灯的方向', 'A16 new hint announces');
+    check(qa.querySelector('.kind-hint').textContent.includes('注意灯的方向'), 'A16 hint QA history retained');
+    const hintAnimation=anim();
+    for(let i=0;i<20;i++) send();
+    check(anim()===hintAnimation, 'A16 repeated hint snapshot does not restart');
+    send({hint_count:4,hint_text:'',qa_log:[hintRow(-3,'注意灯的方向'),hintRow(-4,'注意门外的人')],qa_total:72});
+    await finish();
+    check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
+    send({ai_player:{questions_earned:28,questions_available:0}});
+    check(box.dataset.kind==='ai', 'A16 AI outranks active hint');
+    await finish(); check(notice()==='💡 提示：注意门外的人', 'A16 interrupted hint returns for full reading');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated hint snapshots enqueue once only');
+    send({hint_count:5,hint_text:'旧题尚未播完'});
+    send({puzzle_index:2,hint_count:7,hint_text:'新题首帧历史提示'});
+    check(box.dataset.kind==='leaderboard', 'A16 new puzzle resets baseline and cancels old hint');
+    send({hint_count:8,hint_text:'本题新提示'});
+    check(notice()==='💡 提示：本题新提示', 'A16 new puzzle subsequent hint announces');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 new puzzle hint plays once');
+
+    // 术语分两层:
+    //   ① 观众内容(原话 / 题目正文 / 贡献 quote / operator 自定义文案)逐字透传;
+    //   ② 系统固定文案在**源头**(story/engine.py)就写成汤面/汤底, 前端不做替换。
+    // 这里用一条带"谜底"的**观众可控**文本验证 ① —— 系统固定文案的正确性
+    // 由 test_engine 的回归覆盖(见 test_fixed_viewer_copy_uses_soup_terms)。
+    send({phase:'revealed',revealed_answer:'合成故事正文',reveal_stage:'contribution',solved:true,
+          reveal_contributors:[{qid:1,user_name:'Alice',text:'原话包含谜底一词',verdict:'是',is_final:true}]});
+    check(document.getElementById('reveal-label').textContent==='汤底揭晓'
+          && document.getElementById('reveal-contrib-title').textContent==='共同猜汤', 'A16 reveal labels use soup terminology');
+    check(document.getElementById('reveal-contrib-list').textContent.includes('原话包含谜底一词'), 'A16 viewer content not rewritten');
+    send({phase:'qa',revealed_answer:'',qa_log:[],qa_total:74});
+    check(document.getElementById('prompt').textContent.includes('猜中汤底我就揭晓')
+          && notice().includes('本场猜汤榜'), 'A16 prompt and leaderboard terminology');
+    // 反证: 若有人把术语做回"对任意文本 replaceAll", 下面几条必然失败 ——
+    // 它会把观众提问、计时器标签、贡献链原话一起改写掉。
+    send({phase:'qa',qa_log:[{qid:1,user_name:'观众甲',text:'谜底是不是和灯有关？',verdict:'不是',kind:'qa'}],
+          next_event_ms:60000,next_event_kind:'hint',next_event_label:'谜底揭晓倒计时',qa_total:75});
+    check(qa.textContent.includes('谜底是不是和灯有关？'), 'A16 viewer question wording never rewritten');
+    // 计时器文案由真实 rAF 循环写入(setTimeout 被 fake, rAF 没有)。
+    await new Promise(requestAnimationFrame);
+    check(document.getElementById('puzzle-timer').textContent.startsWith('谜底揭晓倒计时'),
+          'A16 timer label passes through verbatim: '
+          + document.getElementById('puzzle-timer').textContent);
+
+    send({leaderboard:[]});
+    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
+          'A16 clearing leaderboard removes placeholder copy without animation');
+    await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15})); cfg.items[1].enabled=false;
+    await tick(15000); // reload disabled item
+    send({phase:'setting'}); await tick(300000); send({phase:'qa'});
+    await tick(89999);
+    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
+          'A16 empty leaderboard stays quiet before preset due');
+    await tick(251); check(notice().includes('预设甲'), 'A16 preset still triggers from empty leaderboard state');
+    const short=anim(), timing=short.effect.getTiming(), frames=short.effect.getKeyframes();
+    for(let i=0;i<20;i++) send();
+    check(anim()===short, 'A16 repeated snapshots do not restart or enqueue preset');
+    check(box.dataset.motion==='slide' && timing.duration===17000 && frames.length===4,
+          'A16 preset short uses symmetric 1s enter / 15s hold / 1s exit');
+    short.currentTime=1000;
+    check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
+          && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
+          'A16 short hold fully visible');
+    send({hint_count:9,hint_text:'提示应抢占预设公告'});
+    check(box.dataset.kind==='hint', 'A16 hint preempts preset without waiting for interval');
+    check(anim().effect.getTiming().duration===7000,
+          'A16 short hint uses capped 5s hold plus symmetric 1s slides');
+    send({ai_player:{questions_earned:29}});
+    check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
+    check(anim().effect.getTiming().duration===7000,
+          'A16 short AI notice uses capped 5s hold plus symmetric 1s slides');
+    await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
+    await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
+
+    // Bad JSON / bad types / HTTP failure each retain the last-good two items.
+    for (const bad of ['json','types','missing']) {
+      failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
+      await tick(90000);
+      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
+      send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
+    }
+    await reload(config(['更新公告']));
+    send({phase:'setting'}); send({phase:'qa'});
+    await tick(90250); check(notice().includes('更新公告'), 'A16 hot update replaces items');
+    await reload(config(['不该播放'],{enabled:false}));
+    await tick(90000); check(box.dataset.kind==='leaderboard', 'A16 global disable');
+
+    const long='长公告含空格 和标点，'.repeat(12)+'末尾可读';
+    await reload(config(['😀'.repeat(161),long]));
+    send({phase:'setting'}); send({phase:'qa'}); await tick(90250);
+    check(notice()==='📢 游戏公告 '+long, 'A16 >160 Unicode item skipped, not truncated; valid item retained');
+    check(box.dataset.motion==='marquee', 'A16 long uses marquee');
+    const moving=anim(), duration=moving.effect.getTiming().duration;
+    check(Math.abs(duration-(box.clientWidth+text.scrollWidth)/80*1000)<1 && duration>4600,
+          'A16 long duration is full measured distance / speed (not fixed 4s)');
+    check(getComputedStyle(text).textOverflow!=='ellipsis' && getComputedStyle(text).fontSize==='28px'
+          && text.offsetHeight===58 && box.clientHeight===58, 'A16 no ellipsis/shrink/wrap');
+    moving.currentTime=duration-100;
+    const tail=text.getBoundingClientRect().right, left=box.getBoundingClientRect().left;
+    check(tail>=left-1 && tail<left+20, 'A16 final characters travel completely across viewport');
+    await tick(5000); check(notice().endsWith('末尾可读'), 'A16 long item not removed after 4s');
+    send({phase:'revealed',revealed_answer:'合成谜底',revealed_core_answer:'合成核心答案',reveal_stage:'core'});
+    check(box.getBoundingClientRect().height===0 && !anim(), 'A16 reveal hides/cancels announcer');
+    await tick(300000); send({phase:'qa',revealed_answer:''});
+    check(box.dataset.kind==='leaderboard', 'A16 QA returns to default, no accumulated presets');
+
+    reduced=true; listeners.forEach(fn=>fn());
+    await tick(90250);
+    let pages='', count=0;
+    while(box.dataset.kind==='preset' && count++<30) {
+      pages+=notice();
+      check(!anim() && text.scrollWidth<=box.clientWidth, 'A16 reduced motion pages fully fit without motion');
+      await tick(4000);
+    }
+    check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
+    send({leaderboard:[1,2,3].map(rank=>({rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:4-rank}))});
+    const board='📢 本场猜汤榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    let boardPages='';
+    for(let i=0;i<20 && boardPages.length<board.length;i++) {
+      boardPages+=notice();
+      check(text.scrollWidth<=box.clientWidth, 'A16 long nicknames fit static pages');
+      await tick(4000);
+    }
+    check(boardPages===board, 'A16 all Top3 long nicknames readable without truncation');
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    check(text.scrollWidth<=box.clientWidth && !anim(), 'A16 debug resize remeasures reduced-motion pages');
+    geometry();
+
+    // Hints share exactly the same full-text marquee / static-page renderer.
+    const longHint='提示内容不能被永久截断，'.repeat(10)+'最后线索';
+    send({hint_count:10,hint_text:longHint});
+    let hintPages='', pageCount=0;
+    while(box.dataset.kind==='hint' && pageCount++<30) {
+      hintPages+=notice();
+      check(!anim() && text.scrollWidth<=box.clientWidth, 'A16 reduced-motion hint pages fit');
+      await tick(4000);
+    }
+    check(hintPages==='💡 提示：'+longHint, 'A16 reduced-motion hint preserves complete text');
+    reduced=false; listeners.forEach(fn=>fn());
+    send({hint_count:11,hint_text:longHint});
+    check(box.dataset.motion==='marquee' && notice()==='💡 提示：'+longHint, 'A16 long hint uses untruncated marquee');
+    check(Math.abs(anim().effect.getTiming().duration-(box.clientWidth+text.scrollWidth)/80*1000)<1,
+          'A16 long hint duration uses full measured distance');
+    await finish(); check(box.dataset.kind!=='hint', 'A16 long hint finishes without duplicate');
+    check(fetchCount>10, 'A16 periodic hot reload actually runs');
+  } catch(e) { errors.push(e.stack); }
+  const result=document.createElement('pre'); result.id='test-result'; result.hidden=true;
+  result.textContent=JSON.stringify(errors); document.body.appendChild(result);
+});
+'''
+
+
+def test_announcement_http():
+    import socket
+    from http.client import HTTPConnection
+    from unittest.mock import patch
+    sys.path.insert(0, str(ROOT))
+    from story.server import RenderServer, StateHub
+
+    with tempfile.TemporaryDirectory() as tmp, patch("story.server._WEB_DIR", tmp):
+        (Path(tmp) / "index.html").write_text("synthetic page", encoding="utf-8")
+        config_path = Path(tmp) / "announcements.json"
+        config_path.write_bytes((ROOT / "web/announcements.json").read_bytes())
+        hub = StateHub()
+        hub.publish({"leaderboard": []})
+        server = RenderServer(hub, "127.0.0.1", 0)
+        server.start()
+        port = server._httpd.server_port
+
+        def get(path, method="GET"):
+            conn = HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                conn.request(method, path)
+                response = conn.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                conn.close()
+
+        try:
+            status, headers, body = get("/announcements.json")
+            assert status == 200 and json.loads(body)["enabled"] is True
+            assert headers["Content-Type"] == "application/json; charset=utf-8"
+            assert headers["Cache-Control"] == "no-store"
+            assert get("/announcements.json", "POST")[0] == 501
+            for mode in ("missing", "invalid"):
+                if mode == "missing":
+                    config_path.unlink()
+                    assert get("/announcements.json")[0] == 404
+                else:
+                    config_path.write_text("{invalid", encoding="utf-8")
+                    assert get("/announcements.json")[2] == b"{invalid"
+                assert get("/")[0] == 200
+                assert json.loads(get("/state")[2]) == {"leaderboard": []}
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    client.sendall(b"GET /ws HTTP/1.1\r\nHost: localhost\r\n"
+                                   b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                                   b"Sec-WebSocket-Key: c3ludGhldGljLWZpeHR1cmU=\r\n\r\n")
+                    data = b""
+                    while b'"leaderboard": []' not in data:
+                        data += client.recv(4096)
+                    assert b"101 Switching Protocols" in data
+                    client.sendall(b"\x88\x00")
+        finally:
+            server.stop()
+            server._httpd.server_close()
+    print("PASS: readonly announcement HTTP / no-store / missing-invalid config preserves page + WS")
+
+
 def main():
+    test_announcement_http()
     if not CHROME:
         # 找不到浏览器时**默认失败**, 不静默跳过 —— 静默跳过会让这个
         # 套件在 CI 上"一直绿", 而它验的正是真实布局, 恰恰是最该跑的。
@@ -1207,17 +1536,22 @@ def main():
             return
         sys.exit(1)
     print(f"(使用浏览器: {CHROME})")
+    for script in (CHECK, ANNOUNCER_CHECK):
+        run_browser(script)
+
+
+def run_browser(script):
     source = (ROOT / "web/index.html").read_text(encoding="utf-8")
     source = source.replace('href="/style.css"', 'href="' + (ROOT / "web/style.css").as_uri() + '"')
     source = source.replace('<script src="/app.js"></script>',
-                            "<script>" + CHECK + "</script><script src=\"" +
+                            "<script>" + script + "</script><script src=\"" +
                             (ROOT / "web/app.js").as_uri() + '\"></script>')
     # data/ 在干净 checkout 上可能不存在(它只靠两个 .md 撑着)。
     (ROOT / "data").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=ROOT / "data") as tmp:
         page = Path(tmp) / "test.html"
         page.write_text(source, encoding="utf-8")
-        result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu",
+        result = subprocess.run([str(CHROME), "--headless=new", "--disable-gpu", "--enable-logging=stderr",
                                  "--no-first-run", "--hide-scrollbars",
                                  "--user-data-dir=" + str(Path(tmp) / "profile"),
                                  "--window-size=1080,1920", "--virtual-time-budget=15000",
@@ -1225,9 +1559,12 @@ def main():
                                  "--dump-dom", page.as_uri()], capture_output=True, timeout=45)
         dom = result.stdout.decode("utf-8", errors="replace")
         match = re.search(r'<pre id="test-result"[^>]*>(.*?)</pre>', dom, re.S)
-        assert match, result.stderr.decode("utf-8", errors="replace")[-2000:]
+        assert match, dom[-4000:] + result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
         assert not errors, errors
+    if script == ANNOUNCER_CHECK:
+        print("PASS: A16 baseline/delta/queue/presets/hot reload/geometry/marquee/reduced-motion")
+        return
     print("PASS: 问答追加/提示行/思考中/揭晓三阶段/U4 长文本自动滚动/"
           "贡献链/换题清空/调试宽度/长流可滚/无补题文案；data/preview.png")
 

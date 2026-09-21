@@ -25,11 +25,12 @@
 
       <!-- ============ 下半部: 问答流(持续上滚) ============ -->
       <section id="bottom">
+        <div id="announcer" aria-live="polite"><div id="announcer-text"></div></div>
         <div id="qa-title">问答</div>
         <div id="qa">
           <div id="qa-body"></div>
         </div>
-        <div id="prompt">发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓</div>
+        <div id="prompt">发送 <b>#你的问题</b> 向我提问，猜中汤底我就揭晓</div>
         <div id="thinking" class="hidden">AI 正在思考…</div>
         <div id="hintbar" class="hidden"></div>
         <div id="stats"></div>
@@ -51,7 +52,7 @@
         之后 reveal_detail_visible=true 才追加 #reveal-body + 贡献链。
       -->
       <div id="reveal" class="hidden">
-        <div id="reveal-label">谜底揭晓</div>
+        <div id="reveal-label">汤底揭晓</div>
         <div id="reveal-core"></div>
         <div id="reveal-who" class="hidden"></div>
         <div id="reveal-body" class="hidden"></div>
