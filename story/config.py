@@ -402,6 +402,33 @@ class Config:
     # blueprint rng **完全隔离**。
     keyword_session_seed: Optional[int] = None
 
+    # ---- Step 12C: gift_capture_diagnostic 模式 ----
+    #
+    # ⚠️ **诊断模式, 不是业务模式**。打开它只做一件事: 额外开 1~3 路受控的
+    # WS 连接去采集"哪种连接画像能收到 Gift"的原始证据, 每路写进
+    # `data/gift_probe/<session>/<profile>/`。
+    #
+    # ⚠️ 它还是**独占会话**: 打开后 Director **不会启动** —— 本进程只跑
+    # 采集, 跑完退出。这不是"游戏照常直播 + 后台旁路探针"那种模式(那需要
+    # 单独的生命周期接线, 不在本轮范围内)。见 `director._run_gift_capture_diagnostic`。
+    #
+    # 它**不**接前端公告、不感谢礼物、不做打赏榜、不改 SummonLedger ——
+    # 诊断连接不接任何业务回调(`make_diagnostic_fetcher` 会对传回调的
+    # 调用直接报错)。详见 `story/gift_probe/`。
+    gift_capture_diagnostic: bool = False
+    #: 要开的画像名(逗号分隔)。空 = 用默认三臂(A/B/C)。
+    #: 拼错的名字**会报错**而不是被忽略 —— 见 `select_profiles`。
+    gift_probe_profiles: str = ""
+    #: 最多几路(硬上限 3)。不为了省事, 是为了不无意义地制造大量连接。
+    gift_probe_limit: int = 3
+    #: 证据目录根。默认 `data/gift_probe`(gitignored)。
+    #: **不能**传 `data` 本身 —— 那会让 probe 文件与 production 数据同层。
+    gift_probe_dir: str = os.path.join("data", "gift_probe")
+    #: 每个 (profile, method) 最多留几个样本。
+    gift_probe_max_per_method: int = 20
+    #: 摘要间隔(秒)。Issue 建议 20~30。
+    gift_probe_summary_seconds: float = 25.0
+
     # ---- G4-2 §五: 冷启动 prewarm ----
     #
     # keyword2 是**两阶段**的, 一次现场生成几十秒。若第一题让观众等,
@@ -961,6 +988,35 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-question-len", type=int, default=60,
                     help="单条提问最大长度, 默认 60")
 
+    # ---- Step 12C: gift_capture_diagnostic(诊断模式, 非业务模式) ----
+    #
+    # 这四个 flag 刻意都带 `gift-probe` 前缀: 它们只影响**诊断**行为,
+    # 与直播业务参数混在一起会让"我到底改了业务还是只开了诊断"这个问题
+    # 在 `--help` 里看不出来。
+    ap.add_argument("--gift-capture-diagnostic", dest="gift_capture_diagnostic",
+                    action="store_true",
+                    help="**独占诊断会话**(不是直播旁路): 本进程只跑采集, "
+                         "额外开 1~3 路受控 WS 连接抓 Gift 原始证据, 每路写"
+                         "独立目录, 跑完即退出 —— Director 不会启动。"
+                         "不接公告/不感谢礼物/不改 SummonLedger(诊断连接不接"
+                         "任何业务回调)。默认关闭。")
+    ap.add_argument("--gift-probe-profiles", dest="gift_probe_profiles",
+                    default="",
+                    help=("要开的画像名, 逗号分隔。可选: "
+                          "current-auth-control / random-uid-only / "
+                          "reference-2026。留空 = 默认三臂。拼错的名字会"
+                          "报错(不静默忽略)。"))
+    ap.add_argument("--gift-probe-limit", type=int, default=3,
+                    help="最多同时开几路(硬上限 3), 默认 3")
+    ap.add_argument("--gift-probe-dir", dest="gift_probe_dir",
+                    default=os.path.join("data", "gift_probe"),
+                    help="证据目录根, 默认 data/gift_probe(已 gitignored)。"
+                         "不能传 data 本身。")
+    ap.add_argument("--gift-probe-max-per-method", type=int, default=20,
+                    help="每个 (profile, method) 最多留几个原始样本, 默认 20")
+    ap.add_argument("--gift-probe-summary-seconds", type=float, default=25.0,
+                    help="实时摘要间隔(秒), 默认 25(Issue 建议 20~30)")
+
     ap.add_argument("--host", default="127.0.0.1", help="Web 服务绑定地址")
     ap.add_argument("--port", type=int, default=8765, help="Web 服务端口")
     ap.add_argument("--no-window", dest="open_window", action="store_false",
@@ -1025,6 +1081,15 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         playtest_enabled=a.playtest_enabled,
         playtest_max_turns=a.playtest_max_turns,
         max_question_len=a.max_question_len,
+        # ---- Step 12C: gift_capture_diagnostic ----
+        # 加 flag 与接线必须同一处完成, 否则就是 dead config
+        # (参数形同虚设, 而 --help 里明明写着)。
+        gift_capture_diagnostic=a.gift_capture_diagnostic,
+        gift_probe_profiles=a.gift_probe_profiles,
+        gift_probe_limit=a.gift_probe_limit,
+        gift_probe_dir=a.gift_probe_dir,
+        gift_probe_max_per_method=a.gift_probe_max_per_method,
+        gift_probe_summary_seconds=a.gift_probe_summary_seconds,
         host=a.host,
         port=a.port,
         open_window=a.open_window,

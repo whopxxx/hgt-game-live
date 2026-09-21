@@ -130,6 +130,20 @@ jobs:
       - name: 离线套件 ws_cookie
         run: uv run tests/test_ws_cookie.py
 
+      # 12C: gift_capture_diagnostic —— 多连接画像抓取 + Gift-family 原始证据。
+      # 这个套件守的是 Issue「测试要求」的 13 条, 其中好几条是**否定性**
+      # 命题("非 Gift method 不落盘" / "坏 cookie 不进日志" / "probe 目录
+      # 与 production 不相交")—— 那类命题最容易假绿, 所以每条都配了反证。
+      #
+      # 最要紧的两条:
+      #   * **三层计数可独立区分**(seen / parsed / emitted) —— 合并任何两层
+      #     都会让"服务端没给" "parse 炸了" "回调断了" 三种故障在计数上
+      #     长得一模一样;
+      #   * **诊断关闭时生产计数逐字不变** —— 拿基线与诊断类跑同一个响应,
+      #     比对 method/unhandled/parse_error 三个计数与业务回调序列。
+      - name: 离线套件 gift_probe
+        run: uv run tests/test_gift_probe.py
+
       # Solve UX: 通关合同(v5)的**产品语义**回归 —— 房间共同推理、
       # human-only established、Reviewer 四项 fail-closed、确定性揭晓、
       # 运行时身份包含合同。Cases A~M, 全部去身份化的最小构造。
