@@ -104,11 +104,15 @@ class _FakeHTTP:
 
     def __init__(self, respond_model=None):
         self.bodies = []
+        self.urls = []
+        self.api_keys = []
         self.respond_model = respond_model
 
     def __call__(self, req, timeout=None):
         body = json.loads(req.data.decode("utf-8"))
         self.bodies.append(body)
+        self.urls.append(req.full_url)
+        self.api_keys.append(req.headers.get("X-api-key"))
         model = self.respond_model or body.get("model")
         payload = {
             "content": [{"type": "text", "text": "ok"}],
@@ -263,6 +267,123 @@ def test_local_llm_config_covers_endpoint_credentials_models_and_budgets():
               "config/llm.local.json" in gi)
         check("**仓库提供无真实凭据的 example**",
               (root / "config" / "llm.example.json").exists())
+    finally:
+        C.LLM_LOCAL_CONFIG_PATH = old_path
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+# ======================================================================
+# 0b. 多 provider + model alias：同一个 client 真正切 URL / key / model
+# ======================================================================
+def test_multi_provider_alias_routes_endpoint_key_and_model():
+    import os
+    import story.config as C
+
+    payload = {
+        "providers": {
+            "A": {
+                "base_url": "https://api-a.example.test",
+                "api_key": "key-A-secret",
+            },
+            "B": {
+                "base_url": "https://api-b.example.test/base",
+                "api_key": "key-B-secret",
+            },
+        },
+        "models": {
+            "a1": {"provider": "A", "model": "model-a-1"},
+            "a2": {"provider": "A", "model": "model-a-2"},
+            "b1": {"provider": "B", "model": "model-b-1"},
+            "b2": {"provider": "B", "model": "model-b-2"},
+        },
+        "default": "a1",
+        "puzzle.story": "b2",
+        "puzzle.review": "a2",
+        "qa.answer": "a1",
+        "qa.judge": "b1",
+    }
+    fd, path = tempfile.mkstemp(prefix="hgt_llm_multi_", suffix=".json")
+    os.close(fd)
+    old_path = C.LLM_LOCAL_CONFIG_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        C.LLM_LOCAL_CONFIG_PATH = path
+        _clean_env()
+        with _Env(AI_BASE_URL=None, AI_API_KEY=None):
+            cfg = LLMConfig()
+
+            check("**default alias -> A/model-a-1**",
+                  cfg.model_for("hint") == "model-a-1",
+                  cfg.route_for("hint"))
+            check("**story alias -> B/model-b-2**",
+                  cfg.model_for("puzzle.story") == "model-b-2",
+                  cfg.route_for("puzzle.story"))
+            check("**review alias -> A/model-a-2**",
+                  cfg.model_for("puzzle.review") == "model-a-2",
+                  cfg.route_for("puzzle.review"))
+            check("**judge alias -> B/model-b-1**",
+                  cfg.model_for("qa.judge") == "model-b-1",
+                  cfg.route_for("qa.judge"))
+
+            # Explicit aliases in models[] are themselves the whitelist declaration.
+            check("**alias actual models 自动进入允许集合**",
+                  not cfg.unknown_models(), cfg.unknown_models())
+
+            c = AnthropicMessagesClient(cfg)
+            fake = _FakeHTTP()
+            for stage in ("puzzle.story", "puzzle.review",
+                          "qa.answer", "qa.judge"):
+                _call(c, fake, stage=stage)
+
+            check("**四次请求 actual model 正确**",
+                  [b["model"] for b in fake.bodies] ==
+                  ["model-b-2", "model-a-2", "model-a-1", "model-b-1"],
+                  [b["model"] for b in fake.bodies])
+            check("**同一 client 真正切 A/B endpoint**",
+                  fake.urls == [
+                      "https://api-b.example.test/base/v1/messages",
+                      "https://api-a.example.test/v1/messages",
+                      "https://api-a.example.test/v1/messages",
+                      "https://api-b.example.test/base/v1/messages",
+                  ], fake.urls)
+            check("**每个 endpoint 带自己的 API key**",
+                  fake.api_keys == [
+                      "key-B-secret", "key-A-secret",
+                      "key-A-secret", "key-B-secret",
+                  ], fake.api_keys)
+
+            masked = json.dumps(cfg.masked(), ensure_ascii=False)
+            check("**多 provider 启动信息不泄漏任何完整 key**",
+                  "key-A-secret" not in masked and "key-B-secret" not in masked,
+                  masked)
+            check("**LLMConfig repr 不泄漏 provider key**",
+                  "key-A-secret" not in repr(cfg) and "key-B-secret" not in repr(cfg),
+                  repr(cfg))
+
+        # alias typo / provider typo must fail before runtime.
+        with open(path, "w", encoding="utf-8") as fh:
+            bad = dict(payload)
+            bad["puzzle.story"] = "b22"
+            json.dump(bad, fh)
+        try:
+            C._load_llm_local_config(path)
+            check("**stage 引用未知 alias 必须报错**", False, "未报错")
+        except ValueError as e:
+            check("**stage 引用未知 alias 明确报错**", "b22" in str(e), str(e))
+
+        with open(path, "w", encoding="utf-8") as fh:
+            bad = json.loads(json.dumps(payload))
+            bad["models"]["b2"]["provider"] = "NOPE"
+            json.dump(bad, fh)
+        try:
+            C._load_llm_local_config(path)
+            check("**model 引用未知 provider 必须报错**", False, "未报错")
+        except ValueError as e:
+            check("**model 引用未知 provider 明确报错**", "NOPE" in str(e), str(e))
     finally:
         C.LLM_LOCAL_CONFIG_PATH = old_path
         try:
@@ -743,19 +864,21 @@ def test_two_stages_mismatch_warn_independently():
         check("**qa.answer 的错配也被报出(没被吞掉)**", "qa.answer" in txt, txt)
         check("**两条 requested 各自正确**",
               f"requested={B}" in txt and f"requested={A}" in txt, txt)
-        check("**去重集合按三元组记账**",
-              ("puzzle.review", B, "gateway-wrong") in c._warned_model_mismatches
-              and ("qa.answer", A, "gateway-wrong") in c._warned_model_mismatches,
+        check("**去重集合按 provider+stage+model 四元组记账**",
+              ("legacy", "puzzle.review", B, "gateway-wrong")
+              in c._warned_model_mismatches
+              and ("legacy", "qa.answer", A, "gateway-wrong")
+              in c._warned_model_mismatches,
               c._warned_model_mismatches)
 
-        # 反证: 同一个 (stage, requested, actual) 重复出现只报一次(不刷屏)
+        # 反证: 同一个 (provider, stage, requested, actual) 重复出现只报一次(不刷屏)
         h2 = _CaptureLogs()
         llm_log.addHandler(h2)
         try:
             _call(c, fake, stage="puzzle.review")
         finally:
             llm_log.removeHandler(h2)
-        check("**同一三元组重复出现不重复告警**",
+        check("**同一路由错配重复出现不重复告警**",
               "模型错配" not in h2.text(), h2.text())
 
 
@@ -1317,6 +1440,7 @@ def main():
     _clean_env()
     for t in (
         test_local_llm_config_covers_endpoint_credentials_models_and_budgets,
+        test_multi_provider_alias_routes_endpoint_key_and_model,
         test_simple_models_json_config_and_precedence,
         test_global_model_only_all_stages_fall_back,
         test_single_stage_override_is_isolated,
