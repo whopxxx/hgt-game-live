@@ -2,13 +2,14 @@
 # coding: utf-8
 """配置: CLI + 环境变量 + 默认值。
 
-优先级: CLI > env > 默认值。
+优先级: CLI > env > config/models.json > 默认值。
 所有可调项集中在这里, 引擎/客户端只读不可变配置。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -145,6 +146,89 @@ def _check_stage_env_vars() -> None:
 _check_stage_env_vars()
 
 
+# ======================================================================
+# 日常运营用的简单模型配置文件
+# ======================================================================
+# 默认文件跟仓库一起提交。运营时通常只需要改它, 不必先 set 一堆环境变量。
+# 路径相对本文件解析, 所以从任意工作目录启动 director.py 都能找到。
+MODEL_CONFIG_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(__file__), "..", "config", "models.json"))
+
+
+def _load_model_config_file(path: Optional[str] = None) -> tuple[str, dict[str, str]]:
+    """读取 `config/models.json`。
+
+    格式故意保持扁平、可手改:
+
+        {
+          "default": "deepseek-v4.1-flash",
+          "puzzle.story": "glm-5.3-flash",
+          "qa.judge": "deepseek-v4.1-flash"
+        }
+
+    只写想覆盖的 stage; 没写的自动继承 `default`。未知 key / 空模型名
+    直接报错, 防止手滑后静默回退。
+
+    文件不存在时保持旧行为: 代码默认模型 + 没有 stage override。
+    """
+    p = path or MODEL_CONFIG_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return "deepseek-v4.1-flash", {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"模型配置文件 JSON 无效: {p}: {e}") from e
+    except OSError as e:
+        raise ValueError(f"无法读取模型配置文件: {p}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"模型配置文件必须是 JSON object: {p}")
+
+    allowed_keys = {"default"} | set(LLM_STAGES)
+    unknown = sorted(set(raw) - allowed_keys)
+    if unknown:
+        raise ValueError(
+            f"模型配置文件包含未知 key {unknown}; 已知 stage: {sorted(LLM_STAGES)}")
+
+    default = raw.get("default", "deepseek-v4.1-flash")
+    if not isinstance(default, str) or not default.strip():
+        raise ValueError("模型配置文件 default 必须是非空字符串")
+    default = default.strip()
+
+    stages: dict[str, str] = {}
+    for stage in sorted(LLM_STAGES):
+        if stage not in raw:
+            continue
+        model = raw[stage]
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError(f"模型配置文件 {stage} 必须是非空字符串")
+        stages[stage] = model.strip()
+    return default, stages
+
+
+def _configured_global_model() -> str:
+    """AI_MODEL > models.json default > 代码默认值。"""
+    env = os.environ.get("AI_MODEL")
+    if env:
+        return env
+    default, _ = _load_model_config_file()
+    return default
+
+
+def _configured_stage_models() -> dict[str, str]:
+    """解析 stage override。
+
+    优先级: AI_MODEL_<STAGE> > AI_MODEL > 文件 stage > 文件 default。
+    显式 AI_MODEL 表示“整场先全用这个模型”, 因而压掉文件里的 stage
+    override; 更具体的 AI_MODEL_<STAGE> 仍可再次覆盖。
+    """
+    _, file_stages = _load_model_config_file()
+    out = {} if os.environ.get("AI_MODEL") else dict(file_stages)
+    out.update(_env_stage_models())
+    return out
+
+
 def _env_stage_models(environ: Optional[dict] = None) -> dict[str, str]:
     """从环境变量读 stage override。没设的 stage 不出现在结果里。
 
@@ -244,12 +328,12 @@ class LLMConfig:
 
     base_url: str = field(default_factory=lambda: _env_str("AI_BASE_URL", "http://127.0.0.1:8080"))
     api_key: str = field(default_factory=lambda: _env_str("AI_API_KEY", "11"))
-    model: str = field(default_factory=lambda: _env_str("AI_MODEL", "deepseek-v4.1-flash"))
+    model: str = field(default_factory=_configured_global_model)
     #: stage -> model 覆盖。**只放显式配过的 stage** —— 没配的走 `model`。
     #:
     #: 默认从 `AI_MODEL_<STAGE>` 读。保持"空 = 没配"的语义, 于是
     #: `--model X` 清空它就能恢复"整场全用 X"的旧语义(见 `from_args`)。
-    stage_models: dict[str, str] = field(default_factory=_env_stage_models)
+    stage_models: dict[str, str] = field(default_factory=_configured_stage_models)
     timeout: float = field(default_factory=lambda: _env_float("AI_TIMEOUT", 60.0))
     max_tokens: int = field(default_factory=lambda: _env_int("AI_MAX_TOKENS", 700))
     max_retries: int = field(default_factory=lambda: _env_int("AI_MAX_RETRIES", 3))
