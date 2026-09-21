@@ -146,9 +146,10 @@ class FakeClient:
         self.cfg = type("C", (), {"model": "fake"})()
 
     def messages(self, system, user, max_tokens=None, tool=None,
-                 temperature=None, timeout=None, max_retries=None):
+                 temperature=None, timeout=None, max_retries=None,
+                 stage=None, model=None):
         self.calls.append({"system": system, "user": user, "tool": tool,
-                           "max_tokens": max_tokens})
+                           "max_tokens": max_tokens, "stage": stage})
         name = (tool or {}).get("name")
         if name == "emit_truth_audit":
             # 审计默认通过(与 test_llm 的 FakeClient 同一约定)。
@@ -1011,7 +1012,8 @@ def test_h4f_real_content_hard_gate_still_rejects():
     # narrator_truthful=False (truth audit) -> 拒
     class _AuditFail(FakeClient):
         def messages(self, system, user, max_tokens=None, tool=None,
-                     temperature=None, timeout=None, max_retries=None):
+                     temperature=None, timeout=None, max_retries=None,
+                     stage=None, model=None):
             name = (tool or {}).get("name")
             if name == "emit_truth_audit":
                 return LLMResult(tool_input={
@@ -1020,7 +1022,8 @@ def test_h4f_real_content_hard_gate_still_rejects():
                     "why": "叙事不实"}, model="m")
             return super().messages(system, user, max_tokens=max_tokens,
                                     tool=tool, temperature=temperature,
-                                    timeout=timeout, max_retries=max_retries)
+                                    timeout=timeout, max_retries=max_retries,
+                                    stage=stage, model=model)
 
     from story.llm import PuzzleWriter
     fc2 = _AuditFail([LLMResult(tool_input=_compile_tool(), model="m"),

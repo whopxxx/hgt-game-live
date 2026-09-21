@@ -1786,6 +1786,14 @@ class Director:
         else:
             for k, v in cfg.llm.masked().items():
                 _banner(f"  LLM {k:11s}: {v}")
+            # 多模型之后"到底哪一环用了哪个模型"必须能在启动日志里一眼看到。
+            # 只打印**解析后的最终结果**(而不是配置项本身), 因为 stage
+            # 可能来自 env / CLI / 全局回退三条路 —— 打印来源没用, 要让
+            # operator 确认的是结果。这里只有模型名, 不含 api_key。
+            _banner("  LLM model routing:")
+            for stage, model in cfg.llm.resolved_models().items():
+                marker = " (override)" if stage in cfg.llm.stage_models else ""
+                _banner(f"    {stage:24s} = {model}{marker}")
         _banner(f"  渲染页面    : http://{cfg.host}:{cfg.port}/  (?debug=1 开调试)")
         if cfg.open_window:
             _banner(f"  直播窗口    : 已自动打开(最大化, 竖屏居中, 左右黑边)")

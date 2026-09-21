@@ -1404,7 +1404,8 @@ class CuratedCompiler:
             res = client.messages(CURATED_COMPILE_SYSTEM, user,
                                   max_tokens=4000, tool=_TOOL_CURATED,
                                   temperature=self.writer._temperature(
-                                      "generate_temperature"))
+                                      "generate_temperature"),
+                                  stage="puzzle.structure")
             if not res.tool_input:
                 last_err = res.error or "空 tool_input"
                 _bump(info, "compile_call")

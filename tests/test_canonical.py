@@ -76,9 +76,10 @@ class _ReplayClient:
         self.calls = []
 
     def messages(self, system, user, max_tokens=None, tool=None,
-                 temperature=None, timeout=None, max_retries=None):
+                 temperature=None, timeout=None, max_retries=None,
+                 stage=None, model=None):
         self.calls.append({"system": system, "user": user, "tool": tool,
-                           "temperature": temperature})
+                           "temperature": temperature, "stage": stage})
         return LLMResult(tool_input=self.tool_input, error=self.error)
 
 

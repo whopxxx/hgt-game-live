@@ -53,6 +53,21 @@ jobs:
       - name: 离线套件 llm
         run: uv run tests/test_llm.py
 
+      # Issue #23: **按调用阶段配置可插拔模型路由**。
+      #
+      # 守三类东西:
+      #   (a) 优先级 —— CLI stage > CLI --model > AI_MODEL_<STAGE> > AI_MODEL
+      #       > 代码默认。其中 `--model X` 必须**清掉** env 里的 stage
+      #       override, 否则旧脚本里的"整场全用 X"会被某个遗留环境变量
+      #       偷偷改掉一部分 stage;
+      #   (b) 错配告警按 (stage, requested, actual) 三元组独立记账 ——
+      #       一个全局 bool 会让第一个错配吞掉后面所有 stage 的;
+      #   (c) **兜底守卫**: 新增生产 `client.messages()` 若忘了传 stage,
+      #       套件必须变红 —— 不带 stage 的调用会静默落回全局模型,
+      #       配置看着生效而那一环没走路由, 行为层完全看不出来。
+      - name: 离线套件 llm_stage_routing
+        run: uv run tests/test_llm_stage_routing.py
+
       - name: 离线套件 engine
         run: uv run tests/test_engine.py
 

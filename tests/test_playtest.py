@@ -129,9 +129,9 @@ class _FakePlayerClient:
         self.calls = []
 
     def messages(self, system, user, max_tokens=None, tool=None,
-                 temperature=None):
+                 temperature=None, stage=None, **kw):
         self.calls.append({"system": system, "user": user, "tool": tool,
-                           "temperature": temperature})
+                           "temperature": temperature, "stage": stage})
         if self.error:
             return _R(error=self.error)
         if self._ti is not None:

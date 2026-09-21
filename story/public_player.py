@@ -218,6 +218,7 @@ class PublicPlayerCore:
             user=build_prompt(puzzle, public),
             tool=self.tool,
             temperature=self.temperature,
+            stage="puzzle.public_player",
         )
         ti = unwrap_tool_input(res.tool_input) if res is not None else None
         if res is None or res.error or not ti:
