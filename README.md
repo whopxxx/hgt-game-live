@@ -175,34 +175,58 @@ uv run tests/test_web.py       rem 无头 Chrome 验证布局, 截图 data/previ
 
 ## 配置
 
-### 模型配置（推荐：直接改文件）
+### LLM 配置（推荐：只改一个本地文件）
 
-日常直播不需要先设置环境变量。直接编辑：
+第一次配置时，把安全示例复制成你的本地配置：
 
-`config/models.json`
+```bat
+copy config\llm.example.json config\llm.local.json
+```
 
-最简单只写默认模型：
+然后以后只编辑：
+
+`config/llm.local.json`
+
+默认模板不会改变当前模型路由，只需要填 API 地址和 key：
 
 ```json
 {
-  "default": "deepseek-v4.1-flash"
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "你的 API key",
+  "default": "deepseek-v4.1-flash",
+  "timeout": 60,
+  "max_tokens": 700,
+  "max_retries": 3
 }
 ```
 
-如果只想把“出题创作”换成另一个模型，其余环节继续继承默认模型：
+含义：
+
+- `base_url`：Anthropic-compatible API 根地址；程序会自己拼 `/v1/messages`
+- `api_key`：API key
+- `default`：所有未单独配置 stage 的默认模型
+- `timeout / max_tokens / max_retries`：全局 LLM 调用默认预算，可省略
+- 如果要用内置白名单之外的新模型，可选加：
+  `"supported_models_extra": ["你的新模型名"]`
+
+如果只想把“出题创作”换成另一个模型，再额外加这几行即可：
 
 ```json
 {
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "你的 API key",
   "default": "deepseek-v4.1-flash",
+
   "puzzle.story": "glm-5.3-flash",
   "puzzle.surface": "glm-5.3-flash",
   "puzzle.structure": "glm-5.3-flash"
 }
 ```
 
-**不用把所有 stage 都写出来。** 没写的自动继承 `default`。
+**不用把 16 个 stage 全写出来。** 没写的自动继承 `default`。
 
 常用 stage：
+
 - `puzzle.story` / `puzzle.surface` / `puzzle.structure`：出题创作链
 - `puzzle.review`：审题
 - `puzzle.truth_audit`：真相一致性检查
@@ -211,11 +235,23 @@ uv run tests/test_web.py       rem 无头 Chrome 验证布局, 截图 data/previ
 - `hint`：提示
 - `reveal`：揭晓
 
-高级覆盖优先级：
+`config/llm.local.json` 已加入 `.gitignore`，因为它可以包含真实 API key；仓库只提交：
 
-`CLI > 环境变量 > config/models.json > 代码默认值`
+`config/llm.example.json`
 
-所以平时只改 JSON 即可；临时测试某个模型时再用 `--model` / `--model-stage`。
+作为安全示例。
+
+现有 `config/models.json` 保留为仓库默认模型策略，平时不需要改。最终覆盖优先级：
+
+`CLI > 环境变量 > config/llm.local.json > config/models.json > 代码默认值`
+
+所以正常直播启动仍然是：
+
+```bat
+uv run director.py --live 你的直播间ID
+```
+
+不需要先 `set AI_BASE_URL` / `set AI_API_KEY` / `set AI_MODEL`。
 
 环境变量：`AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` / `AI_TIMEOUT` / `AI_MAX_TOKENS` / `AI_MAX_RETRIES`
 

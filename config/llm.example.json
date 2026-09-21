@@ -1,0 +1,8 @@
+{
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "填你自己的 API key",
+  "default": "deepseek-v4.1-flash",
+  "timeout": 60,
+  "max_tokens": 700,
+  "max_retries": 3
+}

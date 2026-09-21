@@ -58,3 +58,7 @@ venv/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ---- 本地 LLM 凭据配置：绝不入库 ----
+# 可包含 API key；仓库只提交 config/llm.example.json 示例。
+config/llm.local.json

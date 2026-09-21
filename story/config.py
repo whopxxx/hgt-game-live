@@ -2,7 +2,7 @@
 # coding: utf-8
 """配置: CLI + 环境变量 + 默认值。
 
-优先级: CLI > env > config/models.json > 默认值。
+优先级: CLI > env > config/llm.local.json > config/models.json > 默认值。
 所有可调项集中在这里, 引擎/客户端只读不可变配置。
 """
 
@@ -32,14 +32,16 @@ AI_SUPPORTED_MODELS_EXTRA_ENV = "AI_SUPPORTED_MODELS_EXTRA"
 
 
 def supported_models() -> frozenset[str]:
-    """内置白名单 + `AI_SUPPORTED_MODELS_EXTRA`。
+    """内置白名单 + 本地配置 + `AI_SUPPORTED_MODELS_EXTRA`。
 
-    只做**并集扩展** —— 不能覆盖/收窄内置集合, 否则 operator 一次手滑
-    就能把 deepseek 这类默认模型判成未知, 启动时满屏 warning。
+    只做**并集扩展** —— 不能覆盖/收窄内置集合。
     """
+    local = _load_llm_local_config()
+    raw_local = local.get("supported_models_extra", [])
+    local_names = {str(x).strip() for x in raw_local if str(x).strip()}
     extra = os.environ.get(AI_SUPPORTED_MODELS_EXTRA_ENV) or ""
-    names = {x.strip() for x in extra.split(",") if x.strip()}
-    return SUPPORTED_MODELS | names
+    env_names = {x.strip() for x in extra.split(",") if x.strip()}
+    return SUPPORTED_MODELS | local_names | env_names
 
 
 # ======================================================================
@@ -154,6 +156,74 @@ _check_stage_env_vars()
 MODEL_CONFIG_PATH = os.path.normpath(os.path.join(
     os.path.dirname(__file__), "..", "config", "models.json"))
 
+# 日常运营唯一需要手改的 LLM 配置。**不入 Git**，因为里面可以放 API key。
+LLM_LOCAL_CONFIG_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(__file__), "..", "config", "llm.local.json"))
+
+
+def _load_llm_local_config(path: Optional[str] = None) -> dict:
+    """读取本地 LLM 配置；文件不存在时返回空 dict。
+
+    允许的顶层 key:
+      base_url / api_key / default / timeout / max_tokens / max_retries
+      + 所有 LLM stage 名。
+
+    未知 key 直接报错，避免手滑后“看起来配了，其实没生效”。
+    """
+    p = path or LLM_LOCAL_CONFIG_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM 本地配置 JSON 无效: {p}: {e}") from e
+    except OSError as e:
+        raise ValueError(f"无法读取 LLM 本地配置: {p}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"LLM 本地配置必须是 JSON object: {p}")
+
+    allowed = {
+        "base_url", "api_key", "default", "supported_models_extra",
+        "timeout", "max_tokens", "max_retries",
+    } | set(LLM_STAGES)
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"LLM 本地配置包含未知 key {unknown}; "
+            f"已知字段: base_url/api_key/default/supported_models_extra/"
+            f"timeout/max_tokens/max_retries "
+            f"+ {sorted(LLM_STAGES)}")
+
+    for key in ("base_url", "api_key", "default"):
+        if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
+            raise ValueError(f"LLM 本地配置 {key} 必须是非空字符串")
+
+    if "supported_models_extra" in raw:
+        extras = raw["supported_models_extra"]
+        if (not isinstance(extras, list)
+                or any(not isinstance(x, str) or not x.strip() for x in extras)):
+            raise ValueError(
+                "LLM 本地配置 supported_models_extra 必须是非空字符串数组")
+
+    if "timeout" in raw:
+        if not isinstance(raw["timeout"], (int, float)) or raw["timeout"] <= 0:
+            raise ValueError("LLM 本地配置 timeout 必须是正数")
+    if "max_tokens" in raw:
+        if not isinstance(raw["max_tokens"], int) or raw["max_tokens"] <= 0:
+            raise ValueError("LLM 本地配置 max_tokens 必须是正整数")
+    if "max_retries" in raw:
+        if not isinstance(raw["max_retries"], int) or raw["max_retries"] < 0:
+            raise ValueError("LLM 本地配置 max_retries 必须是 >= 0 的整数")
+
+    for stage in LLM_STAGES:
+        if stage in raw and (
+                not isinstance(raw[stage], str) or not raw[stage].strip()):
+            raise ValueError(f"LLM 本地配置 {stage} 必须是非空字符串")
+
+    return raw
+
 
 def _load_model_config_file(path: Optional[str] = None) -> tuple[str, dict[str, str]]:
     """读取 `config/models.json`。
@@ -207,11 +277,32 @@ def _load_model_config_file(path: Optional[str] = None) -> tuple[str, dict[str, 
     return default, stages
 
 
+def _configured_base_url() -> str:
+    """AI_BASE_URL > llm.local.json > 代码默认值。"""
+    env = os.environ.get("AI_BASE_URL")
+    if env:
+        return env
+    local = _load_llm_local_config()
+    return str(local.get("base_url") or "http://127.0.0.1:8080").strip()
+
+
+def _configured_api_key() -> str:
+    """AI_API_KEY > llm.local.json > 代码默认值。"""
+    env = os.environ.get("AI_API_KEY")
+    if env:
+        return env
+    local = _load_llm_local_config()
+    return str(local.get("api_key") or "11").strip()
+
+
 def _configured_global_model() -> str:
-    """AI_MODEL > models.json default > 代码默认值。"""
+    """AI_MODEL > llm.local.json default > models.json default > 代码默认值。"""
     env = os.environ.get("AI_MODEL")
     if env:
         return env
+    local = _load_llm_local_config()
+    if local.get("default"):
+        return str(local["default"]).strip()
     default, _ = _load_model_config_file()
     return default
 
@@ -219,14 +310,47 @@ def _configured_global_model() -> str:
 def _configured_stage_models() -> dict[str, str]:
     """解析 stage override。
 
-    优先级: AI_MODEL_<STAGE> > AI_MODEL > 文件 stage > 文件 default。
-    显式 AI_MODEL 表示“整场先全用这个模型”, 因而压掉文件里的 stage
-    override; 更具体的 AI_MODEL_<STAGE> 仍可再次覆盖。
+    优先级:
+      AI_MODEL_<STAGE> > AI_MODEL > llm.local.json stage
+      > models.json stage > global fallback。
+
+    显式 AI_MODEL 表示“整场先全用这个模型”，所以会压掉两个文件里的
+    stage override；更具体的 AI_MODEL_<STAGE> 仍可再次覆盖。
     """
-    _, file_stages = _load_model_config_file()
-    out = {} if os.environ.get("AI_MODEL") else dict(file_stages)
+    _, shared_stages = _load_model_config_file()
+    local = _load_llm_local_config()
+    local_stages = {
+        stage: str(local[stage]).strip()
+        for stage in LLM_STAGES if local.get(stage)
+    }
+    if os.environ.get("AI_MODEL"):
+        out: dict[str, str] = {}
+    else:
+        out = dict(shared_stages)
+        out.update(local_stages)
     out.update(_env_stage_models())
     return out
+
+
+def _configured_timeout() -> float:
+    if "AI_TIMEOUT" in os.environ:
+        return _env_float("AI_TIMEOUT", 60.0)
+    local = _load_llm_local_config()
+    return float(local.get("timeout", 60.0))
+
+
+def _configured_max_tokens() -> int:
+    if "AI_MAX_TOKENS" in os.environ:
+        return _env_int("AI_MAX_TOKENS", 700)
+    local = _load_llm_local_config()
+    return int(local.get("max_tokens", 700))
+
+
+def _configured_max_retries() -> int:
+    if "AI_MAX_RETRIES" in os.environ:
+        return _env_int("AI_MAX_RETRIES", 3)
+    local = _load_llm_local_config()
+    return int(local.get("max_retries", 3))
 
 
 def _env_stage_models(environ: Optional[dict] = None) -> dict[str, str]:
@@ -326,17 +450,17 @@ def parse_proxy(url: Optional[str]):
 class LLMConfig:
     """LLM 客户端配置。"""
 
-    base_url: str = field(default_factory=lambda: _env_str("AI_BASE_URL", "http://127.0.0.1:8080"))
-    api_key: str = field(default_factory=lambda: _env_str("AI_API_KEY", "11"))
+    base_url: str = field(default_factory=_configured_base_url)
+    api_key: str = field(default_factory=_configured_api_key, repr=False)
     model: str = field(default_factory=_configured_global_model)
     #: stage -> model 覆盖。**只放显式配过的 stage** —— 没配的走 `model`。
     #:
     #: 默认从 `AI_MODEL_<STAGE>` 读。保持"空 = 没配"的语义, 于是
     #: `--model X` 清空它就能恢复"整场全用 X"的旧语义(见 `from_args`)。
     stage_models: dict[str, str] = field(default_factory=_configured_stage_models)
-    timeout: float = field(default_factory=lambda: _env_float("AI_TIMEOUT", 60.0))
-    max_tokens: int = field(default_factory=lambda: _env_int("AI_MAX_TOKENS", 700))
-    max_retries: int = field(default_factory=lambda: _env_int("AI_MAX_RETRIES", 3))
+    timeout: float = field(default_factory=_configured_timeout)
+    max_tokens: int = field(default_factory=_configured_max_tokens)
+    max_retries: int = field(default_factory=_configured_max_retries)
 
     # ------------------------------------------------------------------
     def model_for(self, stage: str) -> str:
