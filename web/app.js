@@ -651,7 +651,12 @@
       const width = box.clientWidth, length = text.scrollWidth;
       currentMessage = message;
       measuredWidth = width;
-      const hold = (config ? config.hold_seconds : 4) * 1000;
+      const configuredHold = config ? config.hold_seconds : 4;
+      // 自定义公告可以停更久；AI / Hint / 排行榜继续保持短促，
+      // 避免把 operator 的 15s 配置扩散到所有临时消息。
+      const hold = (kind === "preset"
+        ? configuredHold
+        : Math.min(configuredHold, 5)) * 1000;
       function done() { cancel(); pump(); }
       if (length > width && reduced.matches) {
         // Measure each static page using the same rendered font, not char counts.
@@ -767,7 +772,7 @@
         const c = await response.json();
         if (!c || typeof c.enabled !== "boolean" || !Array.isArray(c.items)
             || !Number.isFinite(c.interval_seconds) || c.interval_seconds <= 0
-            || !Number.isFinite(c.hold_seconds) || c.hold_seconds < 3 || c.hold_seconds > 5
+            || !Number.isFinite(c.hold_seconds) || c.hold_seconds < 3 || c.hold_seconds > 20
             || !Number.isFinite(c.long_text_speed_px_s) || c.long_text_speed_px_s <= 0) {
           throw new Error("invalid announcement config");
         }
