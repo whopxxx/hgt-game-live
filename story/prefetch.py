@@ -641,15 +641,34 @@ class PoolPrefetcher:
         if (extra or {}).get("interrupted") or kind == "interrupted":
             log.info("补池让路(直播变忙), 不计失败不退避: %s", detail)
             return
+
+        # ---- refill-to-target: 内容淘汰不是基础设施故障，不值得等待 ----
+        #
+        # review_rewrite / truth_reject / validation_reject / safety_reject
+        # 的含义都是"这一个候选不收"。下一次 draw 是另一组关键词/另一道题，
+        # 等 30/60/120 秒不会提高成功率，只会让消费速度超过补给速度。
+        # 技术失败仍走原退避，防止网关/存储真的故障时形成热循环。
+        semantic_rejects = {
+            "review_rewrite", "truth_reject",
+            "validation_reject", "safety_reject",
+        }
+        if kind == "gen_fail" and _rej in semantic_rejects:
+            self._retry_at = 0.0
+            self._last_fail = detail or _rej
+            self._fail_streak = 0
+            log.info("补池候选淘汰(%s), 不退避，继续补到目标: %s",
+                     _rej, detail)
+            return
+
         self._fail_streak += 1
         wait = self._backoff_for_streak_now(self._fail_streak)
         self._retry_at = now + wait
         self._last_fail = detail or kind
         if wait > self._backoff_s:
-            log.warning("补池连续失败 %d 次(%s), 退避 %.0fs: %s",
+            log.warning("补池连续技术失败 %d 次(%s), 退避 %.0fs: %s",
                         self._fail_streak, kind, wait, detail)
         else:
-            log.warning("补池失败(%s), 退避 %.0fs: %s", kind, wait, detail)
+            log.warning("补池技术失败(%s), 退避 %.0fs: %s", kind, wait, detail)
 
     def _probe_safe(self) -> dict:
         """读压力探针, **绝不抛**。读不到返回空 dict。
@@ -813,46 +832,40 @@ class PoolPrefetcher:
             return 0
 
     def _low_pressure(self) -> bool:
-        """低压力门: 允许补池的相位与"零在途"要求。
+        """决定这一拍能不能**启动下一道**后台候选。
 
-        ## QA —— 严格零
+        refill latch 一旦已经启动，目标就是**补到高水位才停**。旧实现
+        在 QA 中只要出现 pending / inflight / hint 就暂停，于是活跃房间
+        会反复出现"刚开始补 -> 有人发言 -> 停手"，库存永远追不上消耗。
 
-        `pending == 0 and inflight == 0 and not hint_inflight and
-        not reveal_inflight`。房间忙时补池本来就没必要(存量够用),
-        而且出题会和观众的提问抢同一个网关配额。
+        新语义:
+          * refill 未启动时仍然保守：只在真正低压力的 QA / REVEALED 启动；
+          * refill 已启动时，QA 中允许继续单飞补池，即使有人正在提问；
+          * SETTING / REVEALING 仍禁止新开后台候选，避免与直播自己的
+            下一题现场生成 / 揭晓生成正面撞车；
+          * 永远只有一个 prefetch future，吞吐提高靠"不停"，不是并发堆请求。
 
-        ## REVEALED —— 允许(这是**最好的**生成窗口)
-
-        REVEALED 是"谜底已公布、等 30 秒展示"的那一段。原来把它排除
-        掉是纯粹的浪费: 那 30 秒里没有任何 LLM 工作, 观众在看揭晓,
-        引擎完全空闲。补池在这里生成一道, 有很大概率赶在下一题就位
-        之前完成 —— 于是下一题直接 pop 池子、瞬时切题, 不必现场等
-        10–40 秒。仍要求零在途, 但不看 hint_inflight: REVEALED 期间
-        引擎自己可能还在收尾提示, 那不是"抢配额"的对手。
-
-        ## 明确**不**允许 SETTING / REVEALING
-
-        出题在途时 phase 是 SETTING, 补池会和**直播自己的出题**抢网关
-        —— 那是最该避让的一刻。REVEALING 期间可能还有揭晓生成的工作
-        在飞, 同理不抢。这两个相位保持禁止。
-
-        返回 False 只表示"这一拍不补", 不是错误 —— 下拍再看。
+        这是有意的产品取舍：库存见底比后台单飞带来的少量 QA 竞争更伤
+        直播体验。若池子健康，latch 根本不会启动，因此不会无条件常驻抢网关。
         """
         try:
             p = self._probe()
         except Exception:                       # noqa: BLE001
             log.exception("读压力探针异常, 本次不补池")
             return False
-        if not p:
-            return False
-        if p.get("stopped"):
+        if not p or p.get("stopped"):
             return False
         from .state import Phase
+        phase = p.get("phase")
+
+        # ---- refill-to-target: 已进入补池周期后，QA 不再因普通问答流量停手 ----
+        if self._refill_active and phase == Phase.QA:
+            return True
+
+        # 未进入补池周期仍保持原来的低压力启动纪律。
         if p.get("pending") or p.get("inflight"):
             return False
-        phase = p.get("phase")
         if phase == Phase.QA:
-            # QA 期间 hint/reveal 都可能正在生成 —— 让路。
             if p.get("hint_inflight") or p.get("reveal_inflight"):
                 return False
             return True
@@ -916,38 +929,20 @@ class PoolPrefetcher:
             return True                         # 读到脏值 -> 不启动
 
     def _should_continue(self) -> bool:
-        """G1: 后台生成"还该不该继续" —— 传给 `gen_spec` 的协作式取消谓词。
+        """后台候选已经启动后，决定还要不要继续跑下一阶段。
 
-        与 `_low_pressure()` 是**同一个判定边界**(复用同一个压力探针),
-        但调用时机完全不同, 所以不能互相替代:
+        refill latch 活跃时，QA 中的普通 pending / inflight / hint 不再
+        把**同一道候选**中途丢掉。否则活跃直播会把每个候选都切碎，生成
+        成本已经付了却没有库存产出。
 
-            `_low_pressure()`  决定"这一拍**要不要启动**"      (低频, tick 4Hz)
-            `_should_continue` 决定"已经跑起来的**要不要往下走**"(高频, 每次调用前)
+        仍然 fail closed 的边界:
+          * stopped -> 立即让路；
+          * SETTING / REVEALING -> 让路，避免与直播现场出题/揭晓正面竞争；
+          * REVEALED 临近下一题 guard -> 让路；
+          * 探针异常 -> 让路。
 
-        实播事故正是"启动时低压力、跑着跑着房间忙了"这个窗口造成的:
-        补池在 REVEALED 启动, 下一题开始后它仍在审稿 / 再出一稿, 与
-        直播的现场生成抢了几十秒网关。`_low_pressure` 只在 tick 里跑,
-        根本看不见这个窗口; 这个谓词在**每次昂贵调用之前**跑, 看得见。
-
-        ## 允许继续
-
-            QA 且 pending/inflight/hint/reveal 全 0
-            REVEALED 且没有 reveal 在途、且距下一题还有足够时间
-
-        ## 必须让路
-
-            SETTING / REVEALING  —— 直播自己在用网关
-            pending / inflight > 0 —— 有观众在等回答
-            hint / reveal 在途
-            stopped
-            REVEALED 已进入启动 guard(剩余不足一轮预算)
-
-        ⚠️ 最后那条**必须**用 `_effective_guard_s`(最大 预算+余量), 不能
-        用配置里那个原始值: guard 存在的意义就是"留够一轮生成的时间",
-        用小的那个等于没留。
-
-        探针读不到时 fail closed(返回 False): 后台少生成一道题的成本
-        远小于"在直播最忙的时候抢网关"。谓词自己绝不抛异常。
+        注意：这里没有增加并发，PoolPrefetcher 仍然 max_workers=1 +
+        single-flight。变化只是"一旦缺货，允许这一条后台流水线跑完整"。
         """
         try:
             p = self._probe() or {}
@@ -957,11 +952,16 @@ class PoolPrefetcher:
         if p.get("stopped"):
             return False
         from .state import Phase
+        phase = p.get("phase")
+
+        # ---- refill-to-target: QA 中已启动的补池候选不再被弹幕流量打断 ----
+        if self._refill_active and phase == Phase.QA:
+            return True
+
+        # refill 未启动 / 其他相位维持原保守纪律。
         if p.get("pending") or p.get("inflight"):
             return False
-        phase = p.get("phase")
         if phase == Phase.QA:
-            # QA 期间 hint/reveal 都可能正在生成 —— 让路。
             if p.get("hint_inflight") or p.get("reveal_inflight"):
                 return False
             return True
@@ -970,13 +970,11 @@ class PoolPrefetcher:
                 return False
             left = p.get("reveal_remaining_seconds")
             if left is None:
-                # 拿不到剩余秒数就不限制 —— 与 `_deadline_too_close` 同一
-                # 取舍: 少一次生成远比"误判成快截稿而长期不补池"安全。
                 return True
             try:
                 return float(left) > self._effective_guard_s
             except (TypeError, ValueError):
-                return False                    # 读到脏值 -> 让路
+                return False
         # SETTING / REVEALING / IDLE 之外的一切 —— 让路。
         return False
 
