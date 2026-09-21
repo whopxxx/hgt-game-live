@@ -4036,6 +4036,11 @@ def test_session_leaderboard():
         clk.advance(31)
         eng.tick()
         eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints))
+        before = eng.snapshot().leaderboard
+        eng.submit_qa([QAResult(qid=payload["qid"], verdict=P.SOLVE)],
+                      expect_round=payload["expect_round"],
+                      expect_spec_key=payload["expect_spec_key"])
+        check("上一题迟到 callback 不记分", eng.snapshot().leaderboard == before)
         _answer_and_submit(eng, clk, uid, name, "正确答案", verdict=P.SOLVE)
     rows = eng.snapshot().to_json()["leaderboard"]
     check("legacy 跨题累计/改名/同分先达到者优先", rows == [

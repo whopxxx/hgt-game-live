@@ -624,6 +624,7 @@
     let config = null, phase = "", earned = null, pendingAI = 0;
     let active = "", defaultText = "", lastPresetId = null;
     let nextPreset = Infinity, timer = null, animation = null;
+    let currentMessage = "", measuredWidth = 0;
 
     function cancel() {
       clearTimeout(timer);
@@ -639,6 +640,8 @@
       box.dataset.kind = kind;
       text.textContent = message;
       const width = box.clientWidth, length = text.scrollWidth;
+      currentMessage = message;
+      measuredWidth = width;
       const hold = (config ? config.hold_seconds : 4) * 1000;
       function done() { cancel(); pump(); }
       if (length > width && reduced.matches) {
@@ -753,6 +756,11 @@
       }
     }, 250);
     reduced.addEventListener("change", () => { cancel(); pump(); });
+    new ResizeObserver(() => {
+      if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
+        show(currentMessage, active); // Debug width changed: remeasure pages/motion.
+      }
+    }).observe(box);
     return {update};
   })();
 

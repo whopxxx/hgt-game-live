@@ -1369,6 +1369,11 @@ window.addEventListener('load', async () => {
       await tick(4000);
     }
     check(boardPages===board, 'A16 all Top3 long nicknames readable without truncation');
+    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    check(text.scrollWidth<=box.clientWidth && !anim(), 'A16 debug resize remeasures reduced-motion pages');
+    geometry();
     check(fetchCount>10, 'A16 periodic hot reload actually runs');
   } catch(e) { errors.push(e.stack); }
   const result=document.createElement('pre'); result.id='test-result'; result.hidden=true;
