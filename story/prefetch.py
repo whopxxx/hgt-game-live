@@ -334,6 +334,12 @@ class PoolPrefetcher:
         # (值得改 prompt / 改创作)。全部由 worker 线程的
         # `extra["reject"]` 单写, 与既有的 fail_streak 状态机正交 ——
         # 它们**不**参与退避决策, 只是账本。
+        #
+        # ⚠️ R7/Task0: `safety_reject` 与 `safety_technical_fail` 是 R7
+        # 双门 AND 引入的两个出口。它们**没进**这张表时, 线上会刷
+        # "未知的 reject 标签" 警告, 而这两个原因**恰恰是最该看得见的**:
+        # 安全门拒了多少、网关抖了多少, 直接决定"要不要放宽判据"。
+        # 只补统计, **不动退避逻辑**。
         self.reject_count: dict = {
             "structure_technical_fail": 0,
             "review_technical_fail": 0,
@@ -341,6 +347,8 @@ class PoolPrefetcher:
             "review_rewrite": 0,
             "truth_reject": 0,
             "validation_reject": 0,
+            "safety_reject": 0,
+            "safety_technical_fail": 0,
             "success": 0,
         }
 
