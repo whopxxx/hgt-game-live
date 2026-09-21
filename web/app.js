@@ -13,6 +13,15 @@
   const STAGE_W = 1080, STAGE_H = 1920;
 
   const $ = (id) => document.getElementById(id);
+  // 术语只改**本文件写死的固定 UI 标签**(见 Issue #16 "前端术语统一"):
+  // 汤面 / 汤底 / 本场猜汤榜。
+  //
+  // 刻意**不做**对任意快照文本的 replaceAll —— `next_event_label`、
+  // `kind="system"` 行、贡献链原话都可能包含 "谜底" 字样, 而那是**内容**,
+  // 不是标签。全局替换会把观众/系统原文改写掉(例如把贡献链里的原话
+  // "包含谜底一词" 改成 "包含汤底一词"), 那是改变产品语义, 不是统一术语。
+  // 服务端固定文案另有其源(engine._ACK_BY_PHASE / _NUDGES / notice),
+  // 本次不动, 已在 PR 中说明。
   const el = {
     stage: $("stage"),
     puzzleIndex: $("puzzle-index"), puzzleElapsed: $("puzzle-elapsed"),
@@ -223,7 +232,7 @@
       return;
     }
     el.revealContribTitle.textContent =
-      s.solved ? "共同解谜" : "大家已经推到这里";
+      s.solved ? "共同猜汤" : "大家已经推到这里";
     const box = document.createDocumentFragment();
     rows.forEach(function (r) {
       const row = document.createElement("div");
@@ -449,7 +458,7 @@
     row.className = "qa-row kind-fold";
     const q = document.createElement("div");
     q.className = "q";
-    q.textContent = "…（前 " + n + " 条与谜底无关，已折叠）";
+    q.textContent = "…（前 " + n + " 条与汤底无关，已折叠）";
     row.appendChild(q);
     return row;
   }
@@ -501,8 +510,7 @@
     }
   }
 
-  // 提示只走问答流(作为 kind-hint 行), 不再单独用 hintbar 重复显示一遍 ——
-  // 之前两处都显示同一条, 看起来就像"提示内容重复"。
+  // 提示保留 QA 历史，新提示额外由 announcer 播一次；旧 hintbar 仍隐藏。
   function renderHint(s) {
     el.hintbar.classList.add("hidden");
   }
@@ -518,7 +526,7 @@
     el.prompt.classList.remove("hidden");
     if (s.phase === "qa") {
       el.prompt.innerHTML =
-        "发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓";
+        "发送 <b>#你的问题</b> 向我提问，猜中汤底我就揭晓";
     } else if (s.phase === "setting") {
       el.prompt.textContent = "AI 正在出题，请稍候…";
     } else if (s.phase === "revealing" || s.phase === "revealed") {
@@ -532,9 +540,8 @@
     const st = s.stats || {};
     const ai = s.ai_player || {};
     const parts = [];
-    if (ai.questions_available != null) {
-      parts.push("AI玩家提问次数 <b>" + ai.questions_available
-        + "</b> · 每100赞+1");
+    if (s.ai_player) {
+      parts.push(ai.in_flight ? "🤖 AI玩家正在推理…" : "👍 点赞可以召唤 AI 玩家");
     }
     if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
     if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
@@ -617,7 +624,7 @@
     el.debugBody.innerHTML = L.join("\n");
   }
 
-  // Session-local presentation only: one active item + one merged AI notice.
+  // Session-local presentation: merged AI notice + bounded FIFO of hint notices.
   const announcer = (() => {
     const box = $("announcer"), text = $("announcer-text");
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -625,6 +632,8 @@
     let active = "", defaultText = "", lastPresetId = null;
     let nextPreset = Infinity, timer = null, animation = null;
     let currentMessage = "", measuredWidth = 0;
+    let hintPuzzle = null, hintCount = null;
+    const pendingHints = [];
 
     function cancel() {
       clearTimeout(timer);
@@ -687,7 +696,12 @@
       if (pendingAI) {
         const delta = pendingAI;
         pendingAI = 0;
-        show(`📢 点赞召唤成功，AI玩家提问次数 +${delta}`, "ai");
+        show(delta > 1 ? "🤖 AI玩家已获得新的出手机会"
+          : "🤖 AI玩家已被召唤！正在准备出手…", "ai");
+        return;
+      }
+      if (pendingHints.length) {
+        show(pendingHints.shift(), "hint");
         return;
       }
       const items = config && config.enabled ? config.items.filter(x => x.enabled) : [];
@@ -704,10 +718,28 @@
         if (earned !== null && value > earned) pendingAI += value - earned;
         earned = value; // First valid snapshot (and a server reset) is a baseline.
       }
+      if (hintPuzzle !== s.puzzle_index) {
+        hintPuzzle = s.puzzle_index;
+        hintCount = null;
+        pendingHints.length = 0;
+        if (active === "hint") cancel();
+      }
+      if (Number.isSafeInteger(s.hint_count) && s.hint_count >= 0) {
+        if (hintCount !== null && s.hint_count > hintCount) {
+          const latest = (s.qa_log || []).filter(r => r.kind === "hint").slice(-1)[0];
+          const hint = s.hint_text || (latest && latest.text);
+          if (hint) {
+            // Bound burst backlog to 16 pending notices; QA keeps the history.
+            if (pendingHints.length === 16) pendingHints.shift();
+            pendingHints.push("💡 提示：" + hint);
+          }
+        }
+        hintCount = s.hint_count;
+      }
       const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
       const nextDefault = rows.length
-        ? "📢 本场解谜榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
-        : "📢 游戏公告 猜中谜底即可登上本场解谜榜";
+        ? "📢 本场猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
+        : "📢 游戏公告 猜中汤底即可登上本场猜汤榜";
       const changed = nextDefault !== defaultText;
       defaultText = nextDefault;
       if (phase !== s.phase) {
@@ -717,7 +749,15 @@
       }
       box.classList.toggle("hidden", phase !== "qa");
       if (phase !== "qa") return;
-      if ((pendingAI && active !== "ai") || (changed && active === "leaderboard")) cancel();
+      if (pendingAI && active !== "ai") {
+        // An interrupted hint still gets a full readable turn after the AI notice.
+        if (active === "hint") {
+          pendingHints.unshift(currentMessage);
+          if (pendingHints.length > 16) pendingHints.pop();
+        }
+        cancel();
+      } else if ((pendingHints.length && active !== "ai" && active !== "hint")
+                 || (changed && active === "leaderboard")) cancel();
       pump();
     }
     async function reload() {
@@ -755,7 +795,10 @@
         cancel(); pump();
       }
     }, 250);
-    reduced.addEventListener("change", () => { cancel(); pump(); });
+    reduced.addEventListener("change", () => {
+      if (active) show(currentMessage, active);
+      else pump();
+    });
     new ResizeObserver(() => {
       if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
         show(currentMessage, active); // Debug width changed: remeasure pages/motion.
