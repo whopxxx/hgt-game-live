@@ -4735,12 +4735,29 @@ class PuzzleWriter:
             # 复核两次都没成 -> fail-closed 不入池, 但记
             # `safety_technical_fail` **而不是** `livestream_safe=false`。
             # 把网关抖动写成内容判定会让复盘查错方向(G2-F 同一条纪律)。
+            #
+            # ## 让路 ≠ 技术失败(R7 复审修正)
+            #
+            # 第 1 次失败之后、第 2 次之前直播可能已经变忙。那条出口带
+            # `interrupted=True`, 必须**先**认它 —— 让路不是失败, 不该
+            # 记 `safety_technical_fail`、不该进失败链(G1 契约)。
+            # 注意 `interrupted` 是 `break` 而不是 `continue`: 直播忙了,
+            # 换一稿只会再撞一次同样的让路。
             if _stop():
                 break
             sv = self.verify_safety(spec=spec, should_continue=should_continue)
             if sv is not None:
-                m["safety_verify_calls"] = m.get("safety_verify_calls", 0) + 1
+                m["safety_verify_calls"] = (
+                    m.get("safety_verify_calls", 0)
+                    + int(sv.get("calls") or 1))
                 m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+                if sv.get("interrupted"):
+                    log.info("出题第 %d 稿: 安全复核让路(直播变忙)",
+                             attempts)
+                    _remember(seen_why, "安全复核让路(直播变忙)")
+                    last = spec
+                    interrupted = True
+                    break
                 if sv.get("technical"):
                     m["safety_technical_fail"] = (
                         m.get("safety_technical_fail", 0) + 1)
@@ -5336,12 +5353,28 @@ class PuzzleWriter:
         #
         # 位置理由同 `gen_spec`: 只对本来要放行的 candidate 花这次调用;
         # 审的是 fix 之后的版本; 没过就不必再发 truth audit。
+        #
+        # ⚠️ R7 复审修正: `interrupted`(让路)必须与技术失败分开。前者
+        # 走 `_bail()` 的**让路**分支(靠 `interrupted["v"]` 判定), 不记
+        # `safety_technical_fail`; 后者才记。顺序不能倒 —— 让路的结果
+        # 里也带 `technical=True`(它确实没拿到内容判定), 先读 technical
+        # 就会把让路误记成失败。
         if _stop():
             return _bail()
         sv = self.verify_safety(spec=spec, should_continue=should_continue)
         if sv is not None:
-            m["safety_verify_calls"] = 1
+            m["safety_verify_calls"] = int(sv.get("calls") or 1)
             m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+            if sv.get("interrupted"):
+                # ⚠️ `_bail()` 是靠 `interrupted["v"]` 决定走让路出口的
+                # (见它的实现) —— 复核自己知道的 `interrupted` 不会自动
+                # 传进去。**必须先置位再 _bail**, 否则这里会掉进下面
+                # "既没 reject 也不是让路"的失败出口, 把一次让路记成
+                # 一道没成的题。这个 bug 是变异测试逼出来的:
+                # 不置位时全绿, 只有真去断言 `metrics["interrupted"]`
+                # 才会露出来。
+                interrupted["v"] = True
+                return _bail()
             if sv.get("technical"):
                 m["safety_technical_fail"] = 1
                 return _bail("安全复核技术失败: " + str(sv.get("why"))[:120],
@@ -7217,9 +7250,20 @@ class PuzzleWriter:
                       max_retries: int = 0) -> Optional[dict]:
         """只判 `livestream_safe` 的**窄复核**。返回:
 
-            {"livestream_safe": bool, "reason": str}   正常判定
-            {"livestream_safe": False, "technical": True, "why": str}
+            {"livestream_safe": bool, "reason": str, "calls": int}
+                正常判定。`calls` 是**真实发出的调用次数**(1 或 2)——
+                第 1 次技术失败后才会有第 2 次, 上层据此记
+                `safety_verify_calls`。恒记 1 会让"重试率"这类复盘数字
+                永远为 0。
+            {"livestream_safe": False, "technical": True, "why": str,
+             "calls": int}
                 技术失败(fail-closed, 但**明确标出**这是技术问题)
+            {"livestream_safe": False, "technical": True, "why": str,
+             "interrupted": True, "calls": int}
+                **让路** —— 直播变忙, 主动收手。这不是失败: `technical`
+                只是说"没拿到内容判定", `interrupted` 才是它的**身份**。
+                调用方必须据 `interrupted` 走让路那条路(不记
+                `safety_technical_fail`、不退避), 见下。
             None  输入本身为空(上游硬校验已经拒了, 不该走到这)
 
         ## 为什么它只看 puzzle + answer
@@ -7243,6 +7287,18 @@ class PuzzleWriter:
         `livestream_safe=false` —— 把网关抖动伪装成"不安全"会让复盘
         查错方向, 与 G2-F「技术失败 ≠ 语义拒绝」是同一条纪律。
 
+        ## 让路(interrupted)必须与技术失败再分开
+
+        第 1 次技术失败后、第 2 次发出前, 直播可能已经变忙。这时收手
+        拿到的是**让路**, 不是"复核两次都没成"。旧实现两者都返回
+        `technical=True`, 调用方于是把一次让路记成 `safety_technical_fail`
+        —— 而 `safety_technical_fail` 是**退避/失败链**的信号, 让路不是
+        (G1 的契约: 让路不计失败、不退避)。直播越忙, 这个计数越虚高,
+        真正的网关故障就淹在里面了。
+
+        所以 `interrupted` 是**独立字段**, 且优先于 `technical` 被读:
+        `technical` 只说"没拿到内容判定", `interrupted` 说"为什么没拿到"。
+
         ## 判据措辞
 
         system 里**逐字复用** `_TOOL_CHECK` 的三类情形(自伤/性暴力/
@@ -7261,12 +7317,21 @@ class PuzzleWriter:
             return bool(should_continue is not None and not should_continue())
 
         last_err = ""
+        #: 真实发出的调用次数。**不**恒为 1 —— 第 1 次技术失败后才会
+        #: 有第 2 次, 上层照抄进 `safety_verify_calls`。恒记 1 会让复盘
+        #: 里"复核重试率"永远是 0, 那正好掩盖了网关在抖的时候。
+        calls = 0
         # 一次正常 + 一次技术重试(与 G4-R2 的 Stage B 技术重试同口径)。
         for attempt in range(2):
             if _stop():
+                # ---- 让路: **不是**技术失败 ----
+                # 这里可能是"第 1 次就没发"也可能是"第 1 次失败后不让
+                # 重试了"; 两种都是让路。`interrupted` 是给调用方看的
+                # 身份标记, `technical` 只是说"没有内容判定"。
                 return {"livestream_safe": False, "technical": True,
-                        "why": "让路", "interrupted": True}
+                        "why": "让路", "interrupted": True, "calls": calls}
             try:
+                calls += 1
                 res = self.client.messages(
                     SAFETY_SYSTEM, user, max_tokens=400, tool=_TOOL_SAFETY,
                     temperature=0, timeout=timeout,
@@ -7290,11 +7355,12 @@ class PuzzleWriter:
                 log.warning("安全复核第 %d 次类型不对: %r", attempt + 1, safe)
                 continue
             return {"livestream_safe": safe,
-                    "reason": str(ti.get("reason") or "")[:200]}
+                    "reason": str(ti.get("reason") or "")[:200],
+                    "calls": calls}
         # ---- 两次都没成 -> fail closed, 但**不谎报**成内容判定 ----
         log.error("安全复核两次均技术失败, fail-closed 不入池: %s", last_err)
         return {"livestream_safe": False, "technical": True,
-                "why": last_err or "技术失败"}
+                "why": last_err or "技术失败", "calls": calls}
 
     @staticmethod
     def _audit_failed(why: str) -> dict:

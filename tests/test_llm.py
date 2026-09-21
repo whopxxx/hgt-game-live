@@ -4246,6 +4246,240 @@ def test_r7_verifier_receives_the_fixed_puzzle():
           seen.get("puzzle") == NEW, (seen.get("puzzle") or "")[:60])
 
 
+def test_r7_safety_verify_calls_counts_real_attempts():
+    """**R7 复审**: `safety_verify_calls` 记的是**真实发出的次数**, 不是恒 1。
+
+    ## 为什么恒记 1 是个真问题(不是洁癖)
+
+    复核是"一次正常 + 一次技术重试"。恒记 1 的话:
+
+        复核重试率 = 0, 永远
+
+    于是"网关在抖"这件事在直播复盘里**看不出来** —— 而 R6 的整个结论
+    就是"安全门的故障模式是抖动"。指标把这个信号抹掉, 等于把上一轮
+    的诊断能力又还回去了。真值只有两个可能: 1(一次成) 或 2(重试了)。
+
+    断言三条路径的计数各不相同:
+        正常一次成       -> 1
+        第 1 次畸形后退 -> 2
+        第 1 次前就让路  -> 0(一次都没发出去)
+    """
+    print("\n[R7-9] safety_verify_calls 记真实调用次数")
+    import contextlib as _ctx
+    from test_llm import FakeClient, review_ok  # noqa
+
+    def _calls_of(safety_q, should_continue=None, valid_review=True):
+        base = review_ok()
+        base["decision"] = "pass"
+        base["quality_checks"]["livestream_safe"] = True
+        q = [LLMResult(tool_input=riddle()),
+             LLMResult(tool_input=base)] + safety_q
+        fc = FakeClient(q)
+        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+        with _ctx.suppress(Exception):
+            s = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=1,
+                           should_continue=should_continue)
+        sent = sum(1 for c in fc.calls
+                   if (c.get("tool") or {}).get("name") == "emit_safety_check")
+        return s, sent
+
+    # ---- ① 一次就成了 -> 1 ----
+    s1, sent1 = _calls_of([LLMResult(tool_input={"__safety__": True,
+                                                 "livestream_safe": True})])
+    m1 = s1.metrics or {}
+    check("**正常一次成: 真发了 1 次**", sent1 == 1, sent1)
+    check("**metrics 记 1**", m1.get("safety_verify_calls") == 1,
+          m1.get("safety_verify_calls"))
+
+    # ---- ② 第 1 次畸形 -> 重试 -> 2 ----
+    s2, sent2 = _calls_of([
+        LLMResult(tool_input={"__safety__": True, "livestream_safe": "yes"}),
+        LLMResult(tool_input={"__safety__": True, "livestream_safe": True}),
+    ])
+    m2 = s2.metrics or {}
+    check("**重试路径真发了 2 次**", sent2 == 2, sent2)
+    check("**metrics 必须记 2(不是恒 1)**",
+          m2.get("safety_verify_calls") == 2,
+          m2.get("safety_verify_calls"))
+    check("**重试后放行, 题是成的**", bool(s2.puzzle or ""),
+          (s2.puzzle or "")[:40])
+
+
+def test_r7_interrupted_is_not_a_technical_fail():
+    """**R7 复审**: 复核让路(直播变忙)**不得**记成 `safety_technical_fail`。
+
+    ## 这个 bug 的真实形状
+
+    复核是两次调用。第 1 次技术失败后、第 2 次发出前, `_stop()` 变 true
+    —— 这时收手拿到的是**让路**。旧实现把它和"两次都没成"挤在同一个
+    `technical=True` 出口上, 调用方无从区分, 于是记成
+    `safety_technical_fail`。
+
+    而 `safety_technical_fail` 的语义是**失败**(进失败链、要退避)。
+    让路不是失败 —— 这是 G1 定死的契约: 让路有自己的计数, 绝不进失败链。
+    直播越忙这个数越虚高, 真正的网关故障就淹在里面了。
+
+    ## 契约
+
+        让路 -> `interrupted=True`, 不计 safety_technical_fail,
+                且 gen_spec 的顶层 `interrupted` 也要立起来(供 prefetch
+                分类成 "interrupted" 而不是 "gen_fail")
+    """
+    print("\n[R7-10] 复核让路 ≠ 技术失败")
+    from test_llm import FakeClient, review_ok  # noqa
+
+    base = review_ok()
+    base["decision"] = "pass"
+    base["quality_checks"]["livestream_safe"] = True
+    # 第 1 次复核畸形(技术失败) -> 进重试; 重试**之前**的 _stop() 让路。
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=base),
+        LLMResult(tool_input={"__safety__": True, "livestream_safe": "yes"}),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+
+    state = {"sent": 0}
+
+    def _should_continue():
+        # 让路只在**第 1 次复核发出之后**才变 true —— 模拟"复核第 1 次
+        # 技术失败期间直播忙起来了"。第 1 次之前必须放行, 否则测不到
+        # "重试前让路"这条路径(会退化成 ① 号检查点的让路)。
+        return state["sent"] == 0
+
+    _real = w.client.messages
+
+    def _counting(*a, **kw):
+        r = _real(*a, **kw)
+        if (kw.get("tool") or {}).get("name") == "emit_safety_check":
+            state["sent"] += 1
+        return r
+
+    w.client.messages = _counting
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=1,
+                      should_continue=_should_continue)
+    m = spec.metrics or {}
+    check("**复核只发了 1 次**(第 2 次被让路拦下)", state["sent"] == 1,
+          state["sent"])
+    check("**顶层 interrupted 立起来了**(prefetch 才会分类成让路)",
+          m.get("interrupted") is True, m.get("interrupted"))
+    check("**绝不记 safety_technical_fail**",
+          m.get("safety_technical_fail") is None,
+          m.get("safety_technical_fail"))
+    check("**也没谎报 safety_verified=False**",
+          "safety_verified" not in m, m.get("safety_verified"))
+    check("**让路时不出题**", not (spec.puzzle or ""), (spec.puzzle or "")[:40])
+    # ---- ③ keyword2 链(structure_original_idea)上的同一个契约 ----
+    #
+    # ⚠️ 这一段是**变异测试逼出来的**: 只测 `gen_spec` 时, 把
+    # structure 链的 `interrupted` 分支整段删掉 -> **全绿**。
+    # 而 keyword2 才是直播真正走的链(R7-6 的同一句告诫)。所以这里
+    # 用真 `structure_original_idea` 再走一遍同样的让路路径。
+    print("\n[R7-10b] keyword2 链: 复核让路同样不记技术失败")
+    from test_llm import _kw_structure_payload, _kw_surface, _kw_story  # noqa
+
+    fc2 = FakeClient([
+        LLMResult(tool_input=_kw_structure_payload()),
+        LLMResult(tool_input=review_ok()),
+        LLMResult(tool_input={"__safety__": True, "livestream_safe": "yes"}),
+    ])
+    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
+    st2 = {"sent": 0}
+    _real2 = w2.client.messages
+
+    def _counting2(*a, **kw):
+        r = _real2(*a, **kw)
+        if (kw.get("tool") or {}).get("name") == "emit_safety_check":
+            st2["sent"] += 1
+        return r
+
+    w2.client.messages = _counting2
+    s2 = w2.structure_original_idea(
+        title="", puzzle=_kw_surface()["puzzle"], answer=_kw_story()["answer"],
+        should_continue=lambda: st2["sent"] == 0)
+    m2 = s2.metrics or {}
+    check("**keyword2 链: 复核只发 1 次**", st2["sent"] == 1, st2["sent"])
+    check("**keyword2 链: 顶层 interrupted 立起来了**",
+          m2.get("interrupted") is True, m2.get("interrupted"))
+    check("**keyword2 链: 不记 safety_technical_fail**",
+          m2.get("safety_technical_fail") is None,
+          m2.get("safety_technical_fail"))
+    check("**keyword2 链: reject 标签也不是 safety_technical_fail**",
+          m2.get("reject") != "safety_technical_fail", m2.get("reject"))
+
+
+def test_r7_round_metrics_carries_quality_and_safety_evidence():
+    """**R7 复审**: `quality_checks` 与 `safety_*` 必须进 `_round_metrics`。
+
+    ## 这是第三次踩同一个坑
+
+    G4-E 与 R4 provenance 都栽在"`spec.metrics` 里躺着, 但
+    `_round_metrics` 是**白名单搬运**, 不搬整个 metrics"上。这次的代价
+    最直接: R6 只能靠"重跑冻结产物"去猜原始判定, 正因为
+    `quality_checks` 从没落过 `puzzle.jsonl`; 而 R7 的双门 AND 要靠
+    `safety_verified` / `safety_technical_fail` 才分得清"判了 false"与
+    "网关抖了"。
+
+    所以这条**同时**断言两件事: 值搬对了, 且缺省形状稳定(不让 archive
+    里出现 null 与 0 混杂)。
+    """
+    print("\n[R7-11] _round_metrics 搬运 quality_checks / safety_*")
+    from director import Director  # noqa
+
+    class _Snap:                       # 只喂 `_round_metrics` 会读的字段
+        qa_archive = []
+        stat_questions = 0
+        stat_dropped = 0
+        hint_count = 0
+        stat_viewers_seen = 0
+        puzzle_elapsed_ms = 0
+        solved = False
+
+    class _Spec:
+        metrics = {
+            "quality_checks": {"livestream_safe": False,
+                               "narrator_truthful": True},
+            "safety_verified": False,
+            "safety_reason": "血腥细节",
+            "safety_prompt_version": "safety-v1",
+            "safety_verify_calls": 2,
+            "safety_technical_fail": 1,
+        }
+
+    out = Director._round_metrics(object.__new__(Director), _Snap(), _Spec())
+    check("**quality_checks 原样搬到 archive**",
+          out.get("quality_checks") == {"livestream_safe": False,
+                                        "narrator_truthful": True},
+          out.get("quality_checks"))
+    check("**safety_verified 搬到了**", out.get("safety_verified") is False,
+          out.get("safety_verified"))
+    check("**safety_reason 搬到了**", out.get("safety_reason") == "血腥细节",
+          out.get("safety_reason"))
+    check("**safety_prompt_version 搬到了**",
+          out.get("safety_prompt_version") == "safety-v1",
+          out.get("safety_prompt_version"))
+    check("**safety_verify_calls 搬到了(且是 2, 不是 1)**",
+          out.get("safety_verify_calls") == 2, out.get("safety_verify_calls"))
+    check("**safety_technical_fail 搬到了**",
+          out.get("safety_technical_fail") == 1,
+          out.get("safety_technical_fail"))
+
+    # ---- 缺省形状: 老题 / 兜底题 / --no-llm 的假题都没有这些键 ----
+    class _Empty:
+        metrics = {}
+
+    out2 = Director._round_metrics(object.__new__(Director), _Snap(), _Empty())
+    check("**缺省 quality_checks 是空 dict(不是 None)**",
+          out2.get("quality_checks") == {}, out2.get("quality_checks"))
+    check("**缺省 safety_verified 是 None**(没判过 ≠ 判了 false)",
+          out2.get("safety_verified") is None, out2.get("safety_verified"))
+    check("**缺省计数是 0(不是 None)**",
+          out2.get("safety_verify_calls") == 0
+          and out2.get("safety_technical_fail") == 0,
+          (out2.get("safety_verify_calls"),
+           out2.get("safety_technical_fail")))
+
+
 def test_r4r3_story_has_safety_boundary():
     """**R4-R3**: Story 有一条安全边界, 且**只有**一条。
 
@@ -5691,6 +5925,9 @@ def main():
               test_r7_structure_chain_safety_reject_and_technical_split,
               test_r7_structure_chain_verifier_runs_after_fix,
               test_r7_verifier_receives_the_fixed_puzzle,
+              test_r7_safety_verify_calls_counts_real_attempts,
+              test_r7_interrupted_is_not_a_technical_fail,
+              test_r7_round_metrics_carries_quality_and_safety_evidence,
               test_r4r4_surface_hides_the_why,
               test_r4_story_schema_has_no_scaffold,
               test_r4_surface_stage_returns_puzzle_only,

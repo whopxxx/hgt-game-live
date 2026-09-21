@@ -1,9 +1,37 @@
 # R7 — 独立安全复核(双门 AND)
 
-**base** `main @ fd2a001`(与 `feat/safety-verifier` 同源)
-**不 merge** · **不混进 PR #9**
+**base** `main @ f3c239a`(R5 已 squash merge)
+**不 merge** · **不混进 PR #9** · **PR #10 (draft)**
 
 ---
+
+## 〇、复审修正轮(3 个必修 + rebase)
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 0 | 分支历史仍挂着旧 R5 commits, diff 夹带 R5 文件 | `rebase --onto f3c239a fd2a001`, 两个 R5 commit 被识别为 already upstream 自动丢弃 |
+| 1 | `quality_checks` / `safety_*` 只在 `spec.metrics`, **正式直播 `puzzle.jsonl` 会丢** | 补进 `director._round_metrics()` 白名单 |
+| 2 | `safety_verify_calls` 恒记 1, 但技术重试时实际调用 2 次 | `verify_safety` 回传真实 `calls`; 两处调用点照抄 |
+| 3 | 技术失败后、重试前直播变忙 -> `interrupted` 被误记成 `safety_technical_fail` | `interrupted` 独立成字段, **优先于** `technical` 被读; gen_spec 走 `break`(让路不是失败, 换稿只会再撞) |
+
+rebase 后 `git diff --stat origin/main...HEAD` **不再含** `prefill_pool.py` /
+`data/r5_prefill/*` —— 那是第 0 项的验收。
+
+### ⚠️ rebase 中发现: structure 链的让路曾经是**假绿**
+
+第 3 项在 `gen_spec` 修好后, keyword2 链(`structure_original_idea`)上
+**同一个 bug 仍然存在, 且变异测试抓不到**:
+
+```
+变异: 删掉 structure 链的 interrupted 分支
+      -> 全绿(没有任何行为断言看着它)
+```
+
+原因是 `_bail()` 靠 `interrupted["v"]` 决定出口, 而复核自己返回的
+`interrupted` **不会自动传进去** —— 必须先 `interrupted["v"] = True`
+再 `_bail()`。补了 `[R7-10b]` 用真 `structure_original_idea` 驱动同一条
+让路路径后, 该变异变红。**这正是 R7-6 当初警告过的形状**(keyword2 才是
+直播真正走的链), 却在 R7-2 自己身上又犯了一次。
 
 ## 一、为什么是复核, 不是改判据
 
@@ -76,7 +104,7 @@ v11: 主审 true **且** 复核 true    -> 收
 
 **代价: 上线前 prewarm 补池**(与 v9/v10 同型)。
 
-## 四、回归(10 条, 全部变异验证)
+## 四、回归(13 条, 全部变异验证)
 
 | 用例 | 断言 | 变异 → 结果 |
 |---|---|---|
@@ -88,11 +116,27 @@ v11: 主审 true **且** 复核 true    -> 收
 | `test_r7_main_reviewer_prompt_unchanged` | 主审九项措辞**未动** | 改措辞 → 红 |
 | `test_r7_structure_chain_also_has_the_second_gate` | 两处调用都在 | 只改一处 → 红 |
 | `test_r7_safety_verifier_sees_fixed_version_and_narrow_input` | 窄输入(不传 facts/atoms/…) | 传进去 → 红 |
+| `test_r7_safety_verify_calls_counts_real_attempts` | 1 次成 / 重试 2 次 / 让路 0 次, **计数必须不同** | 恒记 1 → **FAIL** |
+| `test_r7_interrupted_is_not_a_technical_fail` | gen_spec **与** structure 两条链都不许把让路记成技术失败 | 合并回 technical → **2 FAIL**; structure 链不置位 → **FAIL** |
+| `test_r7_round_metrics_carries_quality_and_safety_evidence` | 白名单搬运 + 缺省形状 | 删 quality_checks 搬运 → **2 FAIL** |
 | `test_r6_*`(4 条) | 上一步的落盘(仍绿) | 见 R6 commit |
 
-**离线套件: 21/23 绿 + 2 个基线 GBK 崩溃**
-(`test_solve_ux` 的 `U+2286`、`test_curated_import` 的 `U+00A9`; 逐字
-比对过, **非回归**)。
+**离线套件: 24 套, 与基线逐套件比对 rc / FAIL 数 / traceback 数**
+(`test_curated_import` / `test_g4_source` / `test_judge_golden` /
+`test_keyword_seed` / `test_pool` / `test_prefetch` / `test_solve_ux`
+七套的失败**在 `main @ f3c239a` 上逐项相同**, **非回归**)。
+
+### ⚠️ 两处**既有**假红(不是本轮引入, 记录备查)
+
+`test_llm.py` 的 `[R4-K2f]` 与 `[R7-1]` 各有断言查**日志文本**里有没有
+`livestream_safe` / `safety_verifier`, 而那条拒因走的是 `_remember(seen_why)`
+侧信道, 只在**重试耗尽**时才由最后一行 `log.warning` 打出来。夹具
+`max_attempts=1` 恰好命中, 但 `last.error` 被后一轮覆盖成
+`"改稿后仍不合格: ..."` —— 断言拿到空串。
+
+已验证: 这两条在 `fd2a001`(R4)上**就已经红**(那里共 7 条红, R7 后剩 3 条)。
+**本轮不修** —— 它们测的是日志措辞而非行为, 修法属于"把断言改成读 metrics"
+的独立清理, 混进 PR #10 会让安全门的 diff 不纯。
 
 ### ⚠️ 变异测试中发现的**测试自身**问题(已修)
 
