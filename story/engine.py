@@ -69,10 +69,14 @@ def _clue_dict(c: Any) -> Any:
     return c
 
 
-# 空闲重述时轮换的引导语(零成本, 让冷场画面"呼吸")
+# 空闲重述时轮换的引导语(零成本, 让冷场画面"呼吸")。
+#
+# ⚠️ 这些是**系统固定文案**, 直接展示给观众 —— 用直播观众的术语"汤面/汤底",
+# 与 web/ 的固定标签保持一致。观众原话 / 题目正文 / operator 自定义文案
+# 一律逐字透传, 绝不在前端做全局替换(那会改写内容而不是标签)。
 _NUDGES = (
     "有人想问什么吗？发送 #你的问题 向我提问",
-    "谜面里的每个细节都可能是线索",
+    "汤面里的每个细节都可能是线索",
     "想到了就直接说出你的答案，猜中我就揭晓",
     "别怕猜错，问错方向也没关系",
 )
@@ -85,9 +89,10 @@ _NUDGES = (
 #   REVEALED  刚揭晓, 有人会接着追问, 而其实该等下一题
 # IDLE / STOPPED **不在表里**: 还没开始 / 已结束, 反馈没有意义。
 #
-# 这些都是 0 成本确定性文案, 不调 LLM。
+# 这些都是 0 成本确定性文案, 不调 LLM。同样属于**系统固定文案**,
+# 使用观众术语"汤面/汤底"。
 _ACK_BY_PHASE = {
-    Phase.SETTING: "正在准备新题，谜面出现后再发 #问题。",
+    Phase.SETTING: "正在准备新题，汤面出现后再发 #问题。",
     Phase.REVEALING: "本题正在揭晓，稍后开启下一题。",
     Phase.REVEALED: "本题已结束，下一题即将开始。",
 }
@@ -150,6 +155,9 @@ class RoundEngine:
         # ---- 揭晓 ----
         self._solved = False
         self._solved_by = ""
+        self._leaderboard: dict[str, dict] = {}
+        self._win_sequence = 0
+        self._scored_round = None
         self._revealed = ""
         self._reveals = 0
         self._reveal_deadline: Optional[float] = None
@@ -1038,6 +1046,7 @@ class RoundEngine:
                         <= self._established_fact_ids):
                     log.info("第 %d 题的合同被补齐(由 %s): %s",
                              self._puzzle_index, q.user_name, q.text[:30])
+                    self._record_winner_locked(q)
                     acts.extend(self._solve_by_contract_locked(now, q.user_name))
                     return acts
                 # ---- legacy: P.SOLVE 直接通关(仅限**无合同**的题) ----
@@ -1057,6 +1066,7 @@ class RoundEngine:
                         and self._reveals < self.cfg.max_reveals_per_puzzle):
                     log.info("第 %d 题被 %s 猜中: %s", self._puzzle_index,
                              q.user_name, q.text[:30])
+                    self._record_winner_locked(q)
                     acts.extend(self._enter_revealing_locked(now, "solved",
                                                              q.user_name))
                     return acts
@@ -1253,11 +1263,11 @@ class RoundEngine:
             self._next_puzzle_deadline = now + self.cfg.reveal_hold_seconds
             reason = self._reveal_pending_reason
             if reason in ("solved", "ai_solved") and self._solved_by:
-                self._notice = f"{self._solved_by} 猜中了！谜底揭晓"
+                self._notice = f"{self._solved_by} 猜中了！汤底揭晓"
             elif self._solved:
-                self._notice = "谜底揭晓"
+                self._notice = "汤底揭晓"
             else:
-                self._notice = "谜底揭晓（本题无人猜中）"
+                self._notice = "汤底揭晓（本题无人猜中）"
             self._phase_hint = self._notice + "　—　稍后开启新谜题"
             log.info("揭晓(%s): %s", reason, self._revealed[:40])
             return [EngineAction(ActionKind.BROADCAST, {
@@ -2211,6 +2221,20 @@ class RoundEngine:
                     len(self._established_fact_ids))
         return out
 
+    def _record_winner_locked(self, q: PendingQ) -> None:
+        """Session-only final human winner; callers already verified the solve."""
+        if self._scored_round == self.round_index:
+            return
+        self._scored_round = self.round_index
+        self._win_sequence += 1
+        key = str(q.user_id)
+        previous = self._leaderboard.get(key, {})
+        self._leaderboard[key] = {
+            "user_name": q.user_name,
+            "solved_count": previous.get("solved_count", 0) + 1,
+            "win_sequence": self._win_sequence,
+        }
+
     def _solve_by_contract_locked(self, now: float,
                                   winner: str) -> list[EngineAction]:
         """v5 通关: 合同已被房间共识覆盖。
@@ -2236,11 +2260,11 @@ class RoundEngine:
         self._inflight.clear()
         self._inflight_at.clear()
         if reason in ("solved", "ai_solved"):
-            self._notice = f"{winner} 猜中了！正在揭晓谜底…"
+            self._notice = f"{winner} 猜中了！正在揭晓汤底…"
         elif reason == "skip":
             self._notice = "收到换题请求，正在揭晓…"
         else:
-            self._notice = "时间到，正在揭晓谜底…"
+            self._notice = "时间到，正在揭晓汤底…"
         self._phase_hint = self._notice
         return [EngineAction(ActionKind.REVEAL, {
             "reason": reason,
@@ -2473,6 +2497,13 @@ class RoundEngine:
                 reveal_stage=reveal_stage,
                 solved=self._solved,
                 solved_by=self._solved_by,
+                leaderboard=[
+                    {"rank": i + 1, "user_name": row["user_name"],
+                     "solved_count": row["solved_count"]}
+                    for i, row in enumerate(sorted(
+                        self._leaderboard.values(),
+                        key=lambda row: (-row["solved_count"], row["win_sequence"])
+                    )[:3])],
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
                 qa_archive=[r.to_archive() for r in self._qa_archive],
                 # R2: 只在揭晓阶段下发。QA 阶段这些文本虽然已经公开过,

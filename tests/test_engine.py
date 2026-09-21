@@ -3848,6 +3848,7 @@ def test_ai_player_solve_wrong_and_right_are_independent():
         judge["token"], judge["expect_round"], judge["expect_spec_key"],
         "solve", judge["text"], solved=True)
     sr = right.snapshot()
+    check("AI 真正 solve 不加真人榜", sr.leaderboard == [])
     check("猜中 -> solved_by=AI玩家",
           sr.solved and sr.solved_by == "AI玩家", (sr.solved, sr.solved_by))
     check("猜中进入 REVEALING", right.phase == Phase.REVEALING, right.phase)
@@ -4008,8 +4009,115 @@ def test_ai_player_public_snapshot_only_contains_public_transcript():
                                       "SECRET_ATOM", "同伴的肉汤骗局")), blob)
 
 
+def test_session_leaderboard():
+    from story import parser as P
+    from story.state import PendingQ
+
+    eng, clk, sp = boot_v5()
+    check("新 session 空榜", eng.snapshot().leaderboard == [])
+    _answer_and_submit(eng, clk, "u1", "Alice", "身份正确",
+                       verdict="是", established_fact_ids=["f1"])
+    check("非最终贡献不记分", eng.snapshot().leaderboard == [])
+    _, payload = _answer_and_submit(eng, clk, "u2", "Bob", "时间正确",
+                                    verdict="是", established_fact_ids=["f2"])
+    expected = [{"rank": 1, "user_name": "Bob", "solved_count": 1}]
+    check("contract 最终补齐者 +1", eng.snapshot().leaderboard == expected)
+    eng.submit_qa([QAResult(qid=payload["qid"], verdict=P.SOLVE)])
+    with eng._lock:
+        # Explicit defense-in-depth: even abnormal same-round re-entry cannot score.
+        eng._record_winner_locked(PendingQ(999, "u2", "Bob", "重复"))
+        eng._record_winner_locked(PendingQ(1000, "u3", "Eve", "迟到"))
+        eng._enter_revealing_locked(clk(), "solved", "Bob")
+    check("重复 callback/reveal 同题只计一次", eng.snapshot().leaderboard == expected)
+
+    for uid, name in [("u1", "Alice"), ("u3", "Bob"), ("u4", "Dana"),
+                      ("u2", "Robert"), ("u1", "Alice")]:
+        eng.submit_reveal("合成谜底")
+        clk.advance(31)
+        eng.tick()
+        eng.submit_riddle(sp.puzzle, sp.answer, list(sp.hints))
+        before = eng.snapshot().leaderboard
+        eng.submit_qa([QAResult(qid=payload["qid"], verdict=P.SOLVE)],
+                      expect_round=payload["expect_round"],
+                      expect_spec_key=payload["expect_spec_key"])
+        check("上一题迟到 callback 不记分", eng.snapshot().leaderboard == before)
+        _answer_and_submit(eng, clk, uid, name, "正确答案", verdict=P.SOLVE)
+    rows = eng.snapshot().to_json()["leaderboard"]
+    check("legacy 跨题累计/改名/同分先达到者优先", rows == [
+        {"rank": 1, "user_name": "Robert", "solved_count": 2},
+        {"rank": 2, "user_name": "Alice", "solved_count": 2},
+        {"rank": 3, "user_name": "Bob", "solved_count": 1},
+    ], rows)
+    check("同名不同 uid 独立", len(eng._leaderboard) == 4)
+    check("最多 Top3 且严格公开字段", len(rows) == 3 and all(
+        set(r) == {"rank", "user_name", "solved_count"} for r in rows))
+    check("新 engine 不继承旧榜", boot_v5()[0].snapshot().leaderboard == [])
+    for reason in ("giveup", "timeout", "skip", "ai_solved"):
+        other, clock, _ = boot_v5()
+        with other._lock:
+            other._enter_revealing_locked(clock(), reason, "AI玩家")
+        check(reason + " 不记真人分", other.snapshot().leaderboard == [])
+
+
+def test_fixed_viewer_copy_uses_soup_terms():
+    """Engine 自己生成、展示给观众的**固定文案**用汤面/汤底。
+
+    观众内容是另一回事: 观众原话 / 题目正文 / operator 自定义文案逐字透传,
+    前端不得做全局替换(见 test_web 的 A16 断言)。这里只钉死 engine
+    写死的系统 copy, 因为它不经过任何"内容"通路。
+
+    反证: 把这些字符串改回"谜面/谜底", 本测试必须失败。
+    """
+    from story.engine import _ACK_BY_PHASE, _NUDGES
+    from story.state import Phase
+
+    old = ("谜面", "谜底", "解谜")
+    new = ("汤面", "汤底")
+
+    # ① 冷场重述引导语 —— 作为 BROADCAST.payload["nudge"] 直接进问答流。
+    for n in _NUDGES:
+        check("nudge 不含旧术语: " + n, not any(t in n for t in old), n)
+    check("nudge 至少一条用汤面",
+          any("汤面" in n for n in _NUDGES), _NUDGES)
+
+    # ② 非 QA 阶段的 #问题 反馈 —— 走 kind="system" 行上屏。
+    for ph, msg in _ACK_BY_PHASE.items():
+        check(f"ACK[{ph.value}] 不含旧术语: {msg}",
+              not any(t in msg for t in old), msg)
+    check("ACK[SETTING] 用汤面",
+          "汤面" in _ACK_BY_PHASE[Phase.SETTING], _ACK_BY_PHASE[Phase.SETTING])
+
+    # ③ 揭晓完成 notice(REVEALED) —— 由 submit_reveal() 生成。
+    for reason, winner, solved in (("solved", "Alice", True),
+                                   ("giveup", "", False)):
+        eng, clk, _ = boot_v5()
+        with eng._lock:
+            eng._enter_revealing_locked(clk(), reason, winner)
+            eng._solved = solved
+            eng._solved_by = winner
+            eng._reveal_pending_reason = reason
+        eng.submit_reveal("合成汤底正文。", now=clk())
+        notice = eng.snapshot().notice or ""
+        check(f"REVEALED notice[{reason}] 不含旧术语: {notice}",
+              not any(t in notice for t in old), notice)
+        if solved:
+            check("REVEALED notice 用汤底", "汤底" in notice, notice)
+
+    # ④ 进入揭晓中的 notice(REVEALING)。
+    for reason, winner in (("solved", "Alice"), ("timeout", "")):
+        eng, clk, _ = boot_v5()
+        with eng._lock:
+            eng._enter_revealing_locked(clk(), reason, winner)
+        notice = eng.snapshot().notice or ""
+        check(f"REVEALING notice[{reason}] 不含旧术语: {notice}",
+              not any(t in notice for t in old), notice)
+        if reason == "solved":
+            check("REVEALING notice 用汤底", "汤底" in notice, notice)
+
+
 def main():
-    tests = [test_start_and_riddle,
+    tests = [test_start_and_riddle, test_session_leaderboard,
+             test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
              test_ai_player_solve_wrong_and_right_are_independent,

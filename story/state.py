@@ -286,6 +286,7 @@ class Snapshot:
     revealed_answer: str = ""               # 谜底; 非空 = 已揭晓
     solved: bool = False
     solved_by: str = ""
+    leaderboard: list[dict[str, Any]] = field(default_factory=list)
     # ---- 问答流 ----
     qa_log: list[dict[str, Any]] = field(default_factory=list)
     # 落盘专用的问答流(含裁判覆盖结果)。与 qa_log 分开: 前端不需要
@@ -391,6 +392,7 @@ class Snapshot:
             "reveal_stage": self.reveal_stage,
             "solved": self.solved,
             "solved_by": self.solved_by,
+            "leaderboard": self.leaderboard,
             "qa_log": self.qa_log,
             "qa_total": self.qa_total,
             # R2: 揭晓贡献链(QA 阶段恒为空数组, 见字段说明)。

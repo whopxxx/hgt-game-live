@@ -13,6 +13,15 @@
   const STAGE_W = 1080, STAGE_H = 1920;
 
   const $ = (id) => document.getElementById(id);
+  // 术语只改**本文件写死的固定 UI 标签**(见 Issue #16 "前端术语统一"):
+  // 汤面 / 汤底 / 本场猜汤榜。
+  //
+  // 刻意**不做**对任意快照文本的 replaceAll —— `next_event_label`、
+  // `kind="system"` 行、贡献链原话都可能包含 "谜底" 字样, 而那是**内容**,
+  // 不是标签。全局替换会把观众/系统原文改写掉(例如把贡献链里的原话
+  // "包含谜底一词" 改成 "包含汤底一词"), 那是改变产品语义, 不是统一术语。
+  // 服务端固定文案另有其源(engine._ACK_BY_PHASE / _NUDGES / notice),
+  // 本次不动, 已在 PR 中说明。
   const el = {
     stage: $("stage"),
     puzzleIndex: $("puzzle-index"), puzzleElapsed: $("puzzle-elapsed"),
@@ -223,7 +232,7 @@
       return;
     }
     el.revealContribTitle.textContent =
-      s.solved ? "共同解谜" : "大家已经推到这里";
+      s.solved ? "共同猜汤" : "大家已经推到这里";
     const box = document.createDocumentFragment();
     rows.forEach(function (r) {
       const row = document.createElement("div");
@@ -449,7 +458,7 @@
     row.className = "qa-row kind-fold";
     const q = document.createElement("div");
     q.className = "q";
-    q.textContent = "…（前 " + n + " 条与谜底无关，已折叠）";
+    q.textContent = "…（前 " + n + " 条与汤底无关，已折叠）";
     row.appendChild(q);
     return row;
   }
@@ -501,8 +510,7 @@
     }
   }
 
-  // 提示只走问答流(作为 kind-hint 行), 不再单独用 hintbar 重复显示一遍 ——
-  // 之前两处都显示同一条, 看起来就像"提示内容重复"。
+  // 提示保留 QA 历史，新提示额外由 announcer 播一次；旧 hintbar 仍隐藏。
   function renderHint(s) {
     el.hintbar.classList.add("hidden");
   }
@@ -518,7 +526,7 @@
     el.prompt.classList.remove("hidden");
     if (s.phase === "qa") {
       el.prompt.innerHTML =
-        "发送 <b>#你的问题</b> 向我提问，猜中谜底我就揭晓";
+        "发送 <b>#你的问题</b> 向我提问，猜中汤底我就揭晓";
     } else if (s.phase === "setting") {
       el.prompt.textContent = "AI 正在出题，请稍候…";
     } else if (s.phase === "revealing" || s.phase === "revealed") {
@@ -532,9 +540,8 @@
     const st = s.stats || {};
     const ai = s.ai_player || {};
     const parts = [];
-    if (ai.questions_available != null) {
-      parts.push("AI玩家提问次数 <b>" + ai.questions_available
-        + "</b> · 每100赞+1");
+    if (s.ai_player) {
+      parts.push(ai.in_flight ? "🤖 AI玩家正在推理…" : "👍 点赞可以召唤 AI 玩家");
     }
     if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
     if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
@@ -617,6 +624,189 @@
     el.debugBody.innerHTML = L.join("\n");
   }
 
+  // Session-local presentation: merged AI notice + bounded FIFO of hint notices.
+  const announcer = (() => {
+    const box = $("announcer"), text = $("announcer-text");
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let config = null, phase = "", earned = null, pendingAI = 0;
+    let active = "", defaultText = "", lastPresetId = null;
+    let nextPreset = Infinity, timer = null, animation = null;
+    let currentMessage = "", measuredWidth = 0;
+    let hintPuzzle = null, hintCount = null;
+    const pendingHints = [];
+
+    function cancel() {
+      clearTimeout(timer);
+      if (animation) animation.cancel();
+      animation = null;
+      text.style.transform = "";
+      active = "";
+    }
+    function interval() { return (config ? config.interval_seconds : 90) * 1000; }
+    function show(message, kind) {
+      cancel();
+      active = kind;
+      box.dataset.kind = kind;
+      text.textContent = message;
+      const width = box.clientWidth, length = text.scrollWidth;
+      currentMessage = message;
+      measuredWidth = width;
+      const hold = (config ? config.hold_seconds : 4) * 1000;
+      function done() { cancel(); pump(); }
+      if (length > width && reduced.matches) {
+        // Measure each static page using the same rendered font, not char counts.
+        const pages = [];
+        let page = "";
+        for (const char of Array.from(message)) {
+          text.textContent = page + char;
+          if (text.scrollWidth > width && page) { pages.push(page); page = char; }
+          else page += char;
+        }
+        pages.push(page);
+        let index = 0;
+        function next() {
+          text.textContent = pages[index++];
+          box.dataset.motion = "pages";
+          timer = setTimeout(index < pages.length ? next : done, hold);
+        }
+        next();
+      } else if (length > width) {
+        const duration = (width + length) / (config ? config.long_text_speed_px_s : 80) * 1000;
+        box.dataset.motion = "marquee";
+        animation = text.animate([
+          {transform: `translateX(${width}px)`},
+          {transform: `translateX(${-length}px)`},
+        ], {duration, easing: "linear", fill: "forwards"});
+        timer = setTimeout(done, duration);
+      } else {
+        box.dataset.motion = reduced.matches ? "static" : "slide";
+        if (!reduced.matches) {
+          animation = text.animate([
+            {transform: `translateX(${width}px)`, offset: 0},
+            {transform: "translateX(0)", offset: 300 / (hold + 600)},
+            {transform: "translateX(0)", offset: (hold + 300) / (hold + 600)},
+            {transform: `translateX(${-width}px)`, offset: 1},
+          ], {duration: hold + 600, fill: "forwards"});
+        }
+        timer = setTimeout(done, hold + (reduced.matches ? 0 : 600));
+      }
+    }
+    function pump() {
+      if (phase !== "qa" || active) return;
+      if (pendingAI) {
+        const delta = pendingAI;
+        pendingAI = 0;
+        show(delta > 1 ? "🤖 AI玩家已获得新的出手机会"
+          : "🤖 AI玩家已被召唤！正在准备出手…", "ai");
+        return;
+      }
+      if (pendingHints.length) {
+        show(pendingHints.shift(), "hint");
+        return;
+      }
+      const items = config && config.enabled ? config.items.filter(x => x.enabled) : [];
+      if (items.length && performance.now() >= nextPreset) {
+        const index = (items.findIndex(x => x.id === lastPresetId) + 1) % items.length;
+        lastPresetId = items[index].id; // Advance even when interrupted by AI.
+        nextPreset = performance.now() + interval();
+        show("📢 游戏公告 " + items[index].text, "preset");
+      } else show(defaultText, "leaderboard");
+    }
+    function update(s) {
+      const value = (s.ai_player || {}).questions_earned;
+      if (Number.isSafeInteger(value) && value >= 0) {
+        if (earned !== null && value > earned) pendingAI += value - earned;
+        earned = value; // First valid snapshot (and a server reset) is a baseline.
+      }
+      if (hintPuzzle !== s.puzzle_index) {
+        hintPuzzle = s.puzzle_index;
+        hintCount = null;
+        pendingHints.length = 0;
+        if (active === "hint") cancel();
+      }
+      if (Number.isSafeInteger(s.hint_count) && s.hint_count >= 0) {
+        if (hintCount !== null && s.hint_count > hintCount) {
+          const latest = (s.qa_log || []).filter(r => r.kind === "hint").slice(-1)[0];
+          const hint = s.hint_text || (latest && latest.text);
+          if (hint) {
+            // Bound burst backlog to 16 pending notices; QA keeps the history.
+            if (pendingHints.length === 16) pendingHints.shift();
+            pendingHints.push("💡 提示：" + hint);
+          }
+        }
+        hintCount = s.hint_count;
+      }
+      const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
+      const nextDefault = rows.length
+        ? "📢 本场猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
+        : "📢 游戏公告 猜中汤底即可登上本场猜汤榜";
+      const changed = nextDefault !== defaultText;
+      defaultText = nextDefault;
+      if (phase !== s.phase) {
+        phase = s.phase;
+        cancel();
+        nextPreset = performance.now() + interval();
+      }
+      box.classList.toggle("hidden", phase !== "qa");
+      if (phase !== "qa") return;
+      if (pendingAI && active !== "ai") {
+        // An interrupted hint still gets a full readable turn after the AI notice.
+        if (active === "hint") {
+          pendingHints.unshift(currentMessage);
+          if (pendingHints.length > 16) pendingHints.pop();
+        }
+        cancel();
+      } else if ((pendingHints.length && active !== "ai" && active !== "hint")
+                 || (changed && active === "leaderboard")) cancel();
+      pump();
+    }
+    async function reload() {
+      try {
+        const response = await fetch("/announcements.json", {cache: "no-store"});
+        if (!response.ok) throw new Error("announcement HTTP error");
+        const c = await response.json();
+        if (!c || typeof c.enabled !== "boolean" || !Array.isArray(c.items)
+            || !Number.isFinite(c.interval_seconds) || c.interval_seconds <= 0
+            || !Number.isFinite(c.hold_seconds) || c.hold_seconds < 3 || c.hold_seconds > 5
+            || !Number.isFinite(c.long_text_speed_px_s) || c.long_text_speed_px_s <= 0) {
+          throw new Error("invalid announcement config");
+        }
+        const ids = new Set();
+        for (const item of c.items) {
+          if (!item || typeof item.id !== "string" || !item.id || ids.has(item.id)
+              || typeof item.enabled !== "boolean" || typeof item.text !== "string") {
+            throw new Error("invalid announcement item");
+          }
+          ids.add(item.id);
+        }
+        c.items = c.items.filter(x => Array.from(x.text).length <= 160 && x.text.trim());
+        const first = config === null;
+        const anchor = nextPreset - interval();
+        config = c;
+        if (first && phase === "qa") nextPreset = performance.now() + interval();
+        else if (!first) nextPreset = anchor + interval();
+      } catch (_) { /* Keep last-known-good; config availability never blocks WS. */ }
+    }
+    reload();
+    setInterval(reload, 15000);
+    setInterval(() => {
+      if (phase === "qa" && active === "leaderboard" && config && config.enabled
+          && config.items.some(x => x.enabled) && performance.now() >= nextPreset) {
+        cancel(); pump();
+      }
+    }, 250);
+    reduced.addEventListener("change", () => {
+      if (active) show(currentMessage, active);
+      else pump();
+    });
+    new ResizeObserver(() => {
+      if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
+        show(currentMessage, active); // Debug width changed: remeasure pages/motion.
+      }
+    }).observe(box);
+    return {update};
+  })();
+
   // ================= WebSocket =================
   let ws = null, retry = 800;
   function connect() {
@@ -645,6 +835,7 @@
     renderStats(s);
     renderDebug(s);
     layout();
+    announcer.update(s);
     puzzleScroller.update(
       JSON.stringify([s.puzzle_index, s.puzzle || "", s.phase || ""]),
       s.phase === "qa", true);
