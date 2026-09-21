@@ -3502,27 +3502,32 @@ def test_j1_3_and_4_real_core_facts_do_establish():
           rev[0].payload.get("core_answer") if rev else None)
 
 
-def test_j1_5_legitimate_no_still_completes():
-    """J1-5(反向必测): 合法 NO 不能被误杀。
+def test_j1_5_legitimate_no_does_not_complete():
+    """J1-5 + Task 0: 即使 NO 与某条 completion 逻辑等价，也不直接通关。
 
-    completion 就是"飞机没有机械故障", 而观众问"飞机有机械故障吗?",
-    "不是"**直接等价于**该 fact —— 必须建立、必须能通关。
+    Task 0 把胜利状态收窄成一个更保守、可观察的产品契约:
+    **只有公开裁决「是」才能推进 completion**。所以这里即使上游认为
+    "飞机有机械故障吗?" -> "不是" 等价于 hidden completion，Engine
+    仍必须挡住这条胜利贡献。
 
-    这条与 J1-1 一起构成"不是禁止 NO, 而是禁止 hidden-truth leap"。
+    这不会禁掉 NO 的普通信息价值：support/exclusion 的 NO 仍可建立，
+    由 test_j1_b_noncompletion_ids_pass_through 单独覆盖。
     """
-    print("\n[J1-5] 合法 NO 仍能建立事实")
+    print("\n[J1-5/Task0] 合法 NO 仍不推进 completion")
     sp = plane_spec()
     eng, clk = boot(sp)
     ask(eng, clk, "u1", "甲", "飞机有机械故障吗", verdict="不是",
         established_fact_ids=["f1"])
-    check("**f1 被建立**", eng._established_fact_ids == {"f1"},
+    check("**f1 completion 未被建立**", eng._established_fact_ids == set(),
           eng._established_fact_ids)
-    check("直接通关(合同只有 1 条)",
-          eng.phase == Phase.REVEALING, eng.phase)
-    check("胜者是甲", eng._solved_by == "甲", eng._solved_by)
+    check("合同只有 1 条也**不能**由 NO 直接通关",
+          eng.phase == Phase.QA, eng.phase)
+    check("没有胜者", not eng._solved_by, eng._solved_by)
     c = eng._reveal_contributors_locked()
-    check("贡献链 1 条且 is_final", len(c) == 1 and c[0]["is_final"] is True, c)
-    check("裁决显示为'不是'", c and c[0]["verdict"] == "不是", c)
+    check("NO 不进入 completion 贡献链", c == [], c)
+    qa = [x for x in eng._qa_archive if x.kind == "qa"]
+    check("公开裁决仍正常记录为'不是'",
+          qa and qa[-1].verdict == "不是", qa[-1].verdict if qa else None)
 
 
 def test_j1_6_keyword_hit_is_not_proposition():
@@ -3777,7 +3782,7 @@ def main():
         test_j1_1_wrong_exclusion_is_not_a_completion,
         test_j1_2_verifier_must_reject_the_no_leap,
         test_j1_3_and_4_real_core_facts_do_establish,
-        test_j1_5_legitimate_no_still_completes,
+        test_j1_5_legitimate_no_does_not_complete,
         test_j1_6_keyword_hit_is_not_proposition,
         test_j1_b_invariant_contribution_subset_of_verified,
         test_j1_b_noncompletion_ids_pass_through,
