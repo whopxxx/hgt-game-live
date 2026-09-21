@@ -515,15 +515,19 @@ window.addEventListener("load", async () => {
     check(!prompt.classList.contains("hidden"), "**揭晓阶段提示条不应隐藏**");
     check(prompt.textContent.includes("新谜题"),
           "揭晓阶段应说明即将换题: " + prompt.textContent);
-    // 系统行(非 QA 阶段 #问题 的反馈)要能上屏
+    // 系统行(非 QA 阶段 #问题 的反馈)要能上屏。
+    // 文案用 engine._ACK_BY_PHASE[SETTING] 的当前取值: 系统固定 copy 用汤面/汤底。
     send({phase: "setting", puzzle_index: 6, story_index: 6, puzzle: "",
-          qa_log: [{qid: -1, user_name: "系统", text: "正在准备新题，谜面出现后再发 #问题。",
+          qa_log: [{qid: -1, user_name: "系统", text: "正在准备新题，汤面出现后再发 #问题。",
                     verdict: "", comment: "", kind: "system"}],
           qa_total: 0});
     const sysRows = [...document.querySelectorAll(".qa-row.kind-system")];
     check(sysRows.length === 1, "系统行应渲染 1 条, 实际 " + sysRows.length);
     check(sysRows.length && sysRows[0].textContent.includes("正在准备新题"),
           "系统行内容: " + (sysRows[0] && sysRows[0].textContent));
+    check(sysRows.length && sysRows[0].textContent.includes("汤面")
+          && !sysRows[0].textContent.includes("谜面"),
+          "系统固定文案应用汤面而非谜面: " + (sysRows[0] && sysRows[0].textContent));
     check(sysRows.length && !sysRows[0].textContent.includes("系统："),
           "系统行**不该**带观众名前缀: " + (sysRows[0] && sysRows[0].textContent));
 
@@ -1329,10 +1333,11 @@ window.addEventListener('load', async () => {
     check(notice()==='💡 提示：本题新提示', 'A16 new puzzle subsequent hint announces');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 new puzzle hint plays once');
 
-    // 术语只覆盖固定 UI 标签: 快照里的系统行/贡献链原话属于**内容**,
-    // 必须原样透传 —— 全局 replaceAll 会把观众原文改掉。
-    send({phase:'setting',qa_log:[{qid:-99,kind:'system',text:'谜面出现后提问，谜底稍后揭晓'}],qa_total:73});
-    check(qa.querySelector('.kind-system').textContent==='谜面出现后提问，谜底稍后揭晓', 'A16 system copy passes through verbatim');
+    // 术语分两层:
+    //   ① 观众内容(原话 / 题目正文 / 贡献 quote / operator 自定义文案)逐字透传;
+    //   ② 系统固定文案在**源头**(story/engine.py)就写成汤面/汤底, 前端不做替换。
+    // 这里用一条带"谜底"的**观众可控**文本验证 ① —— 系统固定文案的正确性
+    // 由 test_engine 的回归覆盖(见 test_fixed_viewer_copy_uses_soup_terms)。
     send({phase:'revealed',revealed_answer:'合成故事正文',reveal_stage:'contribution',solved:true,
           reveal_contributors:[{qid:1,user_name:'Alice',text:'原话包含谜底一词',verdict:'是',is_final:true}]});
     check(document.getElementById('reveal-label').textContent==='汤底揭晓'
@@ -1341,7 +1346,7 @@ window.addEventListener('load', async () => {
     send({phase:'qa',revealed_answer:'',qa_log:[],qa_total:74});
     check(document.getElementById('prompt').textContent.includes('猜中汤底我就揭晓')
           && notice().includes('本场猜汤榜'), 'A16 prompt and leaderboard terminology');
-    // 反证: 若有人把术语做回"对任意文本 replaceAll", 下面三条必然失败 ——
+    // 反证: 若有人把术语做回"对任意文本 replaceAll", 下面几条必然失败 ——
     // 它会把观众提问、计时器标签、贡献链原话一起改写掉。
     send({phase:'qa',qa_log:[{qid:1,user_name:'观众甲',text:'谜底是不是和灯有关？',verdict:'不是',kind:'qa'}],
           next_event_ms:60000,next_event_kind:'hint',next_event_label:'谜底揭晓倒计时',qa_total:75});

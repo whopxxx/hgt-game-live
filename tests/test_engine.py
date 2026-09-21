@@ -4059,8 +4059,65 @@ def test_session_leaderboard():
         check(reason + " 不记真人分", other.snapshot().leaderboard == [])
 
 
+def test_fixed_viewer_copy_uses_soup_terms():
+    """Engine 自己生成、展示给观众的**固定文案**用汤面/汤底。
+
+    观众内容是另一回事: 观众原话 / 题目正文 / operator 自定义文案逐字透传,
+    前端不得做全局替换(见 test_web 的 A16 断言)。这里只钉死 engine
+    写死的系统 copy, 因为它不经过任何"内容"通路。
+
+    反证: 把这些字符串改回"谜面/谜底", 本测试必须失败。
+    """
+    from story.engine import _ACK_BY_PHASE, _NUDGES
+    from story.state import Phase
+
+    old = ("谜面", "谜底", "解谜")
+    new = ("汤面", "汤底")
+
+    # ① 冷场重述引导语 —— 作为 BROADCAST.payload["nudge"] 直接进问答流。
+    for n in _NUDGES:
+        check("nudge 不含旧术语: " + n, not any(t in n for t in old), n)
+    check("nudge 至少一条用汤面",
+          any("汤面" in n for n in _NUDGES), _NUDGES)
+
+    # ② 非 QA 阶段的 #问题 反馈 —— 走 kind="system" 行上屏。
+    for ph, msg in _ACK_BY_PHASE.items():
+        check(f"ACK[{ph.value}] 不含旧术语: {msg}",
+              not any(t in msg for t in old), msg)
+    check("ACK[SETTING] 用汤面",
+          "汤面" in _ACK_BY_PHASE[Phase.SETTING], _ACK_BY_PHASE[Phase.SETTING])
+
+    # ③ 揭晓完成 notice(REVEALED) —— 由 submit_reveal() 生成。
+    for reason, winner, solved in (("solved", "Alice", True),
+                                   ("giveup", "", False)):
+        eng, clk, _ = boot_v5()
+        with eng._lock:
+            eng._enter_revealing_locked(clk(), reason, winner)
+            eng._solved = solved
+            eng._solved_by = winner
+            eng._reveal_pending_reason = reason
+        eng.submit_reveal("合成汤底正文。", now=clk())
+        notice = eng.snapshot().notice or ""
+        check(f"REVEALED notice[{reason}] 不含旧术语: {notice}",
+              not any(t in notice for t in old), notice)
+        if solved:
+            check("REVEALED notice 用汤底", "汤底" in notice, notice)
+
+    # ④ 进入揭晓中的 notice(REVEALING)。
+    for reason, winner in (("solved", "Alice"), ("timeout", "")):
+        eng, clk, _ = boot_v5()
+        with eng._lock:
+            eng._enter_revealing_locked(clk(), reason, winner)
+        notice = eng.snapshot().notice or ""
+        check(f"REVEALING notice[{reason}] 不含旧术语: {notice}",
+              not any(t in notice for t in old), notice)
+        if reason == "solved":
+            check("REVEALING notice 用汤底", "汤底" in notice, notice)
+
+
 def main():
     tests = [test_start_and_riddle, test_session_leaderboard,
+             test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
              test_ai_player_solve_wrong_and_right_are_independent,
