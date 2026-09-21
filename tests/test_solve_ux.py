@@ -1380,8 +1380,8 @@ def test_v6_versions_bumped():
     from story.llm import (ANSWER_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            RIDDLE_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
-    check("QUALITY_POLICY_VERSION == quality-v10",
-          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION == quality-v11",
+          QUALITY_POLICY_VERSION == "quality-v11", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("CHECK_PROMPT_VERSION == check-v10",

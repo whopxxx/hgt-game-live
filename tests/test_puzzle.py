@@ -2270,8 +2270,8 @@ def test_g3_riddle_version_bumped_but_policy_unchanged():
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION = answer-v7(未动)",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
-    check("**QUALITY_POLICY_VERSION = quality-v10**",
-          QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
+    check("**QUALITY_POLICY_VERSION = quality-v11**",
+          QUALITY_POLICY_VERSION == "quality-v11", QUALITY_POLICY_VERSION)
     check("CHECK_PROMPT_VERSION = check-v10",
           CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
 

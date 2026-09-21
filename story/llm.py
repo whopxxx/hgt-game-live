@@ -4183,6 +4183,110 @@ _TOOL_TRUTH_AUDIT = {
 
 
 # ======================================================================
+# R7: 独立安全复核(safety verifier) —— 与主 Reviewer 的**双门 AND**
+# ======================================================================
+#
+# ## 为什么需要第二道门(R6 实测依据)
+#
+# R6 对**冻结的**产物重跑 `check-v10` 三次, 同一份 `puzzle`+`answer`:
+#
+#     行 1 (列车上/威胁)   livestream_safe: False / True / False
+#     行 3 (网络/假发)     livestream_safe: False / True / 技术失败
+#
+# 也就是说**主 Reviewer 对安全项的判定本身是抖的** —— 同一道题三次能给
+# 不同答案。而 `livestream_safe` 是**硬门**: 漏一次, 那道题就上播了。
+#
+# ⚠️ 注意这个结论的**方向**: 不是"判据覆盖不到这种情况"(False 出现过,
+# 说明判据够得着), 而是"单次判定不可靠"。所以修法是**加一次独立的
+# 复核**, 不是继续加判据措辞 —— 后者按 R4-R3 的纪律本来也不该做。
+#
+# ## 为什么是 AND, 不是多数票
+#
+# 双门 AND 下, 一道 unsafe 题必须**连续被两次独立调用漏判**才可能进池。
+# 比"固定跑三次完整 Reviewer 取多数"更便宜(复核只看两段文本、只判一项),
+# 也更干净(关注点单一: 复核**不做**结构/配额/好玩度判定)。
+#
+# ## 顺序: Reviewer -> validate -> safety verify -> truth audit
+#
+# 安全没过就**不必**再发 truth audit —— 省一次调用, 且拒因更准确
+# (不是"叙事不真实", 是"不适合直播")。
+#
+# ## 技术失败 ≠ 不安全(必须分开记)
+#
+# 复核**技术失败**(网关抖动 / 空 tool_input)时重试一次; 第二次仍失败
+# 则 **fail-closed 不入池**, 但记成 `safety_technical_fail` —— **不是**
+# `livestream_safe=false`。把技术故障伪装成"不安全"会污染复盘: 前者要
+# 查网关, 后者要查模型判定。这与 G2-F 定下的"技术失败 ≠ 语义拒绝"
+# 是同一条纪律。
+
+#: 安全复核的 prompt 版本号。**独立开号** —— 与 `CHECK_PROMPT_VERSION`
+#: 分开: 复核的措辞会独立演化, 合成一个号会让复盘时分不清"这题被拒是
+#: 因为主审变了还是复核变了"。
+SAFETY_PROMPT_VERSION = "safety-v1"
+
+SAFETY_SYSTEM = """你是海龟汤谜题的**直播安全复核员**。
+
+## 你的唯一任务
+
+只回答一个问题: **这段谜底能不能在直播间直接念出来?**
+
+不要管题目好不好玩、结构对不对、推理公不公平、配额够不够 —— 那些
+**不是**你的事, 已经有别人判过了。你**只**判安全。
+
+## 判据
+
+**普通死亡**(不涉及下面三类的)作为剧情事实 -> **可以(true)**。
+
+以下任一为真 -> **false**:
+
+  * 以**自伤 / 自杀**为主题或核心动机;
+  * 以**性暴力**为核心情节;
+  * 写**血腥细节**(虐杀 / 肢解 / 具体伤口的感官描写), 或把极端
+    伤害本身当噱头。
+
+以儿童 / 家庭严重暴力作为**核心冲击点** -> false。
+
+## 怎么读这道题
+
+你看到的是最终的**谜面 + 谜底**。要判的是"如果主播在直播间把这段
+谜底念出来, 会不会变成拿惨案当乐子"。
+
+⚠️ 注意区分**主题**与**背景事实**:
+
+  ✗ 谜底的核心机制是"从尸体上取器官/部位并写具体感官细节" -> false
+  ✓ 谜底里有人死了(车祸 / 溺水 / 生病), 但死亡只是剧情事实,
+    不写血腥细节, 冲击点是"为什么"而不是"怎么死的" -> true
+
+⚠️ 宁可**严一点**: 你的 false 只是让这道题不进池(代价是一道题),
+你的漏判是让不适合的内容上播(代价是直播事故)。拿不准时判 false,
+并在 reason 里写清你犹豫什么 —— 那对复盘有用。
+"""
+
+_TOOL_SAFETY = {
+    "name": "emit_safety_check",
+    "description": "回传直播安全复核结果",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "livestream_safe": {
+                "type": "boolean",
+                "description": (
+                    "谜底能否在直播间直接念出来。普通非血腥死亡 -> "
+                    "true; 自伤/自杀主题或核心动机 / 性暴力核心情节 / "
+                    "血腥细节 -> false。"),
+            },
+            "reason": {
+                "type": "string",
+                "description": ("一句话说明判断依据(尤其 false 时)。"
+                                "最多一两句, 不要长篇分析。"),
+            },
+        },
+        "required": ["livestream_safe"],
+    },
+}
+
+
+# ======================================================================
 @dataclass
 class RiddleResult:
     puzzle: Optional[str] = None
@@ -4608,6 +4712,60 @@ class PuzzleWriter:
                     bad.append(spec.puzzle)
                     last = spec
                     last.error = "reveal 未执行调度目标: " + "; ".join(ra)
+                    continue
+            # ---- ④a R7: 独立安全复核(双门 AND) ----
+            #
+            # 位置: **Reviewer + validate 之后, truth audit 之前**。三个理由:
+            #
+            #   1. 只对"本来准备放行"的 candidate 花这次调用 —— 一稿已经被
+            #      否掉的题不该再烧一次安全复核;
+            #   2. 安全没过就**不再发** truth audit —— 省一次调用, 且拒因
+            #      准确(不是"叙事不真实", 是"不适合直播");
+            #   3. 它审的是 **fix 之后**的版本(`spec = reviewed` 已在上面
+            #      赋值), 正是最终会入池的那份文本。
+            #
+            # ## 为什么是 AND 而不是把主审那一项调准
+            #
+            # R6 实测(冻结产物重跑三次): 主审的 `livestream_safe` 是
+            # False/True/False —— **单次判定会抖**。双门 AND 下, 一道
+            # unsafe 题必须连续被两次独立调用漏判才可能进池。
+            #
+            # ## 技术失败 ≠ 不安全
+            #
+            # 复核两次都没成 -> fail-closed 不入池, 但记
+            # `safety_technical_fail` **而不是** `livestream_safe=false`。
+            # 把网关抖动写成内容判定会让复盘查错方向(G2-F 同一条纪律)。
+            if _stop():
+                break
+            sv = self.verify_safety(spec=spec, should_continue=should_continue)
+            if sv is not None:
+                m["safety_verify_calls"] = m.get("safety_verify_calls", 0) + 1
+                m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+                if sv.get("technical"):
+                    m["safety_technical_fail"] = (
+                        m.get("safety_technical_fail", 0) + 1)
+                    log.warning("出题第 %d 稿: 安全复核技术失败, 本稿放弃: %s",
+                                attempts, str(sv.get("why"))[:100])
+                    _remember(seen_why,
+                              "安全复核技术失败(网关): "
+                              + str(sv.get("why"))[:100])
+                    last = spec
+                    last.error = "安全复核技术失败: " + str(sv.get("why"))[:120]
+                    continue
+                m["safety_verified"] = bool(sv.get("livestream_safe"))
+                m["safety_reason"] = str(sv.get("reason") or "")[:200]
+                if not sv.get("livestream_safe"):
+                    # 安全门 false -> 拒稿。**不**把它加进 `bad` 之外的
+                    # 特殊处理: 与其它语义拒绝同路(下一稿换方向)。
+                    log.info("出题第 %d 稿安全复核不过: %s",
+                             attempts, str(sv.get("reason"))[:120])
+                    _remember(seen_why,
+                              "安全复核: " + str(sv.get("reason"))[:120])
+                    bad.append(spec.puzzle)
+                    last = spec
+                    last.error = ("安全复核不过: "
+                                  + (str(sv.get("reason"))[:120]
+                                     or "livestream_safe=false"))
                     continue
             # ---- ④b truth audit(Q1: 独立叙事真实性审计) ----
             #
@@ -5171,6 +5329,30 @@ class PuzzleWriter:
             return _bail("改稿后仍不合格: "
                          + "; ".join(vr2.errors + vr2.fixable),
                          "validation_reject")
+        # ---- ②a R7: 独立安全复核(双门 AND) ----
+        #
+        # 与 `gen_spec` 的 ④a 同源同口径 —— 与主 Reviewer 的
+        # `livestream_safe` 构成 AND: 两个都 true 才放行。
+        #
+        # 位置理由同 `gen_spec`: 只对本来要放行的 candidate 花这次调用;
+        # 审的是 fix 之后的版本; 没过就不必再发 truth audit。
+        if _stop():
+            return _bail()
+        sv = self.verify_safety(spec=spec, should_continue=should_continue)
+        if sv is not None:
+            m["safety_verify_calls"] = 1
+            m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+            if sv.get("technical"):
+                m["safety_technical_fail"] = 1
+                return _bail("安全复核技术失败: " + str(sv.get("why"))[:120],
+                             "safety_technical_fail")
+            m["safety_verified"] = bool(sv.get("livestream_safe"))
+            m["safety_reason"] = str(sv.get("reason") or "")[:200]
+            if not sv.get("livestream_safe"):
+                return _bail(
+                    "安全复核不过: " + (str(sv.get("reason"))[:120]
+                                        or "livestream_safe=false"),
+                    "safety_reject")
         # ---- 让路检查 ④: truth audit 之前 ----
         if _stop():
             return _bail()
@@ -7025,6 +7207,94 @@ class PuzzleWriter:
         if not (out["narrator_truthful"] and out["mechanism_consistent"]):
             out.setdefault("why", "叙事真实性/机制一致性不过")
         return out
+
+    # ------------------------------------------------------------------
+    # R7: 独立安全复核(与主 Reviewer 的 livestream_safe 构成**双门 AND**)
+    # ------------------------------------------------------------------
+    def verify_safety(self, puzzle: str = "", answer: str = "",
+                      spec: Any = None, should_continue=None,
+                      timeout: float = 60.0,
+                      max_retries: int = 0) -> Optional[dict]:
+        """只判 `livestream_safe` 的**窄复核**。返回:
+
+            {"livestream_safe": bool, "reason": str}   正常判定
+            {"livestream_safe": False, "technical": True, "why": str}
+                技术失败(fail-closed, 但**明确标出**这是技术问题)
+            None  输入本身为空(上游硬校验已经拒了, 不该走到这)
+
+        ## 为什么它只看 puzzle + answer
+
+        安全判据本身**只依赖文本内容**("这段谜底能不能念出来")。给它
+        facts / atoms / clues / signature 只会引入与安全无关的噪声, 而且
+        让复核有机会去评判"推理公不公平" —— 那不是它的职责(已经有主
+        Reviewer 判过)。窄输入换来的是**关注点单一**。
+
+        ## 顺序上它在哪
+
+            Reviewer -> validate -> **safety verify** -> truth audit
+
+        安全没过就**不再发** truth audit —— 省一次调用, 且拒因准确
+        (不是"叙事不真实", 是"不适合直播")。
+
+        ## 技术失败必须与"判 false"分开
+
+        重试一次; 第二次仍失败则返回 `technical=True` 的 fail-closed
+        结果。调用方**必须**据此记 `safety_technical_fail` 而**不是**
+        `livestream_safe=false` —— 把网关抖动伪装成"不安全"会让复盘
+        查错方向, 与 G2-F「技术失败 ≠ 语义拒绝」是同一条纪律。
+
+        ## 判据措辞
+
+        system 里**逐字复用** `_TOOL_CHECK` 的三类情形(自伤/性暴力/
+        血腥细节 + 普通死亡允许)。不新造一套措辞 —— 两套判据迟早会漂,
+        而漂了以后"主审放行、复核拒绝"会变成常态, 复盘时说不清谁对。
+        """
+        if spec is not None:
+            puzzle = puzzle or (spec.puzzle or "")
+            answer = answer or (spec.answer or "")
+        if not (puzzle or "").strip() or not (answer or "").strip():
+            return None
+        user = (f"【谜面】\n{puzzle}\n\n"
+                f"【谜底】\n{answer}")
+
+        def _stop() -> bool:
+            return bool(should_continue is not None and not should_continue())
+
+        last_err = ""
+        # 一次正常 + 一次技术重试(与 G4-R2 的 Stage B 技术重试同口径)。
+        for attempt in range(2):
+            if _stop():
+                return {"livestream_safe": False, "technical": True,
+                        "why": "让路", "interrupted": True}
+            try:
+                res = self.client.messages(
+                    SAFETY_SYSTEM, user, max_tokens=400, tool=_TOOL_SAFETY,
+                    temperature=0, timeout=timeout,
+                    max_retries=max_retries)
+            except Exception as e:              # noqa: BLE001
+                last_err = f"调用异常: {e}"
+                log.warning("安全复核第 %d 次调用异常: %s", attempt + 1, e)
+                continue
+            ti = _unwrap_tool_input(res.tool_input) if res.tool_input else {}
+            if not isinstance(ti, dict) or "livestream_safe" not in ti:
+                last_err = f"返回不合法: {str(res.tool_input)[:100]}"
+                log.warning("安全复核第 %d 次返回不合法: %r",
+                            attempt + 1, str(res.tool_input)[:120])
+                continue
+            safe = ti.get("livestream_safe")
+            # ⚠️ 类型必须真的对。`bool(None)` 是 False —— 那看着像"判了
+            # unsafe", 实际上根本没判。fail-closed 的同时必须**标出**
+            # 这是技术问题, 否则复盘会把网关故障读成内容判定。
+            if not isinstance(safe, bool):
+                last_err = f"livestream_safe 不是 bool: {safe!r}"
+                log.warning("安全复核第 %d 次类型不对: %r", attempt + 1, safe)
+                continue
+            return {"livestream_safe": safe,
+                    "reason": str(ti.get("reason") or "")[:200]}
+        # ---- 两次都没成 -> fail closed, 但**不谎报**成内容判定 ----
+        log.error("安全复核两次均技术失败, fail-closed 不入池: %s", last_err)
+        return {"livestream_safe": False, "technical": True,
+                "why": last_err or "技术失败"}
 
     @staticmethod
     def _audit_failed(why: str) -> dict:

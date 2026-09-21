@@ -143,7 +143,37 @@ log = logging.getLogger(__name__)
 #:
 #: 代价与 v9 相同且要一起做: **prewarm 补池**。这次多一层紧迫性 ——
 #: 不能只当"形状不同"处理, 旧库存里可能**真的**含有不该上播的题。
-QUALITY_POLICY_VERSION = "quality-v10"
+#:
+#: ---- v10 -> v11 (R7) ----
+#:
+#: 理由是**可靠性**, 不是判据措辞 —— 这与 v9/v10 都不同, 值得单列。
+#:
+#: R6 对**冻结的**产物重跑三次 `check-v10`, 同一份 `puzzle`+`answer`:
+#:
+#:     行 1 (列车上/威胁)   livestream_safe: False / True  / False
+#:     行 3 (网络/假发)     livestream_safe: False / True  / 技术失败
+#:
+#: 也就是说**主 Reviewer 对安全项的判定本身会抖**。而 `livestream_safe`
+#: 是硬门: 漏一次, 那道题就上播了。判据本身没问题(False 出现过, 说明
+#: 够得着) —— 问题在**单次判定的可靠性**。
+#:
+#: R7 加了一道**独立的安全复核**(`SAFETY_PROMPT_VERSION = safety-v1`,
+#: 只判一项、只看 puzzle+answer), 与主审的 `livestream_safe` 构成
+#: **双门 AND**。于是:
+#:
+#:     v10: 主审 true                    -> 收
+#:     v11: 主审 true **且** 复核 true    -> 收
+#:
+#: 同一份 spec 在 v11 下**可能被拒而 v10 下被收**(复核判 false, 或复核
+#: 技术失败 fail-closed)。这就是"接受结果变了", 所以必须 bump ——
+#: 严格相等门会把 v10 库存隔离, 否则"只过了单门"的旧题会与新题混池。
+#:
+#: ⚠️ **不去改主审那九项的措辞**: 按 R4-R3 定下的纪律, 继续堆判据规则
+#: 会把输出推成规范手册且挡不住换说法绕过。这次一行判据都没动, 只是
+#: 把"判一次"变成"判两次且都要过"。
+#:
+#: 代价同样要一起做: **prewarm 补池**。
+QUALITY_POLICY_VERSION = "quality-v11"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
