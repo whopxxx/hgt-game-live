@@ -101,7 +101,20 @@ keyword2，其实用人工词）。
 **`riddle-v9` 数量 = 0。**（全部 6 道都是 `keyword2-v7`。）
 
 `keyword_draw_index` = 1 / 9 / 5 / 9 / 11 / 14 —— 不是恒为 1，
-即 bag 真的跨 attempt 复用了；lane 4 black / 2 red，确实混出。
+**但这一列不能直接读成"一只 bag 连续复用"**：同一个进程内 draw index
+只递增，不可能从 9 回到 5。真实情况是**两个 prefill 进程**
+（`session_seed` 分别是 `17733258656912476509` 与 `14889134290040591661`）：
+
+```
+run 1:  1 -> 9                （递增）
+run 2:  5 -> 9 -> 11 -> 14    （递增）
+```
+
+**结论（bag 确实被复用）成立，证据是"进程内严格递增"**，而不是那条
+跨进程合并序列。上一版这里是我读错了。逐题 `session_seed` 见
+`data/r5_prefill/SNAPSHOT.md`。
+
+lane 4 black / 2 red，确实混出。
 
 ### 3.2 active pool 当前
 
