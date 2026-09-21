@@ -3517,6 +3517,16 @@ def test_g4_provenance_records_vocab_and_seed():
 # ======================================================================
 # stable-refill: 直播 lease + 高水位 + 离线候选让路
 # ======================================================================
+def test_stable_refill_daemon_imports_and_defaults():
+    print("\n[stable-refill] 守护脚本可 import，CLI 默认可解析")
+    import pool_refill as pr
+    a = pr.build_parser().parse_args([])
+    check("默认每周期最多 4 次", a.attempts_per_cycle == 4,
+          a.attempts_per_cycle)
+    check("默认使用 live heartbeat", bool(a.heartbeat), a.heartbeat)
+    check("默认不是 once", a.once is False, a.once)
+
+
 def test_stable_refill_default_waterlines():
     print("\n[stable-refill] 默认水位提前")
     cfg = Config(sim_path="x")
@@ -3659,6 +3669,7 @@ def main():
         test_inverted_hysteresis_is_flagged,
         test_cli_no_prefetch_is_wired,
         # stable-refill
+        test_stable_refill_daemon_imports_and_defaults,
         test_stable_refill_default_waterlines,
         test_stable_refill_live_heartbeat_expires,
         test_stable_refill_corrupt_heartbeat_is_idle,
