@@ -198,7 +198,7 @@ window.addEventListener("load", async () => {
                     verdict: "是", comment: "", kind: "ai_player"}],
           qa_total: 1});
     check(document.getElementById("stats").textContent
-            .includes("点赞可以召唤 AI 玩家"),
+            .includes("每100点赞可以召唤 AI 玩家"),
           "应显示 AI 玩家常态而非 token 数值: "
           + document.getElementById("stats").textContent);
     const aiRow = document.querySelector(".qa-row.kind-ai_player");
@@ -1294,9 +1294,9 @@ window.addEventListener('load', async () => {
     for(let i=0;i<20;i++) send();
     check(anim()===first, 'A16 repeated snapshots do not restart animation');
     send({ai_player:{questions_earned:21,questions_available:1,questions_used:20,in_flight:true}});
-    check(document.getElementById('stats').textContent==='🤖 AI玩家正在推理…', 'A16 AI in-flight shows reasoning state only');
+    check(document.getElementById('stats').textContent==='AI玩家正在推理…', 'A16 AI in-flight shows reasoning state only');
     send({ai_player:{questions_earned:21,questions_available:0,questions_used:21,in_flight:false}});
-    check(document.getElementById('stats').textContent==='👍 点赞可以召唤 AI 玩家', 'A16 available 1 -> 0 shows no numeric flicker');
+    check(document.getElementById('stats').textContent==='每100点赞可以召唤 AI 玩家', 'A16 available 1 -> 0 shows no numeric flicker');
     check(anim()===first && !/\d/.test(notice()), 'A16 consumed token does not interrupt or number summon');
     socket.onclose(); await tick(801); send();
     check(anim()===first, 'A16 reconnect retains baseline');
@@ -1305,9 +1305,9 @@ window.addEventListener('load', async () => {
     await finish();
     check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not queue old AI');
     send({ai_player:{questions_earned:24}});
-    check(notice().includes('新的出手机会') && !/\d/.test(notice()), 'A16 delta >1 merged without numbers');
+    check(notice().includes('AI玩家已被触发') && !/\d/.test(notice()), 'A16 delta >1 merged without numbers');
     send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
-    await finish(); check(notice().includes('新的出手机会'), 'A16 pending AI events coalesce');
+    await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
     send({leaderboard:[{rank:1,user_name:'Alice',solved_count:5}]});
     check(box.dataset.kind==='leaderboard' && notice().includes('Alice 5题'), 'A16 Top3 updates default only');
