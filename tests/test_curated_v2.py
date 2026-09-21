@@ -746,8 +746,11 @@ def test_h4d1_section5_boundary_product_rulings():
     # 死亡作为普通剧情事实 = 可以 —— 断言的是"没有 death 这条门"
     check("**② 没有一条门叫 death**(死亡本身不是拒绝理由)",
           "death" not in _llm._CURATED_HARD_CHECK_FIELDS)
-    check("**② livestream_safe 的判据写明了'死亡作为剧情事实可以'**",
-          "死亡作为普通剧情事实" in _llm.check_tool(
+    check("**② livestream_safe 的判据写明了'普通死亡可以'**",
+          # ⚠️ R4-R3 把措辞从"死亡作为普通剧情事实"改成"**普通死亡**(不涉及
+          # 下面三类的)作为剧情事实" —— 因为旧措辞太宽, 自伤/性暴力/血腥
+          # 那三类也算"死亡", 于是从它底下漏了过去。这里钉的是**新**措辞。
+          "普通死亡" in _llm.check_tool(
               type("S", (), {"source_type": "curated"})()
           )["input_schema"]["properties"]["quality_checks"]
           ["properties"]["livestream_safe"]["description"])

@@ -223,10 +223,12 @@ def test_rejects_spec_with_unfixed_issues():
     print("\n[1c] 还有 fixable 未修的不能入池(它没走完质量链)")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
-        # 谜面缺收尾问句 -> validate_spec 给 can_fix(不是 fail)
+        # ⚠️ R4: 缺收尾问句**不再**是 fixable —— 无问句现在合法,
+        # 所以这样一道题应当**进得了池**。(旧行为: can_fix -> add 返回
+        # False。改成断言"进得去", 防止那条契约被接回来。)
         s = good_spec(puzzle="灯塔守塔人只在退潮时亮灯, 涨潮后熄掉。")
         s.fair_clues = [FairClue(quote="只在退潮时亮灯", supports_atoms=["a1"])]
-        check("缺收尾问句被判 fixable", pool.add(s) is False)
+        check("**无问句现在可以进池**", pool.add(s) is True)
 
 
 def test_no_cached_approval():
@@ -709,12 +711,15 @@ def test_director_falls_back_when_pool_empty():
             # "来源不是 keyword2_live" 这条断言会红, 但红的原因是夹具
             # 不全而不是行为不对。这里给最小实现: Stage A 返回 None
             # (= 没成题), 于是走 failure 分支, 但路径确实经过了 keyword2。
-            def gen_keyword_idea(self, *a, **k):
+            def gen_keyword_story(self, *a, **k):
                 called["kw"] = called.get("kw", 0) + 1
                 return None
 
+            def gen_surface(self, *a, **k):
+                raise AssertionError("Story 没成题, Surface 不该被调")
+
             def structure_original_idea(self, *a, **k):
-                raise AssertionError("Stage A 没成题, Stage B 不该被调")
+                raise AssertionError("Story 没成题, Structure 不该被调")
 
             def hint(self, *a, **k):
                 return ("h", None)
@@ -770,7 +775,10 @@ def test_live_generation_classic_when_keyword_disabled():
                 called["n"] += 1
                 return good_spec()
 
-            def gen_keyword_idea(self, *a, **k):
+            def gen_keyword_story(self, *a, **k):
+                raise AssertionError("--no-keyword-seed 时不该走 keyword2")
+
+            def gen_surface(self, *a, **k):
                 raise AssertionError("--no-keyword-seed 时不该走 keyword2")
 
             def hint(self, *a, **k):
@@ -1799,8 +1807,8 @@ def test_real_v3_to_v4_quarantine():
         v3.quality_policy_version = "quality-v3"
         _raw_pool(cfg.pool_path, v3)
         pool = PuzzlePool.open(cfg)
-        check("当前政策确实是 v8",
-              QUALITY_POLICY_VERSION == "quality-v8", QUALITY_POLICY_VERSION)
+        check("当前政策确实是 v9",
+              QUALITY_POLICY_VERSION == "quality-v10", QUALITY_POLICY_VERSION)
         check("pending 看得见(盘上有候选)", pool.pending_count() == 1,
               pool.pending_count())
         check("**stock == 0**(v3 已失去 live 资格)", pool.stock_count() == 0,

@@ -541,7 +541,8 @@ class PuzzleSpec:
     #:
     #: 与 `answer` 的分工(这是 v5 最重要的拆分):
     #:     answer      = 完整解释, 允许背景、补充、故事性细节
-    #:     core_answer = 一句话核心, 必须直接回答谜面最后那个问题,
+    #:     core_answer = 一句话核心, 直接解释谜面的主要异常 / 核心悬念
+    #:                   (若谜面本来有明确问题, 就直接回答它),
     #:                   不能依赖额外脑补, 推荐 ≤60 汉字, 硬上限 80, 不换行
     #:
     #: 为什么需要它: 直播里"揭晓"过去是让第二个 LLM 把文学谜底重新加工
@@ -983,14 +984,6 @@ META_MARKS = ("【谜底】", "【提示】", "【答案】", "【汤底】", "�
 
 def has_meta_text(puzzle: str) -> bool:
     return any(m in (puzzle or "") for m in META_MARKS)
-
-
-_CLOSING_Q = re.compile(r"[?？][\"'”’」』）)】\s]*$")
-
-
-def has_closing_question(puzzle: str) -> bool:
-    """谜面结尾是不是问句(海龟汤的硬格式要求)。"""
-    return bool(_CLOSING_Q.search((puzzle or "").strip()))
 
 
 _FIRST_PERSON = re.compile(r"我")

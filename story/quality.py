@@ -28,7 +28,7 @@ from .puzzle import (
     ATOM_ROLES, DOMAINS, EMOTION_MODES, FACT_KINDS, FACT_VISIBILITY,
     GRIEF_MODES, MECHANISM_FAMILIES, RELATIONS, REVEAL_MODES, SOLUTION_SHAPES,
     TIME_SHAPES,
-    PuzzleBlueprint, PuzzleSignature, PuzzleSpec, has_closing_question,
+    PuzzleBlueprint, PuzzleSignature, PuzzleSpec,
     has_meta_text, is_first_person, quote_in_puzzle,
 )
 
@@ -77,14 +77,73 @@ log = logging.getLogger(__name__)
 #:     说出核心机制, 合同却永远覆盖不满, 于是一串"是"之后无语揭晓。
 #:   - v6 起 `completion_contract_minimal` 增加"不得严于 core_answer":
 #:     做删除测试 —— 删掉某个身份/权限/制度/职业/流程细节后, 观众仍然
-#:     能回答谜面最后的问题, 那个细节就不属于 completion。
+#:     能完整解释谜面的主要异常 / 核心悬念, 那个细节就不属于 completion。
 #:   - `Answer` 侧同时新增 completion verifier(见 `story/llm.py`), 但那
 #:     只补 `established_fact_ids`, **不产生第二个胜利入口**。
 #:
 #: 为什么必须 bump 政策版本而不是兼容 v5: 盘上已经存在按 quality-v5
 #: Reviewer 生成的题, 它们正是这次真实故障的来源。不 bump 的话修完
 #: prompt 旧题仍然能进直播 —— 所以 v5 一律 quarantine, 不迁移、不猜。
-QUALITY_POLICY_VERSION = "quality-v8"
+#:
+#: ## v8 -> v9(R4): **"谜面必须有结尾问句"这条不再成立**
+#:
+#: 这是本轮唯一改的接受标准, 也是它必须 bump 的原因 —— 不是"生成方式
+#: 变了", 而是**什么算合格**变了:
+#:
+#:   * v8: `validate_spec` 对"谜面结尾不是问句"报一个 `can_fix`, 于是
+#:     它进 `fixable`, `PuzzlePool.add()` 直接挡下(见 `tests/test_pool.py`)
+#:     —— 除非 reviewer 补一句提问, 否则这道题进不了库。
+#:   * v9: **无结尾问句是合法的**, 零 fixable。
+#:
+#: 为什么该删: R2/R3 两个实验里 reviewer 反复因为"谜面结尾不是问句"
+#: 要求补一个提问, 而 R4 的新 Surface 阶段产出的正是**短汤面** ——
+#: 一个从汤底截出来的反常瞬间, 本来就不自带收束提问。强求一句会把
+#: 问句 hard gate 从侧门装回来。
+#:
+#: ## v9 -> v10(R4-R3): **`livestream_safe` 判据写具体了**
+#:
+#: 上一版只写"重口、过度刺激、以极端伤害本身作为噱头 -> false"这么一句
+#: 概括。实测它**漏过**了自伤主题与以性暴力为核心情节的题 —— smoke 里
+#: 那两道真的通过了 Stage B。现在逐条列明三类情形(自伤/自杀主题、
+#: 性暴力核心、血腥细节), 并明确"普通非血腥死亡仍然可以"。
+#:
+#: bump 的理由与 v9 同型: `livestream_safe` 在自由生成链的**硬门切片**
+#: 里, 它为 false 直接拒稿 —— 所以这是**接受结果**变了, 不是描述变细。
+#: 盘上的 `quality-v9` 库存必须一起隔离(它们可能含有不该上播的题)。
+#:
+#: ⚠️ **代价, 不要让它在部署时悄悄发生**: `story/pool.py` 的准入是
+#: `spec_policy == QUALITY_POLICY_VERSION` 的**严格相等**(见那里的
+#: `_validate_pool_spec`)。所以 bump 之后盘上那批 `quality-v8` 库存
+#: **自动失去 live eligibility** —— 不迁移、不删除(行仍在 `pool.jsonl`
+#: 里, 只是被挡住)。这是**有意的**: 旧题是在"必须有问句"的政策下被
+#: 接受的, 与新题的形状不同, 不可混在一起上场。上线前需要一次
+#: **prewarm 重新补池**, 与 G4-CF 记的那次 pool rotation 是同一个动作。
+#:
+#: ---- v9 -> v10 (R4-R3) ----
+#:
+#: 理由与 v9 不同, 但同样成立: **接受标准真的变了** —— 只是这次变的是
+#: `livestream_safe` 那条门。
+#:
+#: 上一版的判据是一句概括("重口、过度刺激、以极端伤害本身作为噱头"),
+#: 实测**挡不住**自伤主题与以性暴力为核心情节的题 —— smoke 里它们真的
+#: 通过了 Stage B 并进了正式链。现在判据逐条写明了三类情形(自伤/自杀
+#: 主题、性暴力核心、血腥细节), 并明确"普通非血腥死亡仍然可以"。
+#:
+#: ⚠️ **为什么这次必须连 policy 一起 bump**(而 R4 那次 check 与 policy
+#: 是分开的): `livestream_safe` **在自由生成链的硬门切片里**
+#: (`_quality_check_contract` 的 `[:9]`, 见 `_QUALITY_CHECK_FIELDS`),
+#: 它为 false 会**直接拒稿**。也就是说同一份 spec:
+#:
+#:     v9 的判据 -> livestream_safe=true  -> 收
+#:     v10 的判据 -> livestream_safe=false -> 拒
+#:
+#: 这是**接受结果**变了, 不是"判定口径描述得更细"。所以盘上那批
+#: `quality-v9` 库存必须一起隔离 —— 否则"v9 下被判安全"的题会与新题
+#: 混在同一池里上场, 而那正是这次要修的洞。
+#:
+#: 代价与 v9 相同且要一起做: **prewarm 补池**。这次多一层紧迫性 ——
+#: 不能只当"形状不同"处理, 旧库存里可能**真的**含有不该上播的题。
+QUALITY_POLICY_VERSION = "quality-v10"
 
 #: 默认看最近多少题
 RECENT_WINDOW = 10
@@ -195,7 +254,6 @@ class ValidationResult:
 #: 每加一条新的 `can_fix()` 规则, 这里**应当**同步加一行; 忘了加不会
 #: 出错(落到 "other"), 只是指标少一个维度 —— 这个方向比"猜错"安全。
 _FIX_REASON_PATTERNS = (
-    ("puzzle_question", "谜面结尾不是问句"),
     ("puzzle_person", "谜面是第一人称叙事"),
     ("puzzle_meta", "谜面混进了"),
     ("fact_enum", "的 kind 非法"),
@@ -238,8 +296,8 @@ _CORE_COUNT_MARK = "[只改分类]"
 #:
 #: R2 的第一版只给 core-count 装了字段守卫, 判据是"`own_fix_focus` 里
 #: **有没有** core-count"。那个判据在**混合修复**上会误伤: 若同一稿既有
-#: `core hidden=4` 又有"谜面缺结尾问句", 前者要求"一个字都不许动",
-#: 后者要求"必须补一个问句" —— 一刀切就会把**本来合法的**补问句判成越界。
+#: `core hidden=4` 又有"谜面是第一人称", 前者要求"一个字都不许动",
+#: 后者要求"改成第三人称" —— 一刀切就会把**本来合法的**改人称判成越界。
 #:
 #: 正确做法是**每一种 fixable 只开放它自己的域**, 而不是"有 core-count
 #: 就全部冻结"。所以守卫变成"取并集": 本次点名要修的每一种, 各自贡献一组
@@ -298,7 +356,10 @@ FIX_DOMAINS = (
     # (它们都引用谜面文本), 而那是正当的连带改动。
     # ⚠️ R2-R2 第一版把它标成 strict, 于是"第一人称 -> 第三人称"这类修复
     # 被逐项冻结整个拒掉 —— 实测打红 `test_llm` 里 6 条真实回归。
-    (("谜面结尾不是问句", "谜面是第一人称叙事", "谜面混进了"),
+    # ⚠️ R4: 原来的 `"谜面结尾不是问句"` 已随该 can_fix 规则一起删除。
+    # 删规则与删这里的键**必须同时做** —— 键是字符串匹配 can_fix 文案的,
+    # 只删一边会让字段冻结守卫静默失效(见 `_PUZZLE_TOUCH_MARK` 那段说明)。
+    (("谜面是第一人称叙事", "谜面混进了"),
      ("puzzle",), True),
     # 枚举填错 -> **loose**: 这类修复同样会整套同步(`review_ok()` 回的是
     # 重新生成的一整套 facts/atoms/clues)。实测逐项冻结会把它判成越界,
@@ -436,12 +497,15 @@ def validate_spec(spec: PuzzleSpec,
         r.fail(f"谜底超过直播展示硬上限 {ANSWER_HARD_MAX_LEN} 字")
 
     # ---- 谜面格式 ----
-    # 注意: 这三样归 `can_fix` 而不是 `fail` —— 审稿人改一句话就能救,
+    # 注意: 这两样归 `can_fix` 而不是 `fail` —— 审稿人改一句话就能救,
     # 整题重出会把一道好题丢掉(实测: 只差一个人称)。
+    #
+    # ⚠️ R4: "谜面结尾没有问句"这条 `can_fix` **已经删掉**。
+    # 它不是被降级, 是被删除 —— 短汤面(由独立 Surface 阶段从汤底截出的
+    # 一个反常瞬间)本来就不自带收束提问。R2/R3 实测里 reviewer 反复因为
+    # "谜面结尾不是问句"要求补一句提问, 而那与"这道题是不是好海龟汤"
+    # 无关。留着它 = 把问句 hard gate 从侧门装回来。
     if spec.puzzle:
-        if not has_closing_question(spec.puzzle):
-            r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面结尾不是问句, "
-                      f"末尾补一句'为什么?'")
         if is_first_person(spec.puzzle):
             r.can_fix(f"{_PUZZLE_TOUCH_MARK} 谜面是第一人称叙事, "
                       f"改成第三人称客观事实")
