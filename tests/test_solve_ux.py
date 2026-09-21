@@ -751,7 +751,7 @@ def test_closeout_b2_v5_must_have_contract():
     ]
     vr3 = validate_spec(sp3)
     check("legacy 空合同 -> 旧 gate 仍可", vr3.ok, vr3.why())
-    check("版本常量确实是 v11", _Q == "quality-v11", _Q)
+    check("版本常量确实是 v12", _Q == "quality-v12", _Q)
     # 运行时"有没有合同"仍表示实际状态, 但准入层已保证 v5 必有合同
     check("has_completion_contract 仍是运行时判据",
           ident_spec().has_completion_contract())
@@ -1381,12 +1381,12 @@ def test_v6_versions_bumped():
     from story.llm import (ANSWER_PROMPT_VERSION, CHECK_PROMPT_VERSION,
                            RIDDLE_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
-    check("QUALITY_POLICY_VERSION == quality-v11",
-          QUALITY_POLICY_VERSION == "quality-v11", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION == quality-v12",
+          QUALITY_POLICY_VERSION == "quality-v12", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v10",
-          CHECK_PROMPT_VERSION == "check-v10", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v11",
+          CHECK_PROMPT_VERSION == "check-v11", CHECK_PROMPT_VERSION)
     check("ANSWER_PROMPT_VERSION == answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
     # v8 bump 到 4: discovery_beats 改了 PuzzleSpec 的 schema。

@@ -1226,14 +1226,26 @@ RIDDLE_PROMPT_VERSION = "riddle-v9"
 #:
 #: `livestream_safe` 的判据**写具体了**。旧版只有"重口、过度刺激、以极端
 #: 伤害本身作为噱头 -> false"这一句概括 —— 实测有自伤主题与以性暴力为
-#: 核心情节的题从它底下**漏过去了**(smoke 里真的发生了)。现在把三类情形
+#: 核心情节的题从它底下**漏过去了**(smoke 里真的发生了)。v10 把三类情形
 #: 逐条列明(自伤/自杀主题、性暴力核心、血腥细节), 并明确"普通非血腥死亡
 #: 仍然可以"。
 #:
-#: 这是**判定口径变了**: 同一个 spec 在 v9 下 livestream_safe=true, 在
-#: v10 下可能 false。所以 bump。`QUALITY_POLICY_VERSION` **不同步动** ——
-#: 见下面 §R4-R3 的理由(接受标准没变, 变的是判据写得够不够具体)。
-CHECK_PROMPT_VERSION = "check-v10"
+#: R8-A: v10 -> v11。`v10` 那版在"三类情形"之外还留了两句**泛化**措辞
+#: ("会不会变成拿惨案当乐子" / 隐含的"拿不准就拒"), 模型于是自行扩张成
+#: "死亡/亡魂/犯罪是核心 = 不安全", 把大量本来完全可播的凶案与灵异题材
+#: 判死。v11 把口径收回到**明确五条边界**:
+#:
+#:     未明确命中五条之一 -> true(拿不准不是判 false 的理由)
+#:
+#: 同一份 spec 在 v11 下**可能 livestream_safe=true 而 v10 下 false**,
+#: 所以 bump —— 这次动的是**主审自己的判据文案**(`_TOOL_CHECK` 的
+#: `livestream_safe.description`, 两条链共用), 属于"Reviewer prompt /
+#: schema 文案真的变了"。
+#:
+#: 注意与 R4-R3 的 v9->v10 是**相反方向**: 那次是收紧(补三类情形),
+#: 这次是收掉泛化(边界一条没少, 双门 AND 也没删)。两次都 bump, 因为
+#: 两次都让同一份 spec 的判定结果变了。
+CHECK_PROMPT_VERSION = "check-v11"
 #: ---- G2-F: 审稿技术失败重试时的 max_tokens ----
 #:
 #: 实播里审稿的输出触顶 3500 导致工具调用没写完。成因就是预算不够 ——
@@ -1875,12 +1887,17 @@ _CURATED_SIGNAL_FIELDS = (
 #: 也就是说 `dramatic_payoff` / `reasoning_beats_nonredundant` 现在是
 #: **双标的**: 对 AI 原创是硬门(前八项), 对 curated 是信号。
 def _quality_check_contract(spec: Any) -> tuple:
-    """这道题该按哪一份 `quality_checks` 清单验收。
+    """这道题该按哪一份 `quality_checks` 清单**记录/索要**。
 
     ⚠️ curated 那份与 `tools.curated_compiler.CURATED_HARD_CHECKS`
     **同名同序**。测试 `test_curated_reviewer_contract_is_semantically_honest`
     断言的是**逐字相等**, 不是长度相等 —— 长度相等正是 H4-D 第一版
     漏掉这个 bug 的原因。
+
+    ⚠️ R8-A: **这不等于门**。它说的是"Reviewer 该回答哪几项"(索要 +
+    落盘), 而**不是**"哪几项 false 就拒稿"。自由生成链的门现在只有
+    六项, 见 `_free_gen_hard_gate()`。两者必须分开 —— 混成一个函数
+    正是 R8-A 之前"signal 也在当资格考试"的成因。
     """
     if str(getattr(spec, "source_type", "") or "") == "curated":
         return _CURATED_HARD_CHECK_FIELDS
@@ -1889,6 +1906,64 @@ def _quality_check_contract(spec: Any) -> tuple:
     #: ⚠️ 它必须排在 `_QUALITY_CHECK_FIELDS` 的第 9 位(紧跟四项"好不好玩"),
     #: **不能** append 到末尾 —— 末尾是题型四问, 切片会取错。
     return _QUALITY_CHECK_FIELDS[:9]
+
+
+#: **R8-A: 自由生成链真正的 fail-closed 门(六项)。**
+#:
+#: ## 为什么从九项收到六项
+#:
+#: R8-A 要解决的问题是: "大量题被 Reviewer / safety 拒绝, 但留下来的题
+#: 也没明显更好"。诊断是 —— 后三项(`clue_recontextualized` /
+#: `dramatic_payoff` / `reasoning_beats_nonredundant`)问的是
+#: **"值不值得玩"**, 而它们**同时**当着**"能不能过"**的资格考试。
+#:
+#: 后果是具体的: 一道真实性、结构、安全都合格的题, 只因为 Reviewer
+#: 觉得"不够戏剧化"就被整稿丢掉 —— 而丢掉的这一稿与"重出的下一稿"
+#: 在**正确性**上并没有差别, 只是掷了一次骰子。补池吞吐因此被压死,
+#: 而留下的题并不更好(它们只是恰好在这三项上被点了头)。
+#:
+#: ## 降级 ≠ 删除
+#:
+#: 这三项仍然:
+#:   * 由 Reviewer **回答**(在 `_quality_check_contract` 的九项里);
+#:   * **写入** `quality_checks` 并落盘(R6 的 observability 不动)。
+#:
+#: 只是不再拿它们**拒稿**。复盘仍然能看到"这一批的 dramatic_payoff
+#: 分布如何" —— 我们只是不再用它当淘汰线。
+#:
+#: ## 三门仍然 fail closed
+#:
+#: 真实性 / 结构一致性 / 安全边界三项**一项都没松**:
+#:     narrator_truthful         编造叙事 -> 拒
+#:     mechanism_consistent      机关自相矛盾 -> 拒
+#:     core_answer_direct        答非所问 -> 拒
+#:     completion_contract_minimal  通关合同不最小 -> 拒
+#:     concrete_anomaly          没有具体反常点 -> 拒
+#:     livestream_safe           命中安全边界 -> 拒
+_FREE_GEN_HARD_CHECK_FIELDS = (
+    "narrator_truthful", "mechanism_consistent",
+    "core_answer_direct", "completion_contract_minimal",
+    "concrete_anomaly",
+    "livestream_safe",
+)
+
+
+def _free_gen_hard_gate() -> tuple:
+    """自由生成链的 fail-closed 清单(R8-A: 九项 -> 六项)。
+
+    与 `_quality_check_contract` 的关系是**真子集**, 不是另一套清单:
+    门里的每一项都必须仍在索要清单里, 否则会出现"拿一个 Reviewer 从没
+    被问过的字段去拒稿"。`test_r8a_hard_gate_is_a_subset_of_contract`
+    钉的就是这条。
+    """
+    return _FREE_GEN_HARD_CHECK_FIELDS
+
+
+def _gate_fields(spec: Any) -> tuple:
+    """**拒稿**判据。curated 仍走它自己的硬门, 自由生成走六项。"""
+    if str(getattr(spec, "source_type", "") or "") == "curated":
+        return _CURATED_HARD_CHECK_FIELDS
+    return _free_gen_hard_gate()
 
 
 def _record_quality_checks(m: dict, checks: Any) -> None:
@@ -3287,17 +3362,35 @@ _TOOL_CHECK = {
                         "type": "boolean",
                         "description": (
                             "**是否适合直播?**(§十 —— **不随题型标准放宽**)\n"
-                            "**普通死亡**(不涉及下面三类的)作为剧情事实 -> "
-                            "**可以(true)**。\n"
-                            "以下任一为真 -> **false**:\n"
+                            "\n"
+                            "═══ 什么**不算**不安全(不得据此判 false)═══\n"
+                            "\n"
+                            "普通、**非血腥**的死亡 / 犯罪 / 谋杀 / 亡魂 / "
+                            "鬼怪 / 恐怖氛围 —— **即使它是谜底核心** —— "
+                            "都不因此判 false。\n"
+                            "\n"
+                            "明确**不得**仅因为下列理由判 false:\n"
+                            "  * 死亡是核心;\n"
+                            "  * 犯罪 / 谋杀是核心;\n"
+                            "  * 出现亡魂 / 鬼怪 / 超自然;\n"
+                            "  * 气氛阴暗 / 恐怖;\n"
+                            "  * \"可能让人有点不适\"这类泛化的主观感觉。\n"
+                            "\n"
+                            "海龟汤本来就有大量凶案与灵异题材, 这是类型"
+                            "特征, 不是安全隐患。\n"
+                            "\n"
+                            "═══ 只有明确命中下列边界才 false ═══\n"
+                            "\n"
                             "  * 以**自伤 / 自杀**为主题或核心动机;\n"
                             "  * 以**性暴力**为核心情节;\n"
-                            "  * 写**血腥细节**(虐杀 / 肢解 / 具体伤口的"
-                            "感官描写), 或把极端伤害本身当噱头。\n"
-                            "以儿童 / 家庭严重暴力作为**核心冲击点** -> "
-                            "false。\n"
-                            "自问: 这段谜底能不能在直播间直接念出来? 念出来"
-                            "会不会变成拿惨案当乐子?"),
+                            "  * 写**血腥、具体伤害的感官细节**(虐杀 / 肢解 / "
+                            "具体伤口的描写);\n"
+                            "  * 把**极端伤害本身**当猎奇卖点;\n"
+                            "  * 以**儿童 / 家庭严重暴力**作为核心冲击点。\n"
+                            "\n"
+                            "**未明确命中以上任一条 -> true。**\n"
+                            "拿不准时**不是**判 false 的理由 —— 拿不准就"
+                            "按上面五条逐条对照: 对不上就是 true。"),
                     },
                     "clue_recontextualized": {
                         "type": "boolean",
@@ -4222,44 +4315,70 @@ _TOOL_TRUTH_AUDIT = {
 #: 安全复核的 prompt 版本号。**独立开号** —— 与 `CHECK_PROMPT_VERSION`
 #: 分开: 复核的措辞会独立演化, 合成一个号会让复盘时分不清"这题被拒是
 #: 因为主审变了还是复核变了"。
-SAFETY_PROMPT_VERSION = "safety-v1"
+#:
+#: R8-A: v1 -> v2。判据口径**实质变了**(见 `QUALITY_POLICY_VERSION` 的
+#: (b) 段): 从"泛化不适感可以判 false"收回到"只有明确命中五条边界才
+#: false, 未命中一律 true"。同一份 puzzle+answer 在 v2 下**可能被判
+#: true 而 v1 下判 false**, 所以必须开新号。
+#:
+#: ⚠️ 与主审 `livestream_safe` 的措辞是**两处同改**: 只改一处会让双门
+#: AND 继续卡死 —— 复核放宽了但主审还在按"惨案当乐子"拒, 题照样进不来。
+SAFETY_PROMPT_VERSION = "safety-v2"
 
 SAFETY_SYSTEM = """你是海龟汤谜题的**直播安全复核员**。
 
 ## 你的唯一任务
 
-只回答一个问题: **这段谜底能不能在直播间直接念出来?**
+只回答一个问题: **这段谜底是否明确命中了下面的安全边界?**
 
 不要管题目好不好玩、结构对不对、推理公不公平、配额够不够 —— 那些
 **不是**你的事, 已经有别人判过了。你**只**判安全。
 
-## 判据
+## 什么**不算**不安全(不得据此判 false)
 
-**普通死亡**(不涉及下面三类的)作为剧情事实 -> **可以(true)**。
+普通、**非血腥**的死亡 / 犯罪 / 谋杀 / 亡魂 / 鬼怪 / 恐怖氛围 ——
+**即使它是谜底核心** —— 都不因此判 false。
 
-以下任一为真 -> **false**:
+明确**不得**仅因为下列理由判 false:
+
+  * 死亡是核心;
+  * 犯罪 / 谋杀是核心;
+  * 出现亡魂 / 鬼怪 / 超自然;
+  * 气氛阴暗 / 恐怖;
+  * "可能让人有点不适"这类泛化的主观感觉。
+
+海龟汤这个类型本来就有大量凶案与灵异题材 —— 那是**类型特征**,
+不是安全隐患。把这些判成 false 会让整个题库空掉, 而那些题并没有
+任何越界内容。
+
+## 只有明确命中下列边界才 false
 
   * 以**自伤 / 自杀**为主题或核心动机;
   * 以**性暴力**为核心情节;
-  * 写**血腥细节**(虐杀 / 肢解 / 具体伤口的感官描写), 或把极端
-    伤害本身当噱头。
-
-以儿童 / 家庭严重暴力作为**核心冲击点** -> false。
+  * 写**血腥、具体伤害的感官细节**(虐杀 / 肢解 / 具体伤口的描写);
+  * 把**极端伤害本身**当猎奇卖点;
+  * 以**儿童 / 家庭严重暴力**作为核心冲击点。
 
 ## 怎么读这道题
 
-你看到的是最终的**谜面 + 谜底**。要判的是"如果主播在直播间把这段
-谜底念出来, 会不会变成拿惨案当乐子"。
+你看到的是最终的**谜面 + 谜底**。要判的只有一件事:
+**它有没有命中上面那五条之一。**
 
 ⚠️ 注意区分**主题**与**背景事实**:
 
   ✗ 谜底的核心机制是"从尸体上取器官/部位并写具体感官细节" -> false
-  ✓ 谜底里有人死了(车祸 / 溺水 / 生病), 但死亡只是剧情事实,
+  ✓ 谜底里有人死了(车祸 / 溺水 / 被杀), 但死亡只是剧情事实,
     不写血腥细节, 冲击点是"为什么"而不是"怎么死的" -> true
 
-⚠️ 宁可**严一点**: 你的 false 只是让这道题不进池(代价是一道题),
-你的漏判是让不适合的内容上播(代价是直播事故)。拿不准时判 false,
-并在 reason 里写清你犹豫什么 —— 那对复盘有用。
+## ⚠️ 未明确命中 -> true(这一条必须遵守)
+
+**未明确命中以上任一条 -> true。**
+
+拿不准时**不是**判 false 的理由。拿不准就意味着"它没有明确命中
+那五条" —— 那就是 true。判 false 必须有**能对上具体某一条**的依据,
+并在 reason 里指出是哪一条。
+
+不要把"读起来沉重 / 阴暗 / 让人不舒服"当成第六条款边界: 它不是。
 """
 
 _TOOL_SAFETY = {
@@ -4271,14 +4390,17 @@ _TOOL_SAFETY = {
             "livestream_safe": {
                 "type": "boolean",
                 "description": (
-                    "谜底能否在直播间直接念出来。普通非血腥死亡 -> "
-                    "true; 自伤/自杀主题或核心动机 / 性暴力核心情节 / "
-                    "血腥细节 -> false。"),
+                    "谜底是否**明确命中**安全边界。未明确命中 -> true。"
+                    "普通非血腥的死亡/犯罪/谋杀/亡魂/鬼怪/恐怖氛围"
+                    "(即使为核心) -> true; 只有自伤自杀主题或核心动机 / "
+                    "性暴力核心情节 / 血腥具体伤害细节 / 极端伤害当卖点 / "
+                    "儿童家庭严重暴力当核心冲击点 -> false。"),
             },
             "reason": {
                 "type": "string",
-                "description": ("一句话说明判断依据(尤其 false 时)。"
-                                "最多一两句, 不要长篇分析。"),
+                "description": ("一句话说明判断依据。判 false 时必须指出"
+                                "命中了上面哪一条。最多一两句, 不要长篇"
+                                "分析。"),
             },
         },
         "required": ["livestream_safe"],
@@ -6325,7 +6447,11 @@ class PuzzleWriter:
             bad.append("quality_checks 缺失")
         else:
             from tools.curated_compiler import check_value_ok
-            _qc_bad = [n for n in _quality_check_contract(spec)
+            # ⚠️ R8-A: 用 `_gate_fields`(**拒稿**判据), 不是
+            # `_quality_check_contract`(索要清单)。两者从 R8-A 起
+            # 不再相等 —— 自由生成链索要九项(含三项 signal), 但只拿
+            # 六项拒稿。写成同一个函数正是"signal 也在当资格考试"的成因。
+            _qc_bad = [n for n in _gate_fields(spec)
                        if not check_value_ok(n, qc.get(n))]
             if _qc_bad:
                 bad.append("quality_checks 未全过(" + ", ".join(_qc_bad) + ")")
