@@ -519,8 +519,14 @@ def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
     上**显式打开**, 并传一个实现了两条新方法的 writer(`_KeywordWriter`)。
     这样"哪条链被测到"在调用点一眼可见, 而不是靠默认值猜。
     """
+    # 机制测试固定旧的 2→5 / playable=1 / reveal 7→2 / max=10。
+    # 这些用例测的是状态机，不应该随着生产默认水位变化而偷偷换题意。
     cfgkw.setdefault("pool_min_size", 2)
     cfgkw.setdefault("pool_target_size", 5)
+    cfgkw.setdefault("pool_playable_min", 1)
+    cfgkw.setdefault("pool_reveal_target_size", 7)
+    cfgkw.setdefault("pool_reveal_playable_target", 2)
+    cfgkw.setdefault("pool_max_size", 10)
     cfgkw.setdefault("pool_keyword_seed_enabled", False)
     cfg = mkcfg(tmp, **cfgkw)
     if pool is None:
@@ -1786,9 +1792,11 @@ def test_playable_min_zero_restores_q9_behavior():
 
 def test_max_size_below_target_is_flagged():
     print("\n[L1-J] Config 抓 max < target")
-    w = Config(sim_path="x", pool_target_size=5, pool_max_size=3).validate()
+    base = dict(pool_min_size=2, pool_target_size=5,
+                pool_reveal_target_size=7, pool_reveal_playable_target=2)
+    w = Config(sim_path="x", pool_max_size=3, **base).validate()
     check("max<target 有告警", any("硬上限" in x for x in w), w)
-    w2 = Config(sim_path="x", pool_target_size=5, pool_max_size=10).validate()
+    w2 = Config(sim_path="x", pool_max_size=10, **base).validate()
     check("正常配置无此告警", not any("硬上限" in x for x in w2), w2)
     w3 = Config(sim_path="x", pool_playable_min=-1).validate()
     check("playable_min 为负有告警", any("playable_min" in x for x in w3), w3)
@@ -2121,7 +2129,7 @@ def test_u1_guard_config_validation():
           c.reveal_hold_seconds)
     check("默认 core_focus 是 15s", c.reveal_core_focus_seconds == 15.0,
           c.reveal_core_focus_seconds)
-    check("默认 reveal_target 是 7", c.pool_reveal_target_size == 7,
+    check("默认 reveal_target 是 12", c.pool_reveal_target_size == 12,
           c.pool_reveal_target_size)
     # ---- G1: guard 必须覆盖一轮补池预算 ----
     # 早先默认 15s, 但一轮 prefetch 可能跑几十秒 —— "只剩 18 秒"照样
