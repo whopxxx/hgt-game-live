@@ -1882,6 +1882,11 @@ class Director:
         return 1 if self._archive_failed else 0
 
 
+def _split_probe_profiles(raw) -> list:
+    """`"a, b"` -> `["a", "b"]`。空白与空段一律丢掉。"""
+    return [p.strip() for p in str(raw or "").split(",") if p.strip()]
+
+
 def main(argv=None) -> int:
     cfg = from_args(argv)
     log_file = cfg.log_file
@@ -1890,7 +1895,54 @@ def main(argv=None) -> int:
         # 事后还能翻。用固定名覆盖, 免得 data/ 里堆一堆日志。
         log_file = os.path.join("data", "run.log")
     setup_logging(cfg.log_level, log_file or None)
+    # ---- Step 12C: gift_capture_diagnostic ----
+    # 诊断模式**在直播之前**单独跑一段, 不参与 Director 的业务循环 ——
+    # 它不接任何业务回调, 也不该被业务生命周期影响。真实直播验收时
+    # (Issue §真实直播验收流程)就是这么用的: 先开诊断采一轮证据, 再决定
+    # 下一步查哪一层。
+    if getattr(cfg, "gift_capture_diagnostic", False):
+        return _run_gift_capture_diagnostic(cfg)
     return Director(cfg).run()
+
+
+def _run_gift_capture_diagnostic(cfg) -> int:
+    """跑诊断模式, 并把结果打成一份可读的日志。
+
+    ⚠️ profile 名字拼错时**直接报错退出**(而不是忽略): 那种情况下实验
+    会变成"看起来跑了三路, 其实只跑了两路", 而日志上完全正常。宁可起不来。
+    """
+    from story.gift_probe.runner import (            # noqa: E402
+        DEFAULT_SUMMARY_INTERVAL_SECONDS,
+        run_gift_capture_diagnostic,
+    )
+    names = _split_probe_profiles(getattr(cfg, "gift_probe_profiles", ""))
+    try:
+        result = run_gift_capture_diagnostic(
+            cfg,
+            profile_names=names,
+            limit=getattr(cfg, "gift_probe_limit", 3),
+            probe_root=getattr(cfg, "gift_probe_dir",
+                               os.path.join("data", "gift_probe")),
+            summary_interval_seconds=float(getattr(
+                cfg, "gift_probe_summary_seconds",
+                DEFAULT_SUMMARY_INTERVAL_SECONDS)),
+            max_per_method=int(getattr(cfg, "gift_probe_max_per_method", 20)))
+    except ValueError as e:
+        # profile 名拼错 / probe 目录配置非法 —— 这类是**配置错误**,
+        # 必须让用户看见, 不能吞。
+        log.error("gift probe 配置错误: %s", e)
+        print(f"!!! gift probe 配置错误: {e}", file=sys.stderr, flush=True)
+        return 2
+    log.info("gift probe 结束: session=%s 证据目录=%s",
+             result["session_id"], result["session_dir"])
+    for p in result["profiles"]:
+        # 逐路打一行**结论**: 现场最需要的就是这一行(见 Issue §D 的四层判据)。
+        log.info("gift probe 结论 profile=%s auth=%s verdict=%s "
+                 "gift_family=%s parsed=%s emitted=%s",
+                 p.get("profile"), p.get("auth"), p.get("verdict"),
+                 p.get("gift_family_methods"), p.get("parsed_gift_count"),
+                 p.get("emitted_gift_count"))
+    return 0
 
 
 if __name__ == "__main__":

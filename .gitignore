@@ -25,6 +25,17 @@ data/_*.py
 # Chrome 直播窗口的用户数据目录(160MB+)
 data/_liveprofile/
 
+# ---- Step 12C: gift 抓取诊断的证据目录 ----
+# `data/gift_probe/<session-id>/<profile>/` 里装的是**原始 protobuf
+# payload**("method 名含 Gift"与"parse_error"两类)以及语义 JSONL。
+# 它们可能含观众资料(昵称/uid), 而且体量随直播时长增长 —— 两条理由
+# 都决定它们不能入库。
+#
+# ⚠️ 用 `data/gift_probe/` 而不是 `data/**/Gift*`: 前者是一条能覆盖
+# 整个证据目录的规则(包含 index.jsonl / session_summary.json / *.bin),
+# 后者要靠文件命名去猜, 漏一种就会把现场样本推进仓库。
+data/gift_probe/
+
 # ---- 外部题库(Batch H) ----
 # 抓下来的原始 dump + 归一后的 curated_raw。**绝不入库**:
 #   1. 体量大(SE 抓一轮就是几 MB, 全量 dump 是 GB 级);
