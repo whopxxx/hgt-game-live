@@ -1997,6 +1997,99 @@ def test_full_fallback_chain_reaches_archive():
           rec.get("blueprint_specified") is False, rec.get("blueprint_specified"))
 
 
+def test_archive_reveal_carries_quality_and_safety_evidence():
+    """**R7 复审**: 走**完整正式归档链**守住 quality_checks / safety_*。
+
+    ## 为什么必须走 `_archive_reveal`, 不能只测 `_round_metrics`
+
+    `_round_metrics` 只是"算一份 dict"; 而真正决定**直播 `puzzle.jsonl`
+    里有什么**的是 `_archive_reveal` -> `json.dumps` -> 文件这一整条。
+    两者之间任何一步漏字段(比如 record 组装时挑了字段、或者落盘用了别
+    的 dict), 单测 `_round_metrics` 都看不见。
+
+    这个坑本项目已经踩过三次(G4-E、R4 provenance、R7), 而 R6 之所以只能
+    靠"重跑冻结产物"去猜原始判定, 正是因为 `quality_checks` 从没进过
+    这个文件。所以这里**读回真文件**, 断言的就是下一轮复盘会拿到的那个
+    JSON。
+    """
+    import io
+    import json
+    import os
+    import tempfile
+    from director import Director
+    from story.puzzle import PuzzleSpec
+
+    cfg = mkcfg()
+    out = os.path.join(tempfile.gettempdir(), "_hgt_arch_r7.jsonl")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg.puzzle_out_path = out
+
+    d = Director(cfg)
+    d.engine.start()
+    sp = PuzzleSpec.from_dict({
+        "puzzle": "题。为什么?", "answer": "底",
+        "facts": [{"id": "f1", "text": "事实一事实", "kind": "core"}],
+        "solve_atoms": [{"id": "a1", "role": "cause", "text": "c",
+                         "fact_ids": ["f1"]},
+                        {"id": "a2", "role": "mechanism", "text": "m",
+                         "fact_ids": ["f1"]}],
+        "fair_clues": [{"quote": "题。为什么?", "supports_atoms": ["a1"]}]})
+    sp.metrics = {
+        # 主审原样返回的九项 —— 这是**证据**, 必须整份进 archive
+        "quality_checks": {"livestream_safe": False,
+                           "narrator_truthful": True,
+                           "core_answer_direct": True},
+        "safety_verified": False,
+        "safety_reason": "血腥细节",
+        "safety_prompt_version": "safety-v1",
+        "safety_verify_calls": 2,
+        "safety_technical_fail": 0,
+    }
+    d._archive_reveal({"puzzle": sp.puzzle, "answer": sp.answer,
+                       "reason": "giveup", "winner": "", "spec": sp}, "揭晓")
+
+    rec = json.loads(io.open(out, encoding="utf-8").read().strip())
+    m = rec["metrics"]
+    check("**quality_checks 整份进了真文件**",
+          m.get("quality_checks") == {"livestream_safe": False,
+                                      "narrator_truthful": True,
+                                      "core_answer_direct": True},
+          m.get("quality_checks"))
+    check("**safety_verified 进了真文件**",
+          m.get("safety_verified") is False, m.get("safety_verified"))
+    check("**safety_reason 进了真文件**",
+          m.get("safety_reason") == "血腥细节", m.get("safety_reason"))
+    check("**safety_prompt_version 进了真文件**",
+          m.get("safety_prompt_version") == "safety-v1",
+          m.get("safety_prompt_version"))
+    check("**safety_verify_calls 进了真文件(且是 2)**",
+          m.get("safety_verify_calls") == 2, m.get("safety_verify_calls"))
+    check("**safety_technical_fail 进了真文件**",
+          m.get("safety_technical_fail") == 0,
+          m.get("safety_technical_fail"))
+
+    # ---- 缺省形状: 老题 / 兜底题 / --no-llm 的假题 ----
+    out2 = os.path.join(tempfile.gettempdir(), "_hgt_arch_r7b.jsonl")
+    if os.path.exists(out2):
+        os.remove(out2)
+    cfg2 = mkcfg()
+    cfg2.puzzle_out_path = out2
+    d2 = Director(cfg2)
+    d2.engine.start()
+    d2._archive_reveal({"puzzle": "兜底。为什么?", "answer": "底",
+                        "reason": "giveup", "winner": ""}, "揭晓")
+    m2 = json.loads(io.open(out2, encoding="utf-8").read().strip())["metrics"]
+    check("**兜底题: quality_checks 是空 dict 不是 null**",
+          m2.get("quality_checks") == {}, m2.get("quality_checks"))
+    check("**兜底题: safety_verified 缺省 None(没判过 ≠ 判了 false)**",
+          m2.get("safety_verified") is None, m2.get("safety_verified"))
+    check("**兜底题: 计数缺省 0**",
+          m2.get("safety_verify_calls") == 0
+          and m2.get("safety_technical_fail") == 0,
+          (m2.get("safety_verify_calls"), m2.get("safety_technical_fail")))
+
+
 def test_archive_records_review_latency_total():
     """Q7(第三轮 review): 审稿耗时是**累计**值, 不是"最后一次"。"""
     import io
@@ -3923,6 +4016,7 @@ def main():
              test_archive_metrics_survive_missing_spec,
              test_archive_fallback_does_not_inherit_previous_metrics,
              test_archive_records_review_latency_total,
+             test_archive_reveal_carries_quality_and_safety_evidence,
              test_full_fallback_chain_reaches_archive,
              # ---- P0-2 / P0-3 ----
              test_retry_riddle_keeps_avoid_and_recent,

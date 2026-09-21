@@ -1260,6 +1260,30 @@ class Director:
             "keyword_session_seed": gen.get("keyword_session_seed"),
             "keyword_draw_index": int(gen.get("keyword_draw_index") or 0),
         })
+        # ---- R7: 主审 quality_checks + 安全复核证据 ----
+        #
+        # ⚠️ 第三次踩同一个坑(前两次是 G4-E 与 R4 provenance): 这些键在
+        # `spec.metrics` 里躺着, 但本函数是**白名单搬运**, 不搬整个 metrics
+        # —— 不显式列出来, 正式直播的 `puzzle.jsonl` 里就**没有**。
+        #
+        # 这一次的代价比前两次更直接: R6 的诊断之所以只能靠"重跑冻结产物"
+        # 去猜, 正是因为原始 `quality_checks` 没落盘; 而 R7 的双门 AND 是
+        # 靠 `safety_verified` / `safety_technical_fail` 才分得清"判了 false"
+        # 与"网关抖了"。这些数不进 archive, 下一轮复盘就要把 R6 的弯路
+        # 再走一遍。
+        #
+        # `quality_checks` 是主审原样返回的九项判定, 直接搬整份 dict ——
+        # 它是**证据**, 不是我们能挑字段重算的东西(挑字段就等于二次解释)。
+        out.update({
+            "quality_checks": dict(gen.get("quality_checks") or {}),
+            "safety_verified": gen.get("safety_verified"),
+            "safety_reason": str(gen.get("safety_reason") or ""),
+            "safety_prompt_version":
+                str(gen.get("safety_prompt_version") or ""),
+            "safety_verify_calls": int(gen.get("safety_verify_calls") or 0),
+            "safety_technical_fail":
+                int(gen.get("safety_technical_fail") or 0),
+        })
         return out
 
     # ---- 离线(--no-llm)用的固定内容 ----
