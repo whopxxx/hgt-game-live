@@ -2,7 +2,7 @@
 
 Issue #23「按调用阶段配置可插拔模型路由」的回归:
 
-    stage override  ->  AI_MODEL  ->  config/models.json  ->  code default
+    stage override -> env -> config/llm.local.json -> config/models.json -> code default
 
 这个套件守的是**否定性**命题居多("配了 stage 不代表别的 stage 也跟着变"
 / "某个 stage 已警告过不代表别的 stage 的错配被吞掉"), 那类命题最容易
@@ -167,6 +167,102 @@ def _call(c, fake, **kw):
     finally:
         urllib.request.urlopen = orig
     return r, (fake.bodies[-1] if fake.bodies else None)
+
+
+# ======================================================================
+# 0. 本地 llm.local.json: URL / key / 模型 / 预算都能从一个文件配置
+# ======================================================================
+def test_local_llm_config_covers_endpoint_credentials_models_and_budgets():
+    import os
+    import story.config as C
+
+    payload = {
+        "base_url": "http://llm-gateway.example:9000",
+        "api_key": "secret-sentinel-123",
+        "default": B,
+        "puzzle.story": A,
+        "qa.judge": A,
+        "timeout": 42,
+        "max_tokens": 1234,
+        "max_retries": 1,
+    }
+    fd, path = tempfile.mkstemp(prefix="hgt_llm_local_", suffix=".json")
+    os.close(fd)
+    old_path = C.LLM_LOCAL_CONFIG_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        C.LLM_LOCAL_CONFIG_PATH = path
+        _clean_env()
+
+        clear = dict(
+            AI_BASE_URL=None, AI_API_KEY=None, AI_TIMEOUT=None,
+            AI_MAX_TOKENS=None, AI_MAX_RETRIES=None,
+        )
+        with _Env(**clear):
+            cfg = LLMConfig()
+            check("**local base_url 生效**",
+                  cfg.base_url == payload["base_url"], cfg.base_url)
+            check("**local api_key 生效**",
+                  cfg.api_key == payload["api_key"], cfg.api_key)
+            check("**local default model 生效**", cfg.model == B, cfg.model)
+            check("**local stage override 生效**",
+                  cfg.model_for("puzzle.story") == A
+                  and cfg.model_for("qa.judge") == A,
+                  cfg.stage_models)
+            check("**没写的 stage 继承 local default**",
+                  cfg.model_for("hint") == B, cfg.model_for("hint"))
+            check("**local timeout/max_tokens/max_retries 生效**",
+                  (cfg.timeout, cfg.max_tokens, cfg.max_retries) == (42.0, 1234, 1),
+                  (cfg.timeout, cfg.max_tokens, cfg.max_retries))
+            check("**启动日志不会吐出完整 API key**",
+                  payload["api_key"] not in json.dumps(cfg.masked(), ensure_ascii=False),
+                  cfg.masked())
+
+        # env 仍然是高级覆盖。
+        with _Env(AI_BASE_URL="http://env-gateway:8088",
+                  AI_API_KEY="env-secret",
+                  AI_MODEL=A,
+                  AI_MODEL_PUZZLE_STORY=B,
+                  AI_TIMEOUT="9",
+                  AI_MAX_TOKENS="321",
+                  AI_MAX_RETRIES="0"):
+            cfg2 = LLMConfig()
+            check("**env base_url/api_key 高于 local**",
+                  cfg2.base_url == "http://env-gateway:8088"
+                  and cfg2.api_key == "env-secret",
+                  (cfg2.base_url, cfg2.api_key))
+            check("**AI_MODEL 压掉 local stage，env stage 再覆盖**",
+                  cfg2.model == A
+                  and cfg2.model_for("puzzle.story") == B
+                  and cfg2.model_for("qa.judge") == A,
+                  (cfg2.model, cfg2.stage_models))
+            check("**env budgets 高于 local**",
+                  (cfg2.timeout, cfg2.max_tokens, cfg2.max_retries) == (9.0, 321, 0),
+                  (cfg2.timeout, cfg2.max_tokens, cfg2.max_retries))
+
+        # local 文件拼错字段必须 fail-fast。
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"api_ulr": "typo"}, fh)
+        try:
+            C._load_llm_local_config(path)
+            check("**local 未知 key 必须报错**", False, "未报错")
+        except ValueError as e:
+            check("**local 未知 key 明确报错**", "api_ulr" in str(e), str(e))
+
+        # 真正含 key 的本地文件必须被 gitignore。
+        root = Path(__file__).resolve().parents[1]
+        gi = (root / ".gitignore").read_text(encoding="utf-8")
+        check("**llm.local.json 被 gitignore**",
+              "config/llm.local.json" in gi)
+        check("**仓库提供无真实凭据的 example**",
+              (root / "config" / "llm.example.json").exists())
+    finally:
+        C.LLM_LOCAL_CONFIG_PATH = old_path
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 # ======================================================================
@@ -1214,6 +1310,7 @@ def main():
     print("=" * 64)
     _clean_env()
     for t in (
+        test_local_llm_config_covers_endpoint_credentials_models_and_budgets,
         test_simple_models_json_config_and_precedence,
         test_global_model_only_all_stages_fall_back,
         test_single_stage_override_is_isolated,
