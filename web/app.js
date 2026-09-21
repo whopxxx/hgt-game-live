@@ -685,17 +685,32 @@
         timer = setTimeout(done, duration);
       } else {
         box.dataset.motion = reduced.matches ? "static" : "slide";
+        const slideMs = 1000;
         if (!reduced.matches) {
+          const total = hold + slideMs * 2;
           animation = text.animate([
             {transform: `translateX(${width}px)`, offset: 0},
-            {transform: "translateX(0)", offset: 300 / (hold + 600)},
-            {transform: "translateX(0)", offset: (hold + 300) / (hold + 600)},
+            {transform: "translateX(0)", offset: slideMs / total},
+            {transform: "translateX(0)", offset: (hold + slideMs) / total},
             {transform: `translateX(${-width}px)`, offset: 1},
-          ], {duration: hold + 600, fill: "forwards"});
+          ], {duration: total, fill: "forwards"});
         }
-        timer = setTimeout(done, hold + (reduced.matches ? 0 : 600));
+        timer = setTimeout(done, hold + (reduced.matches ? 0 : slideMs * 2));
       }
     }
+
+    // Empty leaderboard is a quiet baseline state: keep the scheduler armed
+    // without rendering placeholder copy or starting a pointless animation.
+    function showEmptyLeaderboard() {
+      cancel();
+      active = "leaderboard";
+      box.dataset.kind = "leaderboard";
+      box.dataset.motion = "static";
+      text.textContent = "";
+      currentMessage = "";
+      measuredWidth = box.clientWidth;
+    }
+
     function pump() {
       if (phase !== "qa" || active) return;
       if (pendingAI) {
@@ -715,7 +730,11 @@
         lastPresetId = items[index].id; // Advance even when interrupted by AI.
         nextPreset = performance.now() + interval();
         show("📢 游戏公告 " + items[index].text, "preset");
-      } else show(defaultText, "leaderboard");
+      } else if (defaultText) {
+        show(defaultText, "leaderboard");
+      } else {
+        showEmptyLeaderboard();
+      }
     }
     function update(s) {
       const value = (s.ai_player || {}).questions_earned;
@@ -744,7 +763,7 @@
       const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
       const nextDefault = rows.length
         ? "📢 本场猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
-        : "📢 游戏公告 猜中汤底即可登上本场猜汤榜";
+        : "";
       const changed = nextDefault !== defaultText;
       defaultText = nextDefault;
       if (phase !== s.phase) {
@@ -801,12 +820,14 @@
       }
     }, 250);
     reduced.addEventListener("change", () => {
-      if (active) show(currentMessage, active);
+      if (active === "leaderboard" && !currentMessage) showEmptyLeaderboard();
+      else if (active) show(currentMessage, active);
       else pump();
     });
     new ResizeObserver(() => {
       if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
-        show(currentMessage, active); // Debug width changed: remeasure pages/motion.
+        if (active === "leaderboard" && !currentMessage) showEmptyLeaderboard();
+        else show(currentMessage, active); // Debug width changed: remeasure pages/motion.
       }
     }).observe(box);
     return {update};
