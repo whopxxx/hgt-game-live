@@ -1,7 +1,43 @@
 {
-  "base_url": "http://127.0.0.1:8080",
-  "api_key": "填你自己的 API key",
-  "default": "deepseek-v4.1-flash",
+  "providers": {
+    "A": {
+      "base_url": "https://api-a.example.com",
+      "api_key": "填接口 A 的 API key"
+    },
+    "B": {
+      "base_url": "https://api-b.example.com",
+      "api_key": "填接口 B 的 API key"
+    }
+  },
+
+  "models": {
+    "a1": {
+      "provider": "A",
+      "model": "填接口 A 的模型 1"
+    },
+    "a2": {
+      "provider": "A",
+      "model": "填接口 A 的模型 2"
+    },
+    "b1": {
+      "provider": "B",
+      "model": "填接口 B 的模型 1"
+    },
+    "b2": {
+      "provider": "B",
+      "model": "填接口 B 的模型 2"
+    }
+  },
+
+  "default": "a1",
+
+  "puzzle.story": "b2",
+  "puzzle.surface": "b2",
+  "puzzle.structure": "b2",
+  "puzzle.review": "a2",
+  "qa.answer": "a1",
+  "qa.judge": "b1",
+
   "timeout": 60,
   "max_tokens": 700,
   "max_retries": 3

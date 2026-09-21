@@ -975,14 +975,13 @@ class LLMResult:
 class AnthropicMessagesClient:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        self._url = cfg.base_url.rstrip("/") + "/v1/messages"
-        # 错配按 (stage, requested, actual) 三元组去重。
+        # 错配按 (provider, stage, requested, actual) 四元组去重。
         #
         # 为什么不能再用一个 bool: 多模型之后每个 stage 的 request/actual
         # 组合是**独立**的。一个全局 bool 会让第一个错配把后面所有 stage
         # 的错配全部吞掉 —— 换个模型重配好之后, 另一个 stage 还在错配,
         # 而日志里一条都不剩。
-        self._warned_model_mismatches: set[tuple[str, str, str]] = set()
+        self._warned_model_mismatches: set[tuple[str, str, str, str]] = set()
 
     # ------------------------------------------------------------------
     def messages(self, system: str, user: str,
@@ -1029,9 +1028,12 @@ class AnthropicMessagesClient:
         """
         to = self.cfg.timeout if timeout is None else timeout
         mr = self.cfg.max_retries if max_retries is None else max_retries
-        # 模型解析集中在配置层。传 stage -> 由 `model_for` 查表;
-        # 传 model -> 显式覆盖(测试/诊断)。两者都不传 -> 全局模型。
-        requested_model = model if model is not None else self.cfg.model_for(stage)
+        # 路由解析集中在配置层。一次解析同时决定 provider / endpoint /
+        # api_key / actual model。model 参数仍是测试/诊断逃生口, 也允许传 alias。
+        route = (self.cfg.route_for_selector(model)
+                 if model is not None else self.cfg.route_for(stage))
+        requested_model = route.model
+        request_url = route.base_url.rstrip("/") + "/v1/messages"
         body = {
             "model": requested_model,
             "max_tokens": max_tokens or self.cfg.max_tokens,
@@ -1048,32 +1050,35 @@ class AnthropicMessagesClient:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": self.cfg.api_key,
+            "x-api-key": route.api_key,
             "anthropic-version": "2023-06-01",
         }
 
         last_err = "unknown"
         tool_name = tool["name"] if tool else "(文本)"
         t_call = time.monotonic()
-        _detail("→ LLM %s stage=%s requested_model=%s max_tokens=%s "
-                "system=%d字 user=%d字\n      user=%s",
-                tool_name, stage or "(未标注)", requested_model,
+        _detail("→ LLM %s provider=%s stage=%s selector=%s requested_model=%s "
+                "max_tokens=%s system=%d字 user=%d字\n      user=%s",
+                tool_name, route.provider, stage or "(未标注)",
+                route.alias or requested_model, requested_model,
                 max_tokens or self.cfg.max_tokens,
                 len(system), len(user), _clip(user, 500))
         for attempt in range(mr + 1):
             try:
-                req = urllib.request.Request(self._url, data=data,
+                req = urllib.request.Request(request_url, data=data,
                                             headers=headers, method="POST")
                 with urllib.request.urlopen(req, timeout=to) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 r = self._parse(raw, want_tool=tool is not None,
                                 budget=body.get("max_tokens") or 0,
-                                stage=stage, requested_model=requested_model)
+                                stage=stage, requested_model=requested_model,
+                                requested_provider=route.provider)
                 u = r.usage or {}
-                _detail("← LLM %s stage=%s requested_model=%s actual_model=%s "
-                        "%.1fs in=%s out=%s err=%s\n      结果=%s",
-                        tool_name, stage or "(未标注)", requested_model,
-                        r.model or "(未回)", time.monotonic() - t_call,
+                _detail("← LLM %s provider=%s stage=%s requested_model=%s "
+                        "actual_model=%s %.1fs in=%s out=%s err=%s\n      结果=%s",
+                        tool_name, route.provider, stage or "(未标注)",
+                        requested_model, r.model or "(未回)",
+                        time.monotonic() - t_call,
                         u.get("input_tokens", "?"), u.get("output_tokens", "?"),
                         r.error or "无",
                         _clip(r.tool_input if r.tool_input is not None else r.text, 500))
@@ -1086,14 +1091,17 @@ class AnthropicMessagesClient:
                 except Exception:
                     pass
                 if code not in _RETRYABLE_STATUS:
-                    log.warning("LLM HTTP %s (不重试): %s", code, snippet[:120])
+                    log.warning("LLM HTTP %s provider=%s (不重试): %s",
+                                code, route.provider, snippet[:120])
                     return LLMResult(error=f"HTTP {code}: {snippet}",
                                      stage=stage, requested_model=requested_model)
                 last_err = f"HTTP {code}: {snippet}"
-                log.warning("LLM HTTP %s, 第 %d 次重试…", code, attempt + 1)
+                log.warning("LLM HTTP %s provider=%s, 第 %d 次重试…",
+                            code, route.provider, attempt + 1)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = f"{type(e).__name__}: {e}"
-                log.warning("LLM 网络错误(%s), 第 %d 次重试…", last_err, attempt + 1)
+                log.warning("LLM 网络错误 provider=%s (%s), 第 %d 次重试…",
+                            route.provider, last_err, attempt + 1)
 
             if attempt < mr:
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
@@ -1136,7 +1144,8 @@ class AnthropicMessagesClient:
     # ------------------------------------------------------------------
     def _parse(self, raw: str, want_tool: bool = False,
                budget: int = 0, stage: Optional[str] = None,
-               requested_model: Optional[str] = None) -> LLMResult:
+               requested_model: Optional[str] = None,
+               requested_provider: str = "legacy") -> LLMResult:
         try:
             d = json.loads(raw)
         except json.JSONDecodeError as e:
@@ -1148,13 +1157,15 @@ class AnthropicMessagesClient:
         # 多模型下前者是错的: 配了 stage override 时, 网关正确返回 B 也会
         # 被判成错配(因为 B != 全局 A) —— 那是假警报, 会淹没真警报。
         req_model = requested_model
+        mismatch_key = (
+            requested_provider, stage or "(未标注)", req_model or "", got_model or "")
         if (got_model and req_model and got_model != req_model
-                and (stage, req_model, got_model)
-                not in self._warned_model_mismatches):
-            log.warning("模型错配 stage=%s requested=%s actual=%s —— "
+                and mismatch_key not in self._warned_model_mismatches):
+            log.warning("模型错配 provider=%s stage=%s requested=%s actual=%s —— "
                         "网关静默换了模型, 配置可能无效",
-                        stage or "(未标注)", req_model, got_model)
-            self._warned_model_mismatches.add((stage, req_model, got_model))
+                        requested_provider, stage or "(未标注)",
+                        req_model, got_model)
+            self._warned_model_mismatches.add(mismatch_key)
 
         text = None
         tool_input = None

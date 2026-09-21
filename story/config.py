@@ -32,13 +32,18 @@ AI_SUPPORTED_MODELS_EXTRA_ENV = "AI_SUPPORTED_MODELS_EXTRA"
 
 
 def supported_models() -> frozenset[str]:
-    """内置白名单 + 本地配置 + `AI_SUPPORTED_MODELS_EXTRA`。
+    """内置白名单 + 本地显式声明模型 + 额外白名单。
 
-    只做**并集扩展** —— 不能覆盖/收窄内置集合。
+    多 provider 配置里的 `models` 本身就是 operator 对“这个真实模型名可用”
+    的显式声明，所以这些 actual model 自动进入允许集合；不需要再把同一个
+    名字抄一遍到 supported_models_extra。
     """
     local = _load_llm_local_config()
     raw_local = local.get("supported_models_extra", [])
     local_names = {str(x).strip() for x in raw_local if str(x).strip()}
+    for spec in (local.get("models") or {}).values():
+        if isinstance(spec, dict) and isinstance(spec.get("model"), str):
+            local_names.add(spec["model"].strip())
     extra = os.environ.get(AI_SUPPORTED_MODELS_EXTRA_ENV) or ""
     env_names = {x.strip() for x in extra.split(",") if x.strip()}
     return SUPPORTED_MODELS | local_names | env_names
@@ -164,11 +169,18 @@ LLM_LOCAL_CONFIG_PATH = os.path.normpath(os.path.join(
 def _load_llm_local_config(path: Optional[str] = None) -> dict:
     """读取本地 LLM 配置；文件不存在时返回空 dict。
 
-    允许的顶层 key:
-      base_url / api_key / default / timeout / max_tokens / max_retries
-      + 所有 LLM stage 名。
+    支持两种格式:
 
-    未知 key 直接报错，避免手滑后“看起来配了，其实没生效”。
+    1) 旧的单接口格式(继续兼容):
+       base_url / api_key / default / stage...
+
+    2) 多接口格式:
+       providers -> {name: {base_url, api_key}}
+       models    -> {alias: {provider, model}}
+       default / stage 写 model alias。
+
+    多接口模式故意要求 default/stage 引用 alias，而不是直接写真实模型名；
+    这样一个名字就能同时确定 endpoint + key + actual model，拼错也会启动失败。
     """
     p = path or LLM_LOCAL_CONFIG_PATH
     try:
@@ -185,16 +197,24 @@ def _load_llm_local_config(path: Optional[str] = None) -> dict:
         raise ValueError(f"LLM 本地配置必须是 JSON object: {p}")
 
     allowed = {
-        "base_url", "api_key", "default", "supported_models_extra",
+        "base_url", "api_key", "providers", "models",
+        "default", "supported_models_extra",
         "timeout", "max_tokens", "max_retries",
     } | set(LLM_STAGES)
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(
             f"LLM 本地配置包含未知 key {unknown}; "
-            f"已知字段: base_url/api_key/default/supported_models_extra/"
-            f"timeout/max_tokens/max_retries "
+            f"已知字段: base_url/api_key/providers/models/default/"
+            f"supported_models_extra/timeout/max_tokens/max_retries "
             f"+ {sorted(LLM_STAGES)}")
+
+    multi = ("providers" in raw) or ("models" in raw)
+    if multi and not ("providers" in raw and "models" in raw):
+        raise ValueError("多接口模式必须同时提供 providers 和 models")
+    if multi and ("base_url" in raw or "api_key" in raw):
+        raise ValueError(
+            "多接口模式不要再写顶层 base_url/api_key；请把它们放进 providers")
 
     for key in ("base_url", "api_key", "default"):
         if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
@@ -208,19 +228,80 @@ def _load_llm_local_config(path: Optional[str] = None) -> dict:
                 "LLM 本地配置 supported_models_extra 必须是非空字符串数组")
 
     if "timeout" in raw:
-        if not isinstance(raw["timeout"], (int, float)) or raw["timeout"] <= 0:
+        if (isinstance(raw["timeout"], bool)
+                or not isinstance(raw["timeout"], (int, float))
+                or raw["timeout"] <= 0):
             raise ValueError("LLM 本地配置 timeout 必须是正数")
     if "max_tokens" in raw:
-        if not isinstance(raw["max_tokens"], int) or raw["max_tokens"] <= 0:
+        if (isinstance(raw["max_tokens"], bool)
+                or not isinstance(raw["max_tokens"], int)
+                or raw["max_tokens"] <= 0):
             raise ValueError("LLM 本地配置 max_tokens 必须是正整数")
     if "max_retries" in raw:
-        if not isinstance(raw["max_retries"], int) or raw["max_retries"] < 0:
+        if (isinstance(raw["max_retries"], bool)
+                or not isinstance(raw["max_retries"], int)
+                or raw["max_retries"] < 0):
             raise ValueError("LLM 本地配置 max_retries 必须是 >= 0 的整数")
 
     for stage in LLM_STAGES:
         if stage in raw and (
                 not isinstance(raw[stage], str) or not raw[stage].strip()):
             raise ValueError(f"LLM 本地配置 {stage} 必须是非空字符串")
+
+    if multi:
+        providers = raw["providers"]
+        models = raw["models"]
+        if not isinstance(providers, dict) or not providers:
+            raise ValueError("LLM 本地配置 providers 必须是非空 object")
+        if not isinstance(models, dict) or not models:
+            raise ValueError("LLM 本地配置 models 必须是非空 object")
+
+        for name, provider in providers.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("provider 名必须是非空字符串")
+            if not isinstance(provider, dict):
+                raise ValueError(f"provider {name!r} 必须是 object")
+            extra = sorted(set(provider) - {"base_url", "api_key"})
+            missing = sorted({"base_url", "api_key"} - set(provider))
+            if extra or missing:
+                raise ValueError(
+                    f"provider {name!r} 字段错误: 缺少 {missing}, 多余 {extra}")
+            for key in ("base_url", "api_key"):
+                if (not isinstance(provider[key], str)
+                        or not provider[key].strip()):
+                    raise ValueError(
+                        f"provider {name!r}.{key} 必须是非空字符串")
+
+        for alias, spec in models.items():
+            if not isinstance(alias, str) or not alias.strip():
+                raise ValueError("model alias 必须是非空字符串")
+            if not isinstance(spec, dict):
+                raise ValueError(f"model alias {alias!r} 必须是 object")
+            extra = sorted(set(spec) - {"provider", "model"})
+            missing = sorted({"provider", "model"} - set(spec))
+            if extra or missing:
+                raise ValueError(
+                    f"model alias {alias!r} 字段错误: 缺少 {missing}, 多余 {extra}")
+            provider = spec.get("provider")
+            model = spec.get("model")
+            if (not isinstance(provider, str) or provider not in providers):
+                raise ValueError(
+                    f"model alias {alias!r} 引用了未知 provider {provider!r}")
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError(
+                    f"model alias {alias!r}.model 必须是非空字符串")
+
+        if "default" not in raw:
+            raise ValueError("多接口模式必须设置 default model alias")
+        selectors = {"default": raw["default"]}
+        selectors.update({
+            stage: raw[stage] for stage in LLM_STAGES if stage in raw
+        })
+        for where, alias in selectors.items():
+            if alias not in models:
+                raise ValueError(
+                    f"{where}={alias!r} 不是已定义的 model alias；"
+                    f"可选: {sorted(models)}")
 
     return raw
 
@@ -277,8 +358,37 @@ def _load_model_config_file(path: Optional[str] = None) -> tuple[str, dict[str, 
     return default, stages
 
 
+@dataclass(frozen=True)
+class LLMRoute:
+    """一次请求最终使用的完整路由。api_key 永不进入 repr。"""
+
+    provider: str
+    base_url: str
+    api_key: str = field(repr=False)
+    model: str
+    alias: Optional[str] = None
+
+
+def _configured_routes() -> dict[str, LLMRoute]:
+    """读取 alias -> provider/model 路由；旧单接口配置返回空 dict。"""
+    local = _load_llm_local_config()
+    providers = local.get("providers") or {}
+    models = local.get("models") or {}
+    out: dict[str, LLMRoute] = {}
+    for alias, spec in models.items():
+        p = providers[spec["provider"]]
+        out[alias] = LLMRoute(
+            provider=spec["provider"],
+            base_url=p["base_url"].strip(),
+            api_key=p["api_key"].strip(),
+            model=spec["model"].strip(),
+            alias=alias,
+        )
+    return out
+
+
 def _configured_base_url() -> str:
-    """AI_BASE_URL > llm.local.json > 代码默认值。"""
+    """legacy/fallback endpoint；多 provider alias 自己携带 endpoint。"""
     env = os.environ.get("AI_BASE_URL")
     if env:
         return env
@@ -287,7 +397,7 @@ def _configured_base_url() -> str:
 
 
 def _configured_api_key() -> str:
-    """AI_API_KEY > llm.local.json > 代码默认值。"""
+    """legacy/fallback key；多 provider alias 自己携带 key。"""
     env = os.environ.get("AI_API_KEY")
     if env:
         return env
@@ -296,7 +406,7 @@ def _configured_api_key() -> str:
 
 
 def _configured_global_model() -> str:
-    """AI_MODEL > llm.local.json default > models.json default > 代码默认值。"""
+    """返回全局 model selector：可是真实模型名，也可以是本地 model alias。"""
     env = os.environ.get("AI_MODEL")
     if env:
         return env
@@ -308,7 +418,7 @@ def _configured_global_model() -> str:
 
 
 def _configured_stage_models() -> dict[str, str]:
-    """解析 stage override。
+    """解析 stage selector override（值可为 model alias 或真实模型名）。
 
     优先级:
       AI_MODEL_<STAGE> > AI_MODEL > llm.local.json stage
@@ -448,30 +558,22 @@ def parse_proxy(url: Optional[str]):
 
 @dataclass
 class LLMConfig:
-    """LLM 客户端配置。"""
+    """LLM 客户端配置。
+
+    `model` / `stage_models` 存的是 selector：旧配置下 selector 就是真实
+    模型名；多 provider 下 selector 是 a1/b2 这样的 model alias。
+    """
 
     base_url: str = field(default_factory=_configured_base_url)
     api_key: str = field(default_factory=_configured_api_key, repr=False)
     model: str = field(default_factory=_configured_global_model)
-    #: stage -> model 覆盖。**只放显式配过的 stage** —— 没配的走 `model`。
-    #:
-    #: 默认从 `AI_MODEL_<STAGE>` 读。保持"空 = 没配"的语义, 于是
-    #: `--model X` 清空它就能恢复"整场全用 X"的旧语义(见 `from_args`)。
     stage_models: dict[str, str] = field(default_factory=_configured_stage_models)
+    routes: dict[str, LLMRoute] = field(default_factory=_configured_routes, repr=False)
     timeout: float = field(default_factory=_configured_timeout)
     max_tokens: int = field(default_factory=_configured_max_tokens)
     max_retries: int = field(default_factory=_configured_max_retries)
 
-    # ------------------------------------------------------------------
-    def model_for(self, stage: str) -> str:
-        """解析某个 stage 最终该用哪个模型。
-
-        未知 stage **抛错**, 不静默回退: 静默回退会让一个拼错的 stage
-        变成"这环用了全局模型", 而配置里明明写着别的模型 —— 那种故障
-        在行为层看不出来, 只能靠这里拦住。
-
-        `stage` 允许为 None(诊断/测试用的无标签调用), 此时直接给全局模型。
-        """
+    def _selector_for(self, stage: Optional[str]) -> str:
         if stage is None:
             return self.model
         if stage not in LLM_STAGES:
@@ -479,50 +581,99 @@ class LLMConfig:
                 f"未知 LLM stage {stage!r}。已知: {sorted(LLM_STAGES)}")
         return self.stage_models.get(stage) or self.model
 
+    def route_for(self, stage: Optional[str]) -> LLMRoute:
+        """解析完整 provider + endpoint + key + actual model。"""
+        selector = self._selector_for(stage)
+        route = self.routes.get(selector)
+        if route is not None:
+            return route
+        # 旧格式 / env / CLI 直接给真实模型名时继续走 legacy endpoint。
+        return LLMRoute(
+            provider="legacy",
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=selector,
+            alias=None,
+        )
+
+    def route_for_selector(self, selector: str) -> LLMRoute:
+        """低层诊断/测试逃生口：selector 可以是 alias 或真实模型名。"""
+        route = self.routes.get(selector)
+        if route is not None:
+            return route
+        return LLMRoute(
+            provider="legacy",
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=selector,
+            alias=None,
+        )
+
+    def model_for(self, stage: Optional[str]) -> str:
+        """兼容旧调用：返回最终**真实模型名**，不是 alias。"""
+        return self.route_for(stage).model
+
     def resolved_models(self) -> dict[str, str]:
-        """所有 stage 的**最终**模型 —— 给启动日志用, 确认哪一环用了哪个。"""
-        return {s: self.model_for(s) for s in sorted(LLM_STAGES)}
+        return {stage: self.model_for(stage) for stage in sorted(LLM_STAGES)}
+
+    def resolved_routes(self) -> dict[str, LLMRoute]:
+        return {stage: self.route_for(stage) for stage in sorted(LLM_STAGES)}
 
     def set_stage(self, stage: str, model: str) -> None:
-        """显式设置一个 stage 的模型(CLI 用)。stage 必须合法。"""
         if stage not in LLM_STAGES:
             raise ValueError(
                 f"未知 LLM stage {stage!r}。已知: {sorted(LLM_STAGES)}")
         self.stage_models[stage] = model
 
     def unknown_models(self) -> list[tuple[str, str]]:
-        """返回 [(stage, model), ...] 里模型不在白名单的项。
-
-        global model 用 stage `"(global)"` 表示 —— 让 warning 能说清
-        "是全局配错了"还是"某个 stage 配错了", 而不是笼统报一句"有未知模型"。
-        """
+        """返回实际请求模型中不在允许集合的项。alias 声明的模型自动允许。"""
         allowed = supported_models()
         bad: list[tuple[str, str]] = []
-        if self.model not in allowed:
-            bad.append(("(global)", self.model))
+        default_route = self.route_for(None)
+        if default_route.model not in allowed:
+            bad.append(("(global)", default_route.model))
         for stage in sorted(LLM_STAGES):
-            m = self.stage_models.get(stage)
-            if m and m not in allowed:
-                bad.append((stage, m))
+            if stage not in self.stage_models:
+                continue
+            model = self.route_for(stage).model
+            if model not in allowed:
+                bad.append((stage, model))
         return bad
 
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        return (key[:2] + "***") if len(key) > 2 else "***"
+
     def masked(self) -> dict[str, str]:
-        """用于启动日志 —— key 打码。"""
-        key = self.api_key
-        shown = (key[:2] + "***") if len(key) > 2 else "***"
+        """用于启动日志：永远不打印完整 API key。"""
+        default_route = self.route_for(None)
+        selector = self.model
+        shown_model = (
+            f"{selector} -> {default_route.model}"
+            if default_route.alias else default_route.model
+        )
         out = {
-            "base_url": self.base_url,
-            "model": self.model,
-            "api_key": shown,
+            "base_url": default_route.base_url,
+            "provider": default_route.provider,
+            "model": shown_model,
+            "api_key": self._mask_key(default_route.api_key),
             "timeout": str(self.timeout),
             "max_tokens": str(self.max_tokens),
             "max_retries": str(self.max_retries),
         }
-        # 只在真的配了 stage override 时才列出 —— 单模型部署的启动日志
-        # 保持旧样子(不然每行都会多出 15 行"和全局一样"的噪音)。
+        if self.routes:
+            provider_urls = {
+                route.provider: route.base_url for route in self.routes.values()
+            }
+            out["providers"] = ", ".join(
+                f"{name}={url}" for name, url in sorted(provider_urls.items()))
+            out["model_aliases"] = ", ".join(
+                f"{alias}={route.provider}/{route.model}"
+                for alias, route in sorted(self.routes.items()))
         if self.stage_models:
             out["stage_models"] = ", ".join(
-                f"{s}={m}" for s, m in sorted(self.stage_models.items()))
+                f"{stage}={selector}"
+                for stage, selector in sorted(self.stage_models.items()))
         return out
 
 
@@ -1500,7 +1651,9 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
     # CLI 只会给 None 或非空串, 但没有理由依赖那个细节。
     if a.model is not None:
         llm.model = a.model
-        llm.stage_models.clear()          # 全局强覆盖 -> 清掉 env stage overrides
+        # 全局强覆盖 -> 清掉文件/env stage selectors。若 a.model 本身是 alias,
+        # route_for() 仍会用该 alias 绑定的 provider。
+        llm.stage_models.clear()
     for spec in (a.model_stage or []):
         stage, m = parse_model_stage_arg(spec)
         llm.set_stage(stage, m)

@@ -1791,9 +1791,14 @@ class Director:
             # 可能来自 env / CLI / 全局回退三条路 —— 打印来源没用, 要让
             # operator 确认的是结果。这里只有模型名, 不含 api_key。
             _banner("  LLM model routing:")
-            for stage, model in cfg.llm.resolved_models().items():
+            for stage, route in cfg.llm.resolved_routes().items():
+                selector = cfg.llm.stage_models.get(stage) or cfg.llm.model
                 marker = " (override)" if stage in cfg.llm.stage_models else ""
-                _banner(f"    {stage:24s} = {model}{marker}")
+                if route.alias:
+                    shown = f"{selector} -> {route.provider}/{route.model}"
+                else:
+                    shown = f"{route.provider}/{route.model}"
+                _banner(f"    {stage:24s} = {shown}{marker}")
         _banner(f"  渲染页面    : http://{cfg.host}:{cfg.port}/  (?debug=1 开调试)")
         if cfg.open_window:
             _banner(f"  直播窗口    : 已自动打开(最大化, 竖屏居中, 左右黑边)")
