@@ -175,55 +175,74 @@ uv run tests/test_web.py       rem 无头 Chrome 验证布局, 截图 data/previ
 
 ## 配置
 
-### LLM 配置（推荐：只改一个本地文件）
+### LLM 配置（推荐：一个本地文件管理多个接口 / 多个模型）
 
-第一次配置时，把安全示例复制成你的本地配置：
+第一次复制安全示例：
 
 ```bat
 copy config\llm.example.json config\llm.local.json
 ```
 
-然后以后只编辑：
+以后只编辑：
 
 `config/llm.local.json`
 
-默认模板不会改变当前模型路由，只需要填 API 地址和 key：
+推荐格式是“provider + model alias”两级路由。比如接口 A 有两个模型、接口 B 有两个模型：
 
 ```json
 {
-  "base_url": "http://127.0.0.1:8080",
-  "api_key": "你的 API key",
-  "default": "deepseek-v4.1-flash",
+  "providers": {
+    "A": {
+      "base_url": "https://api-a.example.com",
+      "api_key": "接口 A 的 key"
+    },
+    "B": {
+      "base_url": "https://api-b.example.com",
+      "api_key": "接口 B 的 key"
+    }
+  },
+
+  "models": {
+    "a1": {"provider": "A", "model": "model-a-1"},
+    "a2": {"provider": "A", "model": "model-a-2"},
+    "b1": {"provider": "B", "model": "model-b-1"},
+    "b2": {"provider": "B", "model": "model-b-2"}
+  },
+
+  "default": "a1",
+
+  "puzzle.story": "b2",
+  "puzzle.surface": "b2",
+  "puzzle.structure": "b2",
+  "puzzle.review": "a2",
+  "qa.answer": "a1",
+  "qa.judge": "b1",
+
   "timeout": 60,
   "max_tokens": 700,
   "max_retries": 3
 }
 ```
 
-含义：
+这里：
 
-- `base_url`：Anthropic-compatible API 根地址；程序会自己拼 `/v1/messages`
-- `api_key`：API key
-- `default`：所有未单独配置 stage 的默认模型
-- `timeout / max_tokens / max_retries`：全局 LLM 调用默认预算，可省略
-- 如果要用内置白名单之外的新模型，可选加：
-  `"supported_models_extra": ["你的新模型名"]`
+- `providers` 只管接口地址和 API key
+- `models` 给“接口 + 真实模型名”起一个短别名，例如 `a1 / a2 / b1 / b2`
+- `default` 是没单独配置 stage 时使用的 model alias
+- 每个 stage 只写 alias；程序会同时切换到正确的 URL、Key 和真实模型
+- **不用把 16 个 stage 全写出来**，未写的自动继承 `default`
 
-如果只想把“出题创作”换成另一个模型，再额外加这几行即可：
+例如上面的配置表示：
 
-```json
-{
-  "base_url": "http://127.0.0.1:8080",
-  "api_key": "你的 API key",
-  "default": "deepseek-v4.1-flash",
-
-  "puzzle.story": "glm-5.3-flash",
-  "puzzle.surface": "glm-5.3-flash",
-  "puzzle.structure": "glm-5.3-flash"
-}
+```text
+puzzle.story     -> b2 -> 接口 B / model-b-2
+puzzle.review    -> a2 -> 接口 A / model-a-2
+qa.answer        -> a1 -> 接口 A / model-a-1
+qa.judge         -> b1 -> 接口 B / model-b-1
+其他 stage       -> a1 -> 接口 A / model-a-1
 ```
 
-**不用把 16 个 stage 全写出来。** 没写的自动继承 `default`。
+多接口模式下，`default` 和 stage 必须引用已经定义过的 alias。alias 或 provider 拼错会启动失败，不会静默回退到别的接口。
 
 常用 stage：
 
@@ -235,23 +254,36 @@ copy config\llm.example.json config\llm.local.json
 - `hint`：提示
 - `reveal`：揭晓
 
-`config/llm.local.json` 已加入 `.gitignore`，因为它可以包含真实 API key；仓库只提交：
+旧的单接口格式继续兼容：
+
+```json
+{
+  "base_url": "http://127.0.0.1:8080",
+  "api_key": "你的 API key",
+  "default": "deepseek-v4.1-flash"
+}
+```
+
+`config/llm.local.json` 已加入 `.gitignore`，真实 API key 不会提交 Git；仓库只提交安全示例：
 
 `config/llm.example.json`
 
-作为安全示例。
-
-现有 `config/models.json` 保留为仓库默认模型策略，平时不需要改。最终覆盖优先级：
-
-`CLI > 环境变量 > config/llm.local.json > config/models.json > 代码默认值`
-
-所以正常直播启动仍然是：
+正常启动命令不变：
 
 ```bat
 uv run director.py --live 你的直播间ID
 ```
 
-不需要先 `set AI_BASE_URL` / `set AI_API_KEY` / `set AI_MODEL`。
+启动 banner 会显示每个 stage 的最终路由，例如：
+
+```text
+puzzle.story             = b2 -> B/model-b-2
+qa.answer                = a1 -> A/model-a-1
+```
+
+不会打印完整 API key。
+
+旧环境变量 / CLI 仍保留作为高级覆盖。直接写真实模型名时走 legacy 单接口 endpoint；写 alias 时走 alias 对应 provider。
 
 环境变量：`AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` / `AI_TIMEOUT` / `AI_MAX_TOKENS` / `AI_MAX_RETRIES`
 
