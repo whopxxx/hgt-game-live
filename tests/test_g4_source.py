@@ -2212,13 +2212,22 @@ def test_reject_labels_survive_to_stats():
                   st["reject"].get(lbl))
         check("**未知标签不计数**",
               "other" not in st["reject"], st["reject"])
-        # 分类账**不**影响退避状态机(与 fail_streak 正交)。
+        # refill-to-target: 语义拒绝是"这道候选不收", 下一次 draw 是
+        # 新故事，不需要等待；技术失败才进入 fail_streak / backoff。
         pf2 = _mk_bare_prefetcher(mkcfg(d, pool_prefetch_enabled=True))
         pf2._stock = lambda *a, **k: 3
         pf2._playable = lambda *a, **k: 2
         pf2._apply_result("gen_fail", "x", {"reject": "truth_reject"}, 1000.0)
-        check("**未知标签不会污染 fail_streak**",
+        check("**truth_reject 不污染 fail_streak**",
+              pf2._fail_streak == 0, pf2._fail_streak)
+        check("**truth_reject 不设退避**",
+              pf2._retry_at == 0.0, pf2._retry_at)
+        pf2._apply_result(
+            "gen_fail", "x", {"reject": "structure_technical_fail"}, 1000.0)
+        check("**技术失败仍进入 fail_streak**",
               pf2._fail_streak == 1, pf2._fail_streak)
+        check("**技术失败仍设退避**", pf2._retry_at > 1000.0,
+              pf2._retry_at)
         check("**空 extra 不炸**",
               pf2._apply_result("gen_fail", "x", {}, 1000.0) is None, "")
 
