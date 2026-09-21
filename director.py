@@ -47,6 +47,10 @@ from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
                        _spec_to_riddle)
 from story.pool import PuzzlePool                   # noqa: E402
+from story.live_heartbeat import (                   # noqa: E402
+    DEFAULT_INTERVAL_SECONDS as LIVE_HEARTBEAT_INTERVAL,
+    DEFAULT_PATH as LIVE_HEARTBEAT_PATH,
+    clear_live_heartbeat, write_live_heartbeat)
 from story.played import PlayedLedger               # noqa: E402
 from story.public_player import PublicPlayerCore    # noqa: E402
 from story.server import RenderServer, StateHub     # noqa: E402
@@ -191,6 +195,19 @@ class Director:
         self._narrating = threading.Lock()
         self.segment_counter = 0
         self.session_id = uuid.uuid4().hex
+        # ---- stable-refill: live 进程 lease ----
+        # 独立补池守护进程只在这个 lease 过期时工作。这里在真正打开
+        # pool / LLM 之前先写一次，避免 Director 启动期间与守护进程
+        # 同时写 generated pool。崩溃后文件会自然变 stale。
+        self._live_heartbeat_path = (
+            LIVE_HEARTBEAT_PATH if bool(getattr(cfg, "live_id", None)) else "")
+        self._live_heartbeat_thread: threading.Thread | None = None
+        if self._live_heartbeat_path:
+            write_live_heartbeat(
+                self._live_heartbeat_path,
+                phase=str(getattr(self.engine.phase, "value",
+                                  self.engine.phase) or ""),
+                session_id=self.session_id)
         self._archive_failed = False
         # blueprint 调度用的随机源。**不要用全局 random** —— 出题在 worker
         # 线程里跑, 用模块级 random 会和其他代码互相干扰, 复盘也无法重现。
@@ -1363,6 +1380,54 @@ class Director:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    def _heartbeat_phase(self) -> str:
+        try:
+            return str(getattr(self.engine.phase, "value",
+                               self.engine.phase) or "")
+        except Exception:
+            return ""
+
+    def _live_heartbeat_loop(self) -> None:
+        """直播存活 lease。失败只记 warning，绝不能影响主循环。"""
+        while not self._stop.is_set():
+            if not write_live_heartbeat(
+                    self._live_heartbeat_path,
+                    phase=self._heartbeat_phase(),
+                    session_id=self.session_id):
+                log.warning("直播心跳写入失败(离线补池会保守等待): %s",
+                            self._live_heartbeat_path)
+            self._stop.wait(LIVE_HEARTBEAT_INTERVAL)
+
+    def _start_live_heartbeat(self) -> None:
+        if not self._live_heartbeat_path:
+            return
+        if (self._live_heartbeat_thread is not None
+                and self._live_heartbeat_thread.is_alive()):
+            return
+        # run() 真正启动前再抢先刷新一次，缩短 init -> source.start 之间的窗。
+        write_live_heartbeat(
+            self._live_heartbeat_path,
+            phase=self._heartbeat_phase(),
+            session_id=self.session_id)
+        self._live_heartbeat_thread = threading.Thread(
+            target=self._live_heartbeat_loop, daemon=True,
+            name="live-heartbeat")
+        self._live_heartbeat_thread.start()
+
+    def _stop_live_heartbeat(self) -> None:
+        if not self._live_heartbeat_path:
+            return
+        try:
+            if self._live_heartbeat_thread is not None:
+                self._live_heartbeat_thread.join(timeout=0.25)
+        except Exception:
+            pass
+        if not clear_live_heartbeat(self._live_heartbeat_path):
+            # 文件可能已经被新进程接管；clear 的 pid 保护会故意返回 False。
+            _detail(log, "直播心跳未清理(可能已被新进程接管): %s",
+                    self._live_heartbeat_path)
+
+    # ------------------------------------------------------------------
     def _consume(self) -> None:
         """队列 -> 引擎。与 ws 线程解耦。"""
         while not self._stop.is_set():
@@ -1732,6 +1797,9 @@ class Director:
         for w in cfg.validate():
             log.warning("配置: %s", w)
 
+        # 真直播先声明 lease；离线补池守护进程见到新鲜心跳立即让路。
+        self._start_live_heartbeat()
+
         # 渲染服务
         self.server = RenderServer(self.hub, cfg.host, cfg.port)
         self.server.start()
@@ -1789,6 +1857,7 @@ class Director:
             log.info("收到 Ctrl-C, 退出")
         finally:
             self._stop.set()
+            self._stop_live_heartbeat()
             if self.source:
                 try:
                     self.source.stop()
