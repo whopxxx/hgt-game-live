@@ -3724,6 +3724,82 @@ def test_r4r3_livestream_safe_false_rejects_free_gen():
 
 
 
+def test_r6_quality_checks_are_persisted_into_metrics():
+    """**R6**: Reviewer 回传的 `quality_checks` 必须原样落进 metrics。
+
+    ## 为什么这条必须是回归, 而不是"加个字段"
+
+    R6 复盘时发现盘上有题**按判据应当被 `livestream_safe` 拦下却进了
+    可播池**, 而**没有任何地方记着那道门当时判了什么** —— 于是分不清:
+
+        (a) Reviewer 判 true  -> 判据+模型漏判
+        (b) Reviewer 判 false -> 代码侧的门漏了
+
+    两条的修法毫无重合。不落盘就永远分不出, 所以这个字段是**复盘能力
+    的硬前提**, 不是可有可无的元数据。
+
+    ## 变异
+
+    把任一写点的 `_record_quality_checks(...)` 删掉 -> 对应那条红。
+    两个写点(`gen_spec` / `structure_original_idea`)都要覆盖 —— 只测
+    一条会让另一条静默失效。
+    """
+    print("\n[R6-1] quality_checks 落进 metrics")
+    import io as _io
+    from story.llm import _record_quality_checks
+
+    # ---- ① 纯函数行为 ----
+    m: dict = {}
+    _record_quality_checks(m, {"red": True, "black": False})
+    check("**原样复制**(不是只存布尔结论)",
+          m.get("quality_checks") == {"red": True, "black": False},
+          m.get("quality_checks"))
+    m2: dict = {}
+    _record_quality_checks(m2, None)
+    check("非 dict 不写(空 dict 会被误读成九项全缺)",
+          "quality_checks" not in m2, m2)
+    m3: dict = {}
+    _record_quality_checks(m3, {})
+    check("空 dict 也不写", "quality_checks" not in m3, m3)
+    # 不能把调用方的 dict 挂进 metrics(别名会让后续改动串味)
+    src = {"livestream_safe": False}
+    m4: dict = {}
+    _record_quality_checks(m4, src)
+    src["livestream_safe"] = True
+    check("**存的是副本, 不是别名**",
+          m4["quality_checks"]["livestream_safe"] is False,
+          m4["quality_checks"])
+
+    # ---- ② 端到端: 走真实 `gen_spec`, 看 metrics 里有没有 ----
+    base = review_ok()
+    base["decision"] = "pass"
+    base["quality_checks"]["livestream_safe"] = True
+    fc = FakeClient([
+        LLMResult(tool_input=riddle()),
+        LLMResult(tool_input=base),
+        _truth_tool(),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    spec = w.gen_spec(blueprint=fc.default_blueprint, max_attempts=1)
+    qc = (spec.metrics or {}).get("quality_checks")
+    check("**gen_spec 端到端落盘**", isinstance(qc, dict), type(qc))
+    check("**九项都在**", isinstance(qc, dict) and len(qc) >= 9,
+          len(qc) if isinstance(qc, dict) else qc)
+    check("**含 livestream_safe**",
+          isinstance(qc, dict) and "livestream_safe" in qc,
+          sorted(qc) if isinstance(qc, dict) else qc)
+    check("**值就是 Reviewer 回的那个**",
+          isinstance(qc, dict) and qc.get("livestream_safe") is True,
+          (qc or {}).get("livestream_safe"))
+
+    # ---- ③ 两个写点都要有调用(源码层, 防止只改一处) ----
+    src_txt = _io.open(
+        Path(__file__).resolve().parents[1] / "story" / "llm.py",
+        encoding="utf-8").read()
+    n = src_txt.count("_record_quality_checks(m,")
+    check("**两个 metrics 写点都调了它**", n == 2, n)
+
+
 def test_r4r3_story_has_safety_boundary():
     """**R4-R3**: Story 有一条安全边界, 且**只有**一条。
 
@@ -5160,6 +5236,7 @@ def main():
               test_r4r3_story_has_safety_boundary,
               test_r4r3_livestream_safe_names_the_three_cases,
               test_r4r3_livestream_safe_false_rejects_free_gen,
+              test_r6_quality_checks_are_persisted_into_metrics,
               test_r4r4_surface_hides_the_why,
               test_r4_story_schema_has_no_scaffold,
               test_r4_surface_stage_returns_puzzle_only,

@@ -1891,6 +1891,47 @@ def _quality_check_contract(spec: Any) -> tuple:
     return _QUALITY_CHECK_FIELDS[:9]
 
 
+def _record_quality_checks(m: dict, checks: Any) -> None:
+    """R6: 把 Reviewer 回传的 `quality_checks` **原样**记进 metrics。
+
+    ## 为什么需要它(这不是"以后可能有用"的字段)
+
+    R6 复盘时踩到的实际形状: 盘上有 6 道 `quality-v10` 的题, 其中至少
+    一道(「假发里缠着一小块风干的头皮」)按判据**应当**被
+    `livestream_safe` 拦下, 但它进了可播池。而**没有任何地方记着那道
+    门当时判的是什么** —— `_apply_review` 只把 `observed_signature`
+    合并进 spec, `quality_checks` 是**一次性的判定输入**, 用完就丢。
+
+    于是复盘时分不清两种完全不同的事故:
+
+        (a) Reviewer 判了 `true`  -> 判据+模型漏判(要改 prompt / 加多数票)
+        (b) Reviewer 判了 `false` -> **代码侧的门漏了**(更严重, 要改代码)
+
+    这两条的修法没有一处重合, 而不落盘就**永远分不出来**。
+
+    ## 为什么原样存, 不存"是否通过"
+
+    存布尔判定会把"哪几项 false"这一最有用的信息丢掉 —— 安全门只是九项
+    之一, 复盘时经常要看的是"它是在别的项上挂掉的, 还是安全项"。原样
+    复制还免掉一个风险: 任何"加工"都可能与门本身的判定漂开, 而复盘要
+    的恰恰是**门看到的那份输入**。
+
+    ## 为什么不 bump policy
+
+    这**没有改变任何接受标准** —— 判据、门、清单一个字节没动, 只是把
+    已经发生过的判定留下来。按"同一份 spec 收不收会不会不一样"那条
+    唯一标准, 答案为否, 所以不 bump。
+
+    ## 形状
+
+    `spec.metrics["quality_checks"]` = `{字段名: bool}`。非 dict(技术
+    失败 / 空 tool_input)**不写** —— 一个空字典会被误读成"九项全缺",
+    而"压根没审成"是另一回事(`review_technical_fail` 记的就是它)。
+    """
+    if isinstance(checks, dict) and checks:
+        m["quality_checks"] = dict(checks)
+
+
 def _is_curated(spec: Any) -> bool:
     """这道题是不是外部题库搬进来的(curated)题。
 
@@ -4496,6 +4537,7 @@ class PuzzleWriter:
             m["review_decision"] = (self._last_review_decision or "").lower()
             if self._last_review_issues:
                 m["review_issues"] = list(self._last_review_issues)
+            _record_quality_checks(m, self._last_review_checks)
             if reviewed is None and technical:
                 # 技术失败已经在 `_review_spec_with_retry` 里重试过一次,
                 # 仍未成功 —— 收手时**必须**把这一稿判成"重试耗尽"而不是
@@ -5099,6 +5141,7 @@ class PuzzleWriter:
         m["review_decision"] = (self._last_review_decision or "").lower()
         if self._last_review_issues:
             m["review_issues"] = list(self._last_review_issues)
+        _record_quality_checks(m, self._last_review_checks)
         if reviewed is None:
             # ---- 技术失败与语义拒绝分开记账(与 gen_spec 同一口径) ----
             if technical:
