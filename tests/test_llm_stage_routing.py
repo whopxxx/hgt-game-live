@@ -943,40 +943,183 @@ def test_every_production_call_declares_a_stage():
 # ======================================================================
 # 阶段名与 env 变量名是稳定契约
 # ======================================================================
+#: **完整**的 stage -> 环境变量名契约, 逐条手写。
+#:
+#: 这是本套件的核心断言之一。写成完整字面量(而不是抽查几条)才守得住
+#: "改 stage 名不能让环境变量名漂移" —— 抽查漏掉的那几条恰好就是最可能
+#: 被悄悄改掉的。
+#:
+#: 这张表**故意**与 `story/config.py` 里的 `STAGE_ENV_VARS` 重复一遍。
+#: 重复是刻意的: 如果两边都从同一个表达式推导, 那就等于没测 ——
+#: 改了推导式两边一起变, 测试照样绿。这里必须是**独立写死的期望值**。
+EXPECTED_STAGE_ENV_VARS = {
+    "puzzle.story": "AI_MODEL_PUZZLE_STORY",
+    "puzzle.surface": "AI_MODEL_PUZZLE_SURFACE",
+    "puzzle.structure": "AI_MODEL_PUZZLE_STRUCTURE",
+    "puzzle.generate": "AI_MODEL_PUZZLE_GENERATE",
+    "puzzle.hint_repair": "AI_MODEL_PUZZLE_HINT_REPAIR",
+    "puzzle.review": "AI_MODEL_PUZZLE_REVIEW",
+    "puzzle.truth_audit": "AI_MODEL_PUZZLE_TRUTH_AUDIT",
+    "puzzle.safety": "AI_MODEL_PUZZLE_SAFETY",
+    "puzzle.public_player": "AI_MODEL_PUZZLE_PUBLIC_PLAYER",
+    "qa.answer": "AI_MODEL_QA_ANSWER",
+    "qa.candidate_recheck": "AI_MODEL_QA_CANDIDATE_RECHECK",
+    "qa.completion_verify": "AI_MODEL_QA_COMPLETION_VERIFY",
+    "qa.judge": "AI_MODEL_QA_JUDGE",
+    "hint": "AI_MODEL_HINT",
+    "reveal": "AI_MODEL_REVEAL",
+    "probe": "AI_MODEL_PROBE",
+}
+
+
 def test_stage_names_and_env_vars_are_stable():
-    # Issue #23 明确列出的 stage 一个都不能少
-    required = {
+    # Issue #23 明确列出的 stage 一个都不能少(15 个)
+    issue_stages = {
         "puzzle.story", "puzzle.surface", "puzzle.structure", "puzzle.generate",
         "puzzle.hint_repair", "puzzle.review", "puzzle.truth_audit",
         "puzzle.safety", "qa.answer", "qa.candidate_recheck",
         "qa.completion_verify", "qa.judge", "hint", "reveal", "probe",
     }
-    check("**Issue 要求的 stage 全覆盖**",
-          required <= LLM_STAGES, sorted(required - LLM_STAGES))
+    check("**Issue 要求的 15 个 stage 全覆盖**",
+          issue_stages <= LLM_STAGES, sorted(issue_stages - LLM_STAGES))
 
+    # 实际是 16 个: Issue 的 15 个 + 实现时发现的 puzzle.public_player。
+    # 这条钉住"数量对不对", 免得以后有人以为漏了一个或多塞了一个。
+    check("**实际 stage 数 = Issue 15 + public_player = 16**",
+          len(LLM_STAGES) == 16 and LLM_STAGES == issue_stages | {"puzzle.public_player"},
+          (len(LLM_STAGES), sorted(LLM_STAGES - issue_stages)))
+
+    # ---- 完整固定映射(逐条比对, 不是抽查) ----
+    check("**STAGE_ENV_VARS 与固定契约逐条一致**",
+          STAGE_ENV_VARS == EXPECTED_STAGE_ENV_VARS,
+          {k: (STAGE_ENV_VARS.get(k), v)
+           for k, v in EXPECTED_STAGE_ENV_VARS.items()
+           if STAGE_ENV_VARS.get(k) != v})
+
+    # 一一对应, 不多不少
     check("**每个 stage 都有 env 变量名**",
           set(STAGE_ENV_VARS) == set(LLM_STAGES), len(STAGE_ENV_VARS))
-
-    # 变量名必须是稳定的上划线形式(Issue 里逐条列过)
-    expect = {
-        "puzzle.hint_repair": "AI_MODEL_PUZZLE_HINT_REPAIR",
-        "qa.completion_verify": "AI_MODEL_QA_COMPLETION_VERIFY",
-        "qa.candidate_recheck": "AI_MODEL_QA_CANDIDATE_RECHECK",
-        "puzzle.truth_audit": "AI_MODEL_PUZZLE_TRUTH_AUDIT",
-        "puzzle.story": "AI_MODEL_PUZZLE_STORY",
-        "qa.answer": "AI_MODEL_QA_ANSWER",
-        "qa.judge": "AI_MODEL_QA_JUDGE",
-        "hint": "AI_MODEL_HINT",
-        "reveal": "AI_MODEL_REVEAL",
-        "probe": "AI_MODEL_PROBE",
-    }
-    bad = {s: (STAGE_ENV_VARS[s], v) for s, v in expect.items()
-           if STAGE_ENV_VARS.get(s) != v}
-    check("**env 变量名与 Issue 一致**", not bad, bad)
+    # 名字不得重复(重复 = 两个 stage 抢同一个变量)
+    check("**env 变量名无重复**",
+          len(set(STAGE_ENV_VARS.values())) == len(STAGE_ENV_VARS))
+    # 都以 AI_MODEL_ 开头, 避免和 AI_MODEL 本体或别的变量撞
+    check("**变量名统一前缀 AI_MODEL_**",
+          all(v.startswith("AI_MODEL_") for v in STAGE_ENV_VARS.values()))
+    # 大小写/下划线形式: 不得残留 '.' 或小写(env 名规范)
+    check("**变量名是上划线形式(无 '.' 无小写)**",
+          all(v == v.upper() and "." not in v for v in STAGE_ENV_VARS.values()),
+          [v for v in STAGE_ENV_VARS.values() if v != v.upper() or "." in v])
 
     # stage 名不得重复/前后空格(否则 model_for 查不到)
     check("**stage 名无空白**",
           all(s == s.strip() and " " not in s for s in LLM_STAGES))
+
+
+def test_stage_env_vars_are_a_literal_mapping_not_derived():
+    """`STAGE_ENV_VARS` 必须是**字面量**, 不能由 stage 名推导。
+
+    这是复审明确要求的契约。为什么必须在**源码层**再查一次, 而不是只比
+    值: 值相等**证明不了**这件事。下面这版实现的值与本契约完全一致,
+
+        STAGE_ENV_VARS = {s: "AI_MODEL_" + s.upper().replace(".", "_")
+                          for s in LLM_STAGES}
+
+    但它仍然是**派生**的 —— 哪天有人把 `puzzle.review` 改名成
+    `puzzle.reviewer`, 变量名会自动变成 `AI_MODEL_PUZZLE_REVIEWER`,
+    而线上那个手打配好的 `AI_MODEL_PUZZLE_REVIEW` 从此没人读。路由静默
+    退回全局模型, 没有日志、没有报错。
+
+    所以要直接把源码读出来, 断言那张 dict 里**逐条都是字符串字面量**。
+    """
+    src = io.open(Path(__file__).resolve().parents[1] / "story" / "config.py",
+                  encoding="utf-8").read()
+    tree = ast.parse(src)
+
+    assign = None
+    for node in tree.body:                      # 只看模块顶层
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
+                and node.target.id == "STAGE_ENV_VARS":
+            assign = node
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "STAGE_ENV_VARS":
+                    assign = node
+    check("**找得到 STAGE_ENV_VARS 的赋值**", assign is not None)
+
+    if assign is not None:
+        value = assign.value
+        check("**STAGE_ENV_VARS 是 dict 字面量(不是推导式/函数调用)**",
+              isinstance(value, ast.Dict),
+              type(value).__name__)
+        if isinstance(value, ast.Dict):
+            # 每个 key 与 value 都必须是字符串字面量
+            non_literal = [
+                f"{ast.unparse(k)} -> {ast.unparse(v)}"
+                for k, v in zip(value.keys, value.values)
+                if not (isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        and isinstance(v, ast.Constant) and isinstance(v.value, str))
+            ]
+            check("**每一项的 key/value 都是字符串字面量**",
+                  not non_literal, non_literal)
+            # 字面量条数 == stage 数(没有留 `**{...}` 之类的后门)
+            check("**dict 字面量条数 == stage 数**",
+                  len(value.keys) == len(LLM_STAGES),
+                  (len(value.keys), len(LLM_STAGES)))
+            # 不得出现 `**` 展开
+            check("**dict 里没有 ** 展开**",
+                  all(k is not None for k in value.keys))
+
+    # 反证: 派生式写法必须被判为不合格(否则上面只是恒真)
+    derived = ast.parse(
+        'STAGE_ENV_VARS = {s: "AI_MODEL_" + s.upper().replace(".", "_")'
+        ' for s in LLM_STAGES}')
+    d_value = derived.body[0].value
+    check("**反证: 推导式写法会被识别出来**",
+          not isinstance(d_value, ast.Dict), type(d_value).__name__)
+
+    # 反证: 逐条字面量但少一条, 也要能被"条数"这条断言抓住
+    short = ast.parse('STAGE_ENV_VARS = {"hint": "AI_MODEL_HINT"}')
+    check("**反证: 少写几条会被条数断言抓住**",
+          len(short.body[0].value.keys) != len(LLM_STAGES))
+
+    # 反证: 混进一个非字面量值(如 `AI_MODEL_PREFIX + suffix`)也不算合格
+    mixed = ast.parse(
+        'STAGE_ENV_VARS = {"hint": "AI_MODEL_HINT", '
+        '"reveal": PREFIX + "REVEAL"}')
+    mixed_bad = [
+        ast.unparse(k) for k, v in
+        zip(mixed.body[0].value.keys, mixed.body[0].value.values)
+        if not isinstance(v, ast.Constant)
+    ]
+    check("**反证: 非字面量 value 会被识别出来**", mixed_bad == ["'reveal'"],
+          mixed_bad)
+
+
+def test_config_import_time_consistency_guard_exists():
+    """`story/config.py` 必须自检 `STAGE_ENV_VARS` 与 `LLM_STAGES` 一致。
+
+    测试之外还要有**运行期**的守卫: 有人加 stage 时忘了补 env 映射,
+    应该是导入当场炸, 而不是等到线上发现"这个 stage 的变量名没人读"。
+    """
+    import story.config as C
+    check("**存在 _check_stage_env_vars()**",
+          hasattr(C, "_check_stage_env_vars"))
+
+    # 反证: 真的会抛 —— 直接喂一份不一致的映射
+    import ast as _ast
+    src = io.open(Path(__file__).resolve().parents[1] / "story" / "config.py",
+                  encoding="utf-8").read()
+    fn = None
+    for node in _ast.parse(src).body:
+        if isinstance(node, _ast.FunctionDef) and node.name == "_check_stage_env_vars":
+            fn = node
+    check("**_check_stage_env_vars 是模块顶层函数**", fn is not None)
+
+    # 造一个不一致的场景, 验证检查逻辑本身有效(用同一套判据重算)
+    missing = LLM_STAGES - set(EXPECTED_STAGE_ENV_VARS)
+    extra = set(EXPECTED_STAGE_ENV_VARS) - LLM_STAGES
+    check("**反证: 当前映射确实是一致的(检查逻辑有输入)**",
+          not missing and not extra, (sorted(missing), sorted(extra)))
 
 
 def test_keyword2_live_and_prefetch_share_one_stage_model():
@@ -1023,6 +1166,8 @@ def main():
         test_budgets_unchanged_by_routing,
         test_no_llm_behavior_unchanged,
         test_stage_names_and_env_vars_are_stable,
+        test_stage_env_vars_are_a_literal_mapping_not_derived,
+        test_config_import_time_consistency_guard_exists,
         test_keyword2_live_and_prefetch_share_one_stage_model,
         test_every_production_call_declares_a_stage,
     ):

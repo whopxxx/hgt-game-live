@@ -79,15 +79,70 @@ LLM_STAGES = frozenset({
     "probe",                 # 启动能力探针; 默认只走 global model
 })
 
-#: stage -> 环境变量名。`puzzle.hint_repair` -> `AI_MODEL_PUZZLE_HINT_REPAIR`。
+#: stage -> 环境变量名。
 #:
-#: 用**显式映射**而不是 `stage.upper().replace(".", "_")` 现算:
-#: 前者是可被测试和 grep 钉死的契约; 后者在 stage 改名时会悄悄产生一个
-#: 谁都没配过的新变量名, 于是配置静默失效(旧变量还在, 但再也没人读)。
+#: ⚠️ **必须逐条手写, 不得由 `stage.upper().replace(".", "_")` 现算。**
+#:
+#: 现算看着等价, 但它让"变量名"变成 stage 名的**派生值**: 谁改一个 stage
+#: 名, 环境变量名就跟着变。于是线上旧部署里那个手打配好的
+#: `AI_MODEL_PUZZLE_REVIEW` 仍然存在, 却**再也没人读** —— 路由静默退回
+#: 全局模型, 没有任何日志或报错。这正是本 Issue 要消灭的那类故障。
+#:
+#: 写成字面量之后, 改 stage 名会**先撞上这里的 key 对不上**
+#: (见 `_check_stage_env_vars()` 与 tests 里的固定映射断言), 逼人显式
+#: 决定"旧变量名要不要继续认" —— 那才是一个可以 review 的决定。
 STAGE_ENV_VARS: dict[str, str] = {
-    stage: "AI_MODEL_" + stage.upper().replace(".", "_")
-    for stage in sorted(LLM_STAGES)
+    # ---- 出题链(keyword2 + classic + curated) ----
+    "puzzle.story": "AI_MODEL_PUZZLE_STORY",
+    "puzzle.surface": "AI_MODEL_PUZZLE_SURFACE",
+    "puzzle.structure": "AI_MODEL_PUZZLE_STRUCTURE",
+    "puzzle.generate": "AI_MODEL_PUZZLE_GENERATE",
+    "puzzle.hint_repair": "AI_MODEL_PUZZLE_HINT_REPAIR",
+    "puzzle.review": "AI_MODEL_PUZZLE_REVIEW",
+    "puzzle.truth_audit": "AI_MODEL_PUZZLE_TRUTH_AUDIT",
+    "puzzle.safety": "AI_MODEL_PUZZLE_SAFETY",
+    "puzzle.public_player": "AI_MODEL_PUZZLE_PUBLIC_PLAYER",
+    # ---- 直播 QA ----
+    "qa.answer": "AI_MODEL_QA_ANSWER",
+    "qa.candidate_recheck": "AI_MODEL_QA_CANDIDATE_RECHECK",
+    "qa.completion_verify": "AI_MODEL_QA_COMPLETION_VERIFY",
+    "qa.judge": "AI_MODEL_QA_JUDGE",
+    # ---- 观众侧文案 ----
+    "hint": "AI_MODEL_HINT",
+    "reveal": "AI_MODEL_REVEAL",
+    # ---- 诊断 ----
+    "probe": "AI_MODEL_PROBE",
 }
+
+
+def _check_stage_env_vars() -> None:
+    """`STAGE_ENV_VARS` 与 `LLM_STAGES` 必须严格一一对应。
+
+    这个检查在**导入时**跑, 所以忘加/多留一条会当场炸, 而不是等到
+    某天发现"某个 stage 的 env 变量名没人读"。
+
+    覆盖两个方向:
+      * 新增 stage 忘了加映射 -> 该 stage 永远读不到 env override;
+      * 删掉/改名 stage 却留着旧映射 -> 那条是死配置, 而且会让
+        `_env_stage_models()` 产出一个 `model_for()` 不认的 key。
+    """
+    missing = LLM_STAGES - set(STAGE_ENV_VARS)
+    extra = set(STAGE_ENV_VARS) - LLM_STAGES
+    if missing or extra:
+        raise RuntimeError(
+            f"STAGE_ENV_VARS 与 LLM_STAGES 不一致。"
+            f"缺少映射: {sorted(missing)}; 多余映射: {sorted(extra)}。"
+            f"新增/改名 stage 时**必须**在 STAGE_ENV_VARS 里显式加一行 —— "
+            f"不要改回自动推导(那会让环境变量名随 stage 名漂移, 旧部署的"
+            f"配置会静默失效)。")
+    # 名字重复会让两个 stage 抢同一个环境变量, 而两边都以为自己说了算。
+    dupes = {v for v in STAGE_ENV_VARS.values()
+             if list(STAGE_ENV_VARS.values()).count(v) > 1}
+    if dupes:
+        raise RuntimeError(f"STAGE_ENV_VARS 有重复的环境变量名: {sorted(dupes)}")
+
+
+_check_stage_env_vars()
 
 
 def _env_stage_models(environ: Optional[dict] = None) -> dict[str, str]:
