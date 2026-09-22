@@ -1096,12 +1096,32 @@ class AnthropicMessagesClient:
                     return LLMResult(error=f"HTTP {code}: {snippet}",
                                      stage=stage, requested_model=requested_model)
                 last_err = f"HTTP {code}: {snippet}"
-                log.warning("LLM HTTP %s provider=%s, 第 %d 次重试…",
-                            code, route.provider, attempt + 1)
+                if attempt < mr:
+                    log.warning(
+                        "LLM HTTP %s provider=%s stage=%s model=%s "
+                        "timeout=%.1fs, 第 %d/%d 次重试…",
+                        code, route.provider, stage or "(未标注)",
+                        requested_model, to, attempt + 1, mr)
+                else:
+                    log.warning(
+                        "LLM HTTP %s provider=%s stage=%s model=%s "
+                        "timeout=%.1fs, 重试耗尽/本次不再重试",
+                        code, route.provider, stage or "(未标注)",
+                        requested_model, to)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = f"{type(e).__name__}: {e}"
-                log.warning("LLM 网络错误 provider=%s (%s), 第 %d 次重试…",
-                            route.provider, last_err, attempt + 1)
+                if attempt < mr:
+                    log.warning(
+                        "LLM 网络错误 provider=%s stage=%s model=%s "
+                        "timeout=%.1fs (%s), 第 %d/%d 次重试…",
+                        route.provider, stage or "(未标注)",
+                        requested_model, to, last_err, attempt + 1, mr)
+                else:
+                    log.warning(
+                        "LLM 网络错误 provider=%s stage=%s model=%s "
+                        "timeout=%.1fs (%s), 重试耗尽/本次不再重试",
+                        route.provider, stage or "(未标注)",
+                        requested_model, to, last_err)
 
             if attempt < mr:
                 backoff = (2 ** attempt) + random.uniform(0, 0.5)
