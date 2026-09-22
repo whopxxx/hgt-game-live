@@ -1027,8 +1027,14 @@ class Config:
     # fallback 处理。预热是优化, 不是可用性前提。
     #
     # 设 0 关掉预热(调试 / 离线用)。
-    pool_prewarm_max_rounds: int = 2
-    pool_prewarm_max_seconds: float = 90.0
+    #
+    # 预热只是开播优化，不能继承正式直播的 60s × 4 HTTP 容错预算：
+    # 那会让“最多 45 秒”只剩协作式口号——一笔已经发出的请求照样能
+    # 自己重试几分钟。默认只尝试 1 轮，并给预热独立的短 HTTP 预算。
+    pool_prewarm_max_rounds: int = 1
+    pool_prewarm_max_seconds: float = 45.0
+    pool_prewarm_llm_timeout_seconds: float = 15.0
+    pool_prewarm_llm_max_retries: int = 0
     # 池子本体(已过审、待播)与 used 日志(追加式, 记"哪些已经交付过")。
     # 注意**不要**用 data/puzzle_used.jsonl: `data/puzzle.jsonl` 已经是
     # 直播 archive 了, 两个"used"含义不同, 名字太近迟早看错。
@@ -1363,6 +1369,17 @@ class Config:
                 f"pool_prefetch_budget_seconds("
                 f"{self.pool_prefetch_budget_seconds}) <= 0: 同上的效果 —— "
                 f"补池每次都立刻超预算退出。"
+            )
+        if self.pool_prewarm_llm_timeout_seconds <= 0:
+            warns.append(
+                f"pool_prewarm_llm_timeout_seconds("
+                f"{self.pool_prewarm_llm_timeout_seconds}) <= 0: 冷启动预热"
+                f"每笔 LLM 请求会立即失败。"
+            )
+        if self.pool_prewarm_llm_max_retries < 0:
+            warns.append(
+                f"pool_prewarm_llm_max_retries("
+                f"{self.pool_prewarm_llm_max_retries}) < 0: 已按 0 次重试处理。"
             )
         if self.pool_prefetch_guard_margin_seconds < 0:
             warns.append(
