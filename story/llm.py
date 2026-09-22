@@ -5205,7 +5205,8 @@ class PuzzleWriter:
     # ------------------------------------------------------------------
     def gen_keyword_story(self, keywords, lane: str, *, should_continue=None,
                           max_attempts: int = 1,
-                          temperature: Optional[float] = None
+                          temperature: Optional[float] = None,
+                          timeout: Optional[float] = None
                           ) -> Optional[dict]:
         """围绕 2 个关键词 + 一个方向(lane)写一个**完整隐藏故事**。
 
@@ -5256,6 +5257,7 @@ class PuzzleWriter:
                 system, text, max_tokens=1500, tool=_TOOL_STORY,
                 temperature=(temperature if temperature is not None
                              else self._temperature("generate_temperature")),
+                timeout=timeout,
                 stage="puzzle.story")
             ti = res.tool_input
             if ti:
