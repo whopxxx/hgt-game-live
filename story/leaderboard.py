@@ -172,7 +172,7 @@ class LeaderboardLedger:
             return True
 
     # ------------------------------------------------------------------
-    def top(self, limit: int = 3) -> list[dict]:
+    def top(self, limit: int = 10) -> list[dict]:
         """调试/日志用 TopN；公开字段与前端一致。"""
         with self._lock:
             rows = sorted(
