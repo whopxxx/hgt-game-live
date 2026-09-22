@@ -780,6 +780,9 @@ def test_technical_reject_still_backs_off():
             "gen_fail", "工具调用返回空 input",
             {"reject": "structure_technical_fail"}, clk())
         check("技术失败设 retry_at", pf._retry_at > 0, pf._retry_at)
+        check("refill 中首个技术失败只短退避 5s",
+              round(pf._retry_at - clk.t, 1) == 5.0,
+              pf._retry_at - clk.t)
         check("技术失败累积 fail_streak", pf._fail_streak == 1,
               pf._fail_streak)
         check("技术标签仍正常记账",
@@ -2468,29 +2471,52 @@ def test_g1_interrupted_yields_without_retry_storm():
 
 
 def test_g1_backoff_schedule_increases_then_caps():
-    """**G1**: 连续失败退避必须递增并封顶, 不是永远固定 30 秒。
-
-    实播指纹: 18:46:47 开/18:47:37 败, 18:48:07 开/18:49:09 败 ——
-    固定 30 秒 + 每轮 4 稿, 在**同一个上下文**里反复烧。递增让"越失败
-    等越久", 封顶 300 保证它最终还会再试。
-    """
-    print("\n[G1-E] 连续失败退避递增")
+    """库存健康时仍保留原来的保守长退避。"""
+    print("\n[G1-E] 健康库存下连续失败退避递增")
     with tmpdir() as d:
         clk = _Clock()
-        w = _FakeWriter(fail=True)
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w, clock=clk)
-        fill(pf.pool, 1)
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        pf._refill_active = False
         seen = []
-        for i in range(7):
-            pf.on_tick()
-            pf.on_tick()                 # 应用上一拍的结果
+        for _ in range(7):
+            pf._apply_result(
+                "gen_fail", "模拟技术失败",
+                {"reject": "structure_technical_fail"}, clk())
             seen.append(round(pf._retry_at - clk.t, 1))
-            clk.advance(400)             # 越过任意退避 -> 允许下一次
-        check("**退避递增 30/60/120/240/300**",
+            clk.advance(400)
+        check("**健康库存退避递增 30/60/120/240/300**",
               seen[:5] == [30.0, 60.0, 120.0, 240.0, 300.0], seen)
         check("**封顶 300(不无限翻倍)**", seen[5:] == [300.0, 300.0],
               seen)
         check("失败链记到了 7", pf._fail_streak == 7, pf._fail_streak)
+
+
+def test_refill_active_keeps_technical_backoff_short_until_target():
+    """库存没补到目标时，技术失败不能重新掉进 60/120 秒长退避。"""
+    print("\n[refill-to-target] 未达目标一直用短退避")
+    with tmpdir() as d:
+        clk = _Clock()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        pf._refill_active = True
+        seen = []
+        for _ in range(5):
+            pf._apply_result(
+                "gen_fail", "模拟网关技术失败",
+                {"reject": "structure_technical_fail"}, clk())
+            seen.append(round(pf._retry_at - clk.t, 1))
+            clk.advance(30)
+        check("**refill 技术退避 5/10/15 并封顶 15**",
+              seen == [5.0, 10.0, 15.0, 15.0, 15.0], seen)
+
+        # 一旦达到目标、latch 关闭，下一次技术失败才恢复保守长退避。
+        pf._refill_active = False
+        pf._fail_streak = 0
+        pf._apply_result(
+            "gen_fail", "库存已健康后的技术失败",
+            {"reject": "structure_technical_fail"}, clk())
+        check("**latch 关闭后恢复 30s 第一档**",
+              round(pf._retry_at - clk.t, 1) == 30.0,
+              pf._retry_at - clk.t)
 
 
 def test_g1_success_resets_backoff_streak():
@@ -2518,7 +2544,7 @@ def test_g1_scene_change_resets_long_backoff_once():
 
     退避的初衷是"别在同一个坏上下文里反复烧钱"。新一题开始后 recent
     window / 配额饱和状态整体换了一批, 机械等满 300 秒只是白等 ——
-    但也不能立刻清零(刚失败过的环境没有变好), 所以重置到 30 秒档。
+    但也不能立刻清零(刚失败过的环境没有变好), 所以重置到当前序列第一档。
 
     判据是**场景指纹**(puzzle_index), 不是"时间到了" —— 后者会让
     递增序列形同虚设。
@@ -2553,14 +2579,14 @@ def test_g1_scene_change_resets_long_backoff_once():
         pf.on_tick()
         check("**场景变了 -> 失败链重置为 1**", pf._fail_streak == 1,
               pf._fail_streak)
-        check("**退避回到第一档 30s**",
-              round(pf._retry_at - clk.t, 1) == 30.0,
+        check("**refill 中场景切换回短序列第一档 5s**",
+              round(pf._retry_at - clk.t, 1) == 5.0,
               pf._retry_at - clk.t)
         # 场景**没**再变 -> 不再重置(否则递增序列形同虚设)
-        clk.advance(31)
+        clk.advance(6)
         pf.on_tick()
         pf.on_tick()
-        check("场景不变 -> 继续递增到 60", pf._fail_streak == 2,
+        check("场景不变 -> 失败链继续递增", pf._fail_streak == 2,
               pf._fail_streak)
 
 
@@ -3613,6 +3639,10 @@ def test_stable_refill_default_waterlines():
           and cfg.pool_reveal_playable_target == 3,
           (cfg.pool_reveal_target_size, cfg.pool_reveal_playable_target))
     check("硬上限 = 16", cfg.pool_max_size == 16, cfg.pool_max_size)
+    check("refill 技术短退避默认 5/10/15",
+          tuple(cfg.pool_prefetch_refill_backoff_schedule_s)
+          == (5.0, 10.0, 15.0),
+          cfg.pool_prefetch_refill_backoff_schedule_s)
 
 
 def test_stable_refill_live_heartbeat_expires():
@@ -3815,6 +3845,7 @@ def main():
         test_g1_midflight_switch_stops_reviewer_and_next_draft,
         test_g1_interrupted_yields_without_retry_storm,
         test_g1_backoff_schedule_increases_then_caps,
+        test_refill_active_keeps_technical_backoff_short_until_target,
         # ---- G4-C: 试玩前让路 ----
         test_g4c_playtest_yields_before_starting,
         test_g4c_playtest_still_runs_when_live_is_idle,
