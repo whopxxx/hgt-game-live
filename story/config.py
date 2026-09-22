@@ -911,6 +911,15 @@ class Config:
     # 不动这个序列。
     pool_prefetch_backoff_schedule_s: tuple = (30.0, 60.0, 120.0, 240.0,
                                                300.0)
+    # ---- 缺货追库存时的短退避序列 ----
+    #
+    # 只要 refill latch 还在工作，就说明库存还没恢复到目标线。
+    # 这时技术失败本身往往已经花掉几十秒（尤其网关 timeout），再额外
+    # 等 60/120/240 秒会让补给永远追不上消耗。保持 single-flight，
+    # 但把“失败后的冷却”压到 5/10/15 秒并封顶 15 秒。
+    #
+    # 一旦库存恢复、refill latch 关闭，立即回到上面的保守长退避。
+    pool_prefetch_refill_backoff_schedule_s: tuple = (5.0, 10.0, 15.0)
     # ---- G1: 后台补池的**独立**预算 ----
     #
     # 关键: 后台补池过去直接调 `gen_spec()` 的默认参数 (max_attempts=4,
@@ -1391,6 +1400,22 @@ class Config:
             warns.append(
                 f"pool_prefetch_backoff_schedule_s({_sched}) 不是递增的: "
                 f"连续失败时退避反而变短, 与'越失败越该等久'的意图相反。"
+            )
+        _refill_sched = tuple(self.pool_prefetch_refill_backoff_schedule_s or ())
+        if not _refill_sched:
+            warns.append(
+                "pool_prefetch_refill_backoff_schedule_s 为空: 库存未恢复时"
+                "会退回固定间隔，可能补给追不上消耗。"
+            )
+        elif any(float(x) <= 0 for x in _refill_sched):
+            warns.append(
+                f"pool_prefetch_refill_backoff_schedule_s({_refill_sched}) "
+                f"含非正数: 会形成技术失败热循环。"
+            )
+        elif list(_refill_sched) != sorted(_refill_sched):
+            warns.append(
+                f"pool_prefetch_refill_backoff_schedule_s({_refill_sched}) "
+                f"不是递增的。"
             )
         if self.phase_ack_seconds <= 0:
             warns.append(
