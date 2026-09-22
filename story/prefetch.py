@@ -199,17 +199,24 @@ class PoolPrefetcher:
         self._prefetch_budget = max(
             1.0, float(getattr(cfg, "pool_prefetch_budget_seconds", 25.0)
                        or 25.0))
+        # keyword2 Story 单独允许比普通 prefetch stage 更长，但绝不突破
+        # live/global transport 的硬上限。这个值只通过 keyword_spec 显式
+        # 传给 puzzle.story；其它 stage 继续继承 pf client 的 30s/0。
+        self._story_timeout = min(
+            max(0.1, float(getattr(cfg.llm, "timeout", 60.0) or 60.0)),
+            max(0.1, float(getattr(
+                cfg, "pool_prefetch_story_timeout_seconds", 45.0) or 45.0)))
         self._guard_margin = max(
             0.0, float(getattr(cfg, "pool_prefetch_guard_margin_seconds", 5.0)
                        or 0.0))
-        # ---- G1: guard 必须至少覆盖一轮预算 ----
-        # 只挡"启动"是不够的: 实播里 guard=15s 而一轮 prefetch 可能跑
-        # 几十秒, 于是"只剩 18 秒"照样启动一个注定跨过 deadline 的后台
-        # 任务, 它跑着跑着下一题已经开始现场生成了 —— 两边同时占网关
-        # 51 秒。这里取 max() 兜底, 免得"调大了 budget 却忘了调 guard"
-        # 静默退回旧行为。配置侧会为此出一条告警(见 config.validate)。
+        # ---- G1: guard 必须覆盖预算与单次 Story 最坏在途时间 ----
+        # keyword2 的 budget 只能在 stage 之间阻止继续，不能取消已经发出的
+        # Story HTTP。Story 允许 45s 后，仍用 25+5=30s guard 会重新制造
+        # "后台 Story 跨到下一题"。因此两者取大再加 margin。
         self._effective_guard_s = max(
-            self._reveal_guard_s, self._prefetch_budget + self._guard_margin)
+            self._reveal_guard_s,
+            max(self._prefetch_budget, self._story_timeout)
+            + self._guard_margin)
         self._backoff_s = float(getattr(cfg, "pool_prefetch_backoff_s", 30.0) or 30.0)
         # ---- G1: 连续失败的退避序列 ----
         # 固定 30 秒会让同一个上下文(同样的 recent window / 同样的配额
@@ -1230,7 +1237,8 @@ class PoolPrefetcher:
             self.writer, self._bag, self._keyword_session_seed,
             avoid=avoid, recent=recent,
             should_continue=should_continue,
-            corpus_version=self._bag_meta.get("corpus_version", ""))
+            corpus_version=self._bag_meta.get("corpus_version", ""),
+            story_timeout=self._story_timeout)
         if spec is None:
             if reason == "interrupted":
                 return ("interrupted", "直播变忙, keyword2 让路",
