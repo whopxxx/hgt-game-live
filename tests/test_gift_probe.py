@@ -594,6 +594,34 @@ def test_three_layer_counts_are_distinguishable():
     check("没有 Gift -> 无 capture", c3.captured_payload_count == 0)
 
 
+def test_ctrl_c_wait_is_short_polled_and_interruptible():
+    """Windows 回归: 不能用无限期 Event.wait() 等 Ctrl-C。"""
+    print("\n[GP-12a] Ctrl-C 等待使用短轮询且能退出")
+    from story.gift_probe.runner import _wait_for_ctrl_c
+
+    class _InterruptOnWait:
+        def __init__(self):
+            self.timeouts = []
+
+        def wait(self, timeout):
+            self.timeouts.append(timeout)
+            raise KeyboardInterrupt
+
+    fake = _InterruptOnWait()
+    # 若 helper 没吞掉 KeyboardInterrupt，这里测试进程会直接中断。
+    _wait_for_ctrl_c(poll_seconds=0.05, wait_event=fake)
+    check("Ctrl-C 后 helper 正常返回", True)
+    check("等待调用带有限 timeout", fake.timeouts == [0.05], fake.timeouts)
+    check("timeout 足够短，不会长时间卡住 SIGINT",
+          fake.timeouts and 0 < fake.timeouts[0] <= 0.5, fake.timeouts)
+
+    try:
+        _wait_for_ctrl_c(poll_seconds=0, wait_event=fake)
+        check("非正 poll_seconds 必须拒绝", False, "未报错")
+    except ValueError:
+        check("非正 poll_seconds 明确报错", True)
+
+
 def test_runner_arms_have_isolated_counters_and_dirs():
     """GP-12b: **装配层**的隔离 —— 每路 arm 自己 new 一套 counter + 目录。
 
@@ -1876,6 +1904,7 @@ def main():
         test_probe_dir_disjoint_from_production,
         test_three_layer_counts_are_distinguishable,
         test_profiles_do_not_share_counters,
+        test_ctrl_c_wait_is_short_polled_and_interruptible,
         test_runner_arms_have_isolated_counters_and_dirs,
         test_actual_wss_urls_differ_as_intended,
         test_reference_bootstrap_matches_reference_source,
