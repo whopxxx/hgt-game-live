@@ -1478,9 +1478,10 @@ window.addEventListener('load', async () => {
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      // preset due 由 250ms poll 驱动；覆盖完整 poll 周期，不能假设
-      // 当前 fake-clock 恰好与 250ms 网格对齐。
-      await tick(90250);
+      // preset due 由 250ms poll 驱动，而且上一条 17s preset 的结束点
+      // 会改变 fake-clock 相位。给 2s poll 余量，但仍远小于 17s preset
+      // 自身时长，所以到检查点时只要调度正常就必须正处于 preset。
+      await tick(92000);
       check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
       send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
     }
