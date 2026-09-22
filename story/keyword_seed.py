@@ -608,7 +608,8 @@ def draw_two_keywords(rng: random.Random,
 # 不要再把中间产物塞进去 —— 那会有两份事实来源, 以后要解决"谁权威"。
 def keyword_spec(writer, bag, session_seed: int, *,
                  avoid=None, recent=None, should_continue=None,
-                 corpus_version: str = ""):
+                 corpus_version: str = "",
+                 story_timeout=None):
     """跑一遍 `抽词 + 掷 lane -> Story -> Surface -> Structure + provenance`。
 
     返回 `(spec, reason)`:
@@ -672,8 +673,9 @@ def keyword_spec(writer, bag, session_seed: int, *,
     # ---- lane: 50/50, 无状态派生(不复用 bag 的抽词 rng) ----
     lane = draw_lane(session_seed, draw_index)
 
-    story = writer.gen_keyword_story(keywords, lane,
-                                     should_continue=should_continue)
+    story = writer.gen_keyword_story(
+        keywords, lane, should_continue=should_continue,
+        timeout=story_timeout)
     if story is None:
         return None, "gen_fail"
     if story.get("interrupted"):
