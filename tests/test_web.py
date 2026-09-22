@@ -1266,6 +1266,18 @@ window.addEventListener('load', async () => {
     const duration = anim() ? anim().effect.getTiming().duration : 4000;
     await tick(duration + 1);
   };
+  // 精确走到“当前最早 one-shot timer”的结束点。announcer 的每一轮
+  // show() 都只有一个 one-shot done timer；interval/reload/poll 都是 interval。
+  // 这个 helper 用于已经播到中途的场景，避免 finish() 再加一整个 duration
+  // 而跨过后续 preset / leaderboard turn。
+  const finishCurrentTurn = async () => {
+    const due = [...tasks.values()]
+      .filter(t => !t.interval && t.at >= clock)
+      .map(t => t.at)
+      .sort((a,b) => a-b)[0];
+    if (due === undefined) { await finish(); return; }
+    await tick(Math.max(0, due - clock) + 1);
+  };
   try {
     send();
     check(box.dataset.kind === 'leaderboard' && notice()==='' && !anim(),
@@ -1444,14 +1456,15 @@ window.addEventListener('load', async () => {
     check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(pageAtDue),
           'A16 due preset must not cut off active leaderboard page at 22s');
 
-    // 从当前仍在播放的排行榜页推进一个“完整页时长”一定足够跨过它
-    // 自己的 done()；done -> pump 会立即接上已经 due 的 preset。
-    await finish();
+    // 精确走到当前排行榜页自己的 done()；done -> pump 会立即接上
+    // 已经 due 的 preset。不能用 finish() 再加一整段 duration，否则当前页
+    // 已经播到中途时会顺手把后面的 preset 也推进掉。
+    await finishCurrentTurn();
     check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
           'A16 queued due preset starts immediately after leaderboard page finishes');
-    await finish();
-    check(box.dataset.kind==='leaderboard' && notice().includes('1/2'),
-          'A16 after preset, leaderboard continues from next naturally advanced page');
+    await finishCurrentTurn();
+    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
+          'A16 after preset, leaderboard resumes at the naturally advanced page');
 
     send({leaderboard:[]});
     check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
