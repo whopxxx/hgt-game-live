@@ -1335,26 +1335,30 @@ window.addEventListener('load', async () => {
       rank:i+1,user_name:'P'+(i+1),solved_count:20-i
     }));
     send({leaderboard:top10});
-    check(box.dataset.kind==='leaderboard' && notice().includes('1/2')
-          && notice().includes('1. P1 20题') && notice().includes('5. P5 16题')
-          && !notice().includes('6. P6'),
-          'A16 cumulative Top10 page 1 shows ranks 1-5 only');
-    await finish();
-    check(box.dataset.kind==='leaderboard' && notice().includes('2/2')
-          && notice().includes('6. P6 15题') && notice().includes('10. P10 11题')
-          && !notice().includes('1. P1'),
-          'A16 cumulative Top10 page 2 shows ranks 6-10 only');
-    send({ai_player:{questions_earned:28}});
-    check(box.dataset.kind==='ai', 'A16 AI temporarily overlays leaderboard page 2');
-    await finish();
-    check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
-          'A16 AI overlay resumes interrupted leaderboard page, not page 1');
+    check(box.dataset.kind==='leaderboard'
+          && notice().includes('1. P1 20题')
+          && notice().includes('5. P5 16题')
+          && notice().includes('10. P10 11题')
+          && !notice().includes('1/2') && !notice().includes('2/2'),
+          'A16 cumulative Top10 is one complete message, not two logical pages');
+    check(box.dataset.motion==='marquee' && !!anim(),
+          'A16 long Top10 uses one continuous marquee');
 
-    // 同一题的临时覆盖必须恢复原页；但题号一变，新题必须重新从 Top1 开始。
+    send({ai_player:{questions_earned:28}});
+    check(box.dataset.kind==='ai', 'A16 AI temporarily overlays Top10 marquee');
+    await finish();
+    check(box.dataset.kind==='leaderboard'
+          && notice().includes('1. P1 20题')
+          && notice().includes('10. P10 11题'),
+          'A16 after AI, complete Top10 restarts from rank 1');
+
+    // 新题也重新从整条榜首开始；不再维护 1/2、2/2 页码状态。
     send({puzzle_index:2,hint_count:0,hint_text:'',qa_log:[]});
-    check(box.dataset.kind==='leaderboard' && notice().includes('1/2')
-          && notice().includes('1. P1 20题') && !notice().includes('6. P6'),
-          'A16 new puzzle resets cumulative Top10 to page 1');
+    check(box.dataset.kind==='leaderboard'
+          && notice().includes('1. P1 20题')
+          && notice().includes('10. P10 11题')
+          && !notice().includes('/2'),
+          'A16 new puzzle restarts one-line Top10 from rank 1');
 
     const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
     send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
@@ -1432,39 +1436,43 @@ window.addEventListener('load', async () => {
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
     // 真实用户配置回归：interval=22s / hold=15s。
-    //
-    // 短公告页本身是 1s 入场 + 15s 停留 + 1s 退场 = 17s；
-    // Top10 两页也各自完整播放。22s 会落在第二页中途，所以公告“到点”
-    // 只能排队，不能 cancel() 腰斩第二页。
+    // Top10 已改成一整条长 marquee；22s 公告到点时不能把榜截在中间，
+    // 必须等第 10 名完整滚出视口后再接公告。
     await finish(); // 让当前 preset 正常结束
     await reload(config(['预设甲','禁用','预设乙'],
                         {interval_seconds:22, hold_seconds:15}));
     cfg.items[1].enabled=false;
+    const longTop10=Array.from({length:10},(_,i)=>({
+      rank:i+1,
+      user_name:'LongPlayerName'.repeat(2)+(i+1),
+      solved_count:30-i
+    }));
     send({phase:'setting'});
-    send({phase:'qa', leaderboard:top10});
-    check(box.dataset.kind==='leaderboard' && notice().includes('1/2'),
-          'A16 22s config starts Top10 page 1');
+    send({phase:'qa', leaderboard:longTop10});
+    check(box.dataset.kind==='leaderboard'
+          && box.dataset.motion==='marquee'
+          && notice().includes('1. LongPlayerName')
+          && notice().includes('10. LongPlayerName')
+          && !notice().includes('/2'),
+          'A16 22s config starts one complete Top10 marquee');
+    check(anim().effect.getTiming().duration > 22250,
+          'A16 synthetic Top10 marquee lasts beyond the 22s preset deadline');
 
-    // 排行榜页的真实时长取决于渲染后宽度：
-    //   - 能放下：5s hold + 1s*2 slide
-    //   - 放不下：按实际像素宽度 / speed 跑 marquee
-    // 所以测试不能硬编码“第一页/第二页各 17s”。直接从 QA 锚点推进到
-    // 22.25s（包含一次 250ms due poll）：此刻如果某一排行榜页还没自然
-    // 播完，公告只能保持 due，不能 cancel() 它。
     await tick(22250);
-    const pageAtDue = notice();
-    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(pageAtDue),
-          'A16 due preset must not cut off active leaderboard page at 22s');
+    check(box.dataset.kind==='leaderboard'
+          && notice().includes('10. LongPlayerName'),
+          'A16 due preset must not cut the one-line Top10 at 22s');
 
-    // 精确走到当前排行榜页自己的 done()；done -> pump 会立即接上
-    // 已经 due 的 preset。不能用 finish() 再加一整段 duration，否则当前页
-    // 已经播到中途时会顺手把后面的 preset 也推进掉。
+    // 精确走到这条 Top10 自己的 done()；done -> pump 会立即接上
+    // 已经到期的 preset。
     await finishCurrentTurn();
     check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
-          'A16 queued due preset starts immediately after leaderboard page finishes');
+          'A16 queued due preset starts immediately after complete Top10 finishes');
     await finishCurrentTurn();
-    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
-          'A16 after preset, leaderboard resumes at the naturally advanced page');
+    check(box.dataset.kind==='leaderboard'
+          && notice().includes('1. LongPlayerName')
+          && notice().includes('10. LongPlayerName'),
+          'A16 after preset, the complete Top10 marquee starts again');
 
     send({leaderboard:[]});
     check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
@@ -1526,17 +1534,17 @@ window.addEventListener('load', async () => {
       rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:21-rank
     }))});
     const boardRows=state.leaderboard;
-    const board='📢 累计猜汤榜 1/2　'
-      + boardRows.slice(0,5).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　')
-      + '📢 累计猜汤榜 2/2　'
-      + boardRows.slice(5,10).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    const board='📢 累计猜汤榜　'
+      + boardRows.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
     let boardPages='';
-    for(let i=0;i<80 && boardPages.length<board.length;i++) {
+    for(let i=0;i<120 && boardPages.length<board.length;i++) {
       boardPages+=notice();
-      check(text.scrollWidth<=box.clientWidth, 'A16 long Top10 nicknames fit reduced-motion static pages');
+      check(text.scrollWidth<=box.clientWidth,
+            'A16 reduced-motion slices of one Top10 message fit without animation');
       await tick(4000);
     }
-    check(boardPages===board, 'A16 all Top10 long nicknames readable across both leaderboard pages');
+    check(boardPages===board,
+          'A16 reduced-motion preserves every character of the one-line Top10 message');
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
     await new Promise(requestAnimationFrame);
     await new Promise(requestAnimationFrame);
