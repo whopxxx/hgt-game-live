@@ -448,7 +448,7 @@ def test_no_keyword_seed_returns_both_to_classic():
 # ======================================================================
 def test_prewarm_transport_config_validation():
     print("\n[G4-2-config] prewarm transport budget 配置告警")
-    c = Config()
+    c = Config(sim_path="x")
     c.pool_prewarm_llm_timeout_seconds = 0
     c.pool_prewarm_llm_max_retries = -1
     warns = c.validate()
