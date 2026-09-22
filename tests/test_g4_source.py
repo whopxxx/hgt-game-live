@@ -105,9 +105,15 @@ def test_default_config_curated_off():
     c = Config()
     check("**prefer_curated 默认 False**", c.prefer_curated is False,
           c.prefer_curated)
-    check("prewarm 参数存在且为正",
-          c.pool_prewarm_max_rounds > 0 and c.pool_prewarm_max_seconds > 0,
+    check("prewarm 默认只尝试 1 轮 / 45s",
+          c.pool_prewarm_max_rounds == 1
+          and c.pool_prewarm_max_seconds == 45.0,
           (c.pool_prewarm_max_rounds, c.pool_prewarm_max_seconds))
+    check("prewarm LLM 独立短预算 = 15s / 0 retries",
+          c.pool_prewarm_llm_timeout_seconds == 15.0
+          and c.pool_prewarm_llm_max_retries == 0,
+          (c.pool_prewarm_llm_timeout_seconds,
+           c.pool_prewarm_llm_max_retries))
 
 
 def test_cli_defaults_and_flags():
@@ -440,6 +446,18 @@ def test_no_keyword_seed_returns_both_to_classic():
 # ======================================================================
 # 五、prewarm(§九-8 / §九-9 / §九-10 / §九-11)
 # ======================================================================
+def test_prewarm_transport_config_validation():
+    print("\n[G4-2-config] prewarm transport budget 配置告警")
+    c = Config(sim_path="x")
+    c.pool_prewarm_llm_timeout_seconds = 0
+    c.pool_prewarm_llm_max_retries = -1
+    warns = c.validate()
+    check("timeout<=0 有告警",
+          any("pool_prewarm_llm_timeout_seconds" in w for w in warns), warns)
+    check("retries<0 有告警",
+          any("pool_prewarm_llm_max_retries" in w for w in warns), warns)
+
+
 class _CountingPrefetcher:
     """替身: 让 `_prewarm` 的判定可被直接观察。
 
@@ -576,6 +594,48 @@ def test_prewarm_disabled_by_zero():
             _CountingPrefetcher(0, [("ok", "", {})]))
         dr._prewarm()
         check("没发生成", dr._prefetcher.calls == 0, dr._prefetcher.calls)
+
+
+def test_prewarm_temporarily_caps_client_transport_budget():
+    """冷启动预热不能继承正式直播的 60s×4；结束后必须原样恢复。"""
+    print("\n[G4-2-11c] prewarm 临时收紧 client timeout/retries 并恢复")
+
+    class TransportCfg:
+        timeout = 60.0
+        max_retries = 3
+
+    class Client:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+    class CapturePF(_CountingPrefetcher):
+        def __init__(self, transport):
+            super().__init__(0, [("ok", "", {})])
+            self.transport = transport
+            self.seen = []
+
+        def _generate_one_inner(self, inputs):
+            self.calls += 1
+            self.seen.append((self.transport.timeout,
+                              self.transport.max_retries))
+            return ("ok", "", {})
+
+    with tmpdir() as d:
+        transport = TransportCfg()
+        pf = CapturePF(transport)
+        cfg = mkcfg(
+            d, pool_prewarm_max_rounds=1,
+            pool_prewarm_max_seconds=45.0,
+            pool_prewarm_llm_timeout_seconds=15.0,
+            pool_prewarm_llm_max_retries=0)
+        dr = _dr_with_prefetch(cfg, pf)
+        dr.client = Client(transport)
+        dr._prewarm()
+        check("**预热调用期间生效 15s/0 retry**",
+              pf.seen == [(15.0, 0)], pf.seen)
+        check("**预热返回后恢复正式 60s/3 retry**",
+              transport.timeout == 60.0 and transport.max_retries == 3,
+              (transport.timeout, transport.max_retries))
 
 
 # ======================================================================
@@ -2473,6 +2533,8 @@ def main():
         test_prewarm_stops_after_one,
         test_prewarm_is_bounded_and_never_blocks,
         test_prewarm_disabled_by_zero,
+        test_prewarm_temporarily_caps_client_transport_budget,
+        test_prewarm_transport_config_validation,
         # ---- G4-R1: 三个真实路径缺口 ----
         test_prewarm_real_idle_phase_generates_one,
         test_prewarm_real_idle_classic_killswitch,
