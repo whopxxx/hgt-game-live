@@ -762,7 +762,7 @@
       }
       const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
       const nextDefault = rows.length
-        ? "📢 本场猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
+        ? "📢 累计猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
         : "";
       const changed = nextDefault !== defaultText;
       defaultText = nextDefault;

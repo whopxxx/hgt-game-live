@@ -1346,7 +1346,7 @@ window.addEventListener('load', async () => {
     check(document.getElementById('reveal-contrib-list').textContent.includes('原话包含谜底一词'), 'A16 viewer content not rewritten');
     send({phase:'qa',revealed_answer:'',qa_log:[],qa_total:74});
     check(document.getElementById('prompt').textContent.includes('猜中汤底我就揭晓')
-          && notice().includes('本场猜汤榜'), 'A16 prompt and leaderboard terminology');
+          && notice().includes('累计猜汤榜'), 'A16 prompt and leaderboard terminology');
     // 反证: 若有人把术语做回"对任意文本 replaceAll", 下面几条必然失败 ——
     // 它会把观众提问、计时器标签、贡献链原话一起改写掉。
     send({phase:'qa',qa_log:[{qid:1,user_name:'观众甲',text:'谜底是不是和灯有关？',verdict:'不是',kind:'qa'}],
@@ -1430,7 +1430,7 @@ window.addEventListener('load', async () => {
     }
     check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
     send({leaderboard:[1,2,3].map(rank=>({rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:4-rank}))});
-    const board='📢 本场猜汤榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    const board='📢 累计猜汤榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
     let boardPages='';
     for(let i=0;i<20 && boardPages.length<board.length;i++) {
       boardPages+=notice();

@@ -3,7 +3,9 @@
 海龟汤状态机的确定性单测。用 FakeClock 注入时间, 所以能精确控制
 "空闲 45 秒"、"揭晓展示 30 秒" 这类行为, 不用真的等。
 """
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -4018,8 +4020,12 @@ def test_session_leaderboard():
     _answer_and_submit(eng, clk, "u1", "Alice", "身份正确",
                        verdict="是", established_fact_ids=["f1"])
     check("非最终贡献不记分", eng.snapshot().leaderboard == [])
-    _, payload = _answer_and_submit(eng, clk, "u2", "Bob", "时间正确",
-                                    verdict="是", established_fact_ids=["f2"])
+    solve_acts, payload = _answer_and_submit(
+        eng, clk, "u2", "Bob", "时间正确",
+        verdict="是", established_fact_ids=["f2"])
+    reveal = next(a for a in solve_acts if a.kind == ActionKind.REVEAL)
+    check("真人 solved REVEAL 带稳定 winner_user_id",
+          reveal.payload.get("winner_user_id") == "u2", reveal.payload)
     expected = [{"rank": 1, "user_name": "Bob", "solved_count": 1}]
     check("contract 最终补齐者 +1", eng.snapshot().leaderboard == expected)
     eng.submit_qa([QAResult(qid=payload["qid"], verdict=P.SOLVE)])
@@ -4055,8 +4061,155 @@ def test_session_leaderboard():
     for reason in ("giveup", "timeout", "skip", "ai_solved"):
         other, clock, _ = boot_v5()
         with other._lock:
-            other._enter_revealing_locked(clock(), reason, "AI玩家")
+            other_acts = other._enter_revealing_locked(clock(), reason, "AI玩家")
         check(reason + " 不记真人分", other.snapshot().leaderboard == [])
+        other_reveal = next(a for a in other_acts if a.kind == ActionKind.REVEAL)
+        check(reason + " 不携带真人 winner_user_id",
+              not other_reveal.payload.get("winner_user_id"),
+              other_reveal.payload)
+
+
+def test_persistent_leaderboard_across_restarts():
+    """累计榜：直播 1 写盘 -> 重启恢复 -> 直播 2 继续累计。"""
+    print("\n[persistent leaderboard: 跨直播累计]")
+    from story.leaderboard import LeaderboardLedger
+    from story.state import PendingQ
+
+    with tempfile.TemporaryDirectory(prefix="hgt_leaderboard_") as td:
+        path = os.path.join(td, "leaderboard.jsonl")
+
+        # ---- 第一次直播：4 个胜场 ----
+        first = LeaderboardLedger(path=path, enabled=True)
+        check("首次 load 为空", first.load() == 0, first.stats())
+        check("u1 第1胜写盘",
+              first.record_win("u1", "Alice", "s1:1"))
+        check("u2 第1胜写盘",
+              first.record_win("u2", "Bob", "s1:2"))
+        check("u1 第2胜 + 改名写盘",
+              first.record_win("u1", "Alicia", "s1:3"))
+        check("同名不同 uid 独立写盘",
+              first.record_win("u3", "Bob", "s1:4"))
+
+        before_size = os.path.getsize(path)
+        check("重复 event_id 幂等成功",
+              first.record_win("u1", "Alicia", "s1:3"))
+        check("重复 event_id 不追加文件",
+              os.path.getsize(path) == before_size,
+              (before_size, os.path.getsize(path)))
+
+        # ---- 模拟关播/进程重启 ----
+        second = LeaderboardLedger(path=path, enabled=True)
+        check("重启重放 4 个历史胜场", second.load() == 4, second.stats())
+        check("重启后 Top3 恢复且显示最新昵称", second.top() == [
+            {"rank": 1, "user_name": "Alicia", "solved_count": 2},
+            {"rank": 2, "user_name": "Bob", "solved_count": 1},
+            {"rank": 3, "user_name": "Bob", "solved_count": 1},
+        ], second.top())
+
+        # Engine 自己不读磁盘，只吃 Director 注入的纯数据。
+        eng = RoundEngine(mkcfg(), clock=FakeClock())
+        eng.restore_leaderboard(second.rows())
+        check("新 Engine 启动前恢复累计榜",
+              eng.snapshot().leaderboard == second.top(),
+              eng.snapshot().leaderboard)
+
+        # 恢复后再赢一题，sequence 必须接着历史走，不能从 1 重置。
+        old_seq = eng._win_sequence
+        with eng._lock:
+            eng._record_winner_locked(
+                PendingQ(999, "u2", "Robert", "新一场猜中"))
+        check("恢复后 win_sequence 继续递增",
+              eng._win_sequence == old_seq + 1,
+              (old_seq, eng._win_sequence))
+        check("恢复后内存榜继续累计/更新昵称", eng.snapshot().leaderboard == [
+            {"rank": 1, "user_name": "Alicia", "solved_count": 2},
+            {"rank": 2, "user_name": "Robert", "solved_count": 2},
+            {"rank": 3, "user_name": "Bob", "solved_count": 1},
+        ], eng.snapshot().leaderboard)
+
+        # Director 随后把同一个事实 append 到持久账本。
+        check("第二场胜场继续写盘",
+              second.record_win("u2", "Robert", "s2:1"))
+        third = LeaderboardLedger(path=path, enabled=True)
+        third.load()
+        check("再次重启仍保留累计结果", third.top() == [
+            {"rank": 1, "user_name": "Alicia", "solved_count": 2},
+            {"rank": 2, "user_name": "Robert", "solved_count": 2},
+            {"rank": 3, "user_name": "Bob", "solved_count": 1},
+        ], third.top())
+
+        # append-only 文件若最后一行损坏，排行榜应报警/跳过，但直播可继续。
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("{broken-tail\n")
+        damaged = LeaderboardLedger(path=path, enabled=True)
+        check("坏尾行不阻断历史恢复", damaged.load() == 5,
+              damaged.stats())
+        check("坏尾行被明确计数", damaged.bad_lines == 1,
+              damaged.stats())
+        check("坏尾行前的 Top3 仍可用", damaged.top() == third.top(),
+              damaged.top())
+
+        # restore 只能发生在启动前，防运行中把榜单整个覆盖。
+        eng.start()
+        try:
+            eng.restore_leaderboard([])
+            check("运行中 restore 必须拒绝", False, "未抛异常")
+        except RuntimeError:
+            check("运行中 restore 明确拒绝", True)
+
+
+def test_director_persists_only_human_solved_reveals():
+    """装配层：Director 必须把真人 solved action 真正写进累计账本。"""
+    print("\n[persistent leaderboard: Director wiring]")
+    from director import Director
+
+    class FakeLedger:
+        def __init__(self):
+            self.calls = []
+
+        def record_win(self, user_id, user_name, event_id=""):
+            self.calls.append((user_id, user_name, event_id))
+            return True
+
+    d = Director.__new__(Director)
+    d.session_id = "session-abc"
+    d.leaderboard_ledger = FakeLedger()
+
+    ok = Director._persist_leaderboard_win(d, {
+        "reason": "solved",
+        "winner_user_id": "u42",
+        "winner": "Alice",
+        "expect_round": 7,
+    })
+    check("真人 solved 写一次账本", ok and d.leaderboard_ledger.calls == [
+        ("u42", "Alice", "session-abc:7")
+    ], d.leaderboard_ledger.calls)
+
+    for reason in ("ai_solved", "timeout", "giveup", "skip"):
+        before = list(d.leaderboard_ledger.calls)
+        ok = Director._persist_leaderboard_win(d, {
+            "reason": reason,
+            "winner_user_id": "fake",
+            "winner": "AI玩家",
+            "expect_round": 8,
+        })
+        check(reason + " 不写累计真人榜",
+              ok and d.leaderboard_ledger.calls == before,
+              d.leaderboard_ledger.calls)
+
+    class FailLedger(FakeLedger):
+        def record_win(self, user_id, user_name, event_id=""):
+            self.calls.append((user_id, user_name, event_id))
+            return False
+
+    d.leaderboard_ledger = FailLedger()
+    check("账本写失败只返回 False，不抛异常阻断揭晓",
+          Director._persist_leaderboard_win(d, {
+              "reason": "solved",
+              "winner_user_id": "u99",
+              "winner": "Bob",
+              "expect_round": 9,
+          }) is False)
 
 
 def test_fixed_viewer_copy_uses_soup_terms():
@@ -4117,6 +4270,8 @@ def test_fixed_viewer_copy_uses_soup_terms():
 
 def main():
     tests = [test_start_and_riddle, test_session_leaderboard,
+             test_persistent_leaderboard_across_restarts,
+             test_director_persists_only_human_solved_reveals,
              test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,

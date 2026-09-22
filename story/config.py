@@ -1038,6 +1038,11 @@ class Config:
     # 现场生成与兜底题根本不在池子里, 所以只有后者能拦住它们。
     played_path: str = os.path.join("data", "played.jsonl")
 
+    # ---- 跨直播累计猜汤榜 ----
+    # 每次真人最终解出一题就 append 一条胜场事件；启动时重放恢复。
+    # data/*.jsonl 已被 gitignore，所以观众 user_id / nickname 不会进仓库。
+    leaderboard_path: str = os.path.join("data", "leaderboard.jsonl")
+
     # ---- Batch H2-F/G: curated(外部题库)池 ----
     #
     # curated 题放**单独一个文件**, 不与 `pool.jsonl` 混。任务书 H2-F:
