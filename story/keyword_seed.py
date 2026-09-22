@@ -673,9 +673,14 @@ def keyword_spec(writer, bag, session_seed: int, *,
     # ---- lane: 50/50, 无状态派生(不复用 bag 的抽词 rng) ----
     lane = draw_lane(session_seed, draw_index)
 
-    story = writer.gen_keyword_story(
-        keywords, lane, should_continue=should_continue,
-        timeout=story_timeout)
+    if story_timeout is None:
+        # live / prefill 保持原调用形状；只有 prefetch 显式传 override。
+        story = writer.gen_keyword_story(
+            keywords, lane, should_continue=should_continue)
+    else:
+        story = writer.gen_keyword_story(
+            keywords, lane, should_continue=should_continue,
+            timeout=story_timeout)
     if story is None:
         return None, "gen_fail"
     if story.get("interrupted"):
