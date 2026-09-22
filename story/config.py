@@ -934,9 +934,11 @@ class Config:
     pool_prefetch_budget_seconds: float = 25.0
     # 后台补池走独立 transport client。正式 QA / live 出题继续保留全局
     # LLM timeout/retries；prefetch 只负责“尽快多试候选”，技术故障没必要
-    # 在同一笔 HTTP 上等 60s×4。默认 20s / 0 retries，业务层仍保留
-    # Structure/Reviewer/Audit 自己的一次“同 candidate 技术重试”。
-    pool_prefetch_llm_timeout_seconds: float = 20.0
+    # 在同一笔 HTTP 上等 60s×4。实播里 puzzle.story=GLM 多次刚好撞
+    # 20s 上限，所以给创作阶段多一点真实生成余量；仍保持 0 transport
+    # retry，坏请求最多单笔 30s，不回到 60s×4。
+    # Structure/Reviewer/Audit 自己的一次“同 candidate 技术重试”仍保留。
+    pool_prefetch_llm_timeout_seconds: float = 30.0
     pool_prefetch_llm_max_retries: int = 0
     # ---- G2: keyword2 两阶段起题(prefetch 与 live 现场生成共用) ----
     #
