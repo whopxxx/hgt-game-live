@@ -52,6 +52,7 @@ from story.live_heartbeat import (                   # noqa: E402
     DEFAULT_PATH as LIVE_HEARTBEAT_PATH,
     clear_live_heartbeat, write_live_heartbeat)
 from story.played import PlayedLedger               # noqa: E402
+from story.leaderboard import LeaderboardLedger     # noqa: E402
 from story.public_player import PublicPlayerCore    # noqa: E402
 from story.server import RenderServer, StateHub     # noqa: E402
 from story.state import ActionKind, Phase, QAResult  # noqa: E402
@@ -161,6 +162,24 @@ class Director:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.engine = RoundEngine(cfg)
+
+        # ---- 跨直播累计猜汤榜 ----
+        # Engine 保持纯状态机：Director 负责磁盘 I/O。启动时先重放账本，
+        # 再把聚合结果一次性注入 Engine；之后每个真人 solved REVEAL 再
+        # append 一条胜场事件。默认 enabled 只在生产装配打开，避免离线
+        # 单测直接构造 Config 时碰真实 data/。
+        self.leaderboard_ledger = LeaderboardLedger(
+            path=getattr(cfg, "leaderboard_path", "") or "",
+            enabled=True)
+        self.leaderboard_ledger.load()
+        try:
+            self.engine.restore_leaderboard(self.leaderboard_ledger.rows())
+        except Exception:
+            # Ledger 自己已经把坏行过滤掉；这里若仍失败属于代码/结构 bug。
+            # 排行榜不能阻止开播，所以记录后退回空榜。
+            log.exception("累计猜汤榜恢复到 Engine 失败，本次从空榜继续")
+            self.engine.restore_leaderboard([])
+
         # ---- P0: 全局已播账本(任意来源, 跨重启) ----
         #
         # 挂在 engine 上而不是各处调用方上: `submit_riddle` 是**所有**
@@ -532,6 +551,19 @@ class Director:
         elif k == ActionKind.HINT:
             self._hint(action.payload)
         elif k == ActionKind.REVEAL:
+            # 真人猜中在 Engine 内已经只计一次；这里把同一事实持久化。
+            # event_id = session + round 做第二层幂等，防异常重派同一 action
+            # 时跨重启分数翻倍。
+            if action.payload.get("reason") == "solved":
+                uid = str(action.payload.get("winner_user_id", "") or "").strip()
+                name = str(action.payload.get("winner", "") or "").strip()
+                round_id = action.payload.get("expect_round")
+                event_id = f"{self.session_id}:{round_id}"
+                if not self.leaderboard_ledger.record_win(
+                        uid, name, event_id=event_id):
+                    # 排行榜是增强功能，写失败不能阻断揭晓/直播主线。
+                    log.error("累计猜汤榜写入失败，本场内存分数仍保留: "
+                              "user=%s round=%s", name, round_id)
             self._reveal(action.payload)
         elif k == ActionKind.AI_PLAYER:
             self._ai_player(action.payload)
