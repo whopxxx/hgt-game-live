@@ -1310,8 +1310,24 @@ window.addEventListener('load', async () => {
     send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
     await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
-    send({leaderboard:[{rank:1,user_name:'Alice',solved_count:5}]});
-    check(box.dataset.kind==='leaderboard' && notice().includes('Alice 5题'), 'A16 Top3 updates default only');
+    const top10=Array.from({length:10},(_,i)=>({
+      rank:i+1,user_name:'P'+(i+1),solved_count:20-i
+    }));
+    send({leaderboard:top10});
+    check(box.dataset.kind==='leaderboard' && notice().includes('1/2')
+          && notice().includes('1. P1 20题') && notice().includes('5. P5 16题')
+          && !notice().includes('6. P6'),
+          'A16 cumulative Top10 page 1 shows ranks 1-5 only');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes('2/2')
+          && notice().includes('6. P6 15题') && notice().includes('10. P10 11题')
+          && !notice().includes('1. P1'),
+          'A16 cumulative Top10 page 2 shows ranks 6-10 only');
+    send({ai_player:{questions_earned:28}});
+    check(box.dataset.kind==='ai', 'A16 AI temporarily overlays leaderboard page 2');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
+          'A16 AI overlay resumes interrupted leaderboard page, not page 1');
 
     const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
     send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
@@ -1323,7 +1339,7 @@ window.addEventListener('load', async () => {
     send({hint_count:4,hint_text:'',qa_log:[hintRow(-3,'注意灯的方向'),hintRow(-4,'注意门外的人')],qa_total:72});
     await finish();
     check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
-    send({ai_player:{questions_earned:28,questions_available:0}});
+    send({ai_player:{questions_earned:29,questions_available:0}});
     check(box.dataset.kind==='ai', 'A16 AI outranks active hint');
     await finish(); check(notice()==='💡 提示：注意门外的人', 'A16 interrupted hint returns for full reading');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated hint snapshots enqueue once only');
@@ -1381,7 +1397,7 @@ window.addEventListener('load', async () => {
     check(box.dataset.kind==='hint', 'A16 hint preempts preset without waiting for interval');
     check(anim().effect.getTiming().duration===7000,
           'A16 short hint uses capped 5s hold plus symmetric 1s slides');
-    send({ai_player:{questions_earned:29}});
+    send({ai_player:{questions_earned:30}});
     check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
     check(anim().effect.getTiming().duration===7000,
           'A16 short AI notice uses capped 5s hold plus symmetric 1s slides');
