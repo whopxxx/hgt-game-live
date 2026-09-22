@@ -1310,6 +1310,15 @@ window.addEventListener('load', async () => {
     send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
     await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
+    send({leaderboard:[
+      {rank:1,user_name:'Alice',solved_count:5},
+      {rank:2,user_name:'Bob',solved_count:4},
+      {rank:3,user_name:'Carol',solved_count:3}
+    ]});
+    check(box.dataset.kind==='leaderboard' && box.dataset.motion==='static'
+          && !anim() && notice().includes('Alice 5题'),
+          'A16 one-page leaderboard is a persistent static baseline');
+
     const top10=Array.from({length:10},(_,i)=>({
       rank:i+1,user_name:'P'+(i+1),solved_count:20-i
     }));
