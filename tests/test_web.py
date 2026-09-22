@@ -1310,8 +1310,33 @@ window.addEventListener('load', async () => {
     send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
     await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
-    send({leaderboard:[{rank:1,user_name:'Alice',solved_count:5}]});
-    check(box.dataset.kind==='leaderboard' && notice().includes('Alice 5题'), 'A16 Top3 updates default only');
+    send({leaderboard:[
+      {rank:1,user_name:'Alice',solved_count:5},
+      {rank:2,user_name:'Bob',solved_count:4},
+      {rank:3,user_name:'Carol',solved_count:3}
+    ]});
+    check(box.dataset.kind==='leaderboard' && box.dataset.motion==='static'
+          && !anim() && notice().includes('Alice 5题'),
+          'A16 one-page leaderboard is a persistent static baseline');
+
+    const top10=Array.from({length:10},(_,i)=>({
+      rank:i+1,user_name:'P'+(i+1),solved_count:20-i
+    }));
+    send({leaderboard:top10});
+    check(box.dataset.kind==='leaderboard' && notice().includes('1/2')
+          && notice().includes('1. P1 20题') && notice().includes('5. P5 16题')
+          && !notice().includes('6. P6'),
+          'A16 cumulative Top10 page 1 shows ranks 1-5 only');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes('2/2')
+          && notice().includes('6. P6 15题') && notice().includes('10. P10 11题')
+          && !notice().includes('1. P1'),
+          'A16 cumulative Top10 page 2 shows ranks 6-10 only');
+    send({ai_player:{questions_earned:28}});
+    check(box.dataset.kind==='ai', 'A16 AI temporarily overlays leaderboard page 2');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
+          'A16 AI overlay resumes interrupted leaderboard page, not page 1');
 
     const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
     send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
@@ -1323,7 +1348,7 @@ window.addEventListener('load', async () => {
     send({hint_count:4,hint_text:'',qa_log:[hintRow(-3,'注意灯的方向'),hintRow(-4,'注意门外的人')],qa_total:72});
     await finish();
     check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
-    send({ai_player:{questions_earned:28,questions_available:0}});
+    send({ai_player:{questions_earned:29,questions_available:0}});
     check(box.dataset.kind==='ai', 'A16 AI outranks active hint');
     await finish(); check(notice()==='💡 提示：注意门外的人', 'A16 interrupted hint returns for full reading');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated hint snapshots enqueue once only');
@@ -1381,17 +1406,47 @@ window.addEventListener('load', async () => {
     check(box.dataset.kind==='hint', 'A16 hint preempts preset without waiting for interval');
     check(anim().effect.getTiming().duration===7000,
           'A16 short hint uses capped 5s hold plus symmetric 1s slides');
-    send({ai_player:{questions_earned:29}});
+    send({ai_player:{questions_earned:30}});
     check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
     check(anim().effect.getTiming().duration===7000,
           'A16 short AI notice uses capped 5s hold plus symmetric 1s slides');
     await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
+    // 排行榜是常驻底层：游戏公告只临时覆盖，结束后恢复**被打断的页**。
+    await finish(); // 让当前 preset 正常结束
+    send({leaderboard:top10});
+    check(notice().includes('1/2'), 'A16 Top10 restarts at page 1 after empty baseline');
+    await finish();
+    check(notice().includes('2/2'), 'A16 Top10 can advance naturally to page 2');
+    // 重新进入 QA，明确把 nextPreset 锚到“现在 + 90s”，避免上一条
+    // 17s preset 的 hold 时间污染这个用例的 due 边界。
+    send({phase:'setting'}); send({phase:'qa'});
+    check(notice().includes('2/2'),
+          'A16 QA re-entry preserves the current leaderboard page');
+    await tick(89999);
+    const resumePage = notice().includes('1/2') ? '1/2' : '2/2';
+    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
+          'A16 leaderboard is active immediately before preset due');
+    await tick(251);
+    check(box.dataset.kind==='preset' && notice().includes('预设乙'),
+          'A16 due game preset temporarily overlays leaderboard');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes(resumePage),
+          'A16 preset completion resumes the interrupted leaderboard page');
+    send({leaderboard:[]});
+    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
+          'A16 leaderboard can return to quiet empty baseline after resume test');
+    // 同样重锚下一条 preset；下面每次 tick(90000) 都应刚好“开始公告”，
+    // 而不是刚好“公告播完”。
+    send({phase:'setting'}); send({phase:'qa'});
+
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      await tick(90000);
+      // preset due 由 250ms poll 驱动；覆盖完整 poll 周期，不能假设
+      // 当前 fake-clock 恰好与 250ms 网格对齐。
+      await tick(90250);
       check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
       send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
     }
@@ -1429,15 +1484,21 @@ window.addEventListener('load', async () => {
       await tick(4000);
     }
     check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
-    send({leaderboard:[1,2,3].map(rank=>({rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:4-rank}))});
-    const board='📢 累计猜汤榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    send({leaderboard:[1,2,3,4,5,6,7,8,9,10].map(rank=>({
+      rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:21-rank
+    }))});
+    const boardRows=state.leaderboard;
+    const board='📢 累计猜汤榜 1/2　'
+      + boardRows.slice(0,5).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　')
+      + '📢 累计猜汤榜 2/2　'
+      + boardRows.slice(5,10).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
     let boardPages='';
-    for(let i=0;i<20 && boardPages.length<board.length;i++) {
+    for(let i=0;i<80 && boardPages.length<board.length;i++) {
       boardPages+=notice();
-      check(text.scrollWidth<=box.clientWidth, 'A16 long nicknames fit static pages');
+      check(text.scrollWidth<=box.clientWidth, 'A16 long Top10 nicknames fit reduced-motion static pages');
       await tick(4000);
     }
-    check(boardPages===board, 'A16 all Top3 long nicknames readable without truncation');
+    check(boardPages===board, 'A16 all Top10 long nicknames readable across both leaderboard pages');
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
     await new Promise(requestAnimationFrame);
     await new Promise(requestAnimationFrame);

@@ -629,11 +629,13 @@
     const box = $("announcer"), text = $("announcer-text");
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
     let config = null, phase = "", earned = null, pendingAI = 0;
-    let active = "", defaultText = "", lastPresetId = null;
+    let active = "", lastPresetId = null;
     let nextPreset = Infinity, timer = null, animation = null;
     let currentMessage = "", measuredWidth = 0;
     let hintPuzzle = null, hintCount = null;
     const pendingHints = [];
+    const LEADERBOARD_PAGE_SIZE = 5;
+    let leaderboardRows = [], leaderboardKey = "", leaderboardPage = 0;
 
     function cancel() {
       clearTimeout(timer);
@@ -643,7 +645,7 @@
       active = "";
     }
     function interval() { return (config ? config.interval_seconds : 90) * 1000; }
-    function show(message, kind) {
+    function show(message, kind, onDone = null) {
       cancel();
       active = kind;
       box.dataset.kind = kind;
@@ -652,12 +654,16 @@
       currentMessage = message;
       measuredWidth = width;
       const configuredHold = config ? config.hold_seconds : 4;
-      // 自定义公告可以停更久；AI / Hint / 排行榜继续保持短促，
+      // 自定义公告可以停更久；AI / Hint / 排行榜分页继续保持短促，
       // 避免把 operator 的 15s 配置扩散到所有临时消息。
       const hold = (kind === "preset"
         ? configuredHold
         : Math.min(configuredHold, 5)) * 1000;
-      function done() { cancel(); pump(); }
+      function done() {
+        cancel();
+        if (onDone) onDone();
+        else pump();
+      }
       if (length > width && reduced.matches) {
         // Measure each static page using the same rendered font, not char counts.
         const pages = [];
@@ -699,6 +705,53 @@
       }
     }
 
+    function leaderboardMessage() {
+      if (!leaderboardRows.length) return "";
+      const pageCount = Math.max(
+        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
+      if (leaderboardPage >= pageCount) leaderboardPage = 0;
+      const start = leaderboardPage * LEADERBOARD_PAGE_SIZE;
+      const page = leaderboardRows.slice(start, start + LEADERBOARD_PAGE_SIZE);
+      const pageLabel = pageCount > 1
+        ? ` ${leaderboardPage + 1}/${pageCount}`
+        : "";
+      return "📢 累计猜汤榜" + pageLabel + "　"
+        + page.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　");
+    }
+
+    function showLeaderboardPage() {
+      if (!leaderboardRows.length) {
+        showEmptyLeaderboard();
+        return;
+      }
+      const pageCount = Math.max(
+        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
+      if (leaderboardPage >= pageCount) leaderboardPage = 0;
+      const message = leaderboardMessage();
+
+      // 单页且能完整放下时保持真正的“常驻底层”：不反复滑入/滑出。
+      // 多页或超长昵称则复用完整文本渲染器，确保每个字符都能看到。
+      cancel();
+      text.textContent = message;
+      const fits = text.scrollWidth <= box.clientWidth;
+      if (pageCount === 1 && fits) {
+        active = "leaderboard";
+        box.dataset.kind = "leaderboard";
+        box.dataset.motion = "static";
+        currentMessage = message;
+        measuredWidth = box.clientWidth;
+        return;
+      }
+
+      show(message, "leaderboard", () => {
+        // 只有这一页**自然完整播完**才前进。
+        // 若被 AI / 提示 / 游戏公告打断，cancel() 不会执行这里，
+        // 覆盖结束后 pump() 会恢复同一页。
+        if (pageCount > 1) leaderboardPage = (leaderboardPage + 1) % pageCount;
+        pump();
+      });
+    }
+
     // Empty leaderboard is a quiet baseline state: keep the scheduler armed
     // without rendering placeholder copy or starting a pointless animation.
     function showEmptyLeaderboard() {
@@ -730,8 +783,8 @@
         lastPresetId = items[index].id; // Advance even when interrupted by AI.
         nextPreset = performance.now() + interval();
         show("📢 游戏公告 " + items[index].text, "preset");
-      } else if (defaultText) {
-        show(defaultText, "leaderboard");
+      } else if (leaderboardRows.length) {
+        showLeaderboardPage();
       } else {
         showEmptyLeaderboard();
       }
@@ -760,12 +813,16 @@
         }
         hintCount = s.hint_count;
       }
-      const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 3) : [];
-      const nextDefault = rows.length
-        ? "📢 累计猜汤榜 " + rows.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　")
-        : "";
-      const changed = nextDefault !== defaultText;
-      defaultText = nextDefault;
+      const rows = Array.isArray(s.leaderboard) ? s.leaderboard.slice(0, 10) : [];
+      const nextKey = JSON.stringify(rows.map(r => [
+        r.rank, r.user_name, r.solved_count
+      ]));
+      const changed = nextKey !== leaderboardKey;
+      leaderboardRows = rows;
+      leaderboardKey = nextKey;
+      const pageCount = Math.max(
+        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
+      if (leaderboardPage >= pageCount) leaderboardPage = 0;
       if (phase !== s.phase) {
         phase = s.phase;
         cancel();
@@ -820,13 +877,13 @@
       }
     }, 250);
     reduced.addEventListener("change", () => {
-      if (active === "leaderboard" && !currentMessage) showEmptyLeaderboard();
+      if (active === "leaderboard") showLeaderboardPage();
       else if (active) show(currentMessage, active);
       else pump();
     });
     new ResizeObserver(() => {
       if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
-        if (active === "leaderboard" && !currentMessage) showEmptyLeaderboard();
+        if (active === "leaderboard") showLeaderboardPage();
         else show(currentMessage, active); // Debug width changed: remeasure pages/motion.
       }
     }).observe(box);

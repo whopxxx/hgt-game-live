@@ -2544,7 +2544,7 @@ class RoundEngine:
                     for i, row in enumerate(sorted(
                         self._leaderboard.values(),
                         key=lambda row: (-row["solved_count"], row["win_sequence"])
-                    )[:3])],
+                    )[:10])],
                 qa_log=[r.to_json() for r in self._qa_log[-40:]],
                 qa_archive=[r.to_archive() for r in self._qa_archive],
                 # R2: 只在揭晓阶段下发。QA 阶段这些文本虽然已经公开过,
