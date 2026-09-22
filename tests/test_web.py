@@ -1432,17 +1432,21 @@ window.addEventListener('load', async () => {
     send({phase:'qa', leaderboard:top10});
     check(box.dataset.kind==='leaderboard' && notice().includes('1/2'),
           'A16 22s config starts Top10 page 1');
+
+    // 排行榜页的真实时长取决于渲染后宽度：
+    //   - 能放下：5s hold + 1s*2 slide
+    //   - 放不下：按实际像素宽度 / speed 跑 marquee
+    // 所以测试不能硬编码“第一页/第二页各 17s”。直接从 QA 锚点推进到
+    // 22.25s（包含一次 250ms due poll）：此刻如果某一排行榜页还没自然
+    // 播完，公告只能保持 due，不能 cancel() 它。
+    await tick(22250);
+    const pageAtDue = notice();
+    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(pageAtDue),
+          'A16 due preset must not cut off active leaderboard page at 22s');
+
+    // 从当前仍在播放的排行榜页推进一个“完整页时长”一定足够跨过它
+    // 自己的 done()；done -> pump 会立即接上已经 due 的 preset。
     await finish();
-    check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
-          'A16 22s config reaches Top10 page 2 naturally');
-
-    // 22s deadline = page2 开始约 5s 后。跨过 deadline 后仍必须是完整 page2。
-    await tick(5250);
-    check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
-          'A16 due preset must not cut off active leaderboard page 2');
-
-    // page2 剩余约 11.75s；本页自然结束后，已经到期的 preset 应立即接棒。
-    await tick(12000);
     check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
           'A16 queued due preset starts immediately after leaderboard page finishes');
     await finish();
