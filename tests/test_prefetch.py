@@ -2540,16 +2540,15 @@ def test_g1_success_resets_backoff_streak():
 
 
 def test_g1_scene_change_resets_long_backoff_once():
-    """新一题正式开始 -> 长退避**重置一次**到第一档。
+    """新一题正式开始 -> 当前 refill 失败序列重置一次到第一档。
 
-    退避的初衷是"别在同一个坏上下文里反复烧钱"。新一题开始后 recent
-    window / 配额饱和状态整体换了一批, 机械等满 300 秒只是白等 ——
-    但也不能立刻清零(刚失败过的环境没有变好), 所以重置到当前序列第一档。
+    即使 refill 短退避已经封顶到 15 秒，新一题开始后 recent window /
+    配额环境整体变了，也应回到当前短序列第一档 5 秒；但不能直接清零。
 
     判据是**场景指纹**(puzzle_index), 不是"时间到了" —— 后者会让
     递增序列形同虚设。
     """
-    print("\n[G1-G] 场景变化重置长退避")
+    print("\n[G1-G] 场景变化重置当前 refill 退避")
     with tmpdir() as d:
         clk = _Clock()
         scene = {"n": 5}
@@ -2563,17 +2562,18 @@ def test_g1_scene_change_resets_long_backoff_once():
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)),
                   writer=_FakeWriter(fail=True), clock=clk, probe=probe)
         fill(pf.pool, 1)
-        # 攒出一条长退避
+        # 攒到 refill 短退避封顶档。
         for _ in range(4):
             pf.on_tick()
             pf.on_tick()
-            clk.advance(400)
-        check("已进入长退避档(>=240s)", pf._fail_streak >= 4,
+            clk.advance(30)
+        check("已进入连续失败链", pf._fail_streak >= 4,
               pf._fail_streak)
         pf.on_tick()
         pf.on_tick()
-        long_wait = pf._retry_at - clk.t
-        check("退避已是长档", long_wait >= 240.0, long_wait)
+        capped_wait = pf._retry_at - clk.t
+        check("refill 退避封顶 15s", round(capped_wait, 1) == 15.0,
+              capped_wait)
         # 新一题开始
         scene["n"] = 6
         pf.on_tick()
