@@ -639,6 +639,7 @@
 
     function cancel() {
       clearTimeout(timer);
+      timer = null;
       if (animation) animation.cancel();
       animation = null;
       text.style.transform = "";
@@ -745,8 +746,9 @@
 
       show(message, "leaderboard", () => {
         // 只有这一页**自然完整播完**才前进。
-        // 若被 AI / 提示 / 游戏公告打断，cancel() 不会执行这里，
-        // 覆盖结束后 pump() 会恢复同一页。
+        // 若被 AI / 提示打断，cancel() 不会执行这里，覆盖结束后
+        // pump() 会恢复同一页。游戏公告不会再腰斩正在播放的排行榜页：
+        // 到点后会等本页自然结束，再由 pump() 优先播放。
         if (pageCount > 1) leaderboardPage = (leaderboardPage + 1) % pageCount;
         pump();
       });
@@ -880,6 +882,15 @@
     setInterval(() => {
       if (phase === "qa" && active === "leaderboard" && config && config.enabled
           && config.items.some(x => x.enabled) && performance.now() >= nextPreset) {
+        // 公告到点时不要“腰斩”正在完整播放的排行榜页。
+        //
+        // 多页排行榜 / 超长昵称 / reduced-motion 分页都有 timer：
+        // 让当前页自然结束，done() -> pump() 会立刻发现 preset 已到期，
+        // 然后优先播放公告。这样 1/2 或 2/2 每页都能完整读完。
+        //
+        // 单页且能完整放下的排行榜是静态常驻底层，没有 timer/animation；
+        // 对它仍然允许到点立即切到公告，否则公告永远没有机会出现。
+        if (timer || animation) return;
         cancel(); pump();
       }
     }, 250);

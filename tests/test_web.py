@@ -1266,6 +1266,18 @@ window.addEventListener('load', async () => {
     const duration = anim() ? anim().effect.getTiming().duration : 4000;
     await tick(duration + 1);
   };
+  // 精确走到“当前最早 one-shot timer”的结束点。announcer 的每一轮
+  // show() 都只有一个 one-shot done timer；interval/reload/poll 都是 interval。
+  // 这个 helper 用于已经播到中途的场景，避免 finish() 再加一整个 duration
+  // 而跨过后续 preset / leaderboard turn。
+  const finishCurrentTurn = async () => {
+    const due = [...tasks.values()]
+      .filter(t => !t.interval && t.at >= clock)
+      .map(t => t.at)
+      .sort((a,b) => a-b)[0];
+    if (due === undefined) { await finish(); return; }
+    await tick(Math.max(0, due - clock) + 1);
+  };
   try {
     send();
     check(box.dataset.kind === 'leaderboard' && notice()==='' && !anim(),
@@ -1419,41 +1431,61 @@ window.addEventListener('load', async () => {
     await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
-    // 排行榜是常驻底层：游戏公告只临时覆盖，结束后恢复**被打断的页**。
+    // 真实用户配置回归：interval=22s / hold=15s。
+    //
+    // 短公告页本身是 1s 入场 + 15s 停留 + 1s 退场 = 17s；
+    // Top10 两页也各自完整播放。22s 会落在第二页中途，所以公告“到点”
+    // 只能排队，不能 cancel() 腰斩第二页。
     await finish(); // 让当前 preset 正常结束
-    send({leaderboard:top10});
-    check(notice().includes('1/2'), 'A16 Top10 restarts at page 1 after empty baseline');
-    await finish();
-    check(notice().includes('2/2'), 'A16 Top10 can advance naturally to page 2');
-    // 重新进入 QA，明确把 nextPreset 锚到“现在 + 90s”，避免上一条
-    // 17s preset 的 hold 时间污染这个用例的 due 边界。
-    send({phase:'setting'}); send({phase:'qa'});
-    check(notice().includes('2/2'),
-          'A16 QA re-entry preserves the current leaderboard page');
-    await tick(89999);
-    const resumePage = notice().includes('1/2') ? '1/2' : '2/2';
+    await reload(config(['预设甲','禁用','预设乙'],
+                        {interval_seconds:22, hold_seconds:15}));
+    cfg.items[1].enabled=false;
+    send({phase:'setting'});
+    send({phase:'qa', leaderboard:top10});
+    check(box.dataset.kind==='leaderboard' && notice().includes('1/2'),
+          'A16 22s config starts Top10 page 1');
+
+    // 排行榜页的真实时长取决于渲染后宽度：
+    //   - 能放下：5s hold + 1s*2 slide
+    //   - 放不下：按实际像素宽度 / speed 跑 marquee
+    // 所以测试不能硬编码“第一页/第二页各 17s”。直接从 QA 锚点推进到
+    // 22.25s（包含一次 250ms due poll）：此刻如果某一排行榜页还没自然
+    // 播完，公告只能保持 due，不能 cancel() 它。
+    await tick(22250);
+    const pageAtDue = notice();
+    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(pageAtDue),
+          'A16 due preset must not cut off active leaderboard page at 22s');
+
+    // 精确走到当前排行榜页自己的 done()；done -> pump 会立即接上
+    // 已经 due 的 preset。不能用 finish() 再加一整段 duration，否则当前页
+    // 已经播到中途时会顺手把后面的 preset 也推进掉。
+    await finishCurrentTurn();
+    check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
+          'A16 queued due preset starts immediately after leaderboard page finishes');
+    await finishCurrentTurn();
     check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
-          'A16 leaderboard is active immediately before preset due');
-    await tick(251);
-    check(box.dataset.kind==='preset' && notice().includes('预设乙'),
-          'A16 due game preset temporarily overlays leaderboard');
-    await finish();
-    check(box.dataset.kind==='leaderboard' && notice().includes(resumePage),
-          'A16 preset completion resumes the interrupted leaderboard page');
+          'A16 after preset, leaderboard resumes at the naturally advanced page');
+
     send({leaderboard:[]});
     check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
-          'A16 leaderboard can return to quiet empty baseline after resume test');
-    // 同样重锚下一条 preset；下面每次 tick(90000) 都应刚好“开始公告”，
-    // 而不是刚好“公告播完”。
+          'A16 leaderboard can return to quiet empty baseline after queued preset test');
+
+    // 后面的 last-known-good 配置测试仍使用 90s，避免把 22s 场景时间轴扩散出去。
+    await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15}));
+    cfg.items[1].enabled=false;
+    await tick(15000); // 让 last-known-good 真正载入 disabled 状态
     send({phase:'setting'}); send({phase:'qa'});
 
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
+    // 每种失败独立做 setting -> qa，重新锚定 nextPreset，避免上一轮 preset
+    // 的 17s 生命周期污染下一轮时间轴；这里测的是“坏配置不能覆盖最后一次
+    // 好配置”，不是跨轮 timing 偶合。
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      // preset due 由 250ms poll 驱动；覆盖完整 poll 周期，不能假设
-      // 当前 fake-clock 恰好与 250ms 网格对齐。
-      await tick(90250);
-      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
+      send({phase:'setting'}); send({phase:'qa'});
+      await tick(92000);
+      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
+            'A16 last-known-good survives '+bad);
       send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
     }
     await reload(config(['更新公告']));
