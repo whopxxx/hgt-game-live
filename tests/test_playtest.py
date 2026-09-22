@@ -840,8 +840,17 @@ def test_playtest_enabled_director_builds_playtester():
             check("**host 是 prefetch 的 writer(不是 live 的)**",
                   pf._playtester.host is pf.writer)
             check("host 不是 live writer", pf._playtester.host is not dr.writer)
-            check("Player 用同一 client",
-                  pf._playtester.client is dr.client)
+            check("Player 也走 prefetch 独立 client",
+                  pf._playtester.client is dr._prefetch_client
+                  and pf._playtester.client is not dr.client)
+            check("Player 与 live 的模型路由一致",
+                  pf._playtester.client.cfg.resolved_models()
+                  == dr.client.cfg.resolved_models())
+            check("Player transport 跟随 prefetch 20s/0",
+                  pf._playtester.client.cfg.timeout == 20.0
+                  and pf._playtester.client.cfg.max_retries == 0,
+                  (pf._playtester.client.cfg.timeout,
+                   pf._playtester.client.cfg.max_retries))
         if pf:
             pf.shutdown()
 

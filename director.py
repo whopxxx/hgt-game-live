@@ -34,6 +34,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +203,8 @@ class Director:
         self.server: RenderServer | None = None
         self.writer: PuzzleWriter | None = None
         self.client: AnthropicMessagesClient | None = None
+        # 后台补池独立 client：只收紧 transport timeout/retries，不改模型路由。
+        self._prefetch_client: AnthropicMessagesClient | None = None
         self.ai_player: PublicPlayerCore | None = None
         self._stop = threading.Event()
         # ⚠️ 实际上**只有 `_riddle` 用它**(非阻塞 acquire, 失败则
@@ -297,9 +300,30 @@ class Director:
             # provenance 会被污染(题以后播出时 archive 带着错误审稿指标)。
             # 每边一个实例就切断了这条侧信道。
             #
-            # `client` 仍然共用 —— 它是纯传输层, 无可变业务状态。
-            pf_writer = (PuzzleWriter(client=self.client, runtime_cfg=cfg)
-                         if self.client is not None else None)
+            # ---- 实播吞吐: prefetch transport 独立 fail-fast ----
+            #
+            # live QA / live 出题继续用 cfg.llm 的正式预算(例如 60s/3 retries)；
+            # 后台补池若也继承同一预算，一次 Story/Reviewer 网关故障就可能
+            # 把“有空补一道”拖成几分钟。这里 clone **同一套路由/模型/key**，
+            # 只收紧 timeout/retries；因此不会影响正式直播请求，也不会出现
+            # 共享 cfg 被临时修改的竞态。
+            pf_client = None
+            if self.client is not None:
+                _pf_timeout = max(
+                    0.1, float(getattr(
+                        cfg, "pool_prefetch_llm_timeout_seconds", 20.0) or 20.0))
+                _pf_retries = max(
+                    0, int(getattr(
+                        cfg, "pool_prefetch_llm_max_retries", 0) or 0))
+                _pf_llm = replace(
+                    cfg.llm,
+                    timeout=min(float(cfg.llm.timeout), _pf_timeout),
+                    max_retries=min(max(0, int(cfg.llm.max_retries)),
+                                    _pf_retries))
+                pf_client = AnthropicMessagesClient(_pf_llm)
+                self._prefetch_client = pf_client
+            pf_writer = (PuzzleWriter(client=pf_client, runtime_cfg=cfg)
+                         if pf_client is not None else None)
 
             # ---- Q10: AI 试玩(默认关闭) ----
             # 装配权在这里, 不在 PoolPrefetcher 里 —— 因为 Playtester 需要
@@ -314,7 +338,7 @@ class Director:
                     and pf_writer is not None):
                 from story.playtest import Playtester
                 playtester = Playtester(
-                    player_client=self.client,
+                    player_client=pf_client,
                     host_writer=pf_writer,
                     should_continue=self._playtest_should_continue,
                     max_turns=getattr(cfg, "playtest_max_turns", 10))
@@ -1857,6 +1881,10 @@ class Director:
             else:
                 _banner(f"  补池        : 低水位 {cfg.pool_min_size} -> "
                       f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
+                _banner(
+                    f"  补池 LLM    : timeout "
+                    f"{float(getattr(cfg, 'pool_prefetch_llm_timeout_seconds', 20.0)):.0f}s, "
+                    f"retries {int(getattr(cfg, 'pool_prefetch_llm_max_retries', 0))}")
                 if getattr(cfg, "playtest_enabled", False):
                     _banner(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "
                           f"猜不中不入池; Player temperature=0)")

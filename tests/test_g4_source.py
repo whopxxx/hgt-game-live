@@ -114,6 +114,11 @@ def test_default_config_curated_off():
           and c.pool_prewarm_llm_max_retries == 0,
           (c.pool_prewarm_llm_timeout_seconds,
            c.pool_prewarm_llm_max_retries))
+    check("prefetch LLM 独立短预算 = 20s / 0 retries",
+          c.pool_prefetch_llm_timeout_seconds == 20.0
+          and c.pool_prefetch_llm_max_retries == 0,
+          (c.pool_prefetch_llm_timeout_seconds,
+           c.pool_prefetch_llm_max_retries))
 
 
 def test_cli_defaults_and_flags():
@@ -160,6 +165,40 @@ def test_default_does_not_create_lazy_curator():
               dr._lazy_curator)
         # 0 次 LLM 调用的最强证据: 没有 client, 也就没有可调用的东西。
         check("**没有 client(no_llm)**", dr.client is None, dr.client)
+
+
+def test_prefetch_uses_independent_fail_fast_client():
+    """后台补池 transport 独立收紧，绝不能污染正式直播 client。"""
+    print("\n[prefetch transport] 独立 20s/0 retry client")
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False, pool_prefetch_enabled=True)
+        cfg.llm.timeout = 60.0
+        cfg.llm.max_retries = 3
+        cfg.pool_prefetch_llm_timeout_seconds = 20.0
+        cfg.pool_prefetch_llm_max_retries = 0
+        dr = _mk_director(cfg)
+        check("正式 client 仍是 60s/3",
+              dr.client is not None
+              and dr.client.cfg.timeout == 60.0
+              and dr.client.cfg.max_retries == 3,
+              None if dr.client is None else
+              (dr.client.cfg.timeout, dr.client.cfg.max_retries))
+        check("prefetch client 独立存在",
+              dr._prefetch_client is not None
+              and dr._prefetch_client is not dr.client,
+              dr._prefetch_client)
+        check("prefetch client = 20s/0",
+              dr._prefetch_client.cfg.timeout == 20.0
+              and dr._prefetch_client.cfg.max_retries == 0,
+              (dr._prefetch_client.cfg.timeout,
+               dr._prefetch_client.cfg.max_retries))
+        check("prefetch writer 确实接独立 client",
+              dr._prefetcher.writer.client is dr._prefetch_client,
+              dr._prefetcher.writer.client)
+        check("模型路由仍与正式 client 相同",
+              dr._prefetch_client.cfg.resolved_models()
+              == dr.client.cfg.resolved_models(),
+              dr._prefetch_client.cfg.resolved_models())
 
 
 def test_explicit_curated_loads_external_pool():
@@ -2521,6 +2560,7 @@ def main():
         test_default_config_curated_off,
         test_cli_defaults_and_flags,
         test_default_does_not_create_lazy_curator,
+        test_prefetch_uses_independent_fail_fast_client,
         test_explicit_curated_loads_external_pool,
         test_curated_off_means_truly_off,
         test_default_pops_generated_pool_first,

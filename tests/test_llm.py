@@ -5637,6 +5637,69 @@ def test_g2f_reviewer_technical_failure_retries_same_candidate():
     check("最终出题成功", bool(spec.puzzle), spec.puzzle[:30])
 
 
+def test_reviewer_invalid_patch_retries_same_candidate_once():
+    """Reviewer 自己补坏 bundle 时，重审同一 candidate，不重跑生成链。"""
+    print("\n[review-patch-retry] 非法补丁 -> 同稿重审一次")
+    spec = _v5_fixture()
+    bad = review_fix(spec.puzzle)
+    bad["fair_clues"] = [{
+        "quote": "谜面里根本不存在的句子",
+        "supports_atoms": ["a1"],
+    }]
+    fc = FakeClient([
+        LLMResult(tool_input=bad, model="m"),
+        LLMResult(tool_input=review_ok(spec.puzzle), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    reviewed, why, rewrite, technical = w._review_spec_with_retry(
+        spec, spec.blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("非法 fair_clue 补丁触发 2 次 review",
+          names.count("emit_review") == 2, names)
+    check("第二次重审后同一 candidate 可继续",
+          reviewed is not None and not rewrite and not technical,
+          (why, rewrite, technical))
+    check("最终 fair_clue 仍逐字在谜面",
+          all(c.quote in reviewed.puzzle for c in reviewed.fair_clues),
+          [c.quote for c in reviewed.fair_clues])
+
+
+def test_reviewer_patch_retry_classifier_is_narrow():
+    """只重试真实观察到的 Reviewer 越界，缺字段/语义拒绝不能被放宽。"""
+    print("\n[review-patch-retry] 分类器保持窄边界")
+    from story.llm import _review_patch_retryable
+    check("hintable 越权可重审",
+          _review_patch_retryable(
+              "本次修复**未授权改 fact.hintable**(fact f1) —— 拒绝这次修复"))
+    check("虚构 fair_clue 可重审",
+          _review_patch_retryable(
+              "审稿给的 fair_clue '不存在的句子' 不在改后的谜面里"))
+    check("bundle 缺失仍 fail-closed",
+          not _review_patch_retryable("审稿回传 bundle 不完整"))
+    check("signature 缺字段仍 fail-closed",
+          not _review_patch_retryable("observed_signature 缺字段(domain)"))
+    check("真正语义 rewrite 不重审",
+          not _review_patch_retryable("没有公平推理路径"))
+
+
+def test_reviewer_real_semantic_rewrite_does_not_retry():
+    """真正的语义 rewrite 仍然只审一次，不能靠重审把质量门磨掉。"""
+    print("\n[review-patch-retry] 真实 rewrite 不重试")
+    spec = _v5_fixture()
+    fc = FakeClient([
+        LLMResult(tool_input=review_rewrite("没有公平推理路径"), model="m"),
+    ])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    reviewed, why, rewrite, technical = w._review_spec_with_retry(
+        spec, spec.blueprint)
+    names = [c["tool"]["name"] for c in fc.calls]
+    check("语义 rewrite 只调用一次 reviewer",
+          names.count("emit_review") == 1, names)
+    check("仍然拒绝 candidate",
+          reviewed is None and rewrite and not technical,
+          (reviewed, why, rewrite, technical))
+
+
 def test_g2f_audit_technical_failure_retries_same_candidate():
     """**G2-F**: truth audit 技术失败同样重试同一稿, 不换题。"""
     print("\n[G2-F2] audit 技术失败 -> 同稿重试")
@@ -6218,6 +6281,9 @@ def main():
               test_g2d_narrow_repair_refuses_when_other_issues_remain,
               test_g2e_kind_visibility_swap_is_normalized,
               test_g2f_reviewer_technical_failure_retries_same_candidate,
+              test_reviewer_invalid_patch_retries_same_candidate_once,
+              test_reviewer_patch_retry_classifier_is_narrow,
+              test_reviewer_real_semantic_rewrite_does_not_retry,
               test_g2f_audit_technical_failure_retries_same_candidate,
               test_g2f_no_draft_requests_are_capped,
               # ---- G4-A: fact enum 错位不再换稿 ----

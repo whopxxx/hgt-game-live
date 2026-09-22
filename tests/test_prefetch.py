@@ -1407,8 +1407,9 @@ def test_director_prefetch_has_own_writer():
         -> prefetch 继续 -> 把 B 的 decision/issues 记进 A 的 metrics
     谜题内容不串, 但 review provenance 被污染。
 
-    确定性做法: 直接断言"两个不同的 writer 实例 + 同一 client",
-    而不是起线程跑几次看撞不撞。
+    确定性做法: 直接断言"两个不同的 writer 实例 + 两个独立 client，
+    但模型路由完全一致"，而不是起线程跑几次看撞不撞。prefetch 独立
+    client 的目的只是收紧 transport timeout/retries，不能改变业务模型。
     """
     print("\n[C9] 补池有自己的 Writer 实例")
     from director import Director
@@ -1419,8 +1420,21 @@ def test_director_prefetch_has_own_writer():
               and dr._prefetcher is not None)
         check("**prefetcher.writer 不是 live writer**",
               dr._prefetcher.writer is not dr.writer)
-        check("**但共用同一个 client(纯传输层)**",
-              dr._prefetcher.writer.client is dr.writer.client)
+        check("**prefetch client 也独立，避免短 timeout 污染 live**",
+              dr._prefetcher.writer.client is not dr.writer.client)
+        check("**但模型路由完全一致**",
+              dr._prefetcher.writer.client.cfg.resolved_models()
+              == dr.writer.client.cfg.resolved_models())
+        check("**live transport 保持正式预算**",
+              dr.writer.client.cfg.timeout == 60.0
+              and dr.writer.client.cfg.max_retries == 3,
+              (dr.writer.client.cfg.timeout,
+               dr.writer.client.cfg.max_retries))
+        check("**prefetch transport 是 20s/0**",
+              dr._prefetcher.writer.client.cfg.timeout == 20.0
+              and dr._prefetcher.writer.client.cfg.max_retries == 0,
+              (dr._prefetcher.writer.client.cfg.timeout,
+               dr._prefetcher.writer.client.cfg.max_retries))
 
         # 确定性 interleave: 两个实例各写各的, 互不可见
         dr.writer._last_review_decision = "pass"
