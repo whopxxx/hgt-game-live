@@ -99,6 +99,27 @@ data/leaderboard.jsonl
 如果以后确实想**人工清空总榜**，停播后备份或删除
 `data/leaderboard.jsonl`，下次启动就会从空榜开始。
 
+#### 仍在运行的旧直播：不中断迁移排行榜
+
+如果直播进程是在“累计榜持久化”上线前启动的，不要为了升级立刻停播。
+新版仓库提供旁路桥接工具：
+
+```powershell
+uv run tools/bridge_legacy_leaderboard.py
+```
+
+它会持续读取旧进程仍在写的 `data/puzzle.jsonl` / `data/danmaku.jsonl`
+以及 `http://127.0.0.1:8765/state`，把每一道真人 solved 事件幂等追加到
+`data/leaderboard.jsonl`。脚本可以反复重启，不会重复加分。
+
+如果某昵称对应多个 UID，工具会拒绝猜测。只在本机确认身份后可显式消歧：
+
+```powershell
+uv run tools/bridge_legacy_leaderboard.py --map "昵称=UID"
+```
+
+桥接运行期间按 Ctrl+C 只会停止桥接，不会停止正在直播的 Director。
+
 ### 猜中怎么判定
 
 不靠模型自觉。**先正常裁决**（是/不是/无关/接近了），若不是「揭晓」，**再单独调一次裁判**问"这条提问是否说中了核心谜底"。
