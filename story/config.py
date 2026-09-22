@@ -870,10 +870,10 @@ class Config:
     # 照样会启动一个最多几十秒的后台任务, 那个任务注定跨过 deadline,
     # 与下一题的现场生成正面相撞。
     #
-    # 所以默认值抬到 30s(= `pool_prefetch_budget_seconds` 25 + 余量),
-    # 并且 `PoolPrefetcher` 会取 `max(本值, budget + 余量)` 兜底 ——
-    # 配置调大 budget 却忘了调 guard 时, 不会静默退回旧行为。
-    pool_reveal_start_guard_seconds: float = 30.0
+    # Story 现在单独允许到 45s，因此默认 guard 同步抬到 50s
+    # (= max(prefetch budget 25, Story 45) + 5s 余量)。PoolPrefetcher 仍会
+    # 动态取 max 兜底，避免以后只调 timeout 却忘了调 guard。
+    pool_reveal_start_guard_seconds: float = 50.0
     # 一轮 prefetch 的**安全余量**: guard 至少要比 budget 多这么多,
     # 让"启动的那次生成"有希望在 deadline 之前真的结束。
     pool_prefetch_guard_margin_seconds: float = 5.0
