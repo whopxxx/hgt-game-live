@@ -2626,17 +2626,23 @@ def test_g1_effective_guard_covers_budget():
                   pool_reveal_start_guard_seconds=15.0)
         check("**effective = max(15, max(25,45)+5) = 50**",
               pf._effective_guard_s == 50.0, pf._effective_guard_s)
-        check("stats 同时报 Story timeout 与生效 guard",
+        check("stats 同时报 start/continue guard 与 Story timeout",
               pf.stats()["effective_guard_s"] == 50.0
+              and pf.stats()["continuation_guard_s"] == 30.0
               and pf.stats()["prefetch_story_timeout_s"] == 45.0,
               (pf.stats()["effective_guard_s"],
+               pf.stats()["continuation_guard_s"],
                pf.stats()["prefetch_story_timeout_s"]))
         pf._probe = lambda: _reveal_probe(remaining=45.0)
-        check("**剩余 45s <= effective 50s -> 不启动**",
+        check("**剩余 45s <= start guard 50s -> 不启动新候选**",
               pf._deadline_too_close() is True)
-        check("**剩余 45s 时谓词也让路**", pf._should_continue() is False)
+        check("**但已启动候选 45s > continuation 30s -> 可继续**",
+              pf._should_continue() is True)
+        pf._probe = lambda: _reveal_probe(remaining=25.0)
+        check("剩余 25s <= continuation 30s -> 中途让路",
+              pf._should_continue() is False)
         pf._probe = lambda: _reveal_probe(remaining=55.0)
-        check("剩余 55s > effective -> 可启动",
+        check("剩余 55s > start guard -> 可启动",
               pf._deadline_too_close() is False)
         check("剩余 55s 时谓词放行", pf._should_continue() is True)
 
