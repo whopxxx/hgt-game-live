@@ -2220,6 +2220,10 @@ def test_u1_guard_config_validation():
           list(c.pool_prefetch_backoff_schedule_s)
           == sorted(c.pool_prefetch_backoff_schedule_s),
           c.pool_prefetch_backoff_schedule_s)
+    check("默认 refill 短退避是 5/10/15",
+          tuple(c.pool_prefetch_refill_backoff_schedule_s)
+          == (5.0, 10.0, 15.0),
+          c.pool_prefetch_refill_backoff_schedule_s)
     # guard 小于一轮预算 -> 必须告警(实际生效值会被 max() 抬高)
     w6 = Config(sim_path="x", pool_reveal_start_guard_seconds=5.0,
                 pool_prefetch_budget_seconds=25.0).validate()
@@ -2232,6 +2236,10 @@ def test_u1_guard_config_validation():
                 pool_prefetch_backoff_schedule_s=(30.0, 10.0)).validate()
     check("退避序列非递增会告警",
           any("backoff_schedule" in x for x in w8), w8)
+    w9 = Config(sim_path="x",
+                pool_prefetch_refill_backoff_schedule_s=(5.0, 0.0)).validate()
+    check("refill 短退避含非正数会告警",
+          any("refill_backoff_schedule" in x for x in w9), w9)
 
 
 # ======================================================================
