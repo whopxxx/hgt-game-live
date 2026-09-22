@@ -745,8 +745,9 @@
 
       show(message, "leaderboard", () => {
         // 只有这一页**自然完整播完**才前进。
-        // 若被 AI / 提示 / 游戏公告打断，cancel() 不会执行这里，
-        // 覆盖结束后 pump() 会恢复同一页。
+        // 若被 AI / 提示打断，cancel() 不会执行这里，覆盖结束后
+        // pump() 会恢复同一页。游戏公告不会再腰斩正在播放的排行榜页：
+        // 到点后会等本页自然结束，再由 pump() 优先播放。
         if (pageCount > 1) leaderboardPage = (leaderboardPage + 1) % pageCount;
         pump();
       });
