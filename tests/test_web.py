@@ -1476,13 +1476,15 @@ window.addEventListener('load', async () => {
     send({phase:'setting'}); send({phase:'qa'});
 
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
+    // 每种失败独立做 setting -> qa，重新锚定 nextPreset，避免上一轮 preset
+    // 的 17s 生命周期污染下一轮时间轴；这里测的是“坏配置不能覆盖最后一次
+    // 好配置”，不是跨轮 timing 偶合。
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      // preset due 由 250ms poll 驱动，而且上一条 17s preset 的结束点
-      // 会改变 fake-clock 相位。给 2s poll 余量，但仍远小于 17s preset
-      // 自身时长，所以到检查点时只要调度正常就必须正处于 preset。
+      send({phase:'setting'}); send({phase:'qa'});
       await tick(92000);
-      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
+      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
+            'A16 last-known-good survives '+bad);
       send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
     }
     await reload(config(['更新公告']));
