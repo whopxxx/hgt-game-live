@@ -5664,6 +5664,24 @@ def test_reviewer_invalid_patch_retries_same_candidate_once():
           [c.quote for c in reviewed.fair_clues])
 
 
+def test_reviewer_patch_retry_classifier_is_narrow():
+    """只重试真实观察到的 Reviewer 越界，缺字段/语义拒绝不能被放宽。"""
+    print("\n[review-patch-retry] 分类器保持窄边界")
+    from story.llm import _review_patch_retryable
+    check("hintable 越权可重审",
+          _review_patch_retryable(
+              "本次修复**未授权改 fact.hintable**(fact f1) —— 拒绝这次修复"))
+    check("虚构 fair_clue 可重审",
+          _review_patch_retryable(
+              "审稿给的 fair_clue '不存在的句子' 不在改后的谜面里"))
+    check("bundle 缺失仍 fail-closed",
+          not _review_patch_retryable("审稿回传 bundle 不完整"))
+    check("signature 缺字段仍 fail-closed",
+          not _review_patch_retryable("observed_signature 缺字段(domain)"))
+    check("真正语义 rewrite 不重审",
+          not _review_patch_retryable("没有公平推理路径"))
+
+
 def test_reviewer_real_semantic_rewrite_does_not_retry():
     """真正的语义 rewrite 仍然只审一次，不能靠重审把质量门磨掉。"""
     print("\n[review-patch-retry] 真实 rewrite 不重试")
@@ -6264,6 +6282,7 @@ def main():
               test_g2e_kind_visibility_swap_is_normalized,
               test_g2f_reviewer_technical_failure_retries_same_candidate,
               test_reviewer_invalid_patch_retries_same_candidate_once,
+              test_reviewer_patch_retry_classifier_is_narrow,
               test_reviewer_real_semantic_rewrite_does_not_retry,
               test_g2f_audit_technical_failure_retries_same_candidate,
               test_g2f_no_draft_requests_are_capped,
