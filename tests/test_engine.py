@@ -4053,10 +4053,23 @@ def test_session_leaderboard():
         {"rank": 1, "user_name": "Robert", "solved_count": 2},
         {"rank": 2, "user_name": "Alice", "solved_count": 2},
         {"rank": 3, "user_name": "Bob", "solved_count": 1},
+        {"rank": 4, "user_name": "Dana", "solved_count": 1},
     ], rows)
     check("同名不同 uid 独立", len(eng._leaderboard) == 4)
-    check("最多 Top3 且严格公开字段", len(rows) == 3 and all(
+    check("Top10 严格公开字段", len(rows) == 4 and all(
         set(r) == {"rank", "user_name", "solved_count"} for r in rows))
+
+    # 恢复一个 >10 人的累计榜，Snapshot 只能公开前 10。
+    bulk = RoundEngine(mkcfg(), clock=FakeClock())
+    bulk.restore_leaderboard([
+        {"user_id": f"u{i}", "user_name": f"U{i}",
+         "solved_count": 20 - i, "win_sequence": i + 1}
+        for i in range(12)
+    ])
+    top10 = bulk.snapshot().leaderboard
+    check("累计榜最多公开 Top10", len(top10) == 10, top10)
+    check("Top10 rank 连续 1..10",
+          [r["rank"] for r in top10] == list(range(1, 11)), top10)
     check("新 engine 不继承旧榜", boot_v5()[0].snapshot().leaderboard == [])
     for reason in ("giveup", "timeout", "skip", "ai_solved"):
         other, clock, _ = boot_v5()
