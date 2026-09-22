@@ -2129,25 +2129,28 @@ def test_fallback_still_works_before_exhausted():
 
 
 def test_empty_pool_backoff_capped_at_60():
-    """**§8-12**: stock=0 连续失败时 backoff **不超过 60s**。"""
-    print("\n[G4-R2-12] 空池紧急退避: 封顶 60s")
+    """**§8-12**: refill 未完成时技术失败使用短退避，不因 stock>0 切回长档。"""
+    print("\n[G4-R2-12] refill 未完成: 技术退避封顶 15s")
     with tmpdir() as d:
         cfg = mkcfg(d, pool_prefetch_enabled=True)
         pf = _mk_bare_prefetcher(cfg)
-        pf._stock = lambda *a, **k: 0
-        pf._playable = lambda *a, **k: 0
-        check("**判为空池**", pf._is_empty() is True, pf._is_empty())
-        check("**用的是紧急序列**",
-              list(pf._schedule_now()) == [15.0, 30.0, 60.0],
+        # 复刻实播故障：已经补进 1 道，但仍远低于 8/12 水位。
+        pf._stock = lambda *a, **k: 1
+        pf._playable = lambda *a, **k: 1
+        pf._refill_active = True
+        check("**不是空池也仍在 refill**", pf._is_empty() is False,
+              pf._is_empty())
+        check("**refill 用短序列**",
+              list(pf._schedule_now()) == [5.0, 10.0, 15.0],
               pf._schedule_now())
         for streak in range(1, 9):
             w = pf._backoff_for_streak_now(streak)
-            check(f"第 {streak} 次失败 <= 60s", w <= 60.0, w)
-        check("**第 1 档是 15s**", pf._backoff_for_streak_now(1) == 15.0,
+            check(f"第 {streak} 次失败 <= 15s", w <= 15.0, w)
+        check("**第 1 档是 5s**", pf._backoff_for_streak_now(1) == 5.0,
               pf._backoff_for_streak_now(1))
         check("**封顶不再增长**",
-              pf._backoff_for_streak_now(8) == pf._backoff_for_streak_now(4),
-              (pf._backoff_for_streak_now(4), pf._backoff_for_streak_now(8)))
+              pf._backoff_for_streak_now(8) == 15.0,
+              pf._backoff_for_streak_now(8))
 
 
 def test_normal_stock_keeps_long_backoff():
@@ -2159,9 +2162,12 @@ def test_normal_stock_keeps_long_backoff():
     with tmpdir() as d:
         cfg = mkcfg(d, pool_prefetch_enabled=True)
         pf = _mk_bare_prefetcher(cfg)
-        pf._stock = lambda *a, **k: 5
+        pf._stock = lambda *a, **k: 12
         pf._playable = lambda *a, **k: 3
-        check("**判为不空**", pf._is_empty() is False, pf._is_empty())
+        pf._refill_active = False
+        check("**库存健康且 refill 已关闭**",
+              pf._is_empty() is False and pf._refill_active is False,
+              (pf._is_empty(), pf._refill_active))
         check("**用的是保守序列**",
               list(pf._schedule_now()) == [30.0, 60.0, 120.0, 240.0, 300.0],
               pf._schedule_now())
