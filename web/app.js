@@ -639,6 +639,7 @@
 
     function cancel() {
       clearTimeout(timer);
+      timer = null;
       if (animation) animation.cancel();
       animation = null;
       text.style.transform = "";
