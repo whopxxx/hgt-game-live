@@ -1317,6 +1317,24 @@ CHECK_PROMPT_VERSION = "check-v11"
 #: ⚠️ 只用于**重试**, 不动首次调用的预算: 首次 3500 是长期基线, 整体
 #: 抬高会让每一稿都变慢(而且大部分稿子并不需要)。
 REVIEW_RETRY_MAX_TOKENS = 4500
+
+# Reviewer 已经“读懂题并尝试修补”，但补丁本身违反同步契约时，
+# 允许重审**同一个 candidate**一次。这些是补丁/格式错误，不等于
+# “这道题语义上应该 rewrite”。只列确定性、代码能证明的补丁错误；
+# 真正 rewrite_reason / quality reject 不在这里，仍然直接淘汰。
+_REVIEW_PATCH_RETRY_MARKERS = (
+    "审稿回传 bundle 不完整",
+    "v5 同步合同为空/无效",
+    "未授权改",
+    "审稿给的 fair_clue",
+    "审稿给的 solve_atom",
+    "observed_signature 缺字段",
+)
+
+def _review_patch_retryable(why: str) -> bool:
+    t = str(why or "")
+    return any(mark in t for mark in _REVIEW_PATCH_RETRY_MARKERS)
+
 ANSWER_PROMPT_VERSION = "answer-v7"
 JUDGE_PROMPT_VERSION = "judge-v3"
 HINT_PROMPT_VERSION = "hint-v2"
@@ -5905,6 +5923,39 @@ class PuzzleWriter:
             calls += 1
             reviewed, why, need_rewrite, technical = out
             if not technical:
+                # ---- 实播吞吐: Reviewer 自己补坏结构 -> 同稿重审一次 ----
+                #
+                # 这和真正语义 rewrite 不一样。下面这些 why 都是代码侧能
+                # 确定的“补丁无效”：
+                #   - fair_clue quote 不在谜面；
+                #   - 越权改 hintable / supports_atoms 等冻结字段；
+                #   - v5 bundle / observed_signature 没按契约完整回传。
+                #
+                # 直接把 candidate 丢掉会白烧 Story + Surface + Structure
+                # 的几十秒。这里保留原 spec，再让 Reviewer 重做一次；
+                # 第二次若仍无效/语义 rewrite，就照常淘汰，质量门不放宽。
+                if (reviewed is None and need_rewrite
+                        and _review_patch_retryable(why)):
+                    if should_continue is not None:
+                        try:
+                            if not should_continue():
+                                log.info(
+                                    "审稿补丁无效，但直播已变忙 -> 不重审，同稿让路")
+                                return reviewed, why, need_rewrite, False
+                        except Exception:       # noqa: BLE001
+                            log.exception(
+                                "should_continue 抛异常，不做审稿补丁重试")
+                            return reviewed, why, need_rewrite, False
+                    log.warning(
+                        "审稿补丁无效(%s)，保留同一 candidate 重审一次",
+                        str(why)[:100])
+                    out2 = self._review_spec(
+                        spec, blueprint, must_fix=must_fix,
+                        max_tokens=REVIEW_RETRY_MAX_TOKENS,
+                        own_fix_focus=own_fix_focus)
+                    calls += 1
+                    reviewed2, why2, rewrite2, technical2 = out2
+                    return reviewed2, why2, rewrite2, technical2
                 return reviewed, why, need_rewrite, False
             # ---- 技术失败: 先问要不要让路 ----
             if should_continue is not None:
