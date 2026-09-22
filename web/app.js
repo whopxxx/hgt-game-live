@@ -634,8 +634,7 @@
     let currentMessage = "", measuredWidth = 0;
     let hintPuzzle = null, hintCount = null;
     const pendingHints = [];
-    const LEADERBOARD_PAGE_SIZE = 5;
-    let leaderboardRows = [], leaderboardKey = "", leaderboardPage = 0;
+    let leaderboardRows = [], leaderboardKey = "";
 
     function cancel() {
       clearTimeout(timer);
@@ -655,7 +654,7 @@
       currentMessage = message;
       measuredWidth = width;
       const configuredHold = config ? config.hold_seconds : 4;
-      // 自定义公告可以停更久；AI / Hint / 排行榜分页继续保持短促，
+      // 自定义公告可以停更久；AI / Hint / 排行榜继续保持短促，
       // 避免把 operator 的 15s 配置扩散到所有临时消息。
       const hold = (kind === "preset"
         ? configuredHold
@@ -708,34 +707,26 @@
 
     function leaderboardMessage() {
       if (!leaderboardRows.length) return "";
-      const pageCount = Math.max(
-        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
-      if (leaderboardPage >= pageCount) leaderboardPage = 0;
-      const start = leaderboardPage * LEADERBOARD_PAGE_SIZE;
-      const page = leaderboardRows.slice(start, start + LEADERBOARD_PAGE_SIZE);
-      const pageLabel = pageCount > 1
-        ? ` ${leaderboardPage + 1}/${pageCount}`
-        : "";
-      return "📢 累计猜汤榜" + pageLabel + "　"
-        + page.map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`).join("　");
+      return "📢 累计猜汤榜　"
+        + leaderboardRows
+          .map(r => `${r.rank}. ${r.user_name} ${r.solved_count}题`)
+          .join("　");
     }
 
-    function showLeaderboardPage() {
+    function showLeaderboard() {
       if (!leaderboardRows.length) {
         showEmptyLeaderboard();
         return;
       }
-      const pageCount = Math.max(
-        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
-      if (leaderboardPage >= pageCount) leaderboardPage = 0;
       const message = leaderboardMessage();
 
-      // 单页且能完整放下时保持真正的“常驻底层”：不反复滑入/滑出。
-      // 多页或超长昵称则复用完整文本渲染器，确保每个字符都能看到。
+      // Top10 不再拆 1/2、2/2：整榜就是一条消息。
+      // 能完整放下时保持静态常驻；放不下时统一走完整 marquee，
+      // 从第 1 名一直滚到第 10 名，最后一个字符离开视口才算本轮完成。
       cancel();
       text.textContent = message;
       const fits = text.scrollWidth <= box.clientWidth;
-      if (pageCount === 1 && fits) {
+      if (fits) {
         active = "leaderboard";
         box.dataset.kind = "leaderboard";
         box.dataset.motion = "static";
@@ -745,11 +736,8 @@
       }
 
       show(message, "leaderboard", () => {
-        // 只有这一页**自然完整播完**才前进。
-        // 若被 AI / 提示打断，cancel() 不会执行这里，覆盖结束后
-        // pump() 会恢复同一页。游戏公告不会再腰斩正在播放的排行榜页：
-        // 到点后会等本页自然结束，再由 pump() 优先播放。
-        if (pageCount > 1) leaderboardPage = (leaderboardPage + 1) % pageCount;
+        // 游戏公告到点只排队，不腰斩这条 Top10；整条自然滚完后
+        // pump() 会优先播放已经到期的公告。
         pump();
       });
     }
@@ -786,7 +774,7 @@
         nextPreset = performance.now() + interval();
         show("📢 游戏公告 " + items[index].text, "preset");
       } else if (leaderboardRows.length) {
-        showLeaderboardPage();
+        showLeaderboard();
       } else {
         showEmptyLeaderboard();
       }
@@ -802,12 +790,9 @@
         hintPuzzle = s.puzzle_index;
         hintCount = null;
         pendingHints.length = 0;
-        if (hadPuzzle) {
-          // 每道新题都从累计榜第一页重新亮相。
-          // 这只发生在 puzzle_index 切换时；同一题里被 AI / 提示 /
-          // 游戏公告覆盖后，仍按原逻辑恢复被打断的那一页。
-          leaderboardPage = 0;
-        }
+        // 每道新题都重新从第 1 名开始滚完整 Top10。
+        // 同一题内 AI / 提示覆盖排行榜后，也会重新从整条榜首开始，
+        // 不再维护分页/页码状态。
         if (active === "hint" || (hadPuzzle && active === "leaderboard")) cancel();
       }
       if (Number.isSafeInteger(s.hint_count) && s.hint_count >= 0) {
@@ -829,9 +814,6 @@
       const changed = nextKey !== leaderboardKey;
       leaderboardRows = rows;
       leaderboardKey = nextKey;
-      const pageCount = Math.max(
-        1, Math.ceil(leaderboardRows.length / LEADERBOARD_PAGE_SIZE));
-      if (leaderboardPage >= pageCount) leaderboardPage = 0;
       if (phase !== s.phase) {
         phase = s.phase;
         cancel();
@@ -882,26 +864,22 @@
     setInterval(() => {
       if (phase === "qa" && active === "leaderboard" && config && config.enabled
           && config.items.some(x => x.enabled) && performance.now() >= nextPreset) {
-        // 公告到点时不要“腰斩”正在完整播放的排行榜页。
-        //
-        // 多页排行榜 / 超长昵称 / reduced-motion 分页都有 timer：
-        // 让当前页自然结束，done() -> pump() 会立刻发现 preset 已到期，
-        // 然后优先播放公告。这样 1/2 或 2/2 每页都能完整读完。
-        //
-        // 单页且能完整放下的排行榜是静态常驻底层，没有 timer/animation；
-        // 对它仍然允许到点立即切到公告，否则公告永远没有机会出现。
+        // 公告到点时不要腰斩正在滚动的完整 Top10。
+        // 长榜 marquee / reduced-motion 文本分页都有 timer/animation：
+        // 让整条榜自然结束，done() -> pump() 再立即播已到期公告。
+        // 若整榜短到能静态放下，则没有 timer/animation，公告可到点覆盖。
         if (timer || animation) return;
         cancel(); pump();
       }
     }, 250);
     reduced.addEventListener("change", () => {
-      if (active === "leaderboard") showLeaderboardPage();
+      if (active === "leaderboard") showLeaderboard();
       else if (active) show(currentMessage, active);
       else pump();
     });
     new ResizeObserver(() => {
       if (active && box.clientWidth > 0 && box.clientWidth !== measuredWidth) {
-        if (active === "leaderboard") showLeaderboardPage();
+        if (active === "leaderboard") showLeaderboard();
         else show(currentMessage, active); // Debug width changed: remeasure pages/motion.
       }
     }).observe(box);
