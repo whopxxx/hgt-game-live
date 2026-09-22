@@ -916,7 +916,8 @@ class PoolPrefetcher:
         原始 guard。实播事故就是原始 guard=15s 而一轮 prefetch 能跑
         几十秒 —— "只剩 18 秒"照样启动一个注定跨过 deadline 的后台
         任务, 下一题开始时它还在跑。effective guard = max(配置值,
-        一轮预算 + 余量), 保证启动的那次有希望在 deadline 前结束。
+        max(一轮预算, Story 单次 timeout) + 余量), 保证启动的那次有希望
+        在 deadline 前结束。
 
         只在 REVEALED 且**确实拿到**剩余秒数时判定。探针给 None
         (不在 REVEALED / 没有 deadline)一律按"不限"处理 —— 少一次
@@ -1478,6 +1479,7 @@ class PoolPrefetcher:
                 # 恰恰是 G1 之前那个 bug 的样子。
                 "effective_guard_s": self._effective_guard_s,
                 "prefetch_budget_s": self._prefetch_budget,
+                "prefetch_story_timeout_s": self._story_timeout,
                 "prefetch_max_attempts": self._prefetch_attempts,
                 "fail_streak": self._fail_streak,
 
