@@ -218,24 +218,21 @@ class PoolPrefetcher:
                                None) or ())
         self._backoff_schedule = tuple(
             float(x) for x in _sched if float(x) > 0) or (self._backoff_s,)
-        # ---- G4-R2 §五: 空池时的**紧急**退避序列 ----
+        # ---- 库存未恢复时的**短**退避序列 ----
         #
-        # 实播形状: 池子已经 stock=0 / playable=0(最需要补池的一刻),
-        # 而连续几次坏稿把退避推到 30 → 60 → 120 → **240**, 于是后台
-        # 四分钟不再尝试。那不是"少烧网关", 那是**在最需要库存的时候
-        # 把自己冻住**。
+        # 只要 refill latch 还开着，就说明 stock / playable 还没回到目标线。
+        # 旧实现只在“完全空池”时用短序列；一旦刚补进 1 道，就立刻切回
+        # 30/60/120...，实播里于是出现“明明离 8/12 还很远，第二次技术
+        # 失败却直接睡 60 秒”。那会让补给追不上消费。
         #
-        # 所以空池时换成一条又短又封顶的序列(默认 15/30/60, 上限 60),
-        # 池子一有可播库存就立刻回到上面那条保守序列。
-        #
-        # ⚠️ 这不是"疯狂刷 LLM": 调度只换档位, **所有**启动闸门照旧
-        # (低压力 / pending / inflight / hint / reveal guard / 协作取消),
-        # 一道都没少。它改变的只是"连续失败之后该等多久"。
-        _empty_sched = tuple(
-            getattr(cfg, "pool_prefetch_empty_backoff_schedule_s", None) or ())
-        self._empty_backoff_schedule = tuple(
-            float(x) for x in _empty_sched if float(x) > 0) or (15.0, 30.0,
-                                                                60.0)
+        # 新语义：refill_active 整个期间都用 5/10/15s（可配置）短退避；
+        # 达到目标、latch 关闭后才恢复保守长退避。仍然 single-flight，
+        # 不增加并发，也不绕过 QA/SETTING/reveal guard 等启动闸门。
+        _refill_sched = tuple(
+            getattr(cfg, "pool_prefetch_refill_backoff_schedule_s", None) or ())
+        self._refill_backoff_schedule = tuple(
+            float(x) for x in _refill_sched if float(x) > 0) or (5.0, 10.0,
+                                                                 15.0)
 
         # 补池用**独立**的 rng。共用 Director 的 _rng 会让 live 路径的
         # blueprint 序列随"补池开不开"而变 —— 那既难排查, 也让
@@ -664,7 +661,11 @@ class PoolPrefetcher:
         wait = self._backoff_for_streak_now(self._fail_streak)
         self._retry_at = now + wait
         self._last_fail = detail or kind
-        if wait > self._backoff_s:
+        if self._refill_active:
+            log.warning(
+                "补池技术失败 %d 次(%s), 库存未恢复，短退避 %.0fs 后继续: %s",
+                self._fail_streak, kind, wait, detail)
+        elif wait > self._backoff_s:
             log.warning("补池连续技术失败 %d 次(%s), 退避 %.0fs: %s",
                         self._fail_streak, kind, wait, detail)
         else:
@@ -736,18 +737,19 @@ class PoolPrefetcher:
             return False
 
     def _schedule_now(self) -> tuple:
-        """当前该用哪条退避序列(G4-R2 §五)。
+        """当前该用哪条退避序列。
 
-            池子还有可播库存  -> 保守序列(30/60/120/240/300...)
-            stock=0 或 playable=0 -> 紧急序列(15/30/60, 封顶 60)
+            refill latch 活跃（库存还没恢复目标） -> 短序列 5/10/15...
+            refill latch 已关闭（库存健康）        -> 长序列 30/60/120...
 
-        ⚠️ 只换**序列**, 不碰任何启动闸门: 低压力 / pending / inflight /
-        hint / reveal guard / 协作取消全部照旧。所以"池空"不会让补池
-        变得可以在直播最忙时抢网关 —— 它只保证**网关空闲且确实没题**时,
-        后台不会因为连续坏稿把自己冻结四五分钟。
+        关键不是“池子是不是刚好等于 0”，而是“补库存这项工作完成没有”。
+        这样 stock 从 0 补到 1 后不会突然从 10 秒级冷却跳回 60 秒级。
+
+        这里只换技术失败后的冷却时长；single-flight、相位门、直播优先、
+        deadline guard 全部不变。
         """
-        if self._is_empty():
-            return self._empty_backoff_schedule
+        if self._refill_active:
+            return self._refill_backoff_schedule
         return self._backoff_schedule
 
     def _backoff_for_streak_now(self, streak: int) -> float:
