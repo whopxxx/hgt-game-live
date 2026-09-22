@@ -627,13 +627,19 @@ def run_gift_capture_diagnostic(cfg, *, profile_names=None, limit: int = 3,
         if duration_seconds and duration_seconds > 0:
             time.sleep(float(duration_seconds))
         else:
-            # 一直跑到 Ctrl-C。用 `Event().wait()` 而不是 `while True:
-            # sleep()` —— 后者在收到 KeyboardInterrupt 前会一直占用主线程,
-            # 而我们要的是"可中断地等"。
+            # 一直跑到 Ctrl-C。
+            #
+            # ⚠️ 不要再用“无限期 Event().wait()”。Windows 控制台下，主线程
+            # 卡在一次无超时的底层 wait 时，Ctrl-C / SIGINT 可能不能及时让
+            # Python 抛 KeyboardInterrupt，现场表现就是“Ctrl-C 怎么都关
+            # 不掉”。改成短超时轮询：最坏约 0.25s 就回到 Python 解释器一次，
+            # 让 SIGINT 有机会被处理；worker 仍然都在自己的线程里运行。
+            stop_wait = threading.Event()
             try:
-                threading.Event().wait()
+                while not stop_wait.wait(0.25):
+                    pass
             except KeyboardInterrupt:
-                log.info("gift probe: 收到 Ctrl-C")
+                log.info("gift probe: 收到 Ctrl-C，正在停止三路诊断连接…")
     finally:
         runner.stop()
         summary_path = runner.write_session_summary()
