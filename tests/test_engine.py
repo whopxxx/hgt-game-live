@@ -3,7 +3,6 @@
 海龟汤状态机的确定性单测。用 FakeClock 注入时间, 所以能精确控制
 "空闲 45 秒"、"揭晓展示 30 秒" 这类行为, 不用真的等。
 """
-import json
 import os
 import sys
 import tempfile
@@ -4159,6 +4158,60 @@ def test_persistent_leaderboard_across_restarts():
             check("运行中 restore 明确拒绝", True)
 
 
+def test_director_persists_only_human_solved_reveals():
+    """装配层：Director 必须把真人 solved action 真正写进累计账本。"""
+    print("\n[persistent leaderboard: Director wiring]")
+    from director import Director
+
+    class FakeLedger:
+        def __init__(self):
+            self.calls = []
+
+        def record_win(self, user_id, user_name, event_id=""):
+            self.calls.append((user_id, user_name, event_id))
+            return True
+
+    d = Director.__new__(Director)
+    d.session_id = "session-abc"
+    d.leaderboard_ledger = FakeLedger()
+
+    ok = Director._persist_leaderboard_win(d, {
+        "reason": "solved",
+        "winner_user_id": "u42",
+        "winner": "Alice",
+        "expect_round": 7,
+    })
+    check("真人 solved 写一次账本", ok and d.leaderboard_ledger.calls == [
+        ("u42", "Alice", "session-abc:7")
+    ], d.leaderboard_ledger.calls)
+
+    for reason in ("ai_solved", "timeout", "giveup", "skip"):
+        before = list(d.leaderboard_ledger.calls)
+        ok = Director._persist_leaderboard_win(d, {
+            "reason": reason,
+            "winner_user_id": "fake",
+            "winner": "AI玩家",
+            "expect_round": 8,
+        })
+        check(reason + " 不写累计真人榜",
+              ok and d.leaderboard_ledger.calls == before,
+              d.leaderboard_ledger.calls)
+
+    class FailLedger(FakeLedger):
+        def record_win(self, user_id, user_name, event_id=""):
+            self.calls.append((user_id, user_name, event_id))
+            return False
+
+    d.leaderboard_ledger = FailLedger()
+    check("账本写失败只返回 False，不抛异常阻断揭晓",
+          Director._persist_leaderboard_win(d, {
+              "reason": "solved",
+              "winner_user_id": "u99",
+              "winner": "Bob",
+              "expect_round": 9,
+          }) is False)
+
+
 def test_fixed_viewer_copy_uses_soup_terms():
     """Engine 自己生成、展示给观众的**固定文案**用汤面/汤底。
 
@@ -4218,6 +4271,7 @@ def test_fixed_viewer_copy_uses_soup_terms():
 def main():
     tests = [test_start_and_riddle, test_session_leaderboard,
              test_persistent_leaderboard_across_restarts,
+             test_director_persists_only_human_solved_reveals,
              test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
