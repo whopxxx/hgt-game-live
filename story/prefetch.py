@@ -1071,7 +1071,8 @@ class PoolPrefetcher:
                 self._pending_result = (kind, detail, extra)
 
     def _generate_one_inner(self, inputs: dict,
-                            should_continue=None) -> tuple:
+                            should_continue=None,
+                            story_timeout=None) -> tuple:
         """返回 `(kind, detail, extra)`。
 
         `extra` 目前只带一个 key: `playtest`(试玩 status)或 `interrupted`。
@@ -1115,7 +1116,8 @@ class PoolPrefetcher:
         if should_continue is None:
             should_continue = self._should_continue
         if self._keyword_enabled():
-            return self._generate_keyword_one(inputs, should_continue)
+            return self._generate_keyword_one(
+                inputs, should_continue, story_timeout=story_timeout)
         return self._generate_classic_one(inputs, should_continue)
 
     # ------------------------------------------------------------------
@@ -1193,7 +1195,8 @@ class PoolPrefetcher:
         return self._bag is not None
 
     def _generate_keyword_one(self, inputs: dict,
-                              should_continue=None) -> tuple:
+                              should_continue=None,
+                              story_timeout=None) -> tuple:
         """G2: `2-key -> Stage A -> Stage B`, 之后与 classic 路径**完全共用**。
 
         ## 让路检查点(§九)
@@ -1231,6 +1234,8 @@ class PoolPrefetcher:
         """
         if should_continue is None:
             should_continue = self._should_continue
+        if story_timeout is None:
+            story_timeout = self._story_timeout
         from .keyword_seed import keyword_spec
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
@@ -1239,7 +1244,7 @@ class PoolPrefetcher:
             avoid=avoid, recent=recent,
             should_continue=should_continue,
             corpus_version=self._bag_meta.get("corpus_version", ""),
-            story_timeout=self._story_timeout)
+            story_timeout=story_timeout)
         if spec is None:
             if reason == "interrupted":
                 return ("interrupted", "直播变忙, keyword2 让路",
