@@ -933,12 +933,12 @@ class Config:
     pool_prefetch_max_attempts: int = 2
     pool_prefetch_budget_seconds: float = 25.0
     # 后台补池走独立 transport client。正式 QA / live 出题继续保留全局
-    # LLM timeout/retries；prefetch 只负责“尽快多试候选”，技术故障没必要
-    # 在同一笔 HTTP 上等 60s×4。实播里 puzzle.story=GLM 多次刚好撞
-    # 20s 上限，所以给创作阶段多一点真实生成余量；仍保持 0 transport
-    # retry，坏请求最多单笔 30s，不回到 60s×4。
-    # Structure/Reviewer/Audit 自己的一次“同 candidate 技术重试”仍保留。
+    # LLM timeout/retries；prefetch 普通 stage 继续 fail-fast 30s/0。
+    # puzzle.story 当前路由到 GLM，实播已经出现多次 30s 长尾超时，因此
+    # 单独给 Story 更长的单次预算；Surface/Structure/Reviewer/Audit 不跟涨。
+    # Story override 仍受全局 cfg.llm.timeout 硬上限约束。
     pool_prefetch_llm_timeout_seconds: float = 30.0
+    pool_prefetch_story_timeout_seconds: float = 45.0
     pool_prefetch_llm_max_retries: int = 0
     # ---- G2: keyword2 两阶段起题(prefetch 与 live 现场生成共用) ----
     #
@@ -1384,6 +1384,12 @@ class Config:
                 f"{self.pool_prefetch_llm_timeout_seconds}) <= 0: 后台补池"
                 f"每笔 LLM 请求会立即失败。"
             )
+        if self.pool_prefetch_story_timeout_seconds <= 0:
+            warns.append(
+                f"pool_prefetch_story_timeout_seconds("
+                f"{self.pool_prefetch_story_timeout_seconds}) <= 0: keyword2 Story "
+                f"请求会立即失败。"
+            )
         if self.pool_prefetch_llm_max_retries < 0:
             warns.append(
                 f"pool_prefetch_llm_max_retries("
@@ -1405,21 +1411,24 @@ class Config:
                 f"pool_prefetch_guard_margin_seconds("
                 f"{self.pool_prefetch_guard_margin_seconds}) 为负, 已按 0 处理。"
             )
-        # guard 必须至少覆盖一轮补池预算。不满足时 `PoolPrefetcher` 会
-        # **取 max() 兜底**(不是静默照旧), 所以这里只提示"你配的这个
-        # 数被抬高了", 让运维知道生效值不是他写的那个。
-        _min_guard = (self.pool_prefetch_budget_seconds
-                      + self.pool_prefetch_guard_margin_seconds)
+        # guard 必须覆盖“一轮预算”和“单次 Story 最坏在途时间”中更大的
+        # 那一个。keyword2 的 25s budget 不能取消已经发出的 HTTP 请求；
+        # Story 若允许 45s，就不能仍按 25+5=30s 判断还能否启动。
+        _story_timeout = min(
+            float(self.llm.timeout),
+            max(0.0, float(self.pool_prefetch_story_timeout_seconds)))
+        _guard_work = max(self.pool_prefetch_budget_seconds, _story_timeout)
+        _min_guard = _guard_work + self.pool_prefetch_guard_margin_seconds
         if 0 < self.pool_reveal_start_guard_seconds < _min_guard:
             warns.append(
                 f"pool_reveal_start_guard_seconds("
-                f"{self.pool_reveal_start_guard_seconds}) < 一轮补池预算"
-                f"({_min_guard:.0f}s = budget "
-                f"{self.pool_prefetch_budget_seconds:.0f} + 余量 "
+                f"{self.pool_reveal_start_guard_seconds}) < 补池最坏在途预算"
+                f"({_min_guard:.0f}s = max(budget "
+                f"{self.pool_prefetch_budget_seconds:.0f}, story_timeout "
+                f"{_story_timeout:.0f}) + 余量 "
                 f"{self.pool_prefetch_guard_margin_seconds:.0f}): 实际生效值"
-                f"会被抬到 {_min_guard:.0f}s。否则'只剩这么多秒'时启动的"
-                f"后台生成注定跨过 deadline, 与下一题的现场生成抢网关 —— "
-                f"这正是 G1 要消灭的跨场景白烧。"
+                f"会被抬到 {_min_guard:.0f}s。否则临近 deadline 启动的 "
+                f"Story 可能跨到下一题，与现场生成抢网关。"
             )
         _sched = tuple(self.pool_prefetch_backoff_schedule_s or ())
         if not _sched:
