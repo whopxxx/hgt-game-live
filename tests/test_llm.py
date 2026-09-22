@@ -2731,6 +2731,7 @@ def test_messages_timeout_override():
     """
     import urllib.request
     import urllib.error
+    import story.llm as llm_mod
     from story.llm import AnthropicMessagesClient
     from story.config import LLMConfig
 
@@ -2766,16 +2767,37 @@ def test_messages_timeout_override():
         check("**传了就用传的值**", seen["timeouts"][-1] == 8.0,
               seen["timeouts"][-1])
 
-        # ③ max_retries=0 -> 失败时只打一次, 不重试
+        # ③ max_retries=0 -> 失败时只打一次, 不重试；日志也不能
+        # 再误报“第 1 次重试”。
         def boom(req, timeout=None):
             seen["calls"] += 1
             raise TimeoutError("timed out")
         urllib.request.urlopen = boom
+        warnings = []
+        orig_warning = llm_mod.log.warning
+
+        def capture_warning(msg, *args, **kwargs):
+            try:
+                warnings.append(msg % args if args else str(msg))
+            except Exception:
+                warnings.append(str(msg))
+
+        llm_mod.log.warning = capture_warning
         before = seen["calls"]
-        r = c.messages("s", "u", timeout=8.0, max_retries=0)
+        try:
+            r = c.messages("s", "u", timeout=8.0, max_retries=0,
+                           stage="puzzle.story")
+        finally:
+            llm_mod.log.warning = orig_warning
         check("**max_retries=0 只请求一次**", seen["calls"] - before == 1,
               seen["calls"] - before)
         check("返回的是错误结果(不是抛异常)", r.error is not None, r.error)
+        joined = "\n".join(warnings)
+        check("0 retry 日志不再误报第 1 次重试",
+              "第 1/" not in joined and "本次不再重试" in joined, joined)
+        check("超时日志带 stage/model/timeout",
+              "stage=puzzle.story" in joined and "model=m" in joined
+              and "timeout=8.0s" in joined, joined)
     finally:
         urllib.request.urlopen = orig
 

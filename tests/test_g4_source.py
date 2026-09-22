@@ -114,8 +114,8 @@ def test_default_config_curated_off():
           and c.pool_prewarm_llm_max_retries == 0,
           (c.pool_prewarm_llm_timeout_seconds,
            c.pool_prewarm_llm_max_retries))
-    check("prefetch LLM 独立短预算 = 20s / 0 retries",
-          c.pool_prefetch_llm_timeout_seconds == 20.0
+    check("prefetch LLM 独立短预算 = 30s / 0 retries",
+          c.pool_prefetch_llm_timeout_seconds == 30.0
           and c.pool_prefetch_llm_max_retries == 0,
           (c.pool_prefetch_llm_timeout_seconds,
            c.pool_prefetch_llm_max_retries))
@@ -169,12 +169,12 @@ def test_default_does_not_create_lazy_curator():
 
 def test_prefetch_uses_independent_fail_fast_client():
     """后台补池 transport 独立收紧，绝不能污染正式直播 client。"""
-    print("\n[prefetch transport] 独立 20s/0 retry client")
+    print("\n[prefetch transport] 独立 30s/0 retry client")
     with tmpdir() as d:
         cfg = mkcfg(d, no_llm=False, pool_prefetch_enabled=True)
         cfg.llm.timeout = 60.0
         cfg.llm.max_retries = 3
-        cfg.pool_prefetch_llm_timeout_seconds = 20.0
+        cfg.pool_prefetch_llm_timeout_seconds = 30.0
         cfg.pool_prefetch_llm_max_retries = 0
         dr = _mk_director(cfg)
         check("正式 client 仍是 60s/3",
@@ -187,8 +187,8 @@ def test_prefetch_uses_independent_fail_fast_client():
               dr._prefetch_client is not None
               and dr._prefetch_client is not dr.client,
               dr._prefetch_client)
-        check("prefetch client = 20s/0",
-              dr._prefetch_client.cfg.timeout == 20.0
+        check("prefetch client = 30s/0",
+              dr._prefetch_client.cfg.timeout == 30.0
               and dr._prefetch_client.cfg.max_retries == 0,
               (dr._prefetch_client.cfg.timeout,
                dr._prefetch_client.cfg.max_retries))

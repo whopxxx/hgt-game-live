@@ -1430,8 +1430,8 @@ def test_director_prefetch_has_own_writer():
               and dr.writer.client.cfg.max_retries == 3,
               (dr.writer.client.cfg.timeout,
                dr.writer.client.cfg.max_retries))
-        check("**prefetch transport 是 20s/0**",
-              dr._prefetcher.writer.client.cfg.timeout == 20.0
+        check("**prefetch transport 是 30s/0**",
+              dr._prefetcher.writer.client.cfg.timeout == 30.0
               and dr._prefetcher.writer.client.cfg.max_retries == 0,
               (dr._prefetcher.writer.client.cfg.timeout,
                dr._prefetcher.writer.client.cfg.max_retries))

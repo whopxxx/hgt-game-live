@@ -846,8 +846,8 @@ def test_playtest_enabled_director_builds_playtester():
             check("Player 与 live 的模型路由一致",
                   pf._playtester.client.cfg.resolved_models()
                   == dr.client.cfg.resolved_models())
-            check("Player transport 跟随 prefetch 20s/0",
-                  pf._playtester.client.cfg.timeout == 20.0
+            check("Player transport 跟随 prefetch 30s/0",
+                  pf._playtester.client.cfg.timeout == 30.0
                   and pf._playtester.client.cfg.max_retries == 0,
                   (pf._playtester.client.cfg.timeout,
                    pf._playtester.client.cfg.max_retries))
