@@ -1419,6 +1419,11 @@ window.addEventListener('load', async () => {
     check(notice().includes('1/2'), 'A16 Top10 restarts at page 1 after empty baseline');
     await finish();
     check(notice().includes('2/2'), 'A16 Top10 can advance naturally to page 2');
+    // 重新进入 QA，明确把 nextPreset 锚到“现在 + 90s”，避免上一条
+    // 17s preset 的 hold 时间污染这个用例的 due 边界。
+    send({phase:'setting'}); send({phase:'qa'});
+    check(notice().includes('2/2'),
+          'A16 QA re-entry preserves the current leaderboard page');
     await tick(89999);
     const resumePage = notice().includes('1/2') ? '1/2' : '2/2';
     check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
@@ -1432,6 +1437,9 @@ window.addEventListener('load', async () => {
     send({leaderboard:[]});
     check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
           'A16 leaderboard can return to quiet empty baseline after resume test');
+    // 同样重锚下一条 preset；下面每次 tick(90000) 都应刚好“开始公告”，
+    // 而不是刚好“公告播完”。
+    send({phase:'setting'}); send({phase:'qa'});
 
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
     for (const bad of ['json','types','missing']) {
