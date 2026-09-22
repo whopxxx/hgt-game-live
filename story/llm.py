@@ -1323,12 +1323,10 @@ REVIEW_RETRY_MAX_TOKENS = 4500
 # “这道题语义上应该 rewrite”。只列确定性、代码能证明的补丁错误；
 # 真正 rewrite_reason / quality reject 不在这里，仍然直接淘汰。
 _REVIEW_PATCH_RETRY_MARKERS = (
-    "审稿回传 bundle 不完整",
-    "v5 同步合同为空/无效",
+    # 只保留**代码能证明 Reviewer 自己越界**的补丁错误。
+    # bundle / observed_signature 缺字段仍按原契约 fail-closed，不重审。
     "未授权改",
     "审稿给的 fair_clue",
-    "审稿给的 solve_atom",
-    "observed_signature 缺字段",
 )
 
 def _review_patch_retryable(why: str) -> bool:
