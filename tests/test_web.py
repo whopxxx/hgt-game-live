@@ -1404,6 +1404,26 @@ window.addEventListener('load', async () => {
     await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
+    // 排行榜是常驻底层：游戏公告只临时覆盖，结束后恢复**被打断的页**。
+    await finish(); // 让当前 preset 正常结束
+    send({leaderboard:top10});
+    check(notice().includes('1/2'), 'A16 Top10 restarts at page 1 after empty baseline');
+    await finish();
+    check(notice().includes('2/2'), 'A16 Top10 can advance naturally to page 2');
+    await tick(89999);
+    const resumePage = notice().includes('1/2') ? '1/2' : '2/2';
+    check(box.dataset.kind==='leaderboard' && /[12]\/2/.test(notice()),
+          'A16 leaderboard is active immediately before preset due');
+    await tick(251);
+    check(box.dataset.kind==='preset' && notice().includes('预设乙'),
+          'A16 due game preset temporarily overlays leaderboard');
+    await finish();
+    check(box.dataset.kind==='leaderboard' && notice().includes(resumePage),
+          'A16 preset completion resumes the interrupted leaderboard page');
+    send({leaderboard:[]});
+    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
+          'A16 leaderboard can return to quiet empty baseline after resume test');
+
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
@@ -1445,15 +1465,21 @@ window.addEventListener('load', async () => {
       await tick(4000);
     }
     check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
-    send({leaderboard:[1,2,3].map(rank=>({rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:4-rank}))});
-    const board='📢 累计猜汤榜 '+state.leaderboard.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
+    send({leaderboard:[1,2,3,4,5,6,7,8,9,10].map(rank=>({
+      rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:21-rank
+    }))});
+    const boardRows=state.leaderboard;
+    const board='📢 累计猜汤榜 1/2　'
+      + boardRows.slice(0,5).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　')
+      + '📢 累计猜汤榜 2/2　'
+      + boardRows.slice(5,10).map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
     let boardPages='';
-    for(let i=0;i<20 && boardPages.length<board.length;i++) {
+    for(let i=0;i<80 && boardPages.length<board.length;i++) {
       boardPages+=notice();
-      check(text.scrollWidth<=box.clientWidth, 'A16 long nicknames fit static pages');
+      check(text.scrollWidth<=box.clientWidth, 'A16 long Top10 nicknames fit reduced-motion static pages');
       await tick(4000);
     }
-    check(boardPages===board, 'A16 all Top3 long nicknames readable without truncation');
+    check(boardPages===board, 'A16 all Top10 long nicknames readable across both leaderboard pages');
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
     await new Promise(requestAnimationFrame);
     await new Promise(requestAnimationFrame);
