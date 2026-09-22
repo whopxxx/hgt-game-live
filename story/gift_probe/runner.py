@@ -600,6 +600,22 @@ class GiftCaptureDiagnosticRunner:
                 pass
 
 
+def _wait_for_ctrl_c(*, poll_seconds: float = 0.25, wait_event=None) -> None:
+    """等待 Ctrl-C，同时避免 Windows 主线程卡在无限期 native wait。
+
+    `wait_event` 只供离线测试注入。生产默认新建一个永远不会自行 set 的
+    Event，于是唯一正常出口就是 KeyboardInterrupt。
+    """
+    if poll_seconds <= 0:
+        raise ValueError("poll_seconds 必须 > 0")
+    gate = wait_event if wait_event is not None else threading.Event()
+    try:
+        while not gate.wait(float(poll_seconds)):
+            pass
+    except KeyboardInterrupt:
+        log.info("gift probe: 收到 Ctrl-C，正在停止三路诊断连接…")
+
+
 def run_gift_capture_diagnostic(cfg, *, profile_names=None, limit: int = 3,
                                 probe_root: str = DEFAULT_PROBE_ROOT,
                                 summary_interval_seconds: float =
@@ -627,19 +643,9 @@ def run_gift_capture_diagnostic(cfg, *, profile_names=None, limit: int = 3,
         if duration_seconds and duration_seconds > 0:
             time.sleep(float(duration_seconds))
         else:
-            # 一直跑到 Ctrl-C。
-            #
-            # ⚠️ 不要再用“无限期 Event().wait()”。Windows 控制台下，主线程
-            # 卡在一次无超时的底层 wait 时，Ctrl-C / SIGINT 可能不能及时让
-            # Python 抛 KeyboardInterrupt，现场表现就是“Ctrl-C 怎么都关
-            # 不掉”。改成短超时轮询：最坏约 0.25s 就回到 Python 解释器一次，
-            # 让 SIGINT 有机会被处理；worker 仍然都在自己的线程里运行。
-            stop_wait = threading.Event()
-            try:
-                while not stop_wait.wait(0.25):
-                    pass
-            except KeyboardInterrupt:
-                log.info("gift probe: 收到 Ctrl-C，正在停止三路诊断连接…")
+            # 一直跑到 Ctrl-C。Windows 下不能用无限期 Event().wait():
+            # 它可能让 SIGINT 长时间得不到 Python 层处理。短轮询见 helper。
+            _wait_for_ctrl_c()
     finally:
         runner.stop()
         summary_path = runner.write_session_summary()
