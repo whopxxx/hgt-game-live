@@ -1632,8 +1632,36 @@ class Director:
             log.exception("预热: 读可播数异常, 跳过预热")
             return
 
-        log.info("预热: 冷启动 playable=0, 最多 %d 轮 / %.0fs 内取一道",
-                 max_rounds, budget)
+        # 预热不能直接继承正式直播的全局 HTTP 容错预算。
+        #
+        # 实播曾出现：全局 timeout=60 / max_retries=3，一笔预热 Stage
+        # 最坏可阻塞 4×60s；而下面的 45/90s 总预算只是 cooperative，
+        # 已经发出去的 urllib 请求取消不了，所以开播日志会几分钟无声。
+        #
+        # 这里在 engine.start() **之前**临时收紧共享 client 的传输预算。
+        # 此刻 engine 仍是 IDLE，普通 QA / live 出题尚未开始；scheduler
+        # 也因 IDLE 不会发 prefetch，因此不会把这个临时值泄漏给正式流量。
+        # finally 一定恢复，正式直播仍用用户配置的 60s / retries=3。
+        _llm_cfg = getattr(getattr(self, "client", None), "cfg", None)
+        _old_timeout = getattr(_llm_cfg, "timeout", None)
+        _old_retries = getattr(_llm_cfg, "max_retries", None)
+        _prewarm_timeout = max(
+            0.1, float(getattr(
+                self.cfg, "pool_prewarm_llm_timeout_seconds", 15.0) or 15.0))
+        _prewarm_retries = max(
+            0, int(getattr(
+                self.cfg, "pool_prewarm_llm_max_retries", 0) or 0))
+        if _llm_cfg is not None:
+            if _old_timeout is not None:
+                _llm_cfg.timeout = min(float(_old_timeout), _prewarm_timeout)
+            if _old_retries is not None:
+                _llm_cfg.max_retries = min(
+                    max(0, int(_old_retries)), _prewarm_retries)
+
+        log.info(
+            "预热: 冷启动 playable=0, 最多 %d 轮 / %.0fs；"
+            "预热单次 LLM timeout=%.0fs retries=%d",
+            max_rounds, budget, _prewarm_timeout, _prewarm_retries)
         t0 = time.monotonic()
         # ---- G4-R1: 预热必须注入**它自己的**让路谓词 ----
         #
@@ -1652,37 +1680,46 @@ class Director:
             # 即**行为与 G4-R1 之前逐位相同**。这里刻意不 fail closed:
             # 预热是优化, 为了一个缺失的可选方法而整段不跑是更差的选择。
             sc = None
-        for i in range(max_rounds):
-            if time.monotonic() - t0 > budget:
-                break
-            try:
-                kind, detail, _extra = self._prefetcher._generate_one_inner(
-                    inputs, sc)
-            except TypeError:
-                # 旧签名(只收 inputs)的替身。同上, 退回旧行为。
+        try:
+            for i in range(max_rounds):
+                if time.monotonic() - t0 > budget:
+                    break
+                log.info("预热第 %d/%d 轮开始生成…", i + 1, max_rounds)
                 try:
-                    kind, detail, _extra = \
-                        self._prefetcher._generate_one_inner(inputs)
+                    kind, detail, _extra = self._prefetcher._generate_one_inner(
+                        inputs, sc)
+                except TypeError:
+                    # 旧签名(只收 inputs)的替身。同上, 退回旧行为。
+                    try:
+                        kind, detail, _extra = \
+                            self._prefetcher._generate_one_inner(inputs)
+                    except Exception as e:      # noqa: BLE001
+                        log.exception("预热第 %d 轮异常: %s", i + 1, e)
+                        break
                 except Exception as e:          # noqa: BLE001
                     log.exception("预热第 %d 轮异常: %s", i + 1, e)
                     break
-            except Exception as e:              # noqa: BLE001
-                log.exception("预热第 %d 轮异常: %s", i + 1, e)
-                break
-            if kind == "ok":
-                log.info("预热成功: 第 %d 轮拿到一道(%.1fs), 立即继续启动",
-                         i + 1, time.monotonic() - t0)
-                return
-            log.info("预热第 %d 轮未成题(%s): %s", i + 1, kind,
-                     str(detail)[:100])
-            # 下一轮必须重取快照 —— 上一轮的入池/失败会改变 recent/avoid。
-            try:
-                inputs = self._prefetcher._generation_inputs()
-            except Exception:                   # noqa: BLE001
-                break
-        log.warning("预热未拿到题(%.1fs) —— **正常启动**, "
-                    "第一题按 emergency fallback 处理",
-                    time.monotonic() - t0)
+                if kind == "ok":
+                    log.info(
+                        "预热成功: 第 %d 轮拿到一道(%.1fs), 立即继续启动",
+                        i + 1, time.monotonic() - t0)
+                    return
+                log.info("预热第 %d 轮未成题(%s): %s", i + 1, kind,
+                         str(detail)[:100])
+                # 下一轮必须重取快照 —— 上一轮的入池/失败会改变 recent/avoid。
+                try:
+                    inputs = self._prefetcher._generation_inputs()
+                except Exception:               # noqa: BLE001
+                    break
+            log.warning("预热未拿到题(%.1fs) —— **正常启动**, "
+                        "第一题按 emergency fallback 处理",
+                        time.monotonic() - t0)
+        finally:
+            if _llm_cfg is not None:
+                if _old_timeout is not None:
+                    _llm_cfg.timeout = _old_timeout
+                if _old_retries is not None:
+                    _llm_cfg.max_retries = _old_retries
 
     def push(self) -> None:
         try:
