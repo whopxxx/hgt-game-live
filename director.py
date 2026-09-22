@@ -544,6 +544,26 @@ class Director:
         for a in (actions or []):
             self._run_action(a)
 
+    def _persist_leaderboard_win(self, payload: dict) -> bool:
+        """真人 solved REVEAL -> 跨直播账本；其它揭晓一律不写。
+
+        返回 True 表示无需写或写入成功。单独拆方法是为了让装配测试能直接
+        钉住 event_id / 过滤规则，不需要真的启动 Web/LLM/直播源。
+        """
+        if payload.get("reason") != "solved":
+            return True
+        uid = str(payload.get("winner_user_id", "") or "").strip()
+        name = str(payload.get("winner", "") or "").strip()
+        round_id = payload.get("expect_round")
+        event_id = f"{self.session_id}:{round_id}"
+        ok = self.leaderboard_ledger.record_win(
+            uid, name, event_id=event_id)
+        if not ok:
+            # 排行榜是增强功能，写失败不能阻断揭晓/直播主线。
+            log.error("累计猜汤榜写入失败，本场内存分数仍保留: "
+                      "user=%s round=%s", name, round_id)
+        return ok
+
     def _run_action(self, action) -> None:
         k = action.kind
         if k == ActionKind.ANSWER:
@@ -556,16 +576,7 @@ class Director:
             # 真人猜中在 Engine 内已经只计一次；这里把同一事实持久化。
             # event_id = session + round 做第二层幂等，防异常重派同一 action
             # 时跨重启分数翻倍。
-            if action.payload.get("reason") == "solved":
-                uid = str(action.payload.get("winner_user_id", "") or "").strip()
-                name = str(action.payload.get("winner", "") or "").strip()
-                round_id = action.payload.get("expect_round")
-                event_id = f"{self.session_id}:{round_id}"
-                if not self.leaderboard_ledger.record_win(
-                        uid, name, event_id=event_id):
-                    # 排行榜是增强功能，写失败不能阻断揭晓/直播主线。
-                    log.error("累计猜汤榜写入失败，本场内存分数仍保留: "
-                              "user=%s round=%s", name, round_id)
+            self._persist_leaderboard_win(action.payload)
             self._reveal(action.payload)
         elif k == ActionKind.AI_PLAYER:
             self._ai_player(action.payload)
