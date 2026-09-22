@@ -1338,6 +1338,12 @@ window.addEventListener('load', async () => {
     check(box.dataset.kind==='leaderboard' && notice().includes('2/2'),
           'A16 AI overlay resumes interrupted leaderboard page, not page 1');
 
+    // 同一题的临时覆盖必须恢复原页；但题号一变，新题必须重新从 Top1 开始。
+    send({puzzle_index:2,hint_count:0,hint_text:'',qa_log:[]});
+    check(box.dataset.kind==='leaderboard' && notice().includes('1/2')
+          && notice().includes('1. P1 20题') && !notice().includes('6. P6'),
+          'A16 new puzzle resets cumulative Top10 to page 1');
+
     const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
     send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
     check(box.dataset.kind==='hint' && notice()==='💡 提示：注意灯的方向', 'A16 new hint announces');
@@ -1353,7 +1359,7 @@ window.addEventListener('load', async () => {
     await finish(); check(notice()==='💡 提示：注意门外的人', 'A16 interrupted hint returns for full reading');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated hint snapshots enqueue once only');
     send({hint_count:5,hint_text:'旧题尚未播完'});
-    send({puzzle_index:2,hint_count:7,hint_text:'新题首帧历史提示'});
+    send({puzzle_index:3,hint_count:7,hint_text:'新题首帧历史提示'});
     check(box.dataset.kind==='leaderboard', 'A16 new puzzle resets baseline and cancels old hint');
     send({hint_count:8,hint_text:'本题新提示'});
     check(notice()==='💡 提示：本题新提示', 'A16 new puzzle subsequent hint announces');

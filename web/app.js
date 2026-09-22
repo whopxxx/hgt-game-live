@@ -796,10 +796,17 @@
         earned = value; // First valid snapshot (and a server reset) is a baseline.
       }
       if (hintPuzzle !== s.puzzle_index) {
+        const hadPuzzle = hintPuzzle !== null;
         hintPuzzle = s.puzzle_index;
         hintCount = null;
         pendingHints.length = 0;
-        if (active === "hint") cancel();
+        if (hadPuzzle) {
+          // 每道新题都从累计榜第一页重新亮相。
+          // 这只发生在 puzzle_index 切换时；同一题里被 AI / 提示 /
+          // 游戏公告覆盖后，仍按原逻辑恢复被打断的那一页。
+          leaderboardPage = 0;
+        }
+        if (active === "hint" || (hadPuzzle && active === "leaderboard")) cancel();
       }
       if (Number.isSafeInteger(s.hint_count) && s.hint_count >= 0) {
         if (hintCount !== null && s.hint_count > hintCount) {
