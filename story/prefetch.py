@@ -209,14 +209,18 @@ class PoolPrefetcher:
         self._guard_margin = max(
             0.0, float(getattr(cfg, "pool_prefetch_guard_margin_seconds", 5.0)
                        or 0.0))
-        # ---- G1: guard 必须覆盖预算与单次 Story 最坏在途时间 ----
-        # keyword2 的 budget 只能在 stage 之间阻止继续，不能取消已经发出的
-        # Story HTTP。Story 允许 45s 后，仍用 25+5=30s guard 会重新制造
-        # "后台 Story 跨到下一题"。因此两者取大再加 margin。
+        # ---- G1: “能否启动”与“已启动后能否继续”必须分开 ----
+        # 启动新候选要覆盖 Story 最坏 45s；但 Story 正常 13s 返回后若仍用
+        # 50s 当 continuation guard，会在剩余约 47s 时把好结果直接丢掉。
+        # 所以：
+        #   start guard        = max(config, max(budget, Story timeout)+margin)
+        #   continuation guard = budget + margin（保持此前 30s 的中途让路节奏）
         self._effective_guard_s = max(
             self._reveal_guard_s,
             max(self._prefetch_budget, self._story_timeout)
             + self._guard_margin)
+        self._continuation_guard_s = (
+            self._prefetch_budget + self._guard_margin)
         self._backoff_s = float(getattr(cfg, "pool_prefetch_backoff_s", 30.0) or 30.0)
         # ---- G1: 连续失败的退避序列 ----
         # 固定 30 秒会让同一个上下文(同样的 recent window / 同样的配额
@@ -912,12 +916,10 @@ class PoolPrefetcher:
         那一次生成白烧。已经飞着的跑完就进池子, 下一题用不上也无妨。
         (它**回来了**之后还能不能再发下一次, 由 `_should_continue` 卡。)
 
-        ⚠️ G1: 这里的阈值是 `_effective_guard_s`, **不是**配置里那个
-        原始 guard。实播事故就是原始 guard=15s 而一轮 prefetch 能跑
-        几十秒 —— "只剩 18 秒"照样启动一个注定跨过 deadline 的后台
-        任务, 下一题开始时它还在跑。effective guard = max(配置值,
-        max(一轮预算, Story 单次 timeout) + 余量), 保证启动的那次有希望
-        在 deadline 前结束。
+        ⚠️ G1: 这里是**启动阈值** `_effective_guard_s`。它覆盖 Story
+        单次最坏在途时间，防止临近 deadline 还新开一个 45s 请求。
+        已经启动后的阶段继续判据使用更小的 `_continuation_guard_s`，
+        否则正常 13s Story 返回后也会因为 50s start guard 被误丢弃。
 
         只在 REVEALED 且**确实拿到**剩余秒数时判定。探针给 None
         (不在 REVEALED / 没有 deadline)一律按"不限"处理 —— 少一次
@@ -982,7 +984,7 @@ class PoolPrefetcher:
             if left is None:
                 return True
             try:
-                return float(left) > self._effective_guard_s
+                return float(left) > self._continuation_guard_s
             except (TypeError, ValueError):
                 return False
         # SETTING / REVEALING / IDLE 之外的一切 —— 让路。
@@ -1483,6 +1485,7 @@ class PoolPrefetcher:
                 # 却仍然在剩余 20 秒时启动"这种自相矛盾的指纹, 而那
                 # 恰恰是 G1 之前那个 bug 的样子。
                 "effective_guard_s": self._effective_guard_s,
+                "continuation_guard_s": self._continuation_guard_s,
                 "prefetch_budget_s": self._prefetch_budget,
                 "prefetch_story_timeout_s": self._story_timeout,
                 "prefetch_max_attempts": self._prefetch_attempts,
