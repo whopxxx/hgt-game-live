@@ -114,11 +114,14 @@ def test_default_config_curated_off():
           and c.pool_prewarm_llm_max_retries == 0,
           (c.pool_prewarm_llm_timeout_seconds,
            c.pool_prewarm_llm_max_retries))
-    check("prefetch LLM 独立短预算 = 30s / 0 retries",
+    check("prefetch 普通 stage = 30s / 0 retries",
           c.pool_prefetch_llm_timeout_seconds == 30.0
           and c.pool_prefetch_llm_max_retries == 0,
           (c.pool_prefetch_llm_timeout_seconds,
            c.pool_prefetch_llm_max_retries))
+    check("prefetch Story 专属预算 = 45s",
+          c.pool_prefetch_story_timeout_seconds == 45.0,
+          c.pool_prefetch_story_timeout_seconds)
 
 
 def test_cli_defaults_and_flags():
@@ -175,6 +178,7 @@ def test_prefetch_uses_independent_fail_fast_client():
         cfg.llm.timeout = 60.0
         cfg.llm.max_retries = 3
         cfg.pool_prefetch_llm_timeout_seconds = 30.0
+        cfg.pool_prefetch_story_timeout_seconds = 45.0
         cfg.pool_prefetch_llm_max_retries = 0
         dr = _mk_director(cfg)
         check("正式 client 仍是 60s/3",
@@ -187,11 +191,14 @@ def test_prefetch_uses_independent_fail_fast_client():
               dr._prefetch_client is not None
               and dr._prefetch_client is not dr.client,
               dr._prefetch_client)
-        check("prefetch client = 30s/0",
+        check("prefetch client 基础 transport = 30s/0",
               dr._prefetch_client.cfg.timeout == 30.0
               and dr._prefetch_client.cfg.max_retries == 0,
               (dr._prefetch_client.cfg.timeout,
                dr._prefetch_client.cfg.max_retries))
+        check("**只有 prefetcher 的 Story override = 45s**",
+              dr._prefetcher._story_timeout == 45.0,
+              dr._prefetcher._story_timeout)
         check("prefetch writer 确实接独立 client",
               dr._prefetcher.writer.client is dr._prefetch_client,
               dr._prefetcher.writer.client)
@@ -199,6 +206,17 @@ def test_prefetch_uses_independent_fail_fast_client():
               dr._prefetch_client.cfg.resolved_models()
               == dr.client.cfg.resolved_models(),
               dr._prefetch_client.cfg.resolved_models())
+
+
+    # Story override 只是上限偏好，不能突破 operator 的全局 timeout。
+    with tmpdir() as d:
+        cfg2 = mkcfg(d, no_llm=False, pool_prefetch_enabled=True)
+        cfg2.llm.timeout = 35.0
+        cfg2.pool_prefetch_story_timeout_seconds = 45.0
+        dr2 = _mk_director(cfg2)
+        check("**全局 timeout=35 时 Story 也只能 35s**",
+              dr2._prefetcher._story_timeout == 35.0,
+              dr2._prefetcher._story_timeout)
 
 
 def test_explicit_curated_loads_external_pool():
@@ -653,10 +671,12 @@ def test_prewarm_temporarily_caps_client_transport_budget():
             self.transport = transport
             self.seen = []
 
-        def _generate_one_inner(self, inputs):
+        def _generate_one_inner(self, inputs, should_continue=None,
+                                story_timeout=None):
             self.calls += 1
             self.seen.append((self.transport.timeout,
-                              self.transport.max_retries))
+                              self.transport.max_retries,
+                              story_timeout))
             return ("ok", "", {})
 
     with tmpdir() as d:
@@ -670,8 +690,8 @@ def test_prewarm_temporarily_caps_client_transport_budget():
         dr = _dr_with_prefetch(cfg, pf)
         dr.client = Client(transport)
         dr._prewarm()
-        check("**预热调用期间生效 15s/0 retry**",
-              pf.seen == [(15.0, 0)], pf.seen)
+        check("**预热调用期间生效 15s/0 retry，Story 也明确封顶 15s**",
+              pf.seen == [(15.0, 0, 15.0)], pf.seen)
         check("**预热返回后恢复正式 60s/3 retry**",
               transport.timeout == 60.0 and transport.max_retries == 3,
               (transport.timeout, transport.max_retries))
@@ -767,6 +787,8 @@ def test_prewarm_real_idle_phase_generates_one():
 
         check("**Stage A 被真的调用了**", len(w.keyword_calls) == 1,
               len(w.keyword_calls))
+        check("**预热 Story 没被后台 45s override 撑大，仍是 15s**",
+              w.story_timeouts == [15.0], w.story_timeouts)
         check("**Stage B 被真的调用了**", len(w.structure_calls) == 1,
               len(w.structure_calls))
         check("**没有走 classic 链**", w.gen_spec_calls == [],

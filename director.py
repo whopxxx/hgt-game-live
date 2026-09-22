@@ -1711,7 +1711,7 @@ class Director:
                 log.info("预热第 %d/%d 轮开始生成…", i + 1, max_rounds)
                 try:
                     kind, detail, _extra = self._prefetcher._generate_one_inner(
-                        inputs, sc)
+                        inputs, sc, story_timeout=_prewarm_timeout)
                 except TypeError:
                     # 旧签名(只收 inputs)的替身。同上, 退回旧行为。
                     try:
@@ -1881,9 +1881,15 @@ class Director:
             else:
                 _banner(f"  补池        : 低水位 {cfg.pool_min_size} -> "
                       f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
+                _pf_base_timeout = min(
+                    float(cfg.llm.timeout),
+                    float(getattr(cfg, "pool_prefetch_llm_timeout_seconds", 30.0)))
+                _pf_story_timeout = min(
+                    float(cfg.llm.timeout),
+                    float(getattr(cfg, "pool_prefetch_story_timeout_seconds", 45.0)))
                 _banner(
-                    f"  补池 LLM    : timeout "
-                    f"{float(getattr(cfg, 'pool_prefetch_llm_timeout_seconds', 30.0)):.0f}s, "
+                    f"  补池 LLM    : base {_pf_base_timeout:.0f}s / "
+                    f"Story {_pf_story_timeout:.0f}s, "
                     f"retries {int(getattr(cfg, 'pool_prefetch_llm_max_retries', 0))}")
                 if getattr(cfg, "playtest_enabled", False):
                     _banner(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "

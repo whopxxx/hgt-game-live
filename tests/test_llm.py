@@ -3610,6 +3610,19 @@ def test_r4_story_stage_returns_answer_only():
           "谜面" not in fc.calls[0]["user"], fc.calls[0]["user"][:60])
 
 
+def test_r4_story_timeout_override_is_forwarded():
+    """prefetch 可单独给 Story 更长 timeout；其它 stage 不靠这里改变。"""
+    print("\n[R4-K1b] Story timeout override 透传")
+    fc = FakeClient([LLMResult(tool_input=_kw_story())])
+    w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
+    story = w.gen_keyword_story(["图书馆", "上楼"], "red", timeout=45.0)
+    check("Story 正常返回", bool(story and story.get("answer")), story)
+    check("**45s override 传到 client.messages**",
+          fc.calls[0]["timeout"] == 45.0, fc.calls[0]["timeout"])
+    check("stage 仍是 puzzle.story",
+          fc.calls[0]["stage"] == "puzzle.story", fc.calls[0]["stage"])
+
+
 def test_r4_story_lane_direction_is_short():
     """lane 方向**极短**(两类各一句话), 不是规则手册。"""
     print("\n[R4-K2] lane 方向要短")
@@ -6245,6 +6258,7 @@ def main():
               test_g1_budget_and_attempts_are_honored,
               # ---- R4: Story / Surface / Structure 三段式 ----
               test_r4_story_stage_returns_answer_only,
+              test_r4_story_timeout_override_is_forwarded,
               test_r4_story_lane_direction_is_short,
               test_r4_story_center_is_anomaly_not_darkness,
               test_r4_story_prompt_does_not_suppress_background,
