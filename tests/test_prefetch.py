@@ -1945,7 +1945,7 @@ def test_u1_reveal_uses_higher_target():
     with tmpdir() as d2:
         pf2 = mkpf(d2, pool=PuzzlePool.open(mkcfg(d2)),
                    executor=_SyncExecutor(),
-                   probe=lambda: _reveal_probe(remaining=50.0),
+                   probe=lambda: _reveal_probe(remaining=55.0),
                    pool_reveal_target_size=7,
                    pool_reveal_playable_target=2)
         fill_mixed(pf2.pool, 1)                 # playable=1 < 2
@@ -1991,7 +1991,7 @@ def test_c3_reveal_playable_probe_counts_past_one():
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=50.0),
+                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_playable_min=1, pool_reveal_playable_target=2,
                   pool_reveal_target_size=7)
         # ⚠️ 必须用 mixed: `fill()` 的 variant 全是同一个 (family, shape),
@@ -2037,7 +2037,7 @@ def test_c3_reveal_playable_probe_stops_at_two_not_ten():
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
         pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=50.0),
+                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_playable_min=1, pool_reveal_playable_target=2,
                   pool_reveal_target_size=7, pool_min_size=2)
         fill_mixed(pool, 1)                  # playable=1 < 2 -> 必须补
@@ -2067,7 +2067,7 @@ def test_u1_reveal_playable_target():
     print("\n[U1-B] REVEALED 的 playable 目标更高")
     with tmpdir() as d:
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=50.0),
+                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_playable_min=1, pool_reveal_playable_target=2,
                   pool_reveal_target_size=7)
         fill(pf.pool, 1)                   # stock=1, playable=1
@@ -2088,7 +2088,7 @@ def test_u1_qa_still_uses_conservative_target():
         check("QA: 目标组是保守组 (5,1)", (tgt, need) == (5, 1), (tgt, need))
     with tmpdir() as d:
         pf2 = mkpf(d, executor=_SyncExecutor(),
-                   probe=lambda: _reveal_probe(remaining=50.0),
+                   probe=lambda: _reveal_probe(remaining=55.0),
                    pool_reveal_target_size=7, pool_reveal_playable_target=2)
         tgt2, need2 = pf2._effective_targets()
         check("REVEALED: 切到 reveal 组 (7,2)", (tgt2, need2) == (7, 2),
@@ -2116,11 +2116,11 @@ def test_u1_deadline_guard_blocks_new_requests():
     with tmpdir() as d:
         ex2 = _SyncExecutor()
         pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex2,
-                   probe=lambda: _reveal_probe(remaining=40.0),
+                   probe=lambda: _reveal_probe(remaining=55.0),
                    pool_min_size=2, pool_reveal_target_size=7,
                    pool_reveal_start_guard_seconds=15.0)
         pf2.on_tick()
-        check("剩余 40s > guard -> 照常启动",
+        check("剩余 55s > effective guard -> 照常启动",
               len(ex2.submitted) == 1, len(ex2.submitted))
 
 
@@ -2143,7 +2143,7 @@ def test_u1_multiple_generations_within_one_reveal():
     with tmpdir() as d:
         ex = _SyncExecutor()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=lambda: _reveal_probe(remaining=50.0),
+                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_min_size=2, pool_target_size=5,
                   pool_reveal_target_size=7, pool_reveal_playable_target=1)
         for _ in range(12):
@@ -2175,7 +2175,7 @@ def test_u1_reveal_never_blocks_next_puzzle():
         fill_mixed(pool, 3)
         ex = _ManualExecutor()
         pf = mkpf(d, pool=pool, executor=ex,
-                  probe=lambda: _reveal_probe(remaining=50.0),
+                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_min_size=5)
         for _ in range(3):
             pf.on_tick()
@@ -2214,17 +2214,19 @@ def test_u1_guard_config_validation():
           c.reveal_core_focus_seconds)
     check("默认 reveal_target 是 12", c.pool_reveal_target_size == 12,
           c.pool_reveal_target_size)
-    # ---- G1: guard 必须覆盖一轮补池预算 ----
-    # 早先默认 15s, 但一轮 prefetch 可能跑几十秒 —— "只剩 18 秒"照样
-    # 启动一个注定跨过 deadline 的后台任务, 那正是实播里 live 与
-    # prefetch 同时占网关 51 秒的成因。默认抬到 30s。
-    check("默认 guard 是 30s(G1)", c.pool_reveal_start_guard_seconds == 30.0,
+    # ---- G1: guard 同时覆盖一轮预算与单次 Story 最坏在途时间 ----
+    check("默认 guard 是 50s", c.pool_reveal_start_guard_seconds == 50.0,
           c.pool_reveal_start_guard_seconds)
-    check("默认 guard >= budget + 余量",
+    check("默认 Story timeout 是 45s",
+          c.pool_prefetch_story_timeout_seconds == 45.0,
+          c.pool_prefetch_story_timeout_seconds)
+    check("默认 guard >= max(budget, Story timeout) + 余量",
           c.pool_reveal_start_guard_seconds
-          >= c.pool_prefetch_budget_seconds
+          >= max(c.pool_prefetch_budget_seconds,
+                 min(c.llm.timeout, c.pool_prefetch_story_timeout_seconds))
           + c.pool_prefetch_guard_margin_seconds,
-          (c.pool_reveal_start_guard_seconds, c.pool_prefetch_budget_seconds))
+          (c.pool_reveal_start_guard_seconds, c.pool_prefetch_budget_seconds,
+           c.pool_prefetch_story_timeout_seconds))
     check("默认 prefetch attempts 是 2", c.pool_prefetch_max_attempts == 2,
           c.pool_prefetch_max_attempts)
     check("默认 prefetch budget 是 25s",
@@ -2613,34 +2615,30 @@ def test_g1_scene_change_resets_long_backoff_once():
 
 
 def test_g1_effective_guard_covers_budget():
-    """**配置侧自洽**: guard 小于一轮预算时, 实际生效值必须被抬上去。
-
-    实播事故的算术: guard=15s, 但一轮 prefetch 能跑几十秒。于是
-    "只剩 18 秒"顺利通过启动检查, 然后跨过 deadline 与下一题的现场
-    生成相撞。`effective_guard = max(配置值, budget + 余量)` 让这条
-    算术不再成立 —— 而且**不用运维记得同步改两个数**。
-    """
-    print("\n[G1-H] effective guard 覆盖一轮预算")
+    """guard 必须覆盖 max(一轮预算, Story 单次 timeout) + 余量。"""
+    print("\n[G1-H] effective guard 覆盖 Story 最坏在途时间")
     with tmpdir() as d:
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)),
                   executor=_SyncExecutor(),
                   pool_prefetch_budget_seconds=25.0,
+                  pool_prefetch_story_timeout_seconds=45.0,
                   pool_prefetch_guard_margin_seconds=5.0,
                   pool_reveal_start_guard_seconds=15.0)
-        check("**effective = max(15, 25+5) = 30**",
-              pf._effective_guard_s == 30.0, pf._effective_guard_s)
-        check("stats 报的是生效值",
-              pf.stats()["effective_guard_s"] == 30.0,
-              pf.stats()["effective_guard_s"])
-        # 剩余 20 秒: 旧实现(guard=15)会启动, 新实现必须挡住
-        pf._probe = lambda: _reveal_probe(remaining=20.0)
-        check("**剩余 20s <= effective 30s -> 不启动**",
-              pf._deadline_too_close() is True)
-        check("**剩余 20s 时谓词也让路**", pf._should_continue() is False)
+        check("**effective = max(15, max(25,45)+5) = 50**",
+              pf._effective_guard_s == 50.0, pf._effective_guard_s)
+        check("stats 同时报 Story timeout 与生效 guard",
+              pf.stats()["effective_guard_s"] == 50.0
+              and pf.stats()["prefetch_story_timeout_s"] == 45.0,
+              (pf.stats()["effective_guard_s"],
+               pf.stats()["prefetch_story_timeout_s"]))
         pf._probe = lambda: _reveal_probe(remaining=45.0)
-        check("剩余 45s > effective -> 可启动",
+        check("**剩余 45s <= effective 50s -> 不启动**",
+              pf._deadline_too_close() is True)
+        check("**剩余 45s 时谓词也让路**", pf._should_continue() is False)
+        pf._probe = lambda: _reveal_probe(remaining=55.0)
+        check("剩余 55s > effective -> 可启动",
               pf._deadline_too_close() is False)
-        check("剩余 45s 时谓词放行", pf._should_continue() is True)
+        check("剩余 55s 时谓词放行", pf._should_continue() is True)
 
 
 def test_g1_interrupted_probe_fails_closed():
@@ -2844,6 +2842,8 @@ class _KeywordWriter:
                  stage_b_interrupt=False, stage_a_none=False):
         #: 每次 Story 的 `(keywords, lane)`。
         self.keyword_calls = []
+        #: 每次 Story 收到的显式 timeout；prefetch 应为 45s。
+        self.story_timeouts = []
         #: 每次 Surface 收到的 `answer`(R4: 汤面从这里截)。
         self.surface_calls = []
         #: 每次 `structure_original_idea` 的参数。
@@ -2860,7 +2860,7 @@ class _KeywordWriter:
 
     # ---- R4: Story / Surface 两段(取代旧的一段 Stage A) ----
     def gen_keyword_story(self, keywords, lane, *, should_continue=None,
-                          max_attempts=None, temperature=None):
+                          max_attempts=None, temperature=None, timeout=None):
         """Story 阶段替身: 只交 `{"answer": ...}`。
 
         ⚠️ 让路语义与生产件同构, 见下面 `structure_original_idea` 那段
@@ -2868,6 +2868,7 @@ class _KeywordWriter:
         而不是 None)。
         """
         self.keyword_calls.append((list(keywords), lane))
+        self.story_timeouts.append(timeout)
         if self._a_none:
             return None
         if self._a_interrupt:
@@ -2997,6 +2998,8 @@ def test_g2_keyword_path_draws_two_keys_and_adds():
         pf.on_tick()                          # 提交 + 同步执行
         pf.on_tick()                          # 应用结果(+ 可能再提交一次)
         check("调了 Stage A", len(w.keyword_calls) >= 1, w.keyword_calls)
+        check("**prefetch 每次 Story 都拿到 45s 专属预算**",
+              all(t == 45.0 for t in w.story_timeouts), w.story_timeouts)
         check("**每次恰好 2 个关键词**",
               all(len(k) == 2 for k in w.keyword_calls), w.keyword_calls)
         check("调了 Stage B", len(w.structure_calls) >= 1, w.structure_calls)
