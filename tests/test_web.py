@@ -1444,7 +1444,9 @@ window.addEventListener('load', async () => {
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
     for (const bad of ['json','types','missing']) {
       failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      await tick(90000);
+      // preset due 由 250ms poll 驱动；覆盖完整 poll 周期，不能假设
+      // 当前 fake-clock 恰好与 250ms 网格对齐。
+      await tick(90250);
       check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()), 'A16 last-known-good survives '+bad);
       send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
     }
