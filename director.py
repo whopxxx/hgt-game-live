@@ -1711,7 +1711,7 @@ class Director:
                 log.info("预热第 %d/%d 轮开始生成…", i + 1, max_rounds)
                 try:
                     kind, detail, _extra = self._prefetcher._generate_one_inner(
-                        inputs, sc)
+                        inputs, sc, story_timeout=_prewarm_timeout)
                 except TypeError:
                     # 旧签名(只收 inputs)的替身。同上, 退回旧行为。
                     try:
