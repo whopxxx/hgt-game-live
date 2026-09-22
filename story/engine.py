@@ -1047,7 +1047,8 @@ class RoundEngine:
                     log.info("第 %d 题的合同被补齐(由 %s): %s",
                              self._puzzle_index, q.user_name, q.text[:30])
                     self._record_winner_locked(q)
-                    acts.extend(self._solve_by_contract_locked(now, q.user_name))
+                    acts.extend(self._solve_by_contract_locked(
+                        now, q.user_name, winner_user_id=q.user_id))
                     return acts
                 # ---- legacy: P.SOLVE 直接通关(仅限**无合同**的题) ----
                 #
@@ -1067,8 +1068,9 @@ class RoundEngine:
                     log.info("第 %d 题被 %s 猜中: %s", self._puzzle_index,
                              q.user_name, q.text[:30])
                     self._record_winner_locked(q)
-                    acts.extend(self._enter_revealing_locked(now, "solved",
-                                                             q.user_name))
+                    acts.extend(self._enter_revealing_locked(
+                        now, "solved", q.user_name,
+                        winner_user_id=q.user_id))
                     return acts
 
             # 注意: 这里**不做**"孤儿回收"。逐条秒回下, 一次 submit_qa
@@ -2221,8 +2223,42 @@ class RoundEngine:
                     len(self._established_fact_ids))
         return out
 
+    def restore_leaderboard(self, rows: list[dict]) -> None:
+        """启动时恢复跨直播累计榜。只接受已聚合的纯数据，不做任何 I/O。
+
+        必须在第一题开始前调用。这样 Engine 仍然保持“纯状态机”边界：
+        磁盘读取/写入由 Director + LeaderboardLedger 负责。
+        """
+        with self._lock:
+            if self.phase != Phase.IDLE or self.round_index != 0:
+                raise RuntimeError("排行榜只能在 Engine 启动前恢复")
+            restored: dict[str, dict] = {}
+            max_seq = 0
+            for raw in (rows or []):
+                if not isinstance(raw, dict):
+                    raise ValueError("排行榜恢复项必须是 dict")
+                uid = str(raw.get("user_id", "") or "").strip()
+                name = str(raw.get("user_name", "") or "").strip()
+                try:
+                    count = int(raw.get("solved_count", 0))
+                    seq = int(raw.get("win_sequence", 0))
+                except (TypeError, ValueError) as e:
+                    raise ValueError("排行榜 solved_count/win_sequence 必须是整数") from e
+                if not uid or not name or count <= 0 or seq <= 0:
+                    raise ValueError("排行榜恢复项字段无效")
+                if uid in restored:
+                    raise ValueError(f"排行榜恢复项 user_id 重复: {uid!r}")
+                restored[uid] = {
+                    "user_name": name,
+                    "solved_count": count,
+                    "win_sequence": seq,
+                }
+                max_seq = max(max_seq, seq)
+            self._leaderboard = restored
+            self._win_sequence = max_seq
+
     def _record_winner_locked(self, q: PendingQ) -> None:
-        """Session-only final human winner; callers already verified the solve."""
+        """Final human winner for this round; persistent I/O is handled by Director."""
         if self._scored_round == self.round_index:
             return
         self._scored_round = self.round_index
@@ -2235,18 +2271,20 @@ class RoundEngine:
             "win_sequence": self._win_sequence,
         }
 
-    def _solve_by_contract_locked(self, now: float,
-                                  winner: str) -> list[EngineAction]:
+    def _solve_by_contract_locked(self, now: float, winner: str,
+                                  winner_user_id: str = "") -> list[EngineAction]:
         """v5 通关: 合同已被房间共识覆盖。
 
         与 `_enter_revealing_locked(now, "solved", winner)` 是**同一个**
         状态迁移 —— 这里只是多记一行日志说明触发原因是合同覆盖。
         刻意不另造第二套 solved 路径。
         """
-        return self._enter_revealing_locked(now, "solved", winner)
+        return self._enter_revealing_locked(
+            now, "solved", winner, winner_user_id=winner_user_id)
 
     def _enter_revealing_locked(self, now: float, reason: str,
-                                winner: str) -> list[EngineAction]:
+                                winner: str,
+                                winner_user_id: str = "") -> list[EngineAction]:
         self._release_current_ai_player_locked()
         self.phase = Phase.REVEALING
         self._reveal_pending_reason = reason
@@ -2269,6 +2307,9 @@ class RoundEngine:
         return [EngineAction(ActionKind.REVEAL, {
             "reason": reason,
             "winner": winner if reason in ("solved", "ai_solved") else "",
+            # 只给真人 solved 带稳定身份；AI / timeout / skip 不进真人累计榜。
+            "winner_user_id": (
+                str(winner_user_id or "") if reason == "solved" else ""),
             "expect_round": self.round_index,
             "expect_spec_key": self._current_spec_key,
             "puzzle": self._puzzle, "answer": self._answer,
