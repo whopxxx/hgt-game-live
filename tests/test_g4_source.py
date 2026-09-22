@@ -114,11 +114,14 @@ def test_default_config_curated_off():
           and c.pool_prewarm_llm_max_retries == 0,
           (c.pool_prewarm_llm_timeout_seconds,
            c.pool_prewarm_llm_max_retries))
-    check("prefetch LLM 独立短预算 = 30s / 0 retries",
+    check("prefetch 普通 stage = 30s / 0 retries",
           c.pool_prefetch_llm_timeout_seconds == 30.0
           and c.pool_prefetch_llm_max_retries == 0,
           (c.pool_prefetch_llm_timeout_seconds,
            c.pool_prefetch_llm_max_retries))
+    check("prefetch Story 专属预算 = 45s",
+          c.pool_prefetch_story_timeout_seconds == 45.0,
+          c.pool_prefetch_story_timeout_seconds)
 
 
 def test_cli_defaults_and_flags():
@@ -175,6 +178,7 @@ def test_prefetch_uses_independent_fail_fast_client():
         cfg.llm.timeout = 60.0
         cfg.llm.max_retries = 3
         cfg.pool_prefetch_llm_timeout_seconds = 30.0
+        cfg.pool_prefetch_story_timeout_seconds = 45.0
         cfg.pool_prefetch_llm_max_retries = 0
         dr = _mk_director(cfg)
         check("正式 client 仍是 60s/3",
@@ -187,11 +191,14 @@ def test_prefetch_uses_independent_fail_fast_client():
               dr._prefetch_client is not None
               and dr._prefetch_client is not dr.client,
               dr._prefetch_client)
-        check("prefetch client = 30s/0",
+        check("prefetch client 基础 transport = 30s/0",
               dr._prefetch_client.cfg.timeout == 30.0
               and dr._prefetch_client.cfg.max_retries == 0,
               (dr._prefetch_client.cfg.timeout,
                dr._prefetch_client.cfg.max_retries))
+        check("**只有 prefetcher 的 Story override = 45s**",
+              dr._prefetcher._story_timeout == 45.0,
+              dr._prefetcher._story_timeout)
         check("prefetch writer 确实接独立 client",
               dr._prefetcher.writer.client is dr._prefetch_client,
               dr._prefetcher.writer.client)
