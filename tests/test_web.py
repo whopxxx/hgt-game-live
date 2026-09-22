@@ -1473,6 +1473,7 @@ window.addEventListener('load', async () => {
     // 后面的 last-known-good 配置测试仍使用 90s，避免把 22s 场景时间轴扩散出去。
     await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15}));
     cfg.items[1].enabled=false;
+    await tick(15000); // 让 last-known-good 真正载入 disabled 状态
     send({phase:'setting'}); send({phase:'qa'});
 
     // Bad JSON / bad types / HTTP failure each retain the last-good two items.
