@@ -932,6 +932,12 @@ class Config:
     # 两稿都不合格就放弃, 等下一轮, 而不是一路打到第 4 稿。
     pool_prefetch_max_attempts: int = 2
     pool_prefetch_budget_seconds: float = 25.0
+    # 后台补池走独立 transport client。正式 QA / live 出题继续保留全局
+    # LLM timeout/retries；prefetch 只负责“尽快多试候选”，技术故障没必要
+    # 在同一笔 HTTP 上等 60s×4。默认 20s / 0 retries，业务层仍保留
+    # Structure/Reviewer/Audit 自己的一次“同 candidate 技术重试”。
+    pool_prefetch_llm_timeout_seconds: float = 20.0
+    pool_prefetch_llm_max_retries: int = 0
     # ---- G2: keyword2 两阶段起题(prefetch 与 live 现场生成共用) ----
     #
     # 打开时, 候选的产生方式换成 keyword2:
@@ -1369,6 +1375,17 @@ class Config:
                 f"pool_prefetch_budget_seconds("
                 f"{self.pool_prefetch_budget_seconds}) <= 0: 同上的效果 —— "
                 f"补池每次都立刻超预算退出。"
+            )
+        if self.pool_prefetch_llm_timeout_seconds <= 0:
+            warns.append(
+                f"pool_prefetch_llm_timeout_seconds("
+                f"{self.pool_prefetch_llm_timeout_seconds}) <= 0: 后台补池"
+                f"每笔 LLM 请求会立即失败。"
+            )
+        if self.pool_prefetch_llm_max_retries < 0:
+            warns.append(
+                f"pool_prefetch_llm_max_retries("
+                f"{self.pool_prefetch_llm_max_retries}) < 0: 已按 0 次重试处理。"
             )
         if self.pool_prewarm_llm_timeout_seconds <= 0:
             warns.append(
