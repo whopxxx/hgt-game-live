@@ -170,7 +170,9 @@ class Director:
         # 单测直接构造 Config 时碰真实 data/。
         self.leaderboard_ledger = LeaderboardLedger(
             path=getattr(cfg, "leaderboard_path", "") or "",
-            enabled=True)
+            # 只给真实直播累计。sim/stdin 是调试入口，不能把测试胜场混进
+            # 真实观众总榜。
+            enabled=bool(getattr(cfg, "live_id", None)))
         self.leaderboard_ledger.load()
         try:
             self.engine.restore_leaderboard(self.leaderboard_ledger.rows())
