@@ -311,7 +311,7 @@ class Director:
             if self.client is not None:
                 _pf_timeout = max(
                     0.1, float(getattr(
-                        cfg, "pool_prefetch_llm_timeout_seconds", 20.0) or 20.0))
+                        cfg, "pool_prefetch_llm_timeout_seconds", 30.0) or 30.0))
                 _pf_retries = max(
                     0, int(getattr(
                         cfg, "pool_prefetch_llm_max_retries", 0) or 0))
@@ -1883,7 +1883,7 @@ class Director:
                       f"高水位 {cfg.pool_target_size}(QA 空闲时后台补)")
                 _banner(
                     f"  补池 LLM    : timeout "
-                    f"{float(getattr(cfg, 'pool_prefetch_llm_timeout_seconds', 20.0)):.0f}s, "
+                    f"{float(getattr(cfg, 'pool_prefetch_llm_timeout_seconds', 30.0)):.0f}s, "
                     f"retries {int(getattr(cfg, 'pool_prefetch_llm_max_retries', 0))}")
                 if getattr(cfg, "playtest_enabled", False):
                     _banner(f"  试玩        : 开(最多 {cfg.playtest_max_turns} 轮, "
