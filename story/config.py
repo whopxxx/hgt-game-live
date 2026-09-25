@@ -1701,7 +1701,9 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                     help="控制台日志级别, 默认 INFO")
     ap.add_argument("--log-file", default=None, metavar="PATH",
-                    help="把明细日志写到文件(比控制台详细; 默认 data/run.log)")
+                    help="把明细日志写到文件(比控制台详细; 默认本场 run"
+                         " 目录下的 run.log, 即 data/runs/<日期>/<场次>/"
+                         "run.log; 传 --log-file \"\" 关闭明细落盘)")
     return ap
 
 

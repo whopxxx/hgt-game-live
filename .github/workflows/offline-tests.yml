@@ -162,6 +162,14 @@ jobs:
       - name: 离线套件 gift_probe
         run: uv run tests/test_gift_probe.py
 
+      # Issue #42: 礼物**识别 + 结构化记录**的回归 —— 正常直播链
+      # (keep_all=False)收得到 Gift、字段映射正确、gifts.jsonl 一条
+      # 消息一行(不合并连击/不去重)、每场 run 目录 collision-safe、
+      # 共享 non-gzip decoder 的 fail-soft、Cookie 不进任何日志,
+      # 以及 **Gift 不影响 AI 玩家额度**(earned/available 不变)。
+      - name: 离线套件 gift_logging
+        run: uv run tests/test_gift_logging.py
+
       # Solve UX: 通关合同(v5)的**产品语义**回归 —— 房间共同推理、
       # human-only established、Reviewer 四项 fail-closed、确定性揭晓、
       # 运行时身份包含合同。Cases A~M, 全部去身份化的最小构造。

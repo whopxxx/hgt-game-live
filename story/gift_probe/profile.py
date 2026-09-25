@@ -270,6 +270,14 @@ def login_cookie_is_usable(login_cookie: Optional[str]) -> bool:
 PROFILE_OK = "ok"
 PROFILE_CONFIG_INVALID = "config_invalid"
 
+#: primary 礼物链的 method 名(Issue #42 §8.1)。
+#:
+#: verdict 的**唯一主角**。Gift-family 是个子串分类(`WebcastGiftSortMessage`
+#: 等都算), 但"识别到没有礼物"只由 primary 这一条链决定 —— 实测里
+#: `WebcastGiftSortMessage` 匿名连接也能收到, 它的 unhandled **不得**把
+#: "primary 全链走通"盖成"分发层断了"。
+PRIMARY_GIFT_METHOD = "WebcastGiftMessage"
+
 
 def profile_auth_state(profile: GiftProbeProfile,
                        login_cookie: Optional[str]) -> dict:
@@ -353,6 +361,9 @@ class ProfileCounters:
     bootstrap_mode: str = ""
     first_frame_at: float = 0.0
     last_frame_at: float = 0.0
+    #: ---- Issue #42: 帧解码诊断(只含类别/计数, 不含 payload) ----
+    frame_encoding_counts: dict = field(default_factory=dict)
+    frame_decode_errors: int = 0
 
     def bump_method(self, method: str) -> None:
         self.method_counts[method] = self.method_counts.get(method, 0) + 1
@@ -404,6 +415,11 @@ class ProfileCounters:
             "emitted_gift_count": self.emitted_gift_count,
             "captured_payload_count": self.captured_payload_count,
             "capture_skipped_count": self.capture_skipped_count,
+            "secondary_gift_family_unhandled":
+                self.secondary_gift_family_unhandled(),
+            "frame_encoding_counts": dict(sorted(
+                self.frame_encoding_counts.items())),
+            "frame_decode_errors": self.frame_decode_errors,
         }
 
     def verdict(self) -> str:
@@ -412,35 +428,48 @@ class ProfileCounters:
         这是本包最有价值的一行输出: 真实送礼之后, 不需要等下播、不需要
         猜, 直接看这一路落在哪一层。
 
-            Gift-family = 0                  -> 连接/订阅/认证层
-            Gift-family > 0, unhandled > 0   -> dispatch 层
-            handled > 0, parse_error > 0     -> proto 层
-            parse 成功, emitted = 0          -> callback / ingest 层
+            primary GiftMessage 从未出现        -> 连接/订阅/认证层
+            primary 出现但 unhandled            -> dispatch 层
+            primary handled, parse_error > 0    -> proto 层
+            parse 成功, emitted = 0             -> callback / ingest 层
+
+        ⚠️ **primary 的判据是 exact `WebcastGiftMessage` 是否出现**
+        (Issue #42 review 修正)。`gift_method_seen` 是**子串**分类 ——
+        `WebcastGiftSortMessage` 也算 Gift-family, 而匿名连接实测能
+        持续收到 GiftSort 却**收不到** primary GiftMessage。若外层判据
+        用 family 计数, 那种"只有 secondary"的连接会被误判成 ok, 把
+        "匿名收不到礼物"这个最关键的现场结论洗掉。所以第一层必须看
+        `method_counts["WebcastGiftMessage"]` 本身。
 
         ⚠️ 判据的顺序**就是优先级**, 不要重排。四层是"从外往里"的漏斗:
         服务端没给 -> 给了但没进 handler -> 进了 handler 但解析炸了 ->
         解析成功但业务链没收到。顺序反了会得到自相矛盾的结论(例如同时
         "dispatch"与"proto"), 而那正是现场最难判断的形状。
 
-        ⚠️ `unhandled` 排在 `parse_error` **之前**: 一条 Gift 同时"没有
-        handler"与"曾 parse 失败"时, 先要查的是为什么没有 handler ——
-        那是更靠外的一层, 修好它之前 proto 层的观察本身都不成立。
+        ⚠️ **primary verdict 只看 primary 链**: `WebcastGiftSortMessage`
+        等其它 Gift-family method 的 unhandled 只作为 secondary 诊断(见
+        `secondary_gift_family_unhandled()`), 不得把"primary 解析 +
+        回调全通"盖成 `dispatch`。
         """
-        if self.gift_method_seen == 0:
-            return "transport_or_auth"      # 服务端根本没给 Gift-family
-        if self.gift_family_methods_unhandled():
-            return "dispatch"
-        if self.gift_parse_errors():
-            return "proto"
+        if self.method_counts.get(PRIMARY_GIFT_METHOD, 0) == 0:
+            return "transport_or_auth"      # primary GiftMessage 从未出现
+        if self.unhandled_counts.get(PRIMARY_GIFT_METHOD):
+            return "dispatch"               # primary 自己没进 handler
+        if self.parse_error_counts.get(PRIMARY_GIFT_METHOD):
+            return "proto"                  # primary 的 proto 解析炸了
         if self.parsed_gift_count > 0 and self.emitted_gift_count == 0:
             return "callback_or_ingest"
         return "ok"
 
-    def gift_family_methods_unhandled(self) -> bool:
-        return any(is_gift_family_method(k) for k in self.unhandled_counts)
+    def secondary_gift_family_unhandled(self) -> dict:
+        """**非 primary** 的 Gift-family 里没有 handler 的(诊断用)。
 
-    def gift_parse_errors(self) -> bool:
-        return any(is_gift_family_method(k) for k in self.parse_error_counts)
+        它们不参与 primary verdict —— 见 `verdict()` 的说明。保留为独立
+        的可观察字段: "服务器在推 GiftSort 而我们没处理"本身仍是有效的
+        现场信息, 只是它**永远不会**推翻 primary 的成功结论。
+        """
+        return {k: v for k, v in sorted(self.unhandled_counts.items())
+                if k != PRIMARY_GIFT_METHOD and is_gift_family_method(k)}
 
 
 def is_gift_family_method(method) -> bool:

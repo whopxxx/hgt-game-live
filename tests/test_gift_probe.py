@@ -581,7 +581,8 @@ def test_three_layer_counts_are_distinguishable():
           c2.captured_payload_count == 2, c2.summary())
     check("判据指向 proto 层", c2.verdict() == "proto", c2.verdict())
     check("proto 层样本: parsed 与 parse_error 不自相矛盾",
-          not (c2.parsed_gift_count > 0 and c2.gift_parse_errors()))
+          not (c2.parsed_gift_count > 0
+               and c2.parse_error_counts.get("WebcastGiftMessage")))
 
     # --- seen=0 -> transport/auth 层 ---
     d3 = mkdtemp()
@@ -722,6 +723,9 @@ def _capture_arm_url(profile, *, user_unique_id=None, now_ms=1789000000000,
     `WebSocketApp` 换成一个只记录 URL、然后抛异常中止的替身 —— 这样既拿到
     了真实的 URL 字符串(含 cursor / internal_ext / user_unique_id), 又
     不会真的去连网络。
+
+    `captured["stdout"]` 带回 `_connectWebSocket` 真正打印的内容
+    (bootstrap 日志的输出级回归 GP-24 用的就是这个, 而非任何字段)。
     """
     import websocket as _ws_mod
     from story.config import Config
@@ -744,7 +748,7 @@ def _capture_arm_url(profile, *, user_unique_id=None, now_ms=1789000000000,
     # 房间号与时钟都固定, 让两次调用的差异**只能**来自 profile 本身。
     f.__dict__["_DouyinLiveWebFetcher__room_id"] = room_id
 
-    captured = {"url": None, "headers": None}
+    captured = {"url": None, "headers": None, "stdout": None}
 
     class _StopHere(Exception):
         pass
@@ -762,14 +766,16 @@ def _capture_arm_url(profile, *, user_unique_id=None, now_ms=1789000000000,
         import time as _time
         real_time = _time.time
         _time.time = lambda: now_ms / 1000.0
+        out = io.StringIO()
         try:
             with contextlib.redirect_stderr(io.StringIO()), \
-                    contextlib.redirect_stdout(io.StringIO()):
+                    contextlib.redirect_stdout(out):
                 f._connectWebSocket()
         except _StopHere:
             pass
         finally:
             _time.time = real_time
+        captured["stdout"] = out.getvalue()
     finally:
         _ws_mod.WebSocketApp = real_app
     return captured, counters
@@ -971,6 +977,49 @@ def test_actual_wss_urls_differ_as_intended():
     check("C 的 counters 记录了 bootstrap_mode=reference",
           counters_c.bootstrap_mode == "reference",
           counters_c.bootstrap_mode)
+
+
+def test_bootstrap_log_prints_actual_mode():
+    """GP-24: bootstrap 日志**实际打印**的是真实 mode, 且无旧判据尾巴。
+
+    第二轮 review 补上的缺口: 字段层(`bootstrap_mode` 落到 counters /
+    fetcher 元数据, 见 GP-12b / GP-18)早有断言, 但**真正打到 stdout 的
+    那一行**没人看过。曾经真实输出是
+
+        【bootstrap】本次连接使用 reference <<< B-smoke 有效性判据(应为 local-generated)
+
+    所有字段测试照样绿(它们从不读 stdout), 现场却自相矛盾 —— 而且"以后
+    有人把错误尾巴硬编码回 print()"这类回归, 字段测试也抓不住。
+
+    所以这条对着**输出**断言(复用 GP-18 的替身, 真跑一遍
+    `_connectWebSocket()` 并抓 stdout):
+
+        * C(reference 臂): 必须含 `本次连接使用 reference`
+        * A(local 臂, 逐字走生产路径): 必须含 `本次连接使用 local-generated`
+        * 两臂都不得再出现 `应为 local-generated` 这个旧尾巴
+    """
+    print("\n[GP-24] bootstrap 日志实际输出:mode 真实、无旧尾巴")
+    from story.gift_probe.profile import DEFAULT_PROFILES
+    a, _b, c = DEFAULT_PROFILES
+
+    cap_ref, _ = _capture_arm_url(c)
+    out_ref = cap_ref["stdout"] or ""
+    # 正向控制: 那一行确实打出来了(防止"没打印所以两个 contains 都假绿")。
+    check("reference 臂打印了 bootstrap 行",
+          "【bootstrap】本次连接使用" in out_ref, repr(out_ref))
+    check("reference 臂打印的是 reference",
+          "本次连接使用 reference" in out_ref, repr(out_ref))
+    check("reference 臂不再带旧判据尾巴",
+          "应为 local-generated" not in out_ref, repr(out_ref))
+
+    cap_local, _ = _capture_arm_url(a)
+    out_local = cap_local["stdout"] or ""
+    check("local 臂打印了 bootstrap 行",
+          "【bootstrap】本次连接使用" in out_local, repr(out_local))
+    check("local 臂打印的是 local-generated",
+          "本次连接使用 local-generated" in out_local, repr(out_local))
+    check("local 臂也不带旧判据尾巴",
+          "应为 local-generated" not in out_local, repr(out_local))
 
 
 def test_reference_bootstrap_matches_reference_source():
@@ -1302,6 +1351,54 @@ def test_end_to_end_runner_reaches_all_four_verdict_layers():
     # 诊断 fetcher 的业务隔离: 没有业务回调被接上
     check("端到端: 诊断 fetcher 不接业务回调",
           f._on_interaction is None, f._on_interaction)
+
+    # ---- (f) Issue #42 §8.1: secondary Gift-family unhandled **不得**
+    #          覆盖 primary 的成功结论 ----
+    #
+    # 现场形状: primary `WebcastGiftMessage` parse + emitted 全通, 但
+    # `WebcastGiftSortMessage`(匿名连接也能收到的那种)没有 handler。
+    # 旧 verdict 按"任意 Gift-family unhandled"判成 `dispatch`, 把一场
+    # 成功的验收误读成"分发层断了"。现在 primary verdict 只看 primary,
+    # secondary 只进 summary 诊断字段。
+    arm, f = build()
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 6),
+             ("WebcastGiftSortMessage", b"", 7)])
+    check("secondary unhandled -> verdict 仍是 ok",
+          arm.counters.verdict() == "ok", arm.counters.verdict())
+    check("secondary unhandled 进诊断字段",
+          arm.counters.secondary_gift_family_unhandled()
+          == {"WebcastGiftSortMessage": 1},
+          arm.counters.secondary_gift_family_unhandled())
+    check("secondary unhandled 进 summary",
+          arm.counters.summary().get("secondary_gift_family_unhandled")
+          == {"WebcastGiftSortMessage": 1},
+          arm.counters.summary())
+    # 反向: primary 自己 unhandled 仍然是 dispatch(该层必须保持可达)
+    arm, f = build()
+    f._gift_probe_register_dry_run_handlers = lambda handlers: None
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 8),
+             ("WebcastGiftSortMessage", b"", 9)])
+    check("primary unhandled -> 仍是 dispatch",
+          arm.counters.verdict() == "dispatch", arm.counters.verdict())
+
+    # ---- (g) Issue #42 review 修正: **只有** secondary Gift-family
+    #          (WebcastGiftSortMessage)、primary 一次都没出现 -> 仍然是
+    #          transport_or_auth ----
+    #
+    # 匿名连接的**真实情况**正是这个形状: GiftSort 持续能收, 但 primary
+    # GiftMessage 一条没有。verdict 的第一层必须以 exact
+    # `WebcastGiftMessage` 是否出现为准 —— 若按 family 计数判, 这种
+    # 连接会被误判成 ok, 把"匿名收不到礼物"洗成"礼物链正常"。
+    arm, f = build()
+    feed(f, [("WebcastGiftSortMessage", b"", 10),
+             ("WebcastGiftSortMessage", b"", 11)])
+    check("只有 secondary Gift -> 仍判 transport_or_auth",
+          arm.counters.verdict() == "transport_or_auth",
+          arm.counters.verdict())
+    check("secondary 计入诊断字段",
+          arm.counters.secondary_gift_family_unhandled()
+          == {"WebcastGiftSortMessage": 2},
+          arm.counters.secondary_gift_family_unhandled())
 
 
 def test_dry_run_handler_does_not_swallow_parse_errors():
@@ -1910,6 +2007,7 @@ def main():
         test_reference_bootstrap_matches_reference_source,
         test_reference_uid_range_matches_reference,
         test_reference_templates_are_recorded_with_provenance,
+        test_bootstrap_log_prints_actual_mode,
         test_end_to_end_runner_reaches_all_four_verdict_layers,
         test_dry_run_handler_does_not_swallow_parse_errors,
         test_safe_error_never_carries_credential,

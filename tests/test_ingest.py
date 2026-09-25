@@ -1041,9 +1041,12 @@ def test_method_probe_counts_before_handler() -> None:
               summ["unhandled"])
         # 断言的是**性质**(不含 payload/昵称), 不是固定 key 列表 ——
         # 加新计数器不该让这条测试红, 但泄漏用户内容必须红。
+        # Issue #42: frame_encoding_counts / frame_decode_errors 是
+        # 帧解码诊断, 同样只含类别/计数 —— 进 allowed。
         allowed = {"connection_generation", "session_methods",
                    "session_frames", "ws_frames", "ws_messages",
-                   "methods", "unhandled", "parse_errors"}
+                   "methods", "unhandled", "parse_errors",
+                   "frame_encoding_counts", "frame_decode_errors"}
         check("**探针只含计数类字段**", set(summ) <= allowed, sorted(summ))
         import json as _json
         blob = _json.dumps(summ, ensure_ascii=False)
