@@ -32,7 +32,7 @@ from .puzzle import (
     has_meta_text, is_first_person, quote_in_puzzle,
 )
 from .haiguitang_protocol import (
-    completion_bounds, validate_protocol,
+    PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS, completion_bounds, validate_protocol,
 )
 
 log = logging.getLogger(__name__)
@@ -863,6 +863,15 @@ def validate_spec(spec: PuzzleSpec,
     # 一个 core 标签**(4 条而不是 3 条), 故事 / 谜面 / 谜底 / 推理全都没
     # 问题 —— 却整道丢弃, 再花 A+B+审稿+audit 四到六次昂贵调用重来一轮。
     #
+    # ⚠️ Haiguitang Protocol v1(Issue #49 review Blocker 1): v1 的合同
+    # 本身要求**每条** completion fact 都是 core+hidden, 上限允许 4 条。
+    # 若这里仍用 legacy 的 max_core_hidden=3, 一道合法的 4-fact v1 会
+    # 被标成 can_fix("把多余的 core 改成 support"), 而 reviewer 唯一的
+    # 合法动作又禁止动 completion —— **不可修**; 且题池门拒绝任何带
+    # fixable 的 spec, 4-fact v1 永远进不了题池。所以 v1 的上限取
+    # PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS(= 合同上限 4, 单一来源在
+    # story/haiguitang_protocol.py); legacy/current 一字不变。
+    #
     # 它不是安全门, 也不是逻辑门: `core` / `support` 是**分类标签**, 而
     # 通关只由 `completion_fact_ids` 决定(见 puzzle.py 的说明)。多标一条
     # core 不会让题变得不可玩, 只会让"≤3 条核心"这条内部不变量失真。
@@ -876,17 +885,21 @@ def validate_spec(spec: PuzzleSpec,
     # 不写清楚的话, 它会顺手改谜面 / 改谜底 / 删事实来"把数字凑对" ——
     # 那是改题, 不是改分类。
     n_core = len(spec.core_hidden_facts())
-    if n_core > max_core_hidden:
+    if proto == "haiguitang-v1":
+        n_core_max = max(max_core_hidden, PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS)
+    else:
+        n_core_max = max_core_hidden
+    if n_core > n_core_max:
         r.can_fix(
             f"{_CORE_COUNT_MARK} core hidden facts 有 {n_core} 条, "
-            f"超过 {max_core_hidden}: "
+            f"超过 {n_core_max}: "
             f"**只把不属于最小核心的那几条的 kind 从 core 改成 support**。\n"
             f"  必须保持: fact.id 不变 / fact.text 不变 / "
             f"completion_fact_ids 指向的那 {p_lo}~{p_hi} 条 fact "
             f"**仍然是 core**。\n"
             f"  不得: 改谜面 / 改谜底 / 删除任何 fact / 创造新 fact / "
             f"改动核心机制。\n"
-            f"  改完后 core+hidden 的事实必须 <= {max_core_hidden} 条。")
+            f"  改完后 core+hidden 的事实必须 <= {n_core_max} 条。")
 
     # ---- fair_clues: 必须真的在谜面里 ----
     #

@@ -100,6 +100,16 @@ LEGACY_MAX_COMPLETION_FACTS = 2
 PROTOCOL_V1_MIN_COMPLETION_FACTS = 2
 PROTOCOL_V1_MAX_COMPLETION_FACTS = 4
 
+#: Protocol v1 的 core+hidden 事实条数上限(Issue #49 review Blocker 1)。
+#:
+#: legacy/current 沿用 quality 的 `max_core_hidden=3`。但 v1 的合同
+#: 本身要求**每条** completion fact 都是 core+hidden —— 若 core 上限
+#: 仍是 3, 一道合法的 4-fact v1 会陷入"既要求 4 条保持 core、又要求
+#: core 总数 <=3"的**不可修状态**(validator 把它标成 can_fix, 而
+#: 题池门拒绝任何带 fixable 的 spec —— 4-fact v1 永远进不了题池)。
+#: 所以 v1 的上限必须**至少容下合同上限**: 4。
+PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS = 4
+
 
 def completion_bounds(protocol_version: str) -> tuple:
     """某协议版本下 completion_fact_ids 的合法条数区间 `(lo, hi)`。
@@ -187,19 +197,27 @@ def validate_protocol(spec) -> list:
 
     # ---- primary / categories ----
     primary = str(getattr(spec, "primary_category", "") or "").strip()
-    raw_cats = getattr(spec, "categories", None) or []
-    cats = [str(x).strip() for x in raw_cats if str(x).strip()]
+    raw_cats = getattr(spec, "categories", None)
+    raw_cats = raw_cats if isinstance(raw_cats, (list, tuple)) else []
+    # ---- 原样判(Issue #49 review Blocker 2) ----
+    # **不过滤任何条目**。空串 / None / 非字符串 / 不在 11 类里的值都是
+    # validator 必须看见的坏数据 —— 早期版本在这里悄悄丢掉空白条目,
+    # `["crime", ""]` 会被洗干净成合法的 `["crime"]`, 与 from_dict 的
+    # "parser 不做 validator 的工作"是同一条被冻结的原则(协议 §13)。
+    cats = [str(x).strip() for x in raw_cats]
     if not (MIN_CATEGORIES <= len(cats) <= MAX_CATEGORIES):
         errs.append(f"protocol v1 的 categories 有 {len(cats)} 条, "
                     f"应为 {MIN_CATEGORIES}~{MAX_CATEGORIES} 条")
+    bad_entries = [raw for raw, c in zip(raw_cats, cats)
+                   if not isinstance(raw, str) or not c or c not in CATEGORIES]
+    if bad_entries:
+        errs.append(f"protocol v1 的 categories 含非法值: {bad_entries} "
+                    f"(canonical 11 类: {CATEGORIES}; 空串/None/非法类型"
+                    f"都是坏数据, 不得被静默洗掉)")
     else:
         dupes = sorted({c for c in cats if cats.count(c) > 1})
         if dupes:
             errs.append(f"protocol v1 的 categories 有重复: {dupes}")
-        unknown = [c for c in cats if c not in CATEGORIES]
-        if unknown:
-            errs.append(f"protocol v1 的 categories 含非法值: {unknown} "
-                        f"(canonical 11 类: {CATEGORIES})")
         if primary not in CATEGORIES:
             errs.append(f"protocol v1 的 primary_category 非法: {primary!r} "
                         f"(应为 {CATEGORIES} 之一)")

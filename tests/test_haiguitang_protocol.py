@@ -74,8 +74,8 @@ def _v1_spec(n_completion=2, protocol=V1, with_public_text=True,
              facts_extra=None):
     """n_completion 条 core/hidden completion(f1..fn) + 1 条 support。
 
-    n=2/3 时全过 validate_spec(0 fixable); n=4 时 core hidden 超限
-    会带 1 条 can_fix(ok 仍为 True —— 那不是失败)。
+    n=2/3/4 时 validate_spec **零 error 且零 fixable**(core hidden
+    上限已 protocol-aware, Issue #49 review Blocker 1)—— 能过题池门。
     """
     facts = [
         PuzzleFact(id=f"f{i}", text=f"核心事实{i}", kind="core",
@@ -140,11 +140,12 @@ def DiscoveryBeatLike(**kw):
     return DiscoveryBeat(**kw)
 
 
-def _legacy_spec(n_completion=1):
+def _legacy_spec(n_completion=1, facts_extra=None):
     """legacy/current 形状: 无 protocol 字段、无 public_text。"""
     return _v1_spec(n_completion=n_completion, protocol="",
                     with_public_text=False, difficulty="",
-                    primary="", categories=(), requested="")
+                    primary="", categories=(), requested="",
+                    facts_extra=facts_extra)
 
 
 def _patch_spec(spec, **kw):
@@ -227,6 +228,11 @@ def test_completion_bounds_by_protocol():
               validate_protocol(s))
         r = validate_spec(s)
         check(f"v1 {n} 条: validate_spec 通过", r.ok, r.errors)
+        # Issue #49 review Blocker 1 反证: 合法的 2/3/4-fact v1 必须
+        # **零 fixable** —— 池门拒绝任何带 fixable 的 spec, 留一条
+        # "ok=True 但有 can_fix"都会让合法 v1 进不了题池。
+        check(f"v1 {n} 条: validate_spec 零 fixable", r.fixable == [],
+              r.fixable)
     for n, frag in ((1, "应为 2~4 条"), (5, "应为 2~4 条")):
         s = _v1_spec(n)
         errs = validate_protocol(s)
@@ -242,6 +248,18 @@ def test_completion_bounds_by_protocol():
     check("legacy 3 条仍被拒(未放宽)",
           not validate_spec(_legacy_spec(3)).ok,
           "legacy 3 条不应因 v1 而变合法")
+    # legacy 的 core hidden 上限(3)也**不被** v1 放宽: 4 条 core hidden
+    # 在 legacy 下仍带 can_fix 注记
+    extra = [PuzzleFact(id=f"f{i}", text=f"额外核心{i}", kind="core",
+                        visibility="hidden") for i in (5, 6)]
+    rl = validate_spec(_legacy_spec(2, facts_extra=extra))
+    check("legacy 4 条 core hidden 仍被标 can_fix(上限未放宽)",
+          rl.ok and any("core hidden facts" in f for f in rl.fixable),
+          rl.fixable)
+    # 而 4 条 core hidden 在 **v1** 下必须 clean(Blocker 1 的另一半):
+    check("v1 4 条 core hidden 零 fixable(不再不可修)",
+          validate_spec(_v1_spec(4)).fixable == [],
+          validate_spec(_v1_spec(4)).fixable)
 
 
 # ======================================================================
@@ -482,6 +500,16 @@ def test_pool_eligibility_unchanged():
     check("unknown protocol_version 在池门 fail closed", not ok4, why4)
     ok5, why5 = PuzzlePool._validate_pool_spec(_v1_spec(2))
     check("合法 v1 spec 也可入池(协议层不打折)", ok5, why5)
+    # ---- Issue #49 review Blocker 1 反证 ----
+    # 4-fact v1 曾因"core hidden>3 被标 can_fix + 池门拒一切 fixable"
+    # 陷入不可修状态, 永远进不了题池。core 上限 protocol-aware 之后,
+    # 合法的 4-fact v1 必须 validate_spec clean -> 池门放行。
+    four = _v1_spec(4)
+    vr4 = validate_spec(four)
+    check("4-fact v1: validate_spec clean(ok 且零 fixable)",
+          vr4.ok and not vr4.fixable, (vr4.errors, vr4.fixable))
+    ok6, why6 = PuzzlePool._validate_pool_spec(four)
+    check("4-fact v1: 真正过题池门", ok6, why6)
 
 
 # ======================================================================
@@ -646,10 +674,52 @@ def test_parser_preserves_bad_data():
     check("difficulty 非法值原样保留", s2.difficulty == "banana", s2.difficulty)
     check("primary 非法值原样保留", s2.primary_category == "mystery",
           s2.primary_category)
-    errs = validate_protocol(_patch_spec(s2, protocol_version=V1,
-                                         completion_fact_ids=[]))
-    check("validator 拒非法枚举(不回退 logic)",
-          any("primary_category 非法" in e for e in errs), errs)
+    # categories 非法时"含非法值"先报(primary 检查让位, 避免噪声);
+    # 单独的非法 primary(合法 categories)必须被拒且不回退 logic
+    check("validator 拒非法 primary(不回退 logic)",
+          any("primary_category 非法" in e for e in validate_protocol(
+              _patch_spec(_v1_spec(2), primary_category="mystery"))),
+          validate_protocol(_patch_spec(_v1_spec(2),
+                                        primary_category="mystery")))
+    # ---- Issue #49 review Blocker 2 反证 ----
+    # parser 与 validator **两层**都不许把坏条目洗掉:
+    #   from_dict(["crime", ""])  -> 原样 ["crime", ""]   (不是 ["crime"])
+    #   from_dict(["crime", null])-> 原样 ["crime", None] (不是 ["crime"])
+    #   validate_protocol 也不过滤 —— 空串/null 计入条数并被"含非法值"拒
+    s_blank = PuzzleSpec.from_dict({"puzzle": "p", "answer": "a",
+                                    "categories": ["crime", ""]})
+    check("from_dict 原样保留空串条目", s_blank.categories == ["crime", ""],
+          s_blank.categories)
+    s_null = PuzzleSpec.from_dict({"puzzle": "p", "answer": "a",
+                                   "categories": ["crime", None]})
+    check("from_dict 原样保留 null 条目", s_null.categories == ["crime", None],
+          s_null.categories)
+    for tag, spec_bad in (("空串", s_blank), ("null", s_null)):
+        errs_b = validate_protocol(_patch_spec(spec_bad, protocol_version=V1,
+                                               completion_fact_ids=[],
+                                               difficulty="",
+                                               primary_category="",
+                                               requested_category=""))
+        check(f"validate_protocol 拒 {tag} 条目(不再静默过滤)",
+              any("categories 含非法值" in e for e in errs_b), errs_b)
+        vr_b = validate_spec(_patch_spec(spec_bad, protocol_version=V1,
+                                         completion_fact_ids=[],
+                                         difficulty="",
+                                         primary_category="",
+                                         requested_category=""))
+        check(f"validate_spec 拒 {tag} 条目", not vr_b.ok, vr_b.errors)
+    # JSON 往返也不洗: null 仍是 null
+    check("JSON 往返保持 null 条目",
+          PuzzleSpec.from_dict(json.loads(
+              json.dumps({"categories": ["crime", None]})))
+          .categories == ["crime", None], "null 被洗掉")
+    # 直接构造(绕过 parser)的坏条目同样被 validator 拒 —— 钉死"validator
+    # 层自己也不过滤"这半边
+    direct = _v1_spec(2)
+    direct.categories = ["crime", ""]
+    check("validator 对直接构造的坏条目同样拒绝",
+          any("categories 含非法值" in e for e in validate_protocol(direct)),
+          validate_protocol(direct))
 
 
 # ======================================================================

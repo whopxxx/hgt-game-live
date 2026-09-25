@@ -946,8 +946,15 @@ class PuzzleSpec:
             protocol_version=str(d.get("protocol_version", "") or "").strip(),
             difficulty=str(d.get("difficulty", "") or "").strip(),
             primary_category=str(d.get("primary_category", "") or "").strip(),
-            categories=[str(x).strip() for x in (d.get("categories") or [])
-                        if str(x).strip()],
+            # categories **原样保留**(Issue #49 review Blocker 2): 只对
+            # 字符串条目做 strip 归一; 空串 / None / 非字符串条目**原样**
+            # 进 validator 的视野, parser 绝不偷偷过滤/修复 —— 否则
+            # ["crime", ""] / ["crime", null] 会被洗成合法的 ["crime"]。
+            # 非 list 的值(含 null)与"缺失"同义 -> [](未知)。
+            categories=(
+                [str(x).strip() if isinstance(x, str) else x
+                 for x in d["categories"]]
+                if isinstance(d.get("categories"), list) else []),
             requested_category=str(d.get("requested_category", "") or "").strip(),
             blueprint_specified=bool(d.get("blueprint_specified", False)),
             # ---- H2-F: curated 溯源(老 archive 没有 -> 宽容读成空) ----

@@ -1,8 +1,7 @@
 {
   "case": "valid_four_facts_multi_category",
-  "description": "v1 四 fact 合同 + 多主题 [crime,suspense,twist] 是真合法状态; core hidden=4 会带 1 条 can_fix 注记(不是失败)",
+  "description": "v1 四 fact 合同 + 多主题 [crime,suspense,twist] 是真合法状态, 且 validate_spec **零 fixable**(core 上限 protocol-aware=4) => 能过题池门(Issue #49 review Blocker 1 反证)",
   "expect": "valid",
-  "expect_fixable_contains": "core hidden facts",
   "spec": {
     "id": "fx-gem",
     "title": "消失的红宝石",
