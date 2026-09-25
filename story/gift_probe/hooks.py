@@ -50,7 +50,6 @@ parse 失败时)在基线里**本来就是分开的**。我们只要覆写 `_pro
 
 from __future__ import annotations
 
-import gzip
 import os
 import sys
 import threading
@@ -62,7 +61,12 @@ from .profile import ProfileCounters
 
 #: 基线的分发循环要用到的 proto 类型。**只读**用途 —— 与 `danmaku.py`
 #: 里 import 的是同几个类, 所以"解析同一帧得到同一结果"是同一份实现。
-from protobuf.douyin import PushFrame, Response     # noqa: E402
+from protobuf.douyin import PushFrame                  # noqa: E402
+#: PushFrame -> Response 的**共享**解码器(Issue #42 §1)。生产链与 Probe
+#: 必须是同一份实现 —— 否则"probe 里解得开、生产里解不开"这种差异永远
+#: 查不清是解码器的问题还是连接的问题。
+from danmaku import (decode_push_frame_response,     # noqa: E402
+                     frame_encoding_label)
 
 import websocket                                    # noqa: E402
 
@@ -104,8 +108,14 @@ def _reference_bootstrap(fetcher, now_ms: int) -> dict:
     from .reference_bootstrap import build_reference_bootstrap
 
     uid = str(getattr(fetcher, "user_unique_id", "") or "")
-    return build_reference_bootstrap(
+    boot = build_reference_bootstrap(
         room_id=_safe_room_id(fetcher), user_unique_id=uid, now_ms=now_ms)
+    # ---- Issue #42 §8.2: 让"实际用了哪种 bootstrap"可被日志观察 ----
+    # 底层 liveMan 的连接日志曾把 mode 写死成 "local-generated", 于是
+    # reference 臂明明跑的是 reference 形状, 现场输出却说 local —— 诊断
+    # 结论会指向完全错误的方向。现在由 boot dict 自带真实模式。
+    boot["bootstrap_mode"] = "reference"
+    return boot
 
 
 def _safe_room_id(fetcher) -> str:
@@ -412,6 +422,26 @@ class GiftProbeMixin:
             pass
 
     # ------------------------------------------------------------------
+    def _gift_probe_bump_frame_decode_error(self, err_type: str) -> None:
+        """一帧解不出 Response: 计数 + stderr 一行, **吞掉异常**。
+
+        与生产 `_wsOnMessage` 的 fail-soft 同一策略。只打异常**类型名**
+        (来自类定义, 不可能携带凭据/payload 内容), 不打 `{e}` —— 异常
+        正文可能带请求上下文。
+        """
+        c = getattr(self, "_gift_probe_counters", None)
+        if c is not None:
+            try:
+                with (getattr(self, "_gift_probe_lock", None) or _NULL_LOCK):
+                    c.frame_decode_errors += 1
+            except Exception:                   # noqa: BLE001
+                pass
+        try:
+            print(f"!!! 帧解码失败({err_type}), 跳过该帧",
+                  file=sys.stderr, flush=True)
+        except Exception:                       # noqa: BLE001
+            pass
+
     def _gift_probe_on_frame(self) -> None:
         """每收到一个 WS 帧调一次。**失败一律吞掉。**
 
@@ -512,12 +542,29 @@ def make_gift_capture_fetcher(base_cls) -> type:
             # —— 而"连接还在推帧吗"正是判活的第一手证据。
             self._probe_bump("ws_frame_count")
             self._gift_probe_on_frame()
-            package = PushFrame().parse(message)
-            response = Response().parse(gzip.decompress(package.payload))
+            # ---- Issue #42: 与生产共用同一个解码器, 且 fail-soft ----
+            # authenticated 实播确认有非 gzip payload。单帧解不开 ->
+            # 计数 + 跳过本帧, **不得**让 WS 回调线程退出(那是把
+            # "服务端发了怪帧"放大成"整路诊断断线")。
+            try:
+                package = PushFrame().parse(message)
+            except Exception as e:              # noqa: BLE001
+                self._gift_probe_bump_frame_decode_error(type(e).__name__)
+                return
+            c = getattr(self, "_gift_probe_counters", None)
+            if c is not None:
+                label = frame_encoding_label(package)
+                with (getattr(self, "_gift_probe_lock", None) or _NULL_LOCK):
+                    c.frame_encoding_counts[label] = \
+                        c.frame_encoding_counts.get(label, 0) + 1
+            try:
+                response = decode_push_frame_response(package)
+            except Exception as e:              # noqa: BLE001
+                self._gift_probe_bump_frame_decode_error(type(e).__name__)
+                return
             setattr(self, "ws_message_count",
                     getattr(self, "ws_message_count", 0)
                     + len(response.messages_list))
-            c = getattr(self, "_gift_probe_counters", None)
             if c is not None:
                 with (getattr(self, "_gift_probe_lock", None) or _NULL_LOCK):
                     c.ws_messages += len(response.messages_list)

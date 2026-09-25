@@ -35,6 +35,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,7 @@ from story.engine import RoundEngine                # noqa: E402
 from story.ingest import (ChatEvent, InteractionEvent,  # noqa: E402
                           LiveSource,
                           SimSource, StdinSource)
+from story.gift_log import GiftJsonlWriter           # noqa: E402
 from story import parser as P                       # noqa: E402
 from story.llm import (AnthropicMessagesClient, PuzzleWriter,  # noqa: E402
                        _spec_to_riddle)
@@ -160,7 +162,7 @@ def setup_logging(level: str, log_file: str | None = None) -> None:
 
 
 class Director:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, run_dir: str | None = None):
         self.cfg = cfg
         self.engine = RoundEngine(cfg)
 
@@ -233,6 +235,17 @@ class Director:
                                   self.engine.phase) or ""),
                 session_id=self.session_id)
         self._archive_failed = False
+        # ---- Issue #42: 结构化礼物日志 ----
+        # 持久化责任在 Director(orchestration)层, Engine 不碰磁盘。
+        # 只在 **live 模式**装配: sim/stdin 没有真实礼物。`run_dir` 由
+        # main() 决定(显式 --log-file 时 session 目录也照建 —— 见那里
+        # 的说明); 测试直接构造 Director 时不传, 礼物只进 engine 的
+        # raw 计数, 不落盘。
+        self._gift_writer: GiftJsonlWriter | None = None
+        if run_dir and bool(getattr(cfg, "live_id", None)):
+            self._gift_writer = GiftJsonlWriter(
+                os.path.join(run_dir, "gifts.jsonl"))
+            self._gift_writer.precreate()
         # blueprint 调度用的随机源。**不要用全局 random** —— 出题在 worker
         # 线程里跑, 用模块级 random 会和其他代码互相干扰, 复盘也无法重现。
         # quality_seed 给了就固定(可复现), 否则用系统随机种子。
@@ -1507,8 +1520,23 @@ class Director:
             try:
                 # ---- Step 11: 按类型分发 ----
                 # 两种事件走**同一个队列**(少一条并发链), 靠类型区分。
-                # 互动事件**不**走 submit_danmaku —— 它不是一条提问。
+                # 互动事件**不走 submit_danmaku** —— 它不是一条提问。
                 if isinstance(ev, InteractionEvent):
+                    # ---- Issue #42: 礼物只"识别 + 结构化记录" ----
+                    # 写 gifts.jsonl + run.log 一行可观察摘要, 然后**照旧**
+                    # 交给 engine —— engine 对 gift 只做 raw 计数并返回空
+                    # 动作(summon earned/available 不变), 点赞逻辑原样。
+                    # 落盘在 engine 之前: 就算 engine 分发抛异常, 证据也
+                    # 已经在盘上。
+                    if (str(getattr(ev, "kind", "")) == "gift"
+                            and self._gift_writer is not None):
+                        self._gift_writer.write(ev)
+                        _detail(log,
+                                "礼物消息 user=%s gift=%s gift_id=%s "
+                                "combo=%s repeat=%s repeat_end=%s group=%s",
+                                ev.user_name, ev.gift_name, ev.gift_id,
+                                ev.combo_count, ev.repeat_count,
+                                ev.repeat_end, ev.group_id)
                     for a in self.engine.submit_interaction(ev):
                         self._run_action(a)
                     continue
@@ -1992,6 +2020,10 @@ class Director:
                     self.source.stop()
                 except Exception:
                     pass
+            if self._gift_writer is not None:
+                # 礼物落盘与 source 生命周期一致: 下播即收口, 别把句柄
+                # 留到解释器退出时才被 GC 关掉(Windows 上会占住文件)。
+                self._gift_writer.close()
             if self._answer_pool:
                 # cancel_futures: 还没开跑的排队任务直接丢掉。
                 # 注意它**取消不了已经开始的** urllib 请求 —— 那些只能等
@@ -2016,14 +2048,110 @@ def _split_probe_profiles(raw) -> list:
     return [p.strip() for p in str(raw or "").split(",") if p.strip()]
 
 
+# ======================================================================
+# Issue #42: 每场独立 run directory
+# ======================================================================
+def _safe_run_component(name, fallback: str = "unknown") -> str:
+    """把 live_id / mode 变成安全的单层路径片段(白名单 + 截断)。
+
+    live_id 理论上是纯数字, 但它最终来自命令行 —— 按**不可信输入**处理,
+    与 gift_probe._safe_component 同一纪律。
+    """
+    out = []
+    for ch in str(name or "").strip():
+        if ch.isalnum() or ch in "-_.":
+            out.append(ch)
+        else:
+            out.append("_")
+    safe = "".join(out).strip("._")
+    if safe in ("", ".", ".."):
+        return fallback
+    return safe[:60]
+
+
+def make_run_dir(mode: str, live_id: str = "", base_dir: str | None = None,
+                 now: "datetime | None" = None) -> str:
+    """本次运行的独立目录: `data/runs/YYYY-MM-DD/HHMMSS-<mode>[-<live_id>]`。
+
+    - 一级按**本机日期**; 二级含启动时间 HHMMSS 与来源(live 带 live_id,
+      sim/stdin 用各自 mode 名)。
+    - **collision-safe**: 目标目录已存在(同一秒重复启动)时追加 `-2`
+      / `-3`… 递增后缀, **绝不覆盖**旧场次。用 `exist_ok=False` 的
+      makedirs 原子创建 —— 不做"先判断存在再创建"(那有 TOCTOU 窗口)。
+    - 目录一旦确定, 整个进程生命周期不变(调用方持有返回值)。
+    - 创建失败(权限/磁盘)抛 RuntimeError —— 启动期**清晰报错**, 绝不
+      静默退化成往别的日志里追加。
+
+    返回相对路径(与仓库其它 data/ 路径同一风格)。
+    """
+    base = base_dir or os.path.join("data", "runs")
+    now = now or datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    hm = now.strftime("%H%M%S")
+    live_part = f"-{_safe_run_component(live_id)}" if str(live_id or "").strip() else ""
+    stem = f"{hm}-{_safe_run_component(mode, fallback='run')}{live_part}"
+    dir_path = os.path.join(base, day, stem)
+    n = 1
+    while True:
+        try:
+            os.makedirs(dir_path, exist_ok=False)
+            return dir_path
+        except FileExistsError:
+            n += 1
+            dir_path = os.path.join(base, day, f"{stem}-{n}")
+        except OSError as e:
+            raise RuntimeError(
+                f"无法创建本次运行的目录 {dir_path}: {e} —— "
+                f"请检查磁盘与权限; 为避免覆盖任何历史日志, 本次拒绝启动。") from e
+
+
+def resolve_log_file(cfg, run_dir: str) -> str | None:
+    """`--log-file` 兼容策略(Issue #42 §4)。
+
+    - 未传(None)  -> `<run_dir>/run.log` —— 每场一个文件, 不再全部追加进
+      全局 `data/run.log`;
+    - 显式 PATH   -> **逐字尊重用户路径**, session 目录只承载 gifts.jsonl;
+    - 显式 ""     -> 关闭明细落盘(既有行为), 返回 None。
+
+    返回给 `setup_logging` 的值(None = 不开文件 handler)。
+    """
+    if cfg.log_file is None:
+        return os.path.join(run_dir, "run.log")
+    return cfg.log_file or None
+
+
 def main(argv=None) -> int:
     cfg = from_args(argv)
-    log_file = cfg.log_file
-    if log_file is None:
-        # 默认落盘(除非显式传 --log-file ""), 这样直播中途滚掉的明细
-        # 事后还能翻。用固定名覆盖, 免得 data/ 里堆一堆日志。
-        log_file = os.path.join("data", "run.log")
+    # ---- Issue #42: 每场独立 run directory ----
+    #
+    # run directory 的判定规则(与 --log-file 的关系, PR 里也要写清楚):
+    #
+    #   * run directory **总是**创建: `data/runs/<日期>/<HHMMSS>-<mode>`
+    #     (live 模式带 live_id; sim/stdin 用 HHMMSS-sim / HHMMSS-stdin)。
+    #     它是本场所有运行产物的锚点。
+    #   * run.log: 默认放在 run directory 里(每次直播一个文件, 不再把
+    #     所有场次追加进全局 data/run.log)。**显式 --log-file PATH 时
+    #     尊重用户路径, run.log 写到那里** —— session 目录照常创建,
+    #     gifts.jsonl 仍在 session 目录(live 模式), 两者各归其位。
+    #   * --log-file "" 仍然表示"关闭明细落盘"(与既有行为一致),
+    #     此时 gifts.jsonl 照常。
+    if cfg.live_id:
+        mode = "live"
+    elif cfg.sim_path:
+        mode = "sim"
+    elif getattr(cfg, "use_stdin", False):
+        mode = "stdin"
+    else:                                   # pragma: no cover - validate() 会先挡
+        mode = "run"
+    run_dir = make_run_dir(mode, live_id=str(cfg.live_id or ""))
+    log_file = resolve_log_file(cfg, run_dir)
     setup_logging(cfg.log_level, log_file or None)
+    log.info("run directory: %s", os.path.abspath(run_dir))
+    log.info("run.log: %s",
+             os.path.abspath(log_file) if log_file else "(本次已禁用明细落盘)")
+    if cfg.live_id:
+        log.info("gifts.jsonl: %s",
+                 os.path.abspath(os.path.join(run_dir, "gifts.jsonl")))
     # ---- Step 12C: gift_capture_diagnostic ----
     # 诊断模式**在直播之前**单独跑一段, 不参与 Director 的业务循环 ——
     # 它不接任何业务回调, 也不该被业务生命周期影响。真实直播验收时
@@ -2031,7 +2159,7 @@ def main(argv=None) -> int:
     # 下一步查哪一层。
     if getattr(cfg, "gift_capture_diagnostic", False):
         return _run_gift_capture_diagnostic(cfg)
-    return Director(cfg).run()
+    return Director(cfg, run_dir=run_dir).run()
 
 
 def _run_gift_capture_diagnostic(cfg) -> int:

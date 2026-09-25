@@ -484,7 +484,12 @@ class DouyinLiveWebFetcher:
         now_ms = int(time.time() * 1000)
         boot = self._local_bootstrap(now_ms)
         self.__bootstrap = boot
-        mode = "local-generated"
+        # ---- Issue #42 §8.2: mode 必须反映**实际**使用的 bootstrap ----
+        # 子类(如 gift probe 的 reference 臂)覆写 `_local_bootstrap` 时
+        # 会在 boot dict 里带上 `bootstrap_mode`; 没带就是本类的
+        # local 生成路径。写死 "local-generated" 会让 reference 臂的现场
+        # 输出与实际 profile 不一致, 误导排障。
+        mode = str(boot.get("bootstrap_mode") or "local-generated")
         print(f"【bootstrap】本次连接使用 {mode} now_ms={now_ms}"
               f"   <<< B-smoke 有效性判据(应为 local-generated)", flush=True)
         cursor = boot["cursor"]

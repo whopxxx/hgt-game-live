@@ -72,6 +72,65 @@ def _suppress_stdout():
         yield
 
 
+# ======================================================================
+# PushFrame -> Response 的**共享**解码(Issue #42 §1)
+# ======================================================================
+#: gzip 魔数。authenticated 实播已确认: 部分 PushFrame 声明为空/未知
+#: encoding 时 payload 实际是 gzip —— 用 magic 自恢复, 而不是按声明硬解。
+GZIP_MAGIC = b"\x1f\x8b"
+
+#: `payload_encoding` 里表示"未压缩"的合法取值(小写比较)。
+_PLAIN_ENCODINGS = ("", "none")
+
+
+class FrameDecodeError(Exception):
+    """一帧解不出 Response。调用方**计数后跳过本帧**, 绝不让 WS 回调退出。"""
+
+
+def frame_encoding_label(package) -> str:
+    """帧的编码类别标签 —— 只含类别名, 不含任何 payload 内容。
+
+    用于 `frame_encoding_counts`(Issue 要求的诊断字段): 服务端声明的
+    encoding 分布是排查"为什么这帧丢了"的第一手证据。
+    """
+    enc = str(getattr(package, "payload_encoding", "") or "").strip().lower()
+    if enc == "gzip":
+        return "gzip"
+    if enc in _PLAIN_ENCODINGS:
+        return "empty" if enc == "" else "none"
+    return f"unknown:{enc}"
+
+
+def decode_push_frame_response(package):
+    """PushFrame -> Response。
+
+    规则(Issue #42 §1):
+
+        payload_encoding == "gzip"          -> gzip.decompress
+        payload_encoding in ("", "none")    -> gzip magic 开头则解压,
+                                               否则按 raw Response 解析
+        其它(未知 encoding)                 -> 优先按 gzip magic 自恢复,
+                                               否则按 raw 试解析
+
+    解不了就抛异常(包括 gzip 损坏 / Response 解析失败)—— **调用方**负责
+    计数(`frame_decode_errors`)并跳过本帧。单帧失败是常态运维事件,
+    不是致命错误: 让它炸掉 WebSocket 回调等于"一条坏帧断整个直播"。
+    """
+    payload = bytes(getattr(package, "payload", b"") or b"")
+    enc = str(getattr(package, "payload_encoding", "") or "").strip().lower()
+    if enc == "gzip":
+        return Response().parse(gzip.decompress(payload))
+    looks_gzip = payload[:2] == GZIP_MAGIC
+    if enc in _PLAIN_ENCODINGS:
+        if looks_gzip:
+            return Response().parse(gzip.decompress(payload))
+        return Response().parse(payload)
+    # 未知 encoding: 声明不可信, 按 magic 自恢复; 不是 gzip 就按 raw 试。
+    if looks_gzip:
+        return Response().parse(gzip.decompress(payload))
+    return Response().parse(payload)
+
+
 class DanmakuFetcher(DouyinLiveWebFetcher):
     """只把需要的事件写成 JSONL, 其余丢弃。"""
 
@@ -100,6 +159,9 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         self.method_counts = {}          # method -> 本连接出现次数
         self.unhandled_method_counts = {}  # method -> 本连接无 handler 次数
         self.parse_error_counts = {}     # method -> 本连接解析异常次数
+        # ---- Issue #42: 帧解码诊断(只含类别/计数, 不含 payload) ----
+        self.frame_encoding_counts = {}  # encoding 类别 -> 本连接出现次数
+        self.frame_decode_errors = 0     # 本连接解不出 Response 的帧数
         # ---- 整场累计(可选参考, 不用于 A/B 判定) ----
         self.session_method_counts = {}  # method -> 整场累计
         self.session_frame_count = 0
@@ -269,8 +331,27 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
 
     def _wsOnMessage(self, ws, message):
         self._probe_bump("ws_frame_count")
-        package = PushFrame().parse(message)
-        response = Response().parse(gzip.decompress(package.payload))
+        # ---- Issue #42: 帧解码 fail-soft ----
+        #
+        # authenticated 实播确认存在非 gzip payload。旧代码无条件
+        # `gzip.decompress()` 会在这里抛 Not a gzipped file 并**炸掉整个
+        # WS 回调** —— 一条坏帧断整个直播。现在: 解不开就计数 + 打一行,
+        # 跳过本帧继续收。ack 也一并跳过(服务端会重推)。
+        try:
+            package = PushFrame().parse(message)
+        except Exception as e:                  # noqa: BLE001
+            self._probe_bump("frame_decode_errors")
+            print(f"!!! PushFrame 解析失败({type(e).__name__}), 跳过该帧",
+                  file=sys.stderr, flush=True)
+            return
+        self._probe_bump("frame_encoding_counts", frame_encoding_label(package))
+        try:
+            response = decode_push_frame_response(package)
+        except Exception as e:                  # noqa: BLE001
+            self._probe_bump("frame_decode_errors")
+            print(f"!!! 帧解码失败({type(e).__name__}), 跳过该帧",
+                  file=sys.stderr, flush=True)
+            return
         setattr(self, "ws_message_count",
                 getattr(self, "ws_message_count", 0)
                 + len(response.messages_list))
@@ -379,6 +460,9 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
                 getattr(self, "unhandled_method_counts", {}).items())),
             "parse_errors": dict(sorted(
                 getattr(self, "parse_error_counts", {}).items())),
+            "frame_encoding_counts": dict(sorted(
+                getattr(self, "frame_encoding_counts", {}).items())),
+            "frame_decode_errors": getattr(self, "frame_decode_errors", 0),
         }
 
     def log_method_summary(self, tag: str = "") -> None:
@@ -406,6 +490,8 @@ class DanmakuFetcher(DouyinLiveWebFetcher):
         self.method_counts = {}
         self.unhandled_method_counts = {}
         self.parse_error_counts = {}
+        self.frame_encoding_counts = {}
+        self.frame_decode_errors = 0
         print(f">>> WebSocket 已连接(连接代际 #{self.connection_generation})",
               flush=True)
         threading.Thread(target=self._sendHeartbeat, daemon=True).start()

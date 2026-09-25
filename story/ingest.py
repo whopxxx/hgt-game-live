@@ -131,13 +131,17 @@ class InteractionEvent:
     __slots__ = ("kind", "user_id", "user_name", "ts", "message_id",
                  "envelope_msg_id", "count", "total", "gift_id", "gift_name",
                  "combo_count", "repeat_count", "total_count",
-                 "repeat_end", "group_id", "trace_id", "log_id")
+                 "repeat_end", "group_id", "trace_id", "log_id",
+                 "gift_combo", "gift_type", "diamond_count",
+                 "group_count", "send_type")
 
     def __init__(self, kind, user_id=None, user_name=None, ts=0.0,
                  message_id="", envelope_msg_id="", count=0, total=0,
                  gift_id="", gift_name="",
                  combo_count=0, repeat_count=0, total_count=0,
-                 repeat_end=0, group_id="", trace_id="", log_id=""):
+                 repeat_end=0, group_id="", trace_id="", log_id="",
+                 gift_combo=False, gift_type=0, diamond_count=0,
+                 group_count=0, send_type=0):
         self.kind = kind              # "like" / "gift"
         self.user_id = user_id
         self.user_name = user_name
@@ -167,6 +171,18 @@ class InteractionEvent:
         self.trace_id = trace_id
         #: `GiftMessage.log_id`(proto 字段 16)。单独保留, 供 Step 12 观察。
         self.log_id = log_id
+        # ---- Issue #42: 协议字段原样补齐(不赋任何业务语义) ----
+        #: `GiftMessage.gift.combo`(bool)—— 礼物本体是否为连击型礼物。
+        self.gift_combo = bool(gift_combo)
+        #: `GiftMessage.gift.type`。
+        self.gift_type = int(gift_type)
+        #: `GiftMessage.gift.diamond_count` —— 礼物标价(钻石)。**只记录**,
+        #: 不做任何"价值/兑换"换算(那是明确不做的事)。
+        self.diamond_count = int(diamond_count)
+        #: `GiftMessage.group_count`(proto 字段 4)。只做观察保留。
+        self.group_count = int(group_count)
+        #: `GiftMessage.send_type`(proto 字段 17)。
+        self.send_type = int(send_type)
 
 
 class DanmakuSource(Protocol):
@@ -352,7 +368,15 @@ class CallbackFetcher(DanmakuFetcher):
             # trace_id 被丢掉。Step 12 恰恰要观察 trace/group 在一次
             # combo 内是否稳定, 带错字段进去等于白采。
             trace_id=str(getattr(m, "trace_id", "") or ""),
-            log_id=str(getattr(m, "log_id", "") or ""))
+            log_id=str(getattr(m, "log_id", "") or ""),
+            # ---- Issue #42: 以当前 proto 实际存在的字段为准原样透传 ----
+            # (douyin.proto: GiftStruct.combo/type/diamondCount,
+            #  GiftMessage.groupCount/sendType —— 均存在, 无一伪造。)
+            gift_combo=bool(getattr(g, "combo", False) or False),
+            gift_type=int(getattr(g, "type", 0) or 0),
+            diamond_count=int(getattr(g, "diamond_count", 0) or 0),
+            group_count=int(getattr(m, "group_count", 0) or 0),
+            send_type=int(getattr(m, "send_type", 0) or 0))
 
     def _parseChatMsg(self, payload):
         # 代际检查: 这个回调可能来自**已经被废弃的旧连接** —— 旧线程卡在
@@ -459,6 +483,10 @@ class LiveSource:
         self._consecutive_fails = 0      # 连续重建失败次数
         self._thread: Optional[threading.Thread] = None
         self._watchdog: Optional[threading.Thread] = None
+        #: "本 session 礼物链已确认可用" —— 第一次真正收到 GiftMessage 时
+        #: 置位并打一次 INFO(Issue #42 §2)。挂在 LiveSource 而不是某个
+        #: fetcher 实例上: watchdog 会重建 fetcher, flag 掉了就会重复打。
+        self._gift_chain_confirmed = False
 
     # ------------------------------------------------------------------
     def _on_chat(self, ev: ChatEvent) -> None:
@@ -475,6 +503,13 @@ class LiveSource:
         **不更新 `_last_event`** —— 它是"最后一条弹幕", 用来判"房间还有
         没有人在说话"。收到礼物不代表有人提问。
         """
+        # ---- Issue #42: 礼物链首次确认 ----
+        # Cookie 配置了只代表"配置过", 不代表链路真的通。第一条真实
+        # GiftMessage 到达业务回调, 才是"可用"的证据。只报一次。
+        if (getattr(ev, "kind", "") == "gift"
+                and not self._gift_chain_confirmed):
+            self._gift_chain_confirmed = True
+            log.info("礼物消息链已确认可用")
         self.inbox.put_nowait(ev)
 
     def _on_frame(self) -> None:
@@ -690,7 +725,21 @@ class LiveSource:
             sys.stdout = old
 
     # ------------------------------------------------------------------
+    def _needs_cookie_warning(self) -> bool:
+        """没有配置 DOUYIN_LIVE_COOKIE -> 需要(且仅需要)提醒一次。
+
+        抽成方法是为了能离线单测 —— start() 里起线程, 不适合做断言现场。
+        """
+        return not getattr(self.cfg, "douyin_live_cookie", None)
+
     def start(self) -> None:
+        # ---- Issue #42: Cookie fail-open ----
+        # 没配 Cookie 直播**照常启动**(弹幕/点赞不受影响), 但礼物消息
+        # 匿名连接收不到(现场已确认)。这里只提醒**一次**, 不刷屏;
+        # 也绝不输出 Cookie 本体/长度/hash。
+        if self._needs_cookie_warning():
+            log.warning("未配置 DOUYIN_LIVE_COOKIE —— 礼物消息可能收不到,"
+                        " 弹幕与点赞不受影响(本提醒只出现一次)")
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="live-fetcher")
         self._thread.start()

@@ -581,7 +581,8 @@ def test_three_layer_counts_are_distinguishable():
           c2.captured_payload_count == 2, c2.summary())
     check("判据指向 proto 层", c2.verdict() == "proto", c2.verdict())
     check("proto 层样本: parsed 与 parse_error 不自相矛盾",
-          not (c2.parsed_gift_count > 0 and c2.gift_parse_errors()))
+          not (c2.parsed_gift_count > 0
+               and c2.parse_error_counts.get("WebcastGiftMessage")))
 
     # --- seen=0 -> transport/auth 层 ---
     d3 = mkdtemp()
@@ -1302,6 +1303,35 @@ def test_end_to_end_runner_reaches_all_four_verdict_layers():
     # 诊断 fetcher 的业务隔离: 没有业务回调被接上
     check("端到端: 诊断 fetcher 不接业务回调",
           f._on_interaction is None, f._on_interaction)
+
+    # ---- (f) Issue #42 §8.1: secondary Gift-family unhandled **不得**
+    #          覆盖 primary 的成功结论 ----
+    #
+    # 现场形状: primary `WebcastGiftMessage` parse + emitted 全通, 但
+    # `WebcastGiftSortMessage`(匿名连接也能收到的那种)没有 handler。
+    # 旧 verdict 按"任意 Gift-family unhandled"判成 `dispatch`, 把一场
+    # 成功的验收误读成"分发层断了"。现在 primary verdict 只看 primary,
+    # secondary 只进 summary 诊断字段。
+    arm, f = build()
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 6),
+             ("WebcastGiftSortMessage", b"", 7)])
+    check("secondary unhandled -> verdict 仍是 ok",
+          arm.counters.verdict() == "ok", arm.counters.verdict())
+    check("secondary unhandled 进诊断字段",
+          arm.counters.secondary_gift_family_unhandled()
+          == {"WebcastGiftSortMessage": 1},
+          arm.counters.secondary_gift_family_unhandled())
+    check("secondary unhandled 进 summary",
+          arm.counters.summary().get("secondary_gift_family_unhandled")
+          == {"WebcastGiftSortMessage": 1},
+          arm.counters.summary())
+    # 反向: primary 自己 unhandled 仍然是 dispatch(该层必须保持可达)
+    arm, f = build()
+    f._gift_probe_register_dry_run_handlers = lambda handlers: None
+    feed(f, [("WebcastGiftMessage", _gift_payload(), 8),
+             ("WebcastGiftSortMessage", b"", 9)])
+    check("primary unhandled -> 仍是 dispatch",
+          arm.counters.verdict() == "dispatch", arm.counters.verdict())
 
 
 def test_dry_run_handler_does_not_swallow_parse_errors():
