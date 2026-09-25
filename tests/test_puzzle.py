@@ -139,7 +139,8 @@ def test_v5_completion_contract_roundtrip():
     check("round trip 保持 completion",
           s2.completion_fact_ids == ["f1", "f2"], s2.completion_fact_ids)
     a = s.to_archive()
-    check("archive spec_version=4", a.get("spec_version") == 4, a.get("spec_version"))
+    # Issue #48: 持久化 schema 增加协议字段 -> spec_version 4 -> 5。
+    check("archive spec_version=5", a.get("spec_version") == 5, a.get("spec_version"))
     check("archive 带合同", a.get("completion_fact_ids") == ["f1", "f2"], a)
     check("has_completion_contract() 为真", s.has_completion_contract())
     check("completion_facts() 返回真对象",
@@ -279,7 +280,7 @@ def test_spec_roundtrip():
     check("signature 保持", s2.signature.domain == "maritime", s2.signature)
     # archive 形态
     a = s.to_archive()
-    check("archive 带 spec_version=4", a.get("spec_version") == 4, a.get("spec_version"))
+    check("archive 带 spec_version=5", a.get("spec_version") == 5, a.get("spec_version"))
     # 老 archive(只有 puzzle/answer)也要能读
     old = PuzzleSpec.from_dict({"puzzle": "老谜面。为什么?", "answer": "老谜底。"})
     check("老 archive 能读", old.puzzle == "老谜面。为什么?" and old.answer == "老谜底。",
@@ -1194,11 +1195,15 @@ def test_q2_discovery_beat_validation():
 
 
 def test_q2_completion_stays_one_or_two():
-    """**Q2-H**: 层次变多了, 但**通关仍然只需 1~2 条**。
+    """**Q2-H**: 层次变多了, 但通关合同保持窄。
 
     这是整笔的核心产品规则: 题目允许有层次, 通关必须简单。
+
+    ⚠️ 分档(Issue #48): 本用例的 good_spec 是 legacy/current schema
+    (protocol_version=""), 所以仍是 1~2 条。Haiguitang Protocol v1 的
+    2~4 条合同见 tests/test_haiguitang_protocol.py —— 两者互不放宽。
     """
-    print("\n[Q2-H] 通关仍限 1~2 条")
+    print("\n[Q2-H] legacy/current 通关仍限 1~2 条(v1 分档 2~4 另测)")
     from story.quality import MAX_COMPLETION_FACTS
     check("MAX_COMPLETION_FACTS 仍是 2", MAX_COMPLETION_FACTS == 2,
           MAX_COMPLETION_FACTS)

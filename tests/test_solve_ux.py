@@ -1402,9 +1402,9 @@ def test_v6_versions_bumped():
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
     # v8 bump 到 4: discovery_beats 改了 PuzzleSpec 的 schema。
     from story.puzzle import PuzzleSpec
-    check("spec_version 升到 4",
+    check("spec_version 升到 5",
           PuzzleSpec(puzzle="p", answer="a").to_archive().get("spec_version")
-          == 4)
+          == 5)
 
 
 def test_v6_pool_quarantines_quality_v5():

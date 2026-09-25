@@ -1,0 +1,259 @@
+{
+  "case": "coverage_owns_victory",
+  "description": "victory 由集合覆盖决定: 4 条合同建立 3 条仍不 solved, 补齐第 4 条才REVEALING —— 不存在'差不多猜中了'的通关捷径",
+  "spec": {
+    "id": "fx-gem",
+    "title": "消失的红宝石",
+    "puzzle": "珠宝展清点时少了一枚红宝石戒指。保险柜没被撬，监控没断，门禁记录只有工作人员。三天后，做展台的木工被警察带走了。戒指是怎么被拿走的？",
+    "answer": "布展时木工把戒指粘在自己制作的展台背面内侧。戒指从没离开展厅，警方从展台的做工认出制作者，在他潜回取戒指时守候带走。",
+    "core_answer": "戒指一直粘在他自己做的展台背面，警方靠做工认出了他。",
+    "completion_fact_ids": [
+      "f1",
+      "f2",
+      "f3",
+      "f4"
+    ],
+    "facts": [
+      {
+        "id": "f1",
+        "text": "戒指从没离开展厅，布展时被粘在展台背面内侧",
+        "public_text": "戒指被粘在展台背面",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f2",
+        "text": "放戒指的展台是木工亲手制作的",
+        "public_text": "展台出自木工之手",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f3",
+        "text": "木工三天后潜回取戒指时被守候的警察当场带走",
+        "public_text": "他取赃时被当场带走",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f4",
+        "text": "警方从展台的做工认出制作者，并布控守候",
+        "public_text": "警方靠做工认出了他",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f5",
+        "text": "保险柜与门禁正常，是因为没有人碰过保险柜",
+        "public_text": "",
+        "kind": "support",
+        "visibility": "hidden",
+        "hintable": false
+      }
+    ],
+    "solve_atoms": [
+      {
+        "id": "a1",
+        "role": "key",
+        "text": "戒指粘在展台背面",
+        "fact_ids": [
+          "f1"
+        ],
+        "required": true
+      },
+      {
+        "id": "a2",
+        "role": "key",
+        "text": "展台是木工做的",
+        "fact_ids": [
+          "f2"
+        ],
+        "required": true
+      },
+      {
+        "id": "a3",
+        "role": "mechanism",
+        "text": "三天后落网是取赃时被守候",
+        "fact_ids": [
+          "f3",
+          "f4"
+        ],
+        "required": true
+      },
+      {
+        "id": "a4",
+        "role": "support",
+        "text": "没人碰过保险柜",
+        "fact_ids": [
+          "f5"
+        ],
+        "required": false
+      }
+    ],
+    "discovery_beats": [
+      {
+        "id": "b1",
+        "text": "先确认戒指从未经过保险柜与门禁",
+        "fact_ids": [
+          "f1",
+          "f5"
+        ]
+      },
+      {
+        "id": "b2",
+        "text": "再意识到戒指是布展时就被藏起来的",
+        "fact_ids": [
+          "f1"
+        ]
+      },
+      {
+        "id": "b3",
+        "text": "把展台和制作者联系起来",
+        "fact_ids": [
+          "f2"
+        ]
+      },
+      {
+        "id": "b4",
+        "text": "理解三天后才落网是有守候",
+        "fact_ids": [
+          "f3",
+          "f4"
+        ]
+      }
+    ],
+    "fair_clues": [
+      {
+        "quote": "做展台的木工",
+        "supports_atoms": [
+          "a2"
+        ]
+      },
+      {
+        "quote": "门禁记录只有工作人员",
+        "supports_atoms": [
+          "a1"
+        ]
+      }
+    ],
+    "hints": [
+      "戒指没有离开过展厅",
+      "想想布展时谁能接触展台",
+      "三天后才落网不是巧合"
+    ],
+    "blueprint": {
+      "mechanism_family": "hidden_function",
+      "solution_shape": "hidden_function_explains_behavior",
+      "domain": "commerce",
+      "emotion_mode": "tense",
+      "time_shape": "single_day",
+      "relation": "stranger",
+      "reveal_mode": "hidden_stakes"
+    },
+    "signature": {
+      "mechanism_family": "hidden_function",
+      "solution_shape": "hidden_function_explains_behavior",
+      "domain": "commerce",
+      "emotion_mode": "tense",
+      "relation": "stranger",
+      "time_shape": "single_day"
+    },
+    "prompt_version": "",
+    "quality_policy_version": "quality-v13",
+    "protocol_version": "haiguitang-v1",
+    "difficulty": "hard",
+    "requested_category": "crime",
+    "primary_category": "crime",
+    "categories": [
+      "crime",
+      "suspense",
+      "twist"
+    ]
+  },
+  "steps": [
+    {
+      "viewer_message": "戒指是不是根本没被带出展厅？",
+      "verdict": "是",
+      "proposed_established_fact_ids": [
+        "f1"
+      ],
+      "touched_fact_ids": [
+        "f1"
+      ],
+      "completion_verified_fact_ids": [
+        "f1"
+      ],
+      "expect": {
+        "established_includes": [
+          "f1"
+        ],
+        "solved": false,
+        "phase": "qa"
+      }
+    },
+    {
+      "viewer_message": "展台是不是那个木工做的？",
+      "verdict": "是",
+      "proposed_established_fact_ids": [
+        "f2"
+      ],
+      "touched_fact_ids": [
+        "f2"
+      ],
+      "completion_verified_fact_ids": [
+        "f2"
+      ],
+      "expect": {
+        "established_includes": [
+          "f2"
+        ],
+        "solved": false,
+        "phase": "qa"
+      }
+    },
+    {
+      "viewer_message": "他是三天后回来取的时候被抓的吧？",
+      "verdict": "是",
+      "proposed_established_fact_ids": [
+        "f3"
+      ],
+      "touched_fact_ids": [
+        "f3"
+      ],
+      "completion_verified_fact_ids": [
+        "f3"
+      ],
+      "expect": {
+        "established_includes": [
+          "f3"
+        ],
+        "solved": false,
+        "phase": "qa"
+      }
+    },
+    {
+      "viewer_message": "警方是靠展台做工认出他然后守株待兔的？",
+      "verdict": "是",
+      "proposed_established_fact_ids": [
+        "f4"
+      ],
+      "touched_fact_ids": [
+        "f4"
+      ],
+      "completion_verified_fact_ids": [
+        "f4"
+      ],
+      "expect": {
+        "established_includes": [
+          "f4"
+        ],
+        "solved": true,
+        "phase": "revealing"
+      }
+    }
+  ]
+}

@@ -1,0 +1,122 @@
+{
+  "case": "invalid_category_null_entry",
+  "description": "categories 里的 null 条目是坏数据: parser 原样保留、validator 拒绝 —— 绝不能被洗掉(Issue #49 review Blocker 2)",
+  "expect": "invalid",
+  "expected_error_contains": [
+    "categories 含非法值"
+  ],
+  "spec": {
+    "id": "fx-lamp",
+    "title": "清晨一分钟的灯",
+    "puzzle": "每天清晨六点，老张都会把门口的灯打开一分钟再关掉，风雨无阻。为什么？",
+    "answer": "灯是给远洋船员儿子的平安信号：灯亮，说明父母平安。儿子每次跑船路过近海时用望远镜看一眼家门口，就不必深夜打电话惊动二老。",
+    "core_answer": "灯是给跑船儿子的平安信号，灯亮代表父母平安。",
+    "completion_fact_ids": [
+      "f1",
+      "f2"
+    ],
+    "facts": [
+      {
+        "id": "f1",
+        "text": "老张的儿子是远洋船员，常年不在家",
+        "public_text": "老张的儿子常年在外跑船",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f2",
+        "text": "清晨开灯一分钟是父母与儿子的报平安约定：灯亮代表父母平安",
+        "public_text": "开灯一分钟是报平安的约定",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f3",
+        "text": "儿子每次路过近海会用望远镜看一眼家门口",
+        "public_text": "",
+        "kind": "support",
+        "visibility": "hidden",
+        "hintable": false
+      }
+    ],
+    "solve_atoms": [
+      {
+        "id": "a1",
+        "role": "key",
+        "text": "儿子是远洋船员",
+        "fact_ids": [
+          "f1"
+        ],
+        "required": true
+      },
+      {
+        "id": "a2",
+        "role": "mechanism",
+        "text": "灯是平安信号，不是照明习惯",
+        "fact_ids": [
+          "f2",
+          "f3"
+        ],
+        "required": true
+      }
+    ],
+    "discovery_beats": [
+      {
+        "id": "b1",
+        "text": "先注意到开灯的时间固定在清晨六点",
+        "fact_ids": [
+          "f1"
+        ]
+      },
+      {
+        "id": "b2",
+        "text": "再想到灯是给看不见的人看的信号",
+        "fact_ids": [
+          "f2"
+        ]
+      }
+    ],
+    "fair_clues": [
+      {
+        "quote": "把门口的灯打开一分钟",
+        "supports_atoms": [
+          "a2"
+        ]
+      }
+    ],
+    "hints": [
+      "注意开灯的时长",
+      "想想谁在看这盏灯",
+      "船员家属的约定"
+    ],
+    "blueprint": {
+      "mechanism_family": "social_rule",
+      "solution_shape": "social_constraint",
+      "domain": "family",
+      "emotion_mode": "warm",
+      "time_shape": "habitual",
+      "relation": "family",
+      "reveal_mode": "straight_explanation"
+    },
+    "signature": {
+      "mechanism_family": "social_rule",
+      "solution_shape": "social_constraint",
+      "domain": "family",
+      "emotion_mode": "warm",
+      "relation": "family",
+      "time_shape": "habitual"
+    },
+    "prompt_version": "",
+    "quality_policy_version": "quality-v13",
+    "protocol_version": "haiguitang-v1",
+    "difficulty": "medium",
+    "requested_category": "warm",
+    "primary_category": "warm",
+    "categories": [
+      "crime",
+      null
+    ]
+  }
+}

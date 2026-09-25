@@ -1512,9 +1512,11 @@ def test_answer_action_carries_facts():
                       spec=spec)
     ans = [a for a in say(eng, clk, "u1", "甲", "#礁石吗")
            if a.kind == ActionKind.ANSWER]
+    # Issue #48: PuzzleFact 新增 public_text(默认空), 随 to_dict 进 payload。
     check("ANSWER 带 facts", ans[0].payload.get("facts") == [
         {"id": "f1", "text": "退潮礁石露出", "kind": "core",
-         "visibility": "hidden", "hintable": True}], ans[0].payload.get("facts"))
+         "visibility": "hidden", "hintable": True, "public_text": ""}],
+        ans[0].payload.get("facts"))
 
 
 def test_retry_riddle_keeps_avoid_and_recent():
@@ -1808,7 +1810,8 @@ def test_archive_writes_full_schema():
               "solve_atoms", "fair_clues", "hints", "qa", "winner",
               "reason", "metrics"):
         check(f"archive 有 {k}", k in rec, sorted(rec))
-    check("spec_version=4", rec.get("spec_version") == 4, rec.get("spec_version"))
+    # Issue #48: spec_version 4 -> 5(新增协议字段)。
+    check("spec_version=5", rec.get("spec_version") == 5, rec.get("spec_version"))
     check("prompt_version 落盘",
           rec.get("prompt_version") == RIDDLE_PROMPT_VERSION, rec)
     check("policy_version 落盘",

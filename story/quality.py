@@ -31,6 +31,9 @@ from .puzzle import (
     PuzzleBlueprint, PuzzleSignature, PuzzleSpec,
     has_meta_text, is_first_person, quote_in_puzzle,
 )
+from .haiguitang_protocol import (
+    PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS, completion_bounds, validate_protocol,
+)
 
 log = logging.getLogger(__name__)
 
@@ -547,11 +550,17 @@ PUZZLE_PREFERRED_MAX_LEN = 180
 PUZZLE_HARD_MAX_LEN = 220
 ANSWER_PREFERRED_MAX_LEN = 260
 ANSWER_HARD_MAX_LEN = 300
-#: 通关合同的条数上限。**刻意只有 2** —— 见下面校验里的说明。
+#: legacy/current( protocol_version="" )的通关合同条数上限。**刻意只有 2**
+#: —— 见下面校验里的说明。
 #:
 #: ⚠️ 它**不是**整道题的复杂度上限。v8 起这一点由 `discovery_beats`
 #: 显式承载: 题目可以有 2~4 个发现阶段, 而通关仍然只需 1~2 条事实。
 #: 产品规则: **题目允许有层次, 通关必须简单。**
+#:
+#: ⚠️ Haiguitang Protocol v1(Issue #48)的合同是 **2~4 条** —— 分档常量
+#: 住在 `story/haiguitang_protocol.py`(LEGACY_/PROTOCOL_V1_MIN/MAX_...),
+#: `validate_spec` 按 `spec.protocol_version` 取对应区间。**不要**把本
+#: 常量全局改成 4: 那会把所有 legacy/current spec 的合同一起偷偷放宽。
 MAX_COMPLETION_FACTS = 2
 #: discovery_beats 的条数区间(quality-v8)。少于 2 = 没有层次;
 #: 多于 4 = 一道海龟汤塞不下, 观众会跟丢。
@@ -567,6 +576,20 @@ def validate_spec(spec: PuzzleSpec,
     if spec is None:
         r.fail("spec 为空")
         return r
+
+    # ---- Haiguitang Protocol 版本门(Issue #48) ----
+    #
+    # 协议专属合同(版本枚举 / v1 的 completion 2~4 / public_text /
+    # difficulty / categories)住在 `story/haiguitang_protocol.py` ——
+    # 单一代码来源, 这里**只调用**, 不复制第二套 validator。
+    #
+    # 放在最前面: 版本身份决定后面所有分档行为(尤其 completion 条数),
+    # unknown 版本必须 fail closed, 不能让它先走到 legacy 分支里。
+    # legacy("")协议层零附加约束 —— 旧 archive / 现有测试不受影响。
+    for perr in validate_protocol(spec):
+        r.fail(perr)
+    proto = str(getattr(spec, "protocol_version", "") or "").strip()
+    p_lo, p_hi = completion_bounds(proto)
 
     # ---- 文本 ----
     if not (spec.puzzle or "").strip():
@@ -757,7 +780,9 @@ def validate_spec(spec: PuzzleSpec,
                     f"discovery_beats。")
             if "\n" in spec.core_answer or "\r" in spec.core_answer:
                 r.fail("core_answer 不能换行(揭晓时会原样念给观众)")
-        # (b) 条数 1~2: **不放宽成 4、5 条**。
+        # (b) 条数: legacy/current 1~2(不放宽成 4、5 条);
+        #     haiguitang-v1 2~4 —— 条数由**版本门**(`validate_protocol`,
+        #     见最上面)统一报, 这里不再重复判, 避免同一问题进两次 errors。
         #
         # ⚠️ C6-B: 这里的文案会**原样进 `seen_why`**, 下一稿收到的是
         # "【上一稿不合格的地方】结构问题: ..."。旧文案写的是"超过说明这题
@@ -768,10 +793,10 @@ def validate_spec(spec: PuzzleSpec,
         # 又钻了回来。
         #
         # 硬拒照旧, 只改**为什么拒、下一稿该怎么修**。
-        if not (1 <= len(comp) <= MAX_COMPLETION_FACTS):
-            r.fail(f"completion_fact_ids 有 {len(comp)} 条, 应为 1~"
-                   f"{MAX_COMPLETION_FACTS} 条。通关合同写得过细: 请收窄为 "
-                   f"core_answer 的最小 1~{MAX_COMPLETION_FACTS} 条核心语义; "
+        if proto != "haiguitang-v1" and not (p_lo <= len(comp) <= p_hi):
+            r.fail(f"completion_fact_ids 有 {len(comp)} 条, 应为 {p_lo}~"
+                   f"{p_hi} 条。通关合同写得过细: 请收窄为 "
+                   f"core_answer 的最小 {p_lo}~{p_hi} 条核心语义; "
                    f"不要因此简化谜题本身, 也不要删除有效的 discovery_beats。")
         seen_c: set = set()
         for fid in comp:
@@ -838,6 +863,15 @@ def validate_spec(spec: PuzzleSpec,
     # 一个 core 标签**(4 条而不是 3 条), 故事 / 谜面 / 谜底 / 推理全都没
     # 问题 —— 却整道丢弃, 再花 A+B+审稿+audit 四到六次昂贵调用重来一轮。
     #
+    # ⚠️ Haiguitang Protocol v1(Issue #49 review Blocker 1): v1 的合同
+    # 本身要求**每条** completion fact 都是 core+hidden, 上限允许 4 条。
+    # 若这里仍用 legacy 的 max_core_hidden=3, 一道合法的 4-fact v1 会
+    # 被标成 can_fix("把多余的 core 改成 support"), 而 reviewer 唯一的
+    # 合法动作又禁止动 completion —— **不可修**; 且题池门拒绝任何带
+    # fixable 的 spec, 4-fact v1 永远进不了题池。所以 v1 的上限取
+    # PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS(= 合同上限 4, 单一来源在
+    # story/haiguitang_protocol.py); legacy/current 一字不变。
+    #
     # 它不是安全门, 也不是逻辑门: `core` / `support` 是**分类标签**, 而
     # 通关只由 `completion_fact_ids` 决定(见 puzzle.py 的说明)。多标一条
     # core 不会让题变得不可玩, 只会让"≤3 条核心"这条内部不变量失真。
@@ -851,16 +885,21 @@ def validate_spec(spec: PuzzleSpec,
     # 不写清楚的话, 它会顺手改谜面 / 改谜底 / 删事实来"把数字凑对" ——
     # 那是改题, 不是改分类。
     n_core = len(spec.core_hidden_facts())
-    if n_core > max_core_hidden:
+    if proto == "haiguitang-v1":
+        n_core_max = max(max_core_hidden, PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS)
+    else:
+        n_core_max = max_core_hidden
+    if n_core > n_core_max:
         r.can_fix(
             f"{_CORE_COUNT_MARK} core hidden facts 有 {n_core} 条, "
-            f"超过 {max_core_hidden}: "
+            f"超过 {n_core_max}: "
             f"**只把不属于最小核心的那几条的 kind 从 core 改成 support**。\n"
             f"  必须保持: fact.id 不变 / fact.text 不变 / "
-            f"completion_fact_ids 指向的那 1~2 条 fact **仍然是 core**。\n"
+            f"completion_fact_ids 指向的那 {p_lo}~{p_hi} 条 fact "
+            f"**仍然是 core**。\n"
             f"  不得: 改谜面 / 改谜底 / 删除任何 fact / 创造新 fact / "
             f"改动核心机制。\n"
-            f"  改完后 core+hidden 的事实必须 <= {max_core_hidden} 条。")
+            f"  改完后 core+hidden 的事实必须 <= {n_core_max} 条。")
 
     # ---- fair_clues: 必须真的在谜面里 ----
     #
@@ -984,7 +1023,7 @@ def validate_spec(spec: PuzzleSpec,
                    f"discovery_beats 有 {len(beats)} 条, 应为 "
                    f"{MIN_DISCOVERY_BEATS}~{MAX_DISCOVERY_BEATS} 条"
                    f"(题目允许有层次 —— 但通关仍只需 "
-                   f"completion_fact_ids 那 1~{MAX_COMPLETION_FACTS} 条)")
+                   f"completion_fact_ids 那 {p_lo}~{p_hi} 条)")
     if beats:
         known_facts = {f.id for f in (spec.facts or []) if f.id}
         seen_ids: set = set()
