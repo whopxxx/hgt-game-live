@@ -16,11 +16,24 @@ from story.llm import (  # noqa: E402
     RIDDLE_PROMPT_VERSION, LLMResult, PuzzleWriter,
     # R4: Story/Surface 两段的 prompt、schema 与审稿契约
     STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION,
-    STORY_SYSTEM, SURFACE_SYSTEM, _TOOL_STORY, _TOOL_SURFACE,
-    _TOOL_STRUCTURE, check_tool, _story_system,
+    _TOOL_STORY, _TOOL_SURFACE,
+    _TOOL_STRUCTURE, check_tool,
     # R4-R3: livestream_safe 的三份判据措辞都要钉住。
     CHECK_SYSTEM, _TOOL_CHECK,
 )
+# ---- Issue #50: 生成侧 system prompt 的单一来源是 Prompt Pack 文件 ----
+# truth/surface/contract 已从 llm.py 常量迁到 haiguitang/prompts/generation/;
+# 这里按原变量名给出 loader 视图, 让既有的内容断言继续钉住**现行文本**。
+from story.prompt_pack import load_prompt as _load_prompt  # noqa: E402
+STORY_SYSTEM = _load_prompt("truth")
+SURFACE_SYSTEM = _load_prompt("surface")
+STRUCTURE_SYSTEM = _load_prompt("contract")
+TRUTH_AUDIT_SYSTEM = _load_prompt("audit_truthfulness")
+SAFETY_SYSTEM = _load_prompt("audit_safety")
+# v1 起方向句从 system 移到 user message —— 渲染语义由 `_story_user` 承担,
+# 这里只保留一个等价视图(全静态文本)供旧断言使用。
+def _story_system(lane: str = "red"):  # noqa: E302
+    return STORY_SYSTEM
 from story.quality import QUALITY_POLICY_VERSION  # noqa: E402
 from story.puzzle import FairClue, PuzzleSpec  # noqa: E402
 
@@ -180,11 +193,20 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
         "completion_fact_ids": ["f1", "f2"],
         "hints": list(hints),
         "facts": [
-            {"id": "f1", "text": "退潮时礁石露出水面", "kind": "core"},
-            {"id": "f2", "text": "灯的真正作用是标示礁石位置", "kind": "core"},
+            # ---- Issue #50: v1 合同 fact 必须带 public_text(§27) ----
+            # 非通关的 support/exclusion 允许空串; 这里给 f1/f2 写
+            # 安全摘要, 使 scripted payload 成为合法的 v1 Contract 输出。
+            {"id": "f1", "text": "退潮时礁石露出水面", "kind": "core",
+             "public_text": "退潮后水下的礁石会露出来"},
+            {"id": "f2", "text": "灯的真正作用是标示礁石位置", "kind": "core",
+             "public_text": "灯是在标记危险礁石的位置"},
             {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support"},
             {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion"},
         ],
+        # ---- Issue #50 §23: Contract 的 observed 分类 ----
+        "difficulty": "medium",
+        "primary_category": "logic",
+        "categories": ["logic", "suspense"],
         "solve_atoms": [
             {"id": "a1", "role": "cause", "text": "退潮使礁石需要标出",
              "fact_ids": ["f1"]},
@@ -3937,10 +3959,12 @@ def test_r7_safety_verifier_is_a_second_and_gate():
     s3, log3, tools3, audit3 = _run(True, (True, ""))
     check("**双门都过 -> 收**", bool(s3.puzzle), s3.error)
     check("**这次发了 truth audit**", audit3 == 1, audit3)
-    check("**metrics 记了复核版本**",
-          (s3.metrics or {}).get("safety_prompt_version")
-          == "safety-v3",
-          (s3.metrics or {}).get("safety_prompt_version"))
+    # Issue #50: safety prompt 版本溯源改记 Prompt Pack 的 stage 版本。
+    from story.prompt_pack import stage_version as _sv
+    check("**metrics 记了复核版本(Pack stage 版本)**",
+          (s3.metrics or {}).get("safety_audit_prompt_version")
+          == _sv("audit_safety"),
+          (s3.metrics or {}).get("safety_audit_prompt_version"))
     check("**metrics 记了复核结论**",
           (s3.metrics or {}).get("safety_verified") is True,
           (s3.metrics or {}).get("safety_verified"))

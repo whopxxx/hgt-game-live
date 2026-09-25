@@ -29,6 +29,16 @@ from typing import Callable, Optional
 
 from . import parser as P
 from .config import LLMConfig
+from .haiguitang_protocol import (
+    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION,
+    MAX_CATEGORIES, MIN_CATEGORIES,
+    PROTOCOL_V1_MAX_COMPLETION_FACTS, PROTOCOL_V1_MIN_COMPLETION_FACTS,
+    GenerationBrief,
+)
+from .prompt_pack import (
+    HAIGUITANG_GENERATION_PROMPT_VERSION, PROMPT_PACK_VERSION,
+    load_prompt, stage_version,
+)
 from .puzzle import (
     DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS, REVEAL_MODES,
     SOLUTION_SHAPES, TIME_SHAPES,
@@ -299,7 +309,11 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
             id=fid, text=text,
             kind=str(raw.get("kind", "") or "support").strip().lower(),
             visibility=str(raw.get("visibility", "") or "hidden").strip().lower(),
-            hintable=bool(raw.get("hintable", True))))
+            hintable=bool(raw.get("hintable", True)),
+            # ---- Issue #50 §27: public_text 是 Contract 产出的一部分 ----
+            # 通关 fact 缺它会被 validate_protocol 拒(§67: 绝不由代码
+            # 拿 canonical text 补)。
+            public_text=str(raw.get("public_text", "") or "").strip()))
 
     atoms = []
     for i, raw in enumerate(d.get("solve_atoms") or []):
@@ -344,6 +358,18 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
         if fid and fid not in comp_ids:
             comp_ids.append(fid)
 
+    # ---- Haiguitang Protocol v1: 模型拥有的**观察**字段(Issue #50 §23) ----
+    # difficulty / primary_category / categories 由 Contract 给出。
+    # categories **原样保留**(不去重不回退 —— 与 from_dict 同一条纪律,
+    # 坏数据留给 validate_protocol 拒); 非法枚举同样交给 validator。
+    # ⚠️ 这里**不**写 protocol_version / requested_category /
+    # prompt_version —— 那些是代码字段, 由调用方(structure_original_idea
+    # / gen_spec)注入; legacy 链调用本函数时它们保持默认("")。
+    raw_cats = d.get("categories")
+    categories = ([str(x).strip() if isinstance(x, str) else x
+                   for x in raw_cats]
+                  if isinstance(raw_cats, list) else [])
+
     return PuzzleSpec(
         title=str(title if title is not None else d.get("title", "") or "").strip(),
         puzzle=_strip_puzzle_tail(str(d.get("puzzle", "") or "").strip()),
@@ -354,6 +380,9 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
         discovery_beats=beats,
         hints=[str(h).strip() for h in (d.get("hints") or [])
                if str(h).strip()][:3],
+        difficulty=str(d.get("difficulty", "") or "").strip(),
+        primary_category=str(d.get("primary_category", "") or "").strip(),
+        categories=categories,
         blueprint=bp, signature=sig,
         prompt_version=RIDDLE_PROMPT_VERSION,
         quality_policy_version=QUALITY_POLICY_VERSION)
@@ -590,6 +619,18 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
     """是不是带 signature 的新版 spec。老数据不做严格比对。"""
     sig = getattr(spec, "signature", None)
     return bool(sig and (sig.mechanism_family or sig.solution_shape))
+
+
+def _is_v1(spec: "PuzzleSpec") -> bool:
+    """这道题是不是 Haiguitang Protocol v1(Issue #50 §51)。
+
+    **shared Reviewer / 审计必须按它分派行为**: v1 keyword2 题走
+    Prompt Pack 的 audit-v1 与 v1 同步 bundle(2~4 completion +
+    public_text + difficulty/categories); legacy/current/curated 题
+    走原 CHECK_SYSTEM 与原 schema, 逐位不变。绝不能"全局一律 v1"。
+    """
+    return (str(getattr(spec, "protocol_version", "") or "")
+            == HAIGUITANG_PROTOCOL_VERSION)
 
 
 def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
@@ -2377,34 +2418,12 @@ _TOOL_RIDDLE = {
     },
 }
 
-STRUCTURE_SYSTEM = """你是**题库编辑**, 不是出题人。全程用中文。
-
-用户会给你一道**已经写好**的谜题(谜面 + 谜底)。你的工作**不是**评价它
-好不好, 也**不是**重新创作 —— 而是把它**搬进**我们的结构化 schema:
-填出 facts / solve_atoms / completion_fact_ids / fair_clues /
-discovery_beats / hints / core_answer, 以及这道题**实际**是什么形状
-(observed signature)。
-
-## 铁律
-
-1. **谜面与谜底已经定了, 你改不了也不该改。** schema 里根本没有这两个
-   字段 —— 不要试图"顺手润色一下"。
-2. `core_answer` 必须**直接解释谜面的主要异常 / 核心悬念**。
-   若谜面本来有明确问题, 就直接回答它; 谜面**不一定**有问句。
-   一句话, <=60 字,
-   不换行。
-3. `fair_clues.quote` 必须**逐字**摘自**用户给出的那个谜面**(代码会做
-   包含检查)。一个字都不能改 —— 更不许改谜面去迁就 quote。
-4. `completion_fact_ids` 是**通关合同**(1~2 条), 不是"谜底要点"。指向
-   `kind=core` 且 `visibility=hidden` 的 fact。support / exclusion
-   **绝不能**填在这里。
-5. `signature` 是**观察结果**, 不是创作指令: 没有任何目标骨架要你迎合,
-   如实填写这道题**本来**是什么形状。
-6. 这道题**没有** target Blueprint。不要因为"它不是某个形状"就说它
-   不合格 —— 你要判的只有一件事: **它本身是不是一道合格的直播海龟汤**。
-
-按工具字段填: core_answer / facts / completion_fact_ids / solve_atoms /
-fair_clues / discovery_beats / hints / signature。"""
+#: Contract 阶段的 system prompt **已迁到 Prompt Pack**(Issue #50):
+#:     haiguitang/prompts/generation/contract-v1.md   (via load_prompt("contract"))
+#: 迁移时按 Haiguitang Protocol v1 适配: completion 2~4、facts 带
+#: public_text(text vs public_text 的语义)、difficulty/categories 的
+#: 盲观察规则(§29: 看不到 requested)。单一事实来源是文件; `load_prompt`
+#: fail closed, 绝不回退旧常量。
 
 
 def _unconstrained_blueprint():
@@ -2609,6 +2628,13 @@ def _structure_user_prompt(puzzle: str, answer: str, *, title: str = "",
 #: ⚠️ Story 的 schema **只有 `answer` 一个字段**。曾考虑再留一个内部
 #: 摘要 `core_truth`, 但那没有任何下游读者(实测全仓零引用), 而"为了
 #: 以后可能有用"加字段正是要被避免的形状。
+#:
+#: ---- Issue #50: 这个版本号**退役**为 metrics/旧档的历史标签 ----
+#: keyword2 链的 prompt 现在由 Prompt Pack 提供(`truth-v1.md`), spec 的
+#: canonical `prompt_version` = `HAIGUITANG_GENERATION_PROMPT_VERSION`
+#: (见 `story/prompt_pack.py`), stage 版本走
+#: `metrics["truth_prompt_version"]`。本常量只用于读旧 archive/metrics
+#: 时对号入座, **绝不再写进新 spec** —— v1 不允许"文件 + 常量"两份。
 STORY_PROMPT_VERSION = "keyword2-v7"
 
 #: **Surface** 阶段的 prompt 版本号。
@@ -2624,6 +2650,9 @@ STORY_PROMPT_VERSION = "keyword2-v7"
 #: 泄底(61 字汤面直接把"祭祖其实是把活人送去喂怪物"写了出来)。现在写
 #: "只写角色当时能看到、听到、知道的表面事实; 把'为什么如此'的真相全部
 #: 藏起来"。判据变了, 所以 bump。
+#:
+#: ---- Issue #50: 与 STORY_PROMPT_VERSION 一同退役为历史标签 ----
+#: stage 版本现在由 `stage_version("surface")` 提供(surface-v1.md)。
 SURFACE_PROMPT_VERSION = "surface-v2"
 
 #: **Story 阶段的方向提示** —— 极短, 两类各**一句话**。
@@ -2671,34 +2700,20 @@ STORY_LANE_DIRECTION = {
 #: "换个说法绕过去"。这条写的是**创作侧的边界**(别往那个方向构思),
 #: 与 Reviewer 的 `livestream_safe`(成题后兜底)是两道**独立**的门:
 #: 创作侧少产出, 审核侧照拒 —— 只靠任何一道都会漏。
-STORY_SYSTEM = """你是一个擅长构思中文海龟汤隐藏故事的作者。
-
-根据两个随机关键词，构思一个适合海龟汤的完整隐藏情境。
-表面看起来会很奇怪，但知道完整背景后完全说得通。
-先只写真相，不写汤面（汤面之后会由一步单独的截取产生）。
-把背景交代完整 —— 要让表面上那些反常之处都能被解释。
-只允许一个核心解释：不允许"其实是 A，也可能是 B"。
-安全边界：不以性暴力为核心情节，不写血腥、具体伤害的感官细节（虐杀 / 肢解 / 具体伤口的描写）。普通的、不涉及血腥的死亡可以作为剧情事实。
-
-{lane}
-
-## 运行约束
-
-1. **全程中文**。
-2. **不依赖冷门专业知识** —— 真相要能靠常识讲通。
-3. **不依赖外部图片 / 音频 / 特定软件** —— 观众只能靠文字与提问。
-4. **适合普通直播场景** —— 能被念出来、能被弹幕追问。
-5. **汤底保持简洁** —— 建议 2~4 句, 中文总长度不超过 260 字。
-   汤底是**揭晓时直接念给观众**的, 写成长篇说明会拖垮直播节奏。
-6. 按工具字段输出。"""
-
-
-def _story_system(lane: str) -> str:
-    """拼出带 lane 方向的 Story system。`lane` 只认 red / black。"""
-    return STORY_SYSTEM.format(
-        lane=STORY_LANE_DIRECTION.get(str(lane or "").strip().lower(),
-                                      STORY_LANE_DIRECTION["red"]))
-
+#: Story(Truth)阶段的 system prompt **已迁到 Prompt Pack**(Issue #50):
+#:     haiguitang/prompts/generation/truth-v1.md   (via load_prompt("truth"))
+#:
+#: 为什么不留一份 Python 常量: 单一事实来源。文件与常量并存迟早漂
+#: (任务书 §10)。`load_prompt` fail closed —— 文件缺失是部署错误,
+#: 绝不静默回退任何旧常量。
+#:
+#: 原 `{lane}` 占位符**移出了 system**: lane 方向、requested category、
+#: requested difficulty 都是**运行时数据**, 由 `_story_user` 拼进
+#: user message(§6: 让 truth prompt 完全静态, 避免 .format 花括号
+#: 冲突与漏填变量)。
+#:
+#: R4-R2 中心目标 / R4-R3 安全边界等历史理由见 git 历史
+#: 与 truth-v1.md 的现行文本。
 
 #: Story 阶段的工具 schema —— **只有一个字段**。
 #:
@@ -2747,10 +2762,10 @@ _TOOL_STORY = {
 #:     hard gate 从侧门装回来;
 #:   * 不要求汤面塞多条 clue;
 #:   * **不传** observed_clues(它已经不在创作链里了)。
-SURFACE_SYSTEM = """从这个完整汤底里，只截一个最值得追问的反常瞬间作为海龟汤汤面。
-只写角色当时能看到、听到、知道的表面事实；把"为什么如此"的真相全部藏起来。
-汤面不是摘要。
-只写 1～3 句，尽量简短。"""
+#: Surface 阶段的 system prompt **已迁到 Prompt Pack**(Issue #50):
+#:     haiguitang/prompts/generation/surface-v1.md   (via load_prompt("surface"))
+#: 文本逐字迁移(R3/R4-R4 的历史理由见 git 历史)。单一事实来源是文件;
+#: `load_prompt` fail closed, 绝不回退旧常量。
 
 #: Surface 阶段的工具 schema —— 只有一个字段。
 _TOOL_SURFACE = {
@@ -2772,17 +2787,49 @@ _TOOL_SURFACE = {
 }
 
 
-def _story_user(keywords, lane: str) -> str:
-    """Story 阶段的 user message: lane 行 + 关键词行。
+def _story_user(keywords, lane: str,
+                brief: Optional[GenerationBrief] = None) -> str:
+    """Story(Truth)阶段的 user message。
 
-    ⚠️ 与旧 `_keywords_prompt` 的差别: **去掉**"直接给出谜面与谜底"。
-    这一阶段不写谜面。
+    ## v1(Issue #50): lane 方向与 GenerationBrief 意图都在这里
+
+    Prompt Pack 化之后 system(`truth-v1.md`)是**全静态**的, 所有运行时
+    数据都从这条 user message 进:
+
+        类型行        lane(红/黑)—— 既有行为
+        关键词行      抽到的 2 个词 —— 既有行为
+        方向句        STORY_LANE_DIRECTION 的一句话(原 `{lane}` 占位符)
+        创作意图      brief.requested_category / brief.difficulty(§17~§19)
+
+    ⚠️ requested 是**创作目标**, 不是分类答案: 这里只告诉模型"本次希望
+    主方向偏向什么"。Contract/Audit 的 observed 分类**看不到**这条
+    message(它们只看冻结的成品), 所以不会污染 `primary_category`。
     """
     words = [str(k).strip() for k in (keywords or []) if str(k).strip()]
     road = "红汤" if str(lane or "").strip().lower() == "red" else "黑汤"
-    return ("类型：" + road + "。\n"
-            "关键词：" + "，".join(words) + "\n\n"
-            "请围绕这几个关键词构思一个完整的中文海龟汤隐藏故事。")
+    direction = STORY_LANE_DIRECTION.get(
+        str(lane or "").strip().lower(), STORY_LANE_DIRECTION["red"])
+    b = brief if brief is not None else GenerationBrief()
+    lines = ["类型：" + road + "。",
+             "关键词：" + "，".join(words)]
+    if b.requested_category:
+        lines.append(f"本次希望主方向偏向 {b.requested_category}"
+                     f"（{_CATEGORY_LABELS.get(b.requested_category, '')}）。")
+    if b.difficulty:
+        lines.append(f"希望整体推理难度偏 {_DIFFICULTY_LABELS.get(b.difficulty, b.difficulty)}。")
+    lines += ["", direction,
+              "请围绕这几个关键词构思一个完整的中文海龟汤隐藏故事。"]
+    return "\n".join(lines)
+
+
+#: canonical 枚举的中文展示名 —— **纯展示**(进 Truth 的创作意图行),
+#: 不参与任何协议判定; 枚举本身的单一来源在 haiguitang_protocol.py。
+_CATEGORY_LABELS = {
+    "logic": "逻辑", "suspense": "悬疑", "horror": "恐怖", "twist": "反转",
+    "brainstorm": "脑洞", "family": "亲情", "crime": "罪案",
+    "tragedy": "悲剧", "warm": "温暖", "comedy": "喜剧", "sci_fi": "科幻",
+}
+_DIFFICULTY_LABELS = {"easy": "简单", "medium": "中等", "hard": "困难"}
 
 
 def _surface_user(answer: str) -> str:
@@ -2825,16 +2872,25 @@ _TOOL_STRUCTURE = {
                     "它是揭晓时**第一句**念给观众的话 —— 写得绕等于没写。"),
             },
             "completion_fact_ids": {
-                "type": "array", "minItems": 1, "maxItems": 2,
+                "type": "array",
+                # ---- Issue #50 §25: v1 Contract = 2~4 条 ----
+                # 数字**必须**来自 story.haiguitang_protocol(§26: 不许
+                # 复制魔法值, 否则协议文件与 tool schema 会漂移)。
+                "minItems": PROTOCOL_V1_MIN_COMPLETION_FACTS,
+                "maxItems": PROTOCOL_V1_MAX_COMPLETION_FACTS,
                 "items": {"type": "string"},
                 "description": (
-                    "**通关合同**: 观众房间必须真正建立的 1~2 条核心事实"
-                    "(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
-                    "房间已公开确认的事实会**累计**, 最后补齐缺口的观众立即"
-                    "触发揭晓 —— 不要求某一个人独自说全。\n"
-                    "所以这里要填的是\"解出这题最少必须知道什么\", "
-                    "**不是**\"完整谜底需要解释什么\"。\n"
-                    "support / exclusion **绝不能**填在这里。"),
+                    f"**通关合同**: 观众房间必须真正建立的 "
+                    f"{PROTOCOL_V1_MIN_COMPLETION_FACTS}~"
+                    f"{PROTOCOL_V1_MAX_COMPLETION_FACTS} 条核心事实"
+                    f"(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
+                    f"房间已公开确认的事实会**累计**, 最后补齐缺口的观众立即"
+                    f"触发揭晓 —— 不要求某一个人独自说全。\n"
+                    f"所以这里要填的是\"解出这题最少必须知道什么\", "
+                    f"**不是**\"完整谜底需要解释什么\"。\n"
+                    f"2~4 是允许区间: 填真正缺一不可的那几条, "
+                    f"不要为凑满 4 条把 support 硬塞进来。\n"
+                    f"support / exclusion **绝不能**填在这里。"),
             },
             "facts": {
                 "type": "array", "minItems": 4, "maxItems": 10,
@@ -2845,10 +2901,18 @@ _TOOL_STRUCTURE = {
                                "description": "如 f1, f2 … 唯一"},
                         "text": {"type": "string",
                                  "description": "一条确定的事实, 一句话"},
+                        "public_text": {
+                            "type": "string",
+                            "description": (
+                                "这条事实被观众正式建立**之后**才展示的"
+                                "安全摘要。不得比 text 多说任何真相。"
+                                "通关合同里那几条(core+hidden)的 "
+                                "public_text **绝不能为空**。"),
+                        },
                         "kind": {
                             "type": "string",
                             "enum": ["core", "support", "exclusion"],
-                            "description": "core=解谜核心(≤3 条); "
+                            "description": "core=解谜核心(≤4 条); "
                                            "support=支撑/背景; "
                                            "exclusion=用来排除常见错误路线",
                         },
@@ -2863,11 +2927,12 @@ _TOOL_STRUCTURE = {
                                            "核心 mechanism 建议 false",
                         },
                     },
-                    "required": ["id", "text", "kind"],
+                    "required": ["id", "text", "public_text", "kind"],
                 },
                 "description": (
                     "主持人在整局游戏里判断「是/不是/无关」的**事实空间**。"
-                    "至少 1 条 kind=exclusion。"),
+                    "text=canonical truth, public_text=已建立后的安全摘要"
+                    "(不比 text 多说任何真相)。至少 1 条 kind=exclusion。"),
             },
             "solve_atoms": {
                 "type": "array", "minItems": 1, "maxItems": 4,
@@ -2953,6 +3018,35 @@ _TOOL_STRUCTURE = {
                 "items": {"type": "string"},
                 "description": "3 条由浅入深的提示, 每条不超过 30 字, 不剧透",
             },
+            # ---- Issue #50 §23: Contract 的 observed 分类 ----
+            # difficulty / primary_category / categories 由模型**观察**
+            # 冻结的 puzzle+answer 给出(§29/§34: 看不到 requested,
+            # 分类答案只有一个来源 = 对成品的观察)。枚举与区间全部来自
+            # story.haiguitang_protocol(§26), 不复制魔法值。
+            "difficulty": {
+                "type": "string",
+                "enum": list(DIFFICULTIES),
+                "description": (
+                    "难度观察结果: easy / medium / hard 三选一。判据是"
+                    "\"普通观众靠是/否问答推出来大概要多费劲\", **不是**"
+                    "题目长短, 也**不是** completion 条数(两条独立轴, "
+                    "不许互推)。只看你面前的谜面与谜底, 如实判断。"),
+            },
+            "primary_category": {
+                "type": "string",
+                "enum": list(CATEGORIES),
+                "description": (
+                    "这道题**最主要**的 canonical 主题(11 选 1, enum 见 "
+                    "schema)。是**观察结果**, 不是创作指令。"),
+            },
+            "categories": {
+                "type": "array",
+                "minItems": MIN_CATEGORIES, "maxItems": MAX_CATEGORIES,
+                "items": {"type": "string", "enum": list(CATEGORIES)},
+                "description": (
+                    "这道题涉及的 canonical 主题, 1~3 个, "
+                    "**必须包含** primary_category; 不确定的主题不要硬凑。"),
+            },
             "signature": {
                 "type": "object",
                 "properties": {
@@ -2998,9 +3092,14 @@ _TOOL_STRUCTURE = {
             },
         },
         # ⚠️ 注意这里**没有** puzzle / answer / title —— 见上面的说明。
+        # 也**没有** protocol_version / requested_category /
+        # quality_policy_version / prompt_version —— 那些是**代码字段**
+        # (Issue #50 §24), 模型不拥有, 由 structure_original_idea 在
+        # 组装后注入。
         "required": ["core_answer", "hints", "facts",
                      "completion_fact_ids", "solve_atoms",
-                     "fair_clues", "discovery_beats", "signature"],
+                     "fair_clues", "discovery_beats", "signature",
+                     "difficulty", "primary_category", "categories"],
     },
 }
 
@@ -3623,6 +3722,75 @@ _TOOL_CHECK = {
 #: (早先这里写成一个中间变量 `_CHECK_REQUIRED_FIELDS`, 但它在
 #: `_TOOL_CHECK` 之后才定义 -> 模块加载即 NameError。教训: `_TOOL_CHECK`
 #: 是个字面量字典, 它只能引用**已经在它之前**定义的名字。)
+def _v1_check_tool() -> dict:
+    """v1 keyword2 题的审稿 tool schema(Issue #50 §25/§26/§41)。
+
+    在 `_TOOL_CHECK`(自由生成形态)上做三件事, 其余逐位不动:
+
+        1. completion_fact_ids 的 minItems/maxItems 改成 Protocol v1
+           常量(2~4) —— 不再手写 1~2;
+        2. facts[].public_text 进 items.properties + items.required
+           (通关 fact 空 public_text 会被 validator 整份拒绝, reviewer
+           必须回传它才能同步);
+        3. 顶层增加 difficulty / primary_category / categories(观察值,
+           §41: v1 同步 bundle 的组成部分), 并加入顶层 required。
+
+    枚举与区间**全部来自 story.haiguitang_protocol** —— 协议常量改了,
+    这里自动跟着变(§26)。
+    """
+    import copy as _copy
+    tool = _copy.deepcopy(_TOOL_CHECK)
+    sch = tool["input_schema"]["properties"]
+    comp = sch["completion_fact_ids"]
+    comp["minItems"] = PROTOCOL_V1_MIN_COMPLETION_FACTS
+    comp["maxItems"] = PROTOCOL_V1_MAX_COMPLETION_FACTS
+    comp["description"] = (
+        f"**通关合同**: 观众房间必须真正建立的 "
+        f"{PROTOCOL_V1_MIN_COMPLETION_FACTS}~"
+        f"{PROTOCOL_V1_MAX_COMPLETION_FACTS} 条核心事实"
+        f"(指向 facts 里 kind=core 且 visibility=hidden 的 id)。\n"
+        f"pass 时原样回传; 改了核心机制就**必须重出**。"
+        f"support/exclusion 不能出现在这里。")
+    facts = sch["facts"]
+    facts["items"]["properties"]["public_text"] = {
+        "type": "string",
+        "description": (
+            "这条事实被观众正式建立**之后**才展示的安全摘要。"
+            "不得比 text 多说任何真相。通关合同里的 fact "
+            "**绝不能为空**。"),
+    }
+    facts["items"]["required"] = ["id", "text", "public_text", "kind"]
+    facts["description"] = (
+        "事实表 —— **正式 Q&A 的判定依据**。text=canonical truth, "
+        "public_text=已建立后的安全摘要。改了 answer 或核心机制就必须"
+        "重出这一整组, 否则主持人会依据**过期事实**回答观众。"
+        "没动核心就原样回传(含 public_text)。")
+    sch["difficulty"] = {
+        "type": "string", "enum": list(DIFFICULTIES),
+        "description": (
+            "按**改后**的题如实重判的难度(easy/medium/hard)。"
+            "不要照抄原稿 —— 改了谜底难度可能变。"),
+    }
+    sch["primary_category"] = {
+        "type": "string", "enum": list(CATEGORIES),
+        "description": (
+            "按**改后**的题如实重判的最主要 canonical 主题。不要照抄原稿。"),
+    }
+    sch["categories"] = {
+        "type": "array",
+        "minItems": MIN_CATEGORIES, "maxItems": MAX_CATEGORIES,
+        "items": {"type": "string", "enum": list(CATEGORIES)},
+        "description": (
+            "按**改后**的题如实重判的 canonical 主题, 1~3 个, "
+            "必须包含 primary_category。"),
+    }
+    tool["input_schema"]["required"] = [
+        "decision", "observed_signature", "quality_checks",
+        "difficulty", "primary_category", "categories",
+    ]
+    return tool
+
+
 def check_tool(spec: Any = None) -> dict:
     """按题目来源裁出这次审稿该用的 `_TOOL_CHECK` schema。
 
@@ -3651,8 +3819,24 @@ def check_tool(spec: Any = None) -> dict:
     永久变成 curated 的 schema(顺序依赖的隐藏状态)。
 
     `spec=None` 按自由生成处理(向后兼容: 老调用点没有 spec)。
+
+    ## Issue #50: Protocol v1 是第三种分派
+
+    v1 keyword2 题(`_is_v1(spec)`)在"自由生成"的 quality_checks 之上,
+    同步 bundle 还要带 v1 协议字段, 且 completion 区间是 2~4:
+
+        completion_fact_ids  minItems/maxItems = Protocol 常量(2~4)
+        facts[].public_text  必填(通关 fact 空 public_text 会被拒)
+        difficulty           enum = Protocol DIFFICULTIES
+        primary_category     enum = Protocol CATEGORIES
+        categories           1~3, enum = Protocol CATEGORIES
+
+    枚举与区间**全部引用 story.haiguitang_protocol**(§26: 不复制魔法值,
+    测试钉死 schema == 协议常量)。legacy/current/curated 分支**逐位不变**。
     """
     import copy as _copy
+    if spec is not None and _is_v1(spec):
+        return _v1_check_tool()
     props = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
     curated = spec is not None and _is_curated(spec)
     keep = (set(_CURATED_HARD_CHECK_FIELDS) | set(_CURATED_SIGNAL_FIELDS)
@@ -4253,86 +4437,13 @@ _TOOL_CANDIDATE_RECHECK = {
 # CHECK_SYSTEM 里**已经**明确写着"谜面直接说 A, 谜底不能说其实不是 A",
 # 但仍然放过了。所以这一件事需要**自己的调用**, 输入只有三样:
 # puzzle / core_answer / answer —— 不给 recent / quota / blueprint。
-TRUTH_AUDIT_SYSTEM = """你是海龟汤谜题的**叙事真实性审计员**。
-
-## 你的唯一任务
-
-判断这道题的**谜面**与**谜底**在字面上是否自相矛盾。
-
-只看三样东西: 谜面 / 核心答案 / 完整谜底。**不要**考虑题目好不好玩、
-结构是否符合什么模板、配额够不够 —— 那不是你的事。
-
-## 判据
-
-谜面里由**全知叙述者直接断言**的事实, 必须在 canonical world 里
-**字面为真**。谜底可以隐瞒、可以补全、可以揭示读者没想到的一层,
-但**不能推翻**叙述者已经断言过的话。
-
-允许的:
-- 隐瞒 / 省略(谜面没说的事, 谜底可以说)
-- 双关 / 换义(同一个词在谜底里是另一层意思)
-- **有归属**的陈述 —— 那是角色以为的, 不是事实:
-    "在他看来, 司机没有掉头"
-    "家里人一直以为……"
-    "交警确信……"
-  谜底可以说这些**以为**是错的。这不是 narrator 在断言。
-
-禁止的:
-- 谜面直接说 A, 谜底说其实不是 A。
-
-## 必须逐句扫描的**绝对断言**
-
-谜面里出现下面这些词时, **每一处**都要单独和谜底对照:
-
-   没有 / 并没有 / 从未 / 从来没 / 绝不 / 一直 / 始终 / 只 / 唯一 /
-   同一个 / 从不 / 已经 / 还没有
-
-以及任何关于下面这些维度的**无归属**断言:
-
-   身份 / 动作 / 方向 / 前后顺序 / 时间 / 数量 / 地点
-
-## 对照例
-
-✗ **不过(典型)**:
-    谜面  "司机并没有掉头"
-    谜底  "司机到对岸正常调头后又驶回桥上"
-    -> narrator_truthful = false。谜面用无归属的绝对否定断言了"没掉头",
-       而谜底要求"掉过头"。这不是隐瞒, 是**字面矛盾**。
-
-✓ **可以过(有归属)**:
-    谜面  "在他看来, 司机没有掉头"
-    谜底  司机实际上在对岸掉过头
-    -> narrator_truthful = true。"在他看来" 把这句话降级成角色信念。
-
-✗ **不过(绝对时间断言)**:
-    谜面  "此刻锅底仍开着小火"
-    谜底  "其实早已关火, 只是在焐"
-    -> false。谜面断言了**当下**的火还在烧。
-
-✓ **可以过(弱断言)**:
-    谜面  "锅还温着"
-    谜底  "早已关火, 正在焐"
-    -> true。"温着"与"关火了但焐着"完全相容 —— 这是**允许的误导**。
-
-判断分界: 谜面那句话**是否已经排除了谜底那个可能**?
-"仍开着小火"排除了"已关火"; "还温着"没有排除任何东西。
-
-## mechanism_consistent
-
-谜底依赖的方向 / 时区早晚 / 前后顺序 / 数量累计 / 速度距离 / 简单物理
-是否真的成立?**实际在脑子里走一遍**, 不要凭印象。
-
-不需要专业知识, 只要求基本因果与符号方向**不自相矛盾**。
-
-## 输出
-
-- `narrator_truthful`: 谜底没有推翻谜面的无归属断言 -> true。
-- `mechanism_consistent`: 核心物理/时间/方向/数量/因果真的成立 -> true。
-- `conflicts`: 每一处矛盾一条, 写清"谜面那句断言" / "谜底那句推翻" /
-  "为什么"。没有矛盾就留空数组。
-
-⚠️ 拿不准时**不要**放过 —— 矛盾的题在直播里会变成"观众按谜面推理,
-结果系统说他错了"。填 false 并写清在哪一句。"""
+#: Truthfulness Audit 与 Safety Review 的 system prompt **已迁到
+#: Prompt Pack**(Issue #50 §32/§33, 行为逐位不变 —— 文本逐字迁移):
+#:     haiguitang/prompts/generation/audit-truthfulness-v1.md
+#:     haiguitang/prompts/generation/audit-safety-v1.md
+#: 单一事实来源是文件; `load_prompt` fail closed, 绝不回退旧常量。
+#: 旧 SAFETY_PROMPT_VERSION("safety-v3")一并退役 —— stage 版本现在由
+#: `stage_version("audit_safety")` 提供, 进 metrics。
 
 _TOOL_TRUTH_AUDIT = {
     "name": "emit_truth_audit",
@@ -4385,61 +4496,6 @@ _TOOL_TRUTH_AUDIT = {
 #: 2026-09-25: safety-v2 -> safety-v3。与主审 check-v12 同批: 复核边界
 #: 同步收窄为两条(性暴力核心 / 血腥具体伤害细节), 自伤 / 猎奇卖点 /
 #: 儿童家庭三条移除。同一份题在 v3 下可能 true 而 v2 下 false, 独立开号。
-SAFETY_PROMPT_VERSION = "safety-v3"
-
-SAFETY_SYSTEM = """你是海龟汤谜题的**直播安全复核员**。
-
-## 你的唯一任务
-
-只回答一个问题: **这段谜底是否明确命中了下面的安全边界?**
-
-不要管题目好不好玩、结构对不对、推理公不公平、配额够不够 —— 那些
-**不是**你的事, 已经有别人判过了。你**只**判安全。
-
-## 什么**不算**不安全(不得据此判 false)
-
-普通、**非血腥**的死亡 / 犯罪 / 谋杀 / 亡魂 / 鬼怪 / 恐怖氛围 ——
-**即使它是谜底核心** —— 都不因此判 false。
-
-明确**不得**仅因为下列理由判 false:
-
-  * 死亡是核心;
-  * 犯罪 / 谋杀是核心;
-  * 出现亡魂 / 鬼怪 / 超自然;
-  * 气氛阴暗 / 恐怖;
-  * "可能让人有点不适"这类泛化的主观感觉。
-
-海龟汤这个类型本来就有大量凶案与灵异题材 —— 那是**类型特征**,
-不是安全隐患。把这些判成 false 会让整个题库空掉, 而那些题并没有
-任何越界内容。
-
-## 只有明确命中下列边界才 false
-
-  * 以**性暴力**为核心情节;
-  * 写**血腥、具体伤害的感官细节**(虐杀 / 肢解 / 具体伤口的描写)。
-
-## 怎么读这道题
-
-你看到的是最终的**谜面 + 谜底**。要判的只有一件事:
-**它有没有命中上面那两条之一。**
-
-⚠️ 注意区分**主题**与**背景事实**:
-
-  ✗ 谜底的核心机制是"从尸体上取器官/部位并写具体感官细节" -> false
-  ✓ 谜底里有人死了(车祸 / 溺水 / 被杀), 但死亡只是剧情事实,
-    不写血腥细节, 冲击点是"为什么"而不是"怎么死的" -> true
-
-## ⚠️ 未明确命中 -> true(这一条必须遵守)
-
-**未明确命中以上任一条 -> true。**
-
-拿不准时**不是**判 false 的理由。拿不准就意味着"它没有明确命中
-那两条" —— 那就是 true。判 false 必须有**能对上具体某一条**的依据,
-并在 reason 里指出是哪一条。
-
-不要把"读起来沉重 / 阴暗 / 让人不舒服"当成第六条款边界: 它不是。
-"""
-
 _TOOL_SAFETY = {
     "name": "emit_safety_check",
     "description": "回传直播安全复核结果",
@@ -4937,7 +4993,8 @@ class PuzzleWriter:
                 m["safety_verify_calls"] = (
                     m.get("safety_verify_calls", 0)
                     + int(sv.get("calls") or 0))
-                m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+                # Issue #50: safety prompt 版本溯源改记 Pack 的 stage 版本。
+                m["safety_audit_prompt_version"] = stage_version("audit_safety")
                 if sv.get("interrupted"):
                     log.info("出题第 %d 稿: 安全复核让路(直播变忙)",
                              attempts)
@@ -5169,7 +5226,8 @@ class PuzzleWriter:
     def gen_keyword_story(self, keywords, lane: str, *, should_continue=None,
                           max_attempts: int = 1,
                           temperature: Optional[float] = None,
-                          timeout: Optional[float] = None
+                          timeout: Optional[float] = None,
+                          brief: Optional[GenerationBrief] = None,
                           ) -> Optional[dict]:
         """围绕 2 个关键词 + 一个方向(lane)写一个**完整隐藏故事**。
 
@@ -5187,9 +5245,19 @@ class PuzzleWriter:
 
         ## lane
 
-        `lane` 只认 `"red"` / `"black"`, 用来选 `STORY_LANE_DIRECTION` 里
-        那**两句话**的方向提示。它**不是**质量政策 —— 没有"跑题就 reject"
-        这种门; 方向对不对由人读产物判断, 不是代码判。
+        `lane` 只认 `"red"` / `"black"`, 用来在 **user message** 里放
+        `STORY_LANE_DIRECTION` 那**两句话**的方向提示(v1 起方向句从
+        system 移到 user —— Prompt Pack 的 system 全静态)。它**不是**
+        质量政策 —— 没有"跑题就 reject"这种门; 方向对不对由人读产物
+        判断, 不是代码判。
+
+        ## brief(GenerationBrief, Issue #50 §17 首次接线)
+
+        `brief.requested_category` / `brief.difficulty` 是**创作意图**:
+        只作为一行"本次希望主方向偏向…"进 user message。它们**不是**
+        分类答案 —— Contract/Audit 的 observed 分类看不到这条 message,
+        `requested_category` 由代码注入 spec(§18/§36)。`None` 等价于
+        `GenerationBrief()`(自由生成)。
 
         ## 不做语义审核
 
@@ -5212,8 +5280,9 @@ class PuzzleWriter:
         if should_continue is not None and not should_continue():
             log.info("Story 让路(调用前, 直播已忙)")
             return {"interrupted": True}
-        system = _story_system(lane)
-        text = _story_user(keywords, lane)
+        # ---- Issue #50: system 来自 Prompt Pack(fail closed) ----
+        system = load_prompt("truth")
+        text = _story_user(keywords, lane, brief=brief)
         last_err = ""
         for attempt in range(1, max(1, int(max_attempts)) + 1):
             res = self.client.messages(
@@ -5255,7 +5324,7 @@ class PuzzleWriter:
 
         R3 实测: 同一批汤底只把"汤面怎么截"换成独立调用, 平均长度
         109.2 -> 62.8 字。**但短 ≠ 好** —— R3 也看到有些短汤面直接把因果
-        写出来, 快把谜底说完。所以 `SURFACE_SYSTEM` 的落点是"只截一个最
+        写出来, 快把谜底说完。所以 surface-v1.md 的落点是"只截一个最
         值得追问的反常瞬间", 不是"压缩成短摘要"。
 
         ## 输入只有 canonical 汤底
@@ -5271,11 +5340,16 @@ class PuzzleWriter:
         if should_continue is not None and not should_continue():
             log.info("Surface 让路(调用前, 直播已忙)")
             return {"interrupted": True}
+        # ---- Issue #50: system 来自 Prompt Pack(fail closed) ----
+        # 输入只有 canonical 汤底 —— requested_category / requested
+        # difficulty **不**进 Surface(§20: 它的职责只有"怎么截一个好
+        # 的异常切片", 不是"怎么让谜面更像某个主题")。
+        system = load_prompt("surface")
         text = _surface_user(answer)
         last_err = ""
         for attempt in range(1, max(1, int(max_attempts)) + 1):
             res = self.client.messages(
-                SURFACE_SYSTEM, text, max_tokens=900, tool=_TOOL_SURFACE,
+                system, text, max_tokens=900, tool=_TOOL_SURFACE,
                 temperature=(temperature if temperature is not None
                              else self._temperature("generate_temperature")),
                 stage="puzzle.surface")
@@ -5302,7 +5376,9 @@ class PuzzleWriter:
                                 avoid: Optional[list] = None,
                                 recent: Optional[list] = None,
                                 should_continue=None,
-                                max_attempts: int = 1) -> PuzzleSpec:
+                                max_attempts: int = 1,
+                                brief: Optional[GenerationBrief] = None,
+                                ) -> PuzzleSpec:
         """**Stage B**: 把 Stage A 的三样**冻结**着结构化成 `PuzzleSpec`。
 
         ## 铁律: `puzzle` / `answer` / `title` 一个字都不许变
@@ -5333,10 +5409,19 @@ class PuzzleWriter:
         现有 `cross_puzzle_gate`(§六: keyword AI 仍属 AI-original, 题型
         分布对它**还是 hard**)。过不了就这一道候选失败, **不回头改题**。
 
+        ## brief 与 code-owned 字段(Issue #50)
+
+        `brief` 只用于 provenance: `brief.requested_category` 由**代码**
+        写进 spec(§36: Reviewer/Audit 不能遗漏、覆盖、修改它)。Contract
+        的 user message **不含** requested(§29: 分类必须 blind);
+        `protocol_version` / `prompt_version` / `quality_policy_version`
+        同样由代码注入(§37/§38/§39) —— 模型的 tool schema 里根本没有
+        这些字段。
+
         ## 返回
 
         成功 -> 一个 `source_type` **为空**的普通 generated spec
-                (即 AI 原创, **不是** curated)。
+                (即 AI 原创, **不是** curated), `protocol_version=v1`。
         让路 -> `puzzle` 为空、`metrics["interrupted"]=True` 的 spec。
         失败 -> `puzzle` 为空、`error` 非空的 spec。
 
@@ -5370,7 +5455,19 @@ class PuzzleWriter:
                    #: G4-R2: 结构调用的**实际发出次数**与其中因技术形状
                    #: 重试的次数。两个数分开报, 否则"结构了一次还是两次"
                    #: 与"是不是技术重试"就分不出来了(§六 的同一套口径)。
-                   "structure_calls": 0, "structure_technical_retries": 0}
+                   "structure_calls": 0, "structure_technical_retries": 0,
+                   #: Issue #50 §12: Prompt Pack 的版本溯源全部进 metrics
+                   #: (**不**做 PuzzleSpec 正式字段 —— spec 字段只放内容
+                   #: canonical metadata, metrics 记"这道题是怎么来的")。
+                   "prompt_pack_version": PROMPT_PACK_VERSION,
+                   "truth_prompt_version": stage_version("truth"),
+                   "surface_prompt_version": stage_version("surface"),
+                   "contract_prompt_version": stage_version("contract"),
+                   "audit_prompt_version": stage_version("audit"),
+                   "truthfulness_audit_prompt_version":
+                       stage_version("audit_truthfulness"),
+                   "safety_audit_prompt_version":
+                       stage_version("audit_safety")}
         interrupted = {"v": False}
         # ---- G4-R2 §六: 侧信道清零(必须在**任何**出口之前) ----
         # 见 `_last_reject` 的声明。成功路径不写它, 所以不清零就会把
@@ -5431,7 +5528,8 @@ class PuzzleWriter:
             if attempt > 1 and _stop():
                 return _bail()
             res = self.client.messages(
-                STRUCTURE_SYSTEM, user, max_tokens=4000, tool=_TOOL_STRUCTURE,
+                load_prompt("contract"), user, max_tokens=4000,
+                tool=_TOOL_STRUCTURE,
                 temperature=self._temperature("generate_temperature"),
                 stage="puzzle.structure")
             if not res.tool_input:
@@ -5481,12 +5579,18 @@ class PuzzleWriter:
             # 且**从不写 metrics** —— 这两样必须在这里补, 否则 archive 里
             # 分不出这题是哪条链产的, 而且溯源("这题是怎么来的")整个丢失。
             #
-            # R4: 落的是 **Story 阶段**的版本号。一条 keyword2 题由
-            # Story -> Surface -> Structure 三段合成, 而 `prompt_version`
-            # 只放得下一个 —— 放 Story 是因为它决定这道题的**内容**
-            # (Surface 只是截取, Structure 只是搬运)。Surface 的版本号
-            # 走 `metrics["surface_prompt_version"]`(见 `keyword_spec`)。
-            spec.prompt_version = STORY_PROMPT_VERSION
+            # ---- Issue #50 §37/§38/§39/§36: code-owned 字段 ----
+            # keyword2 v1 路径的全部版本/协议/来源字段由**代码**注入,
+            # 模型的 tool schema 里根本没有它们:
+            #   protocol_version        = haiguitang-v1(默认 keyword2 正式激活)
+            #   requested_category      = 原 GenerationBrief(Audit 不能改)
+            #   prompt_version          = 生成 Prompt Pack 总版本
+            #   quality_policy_version  = quality-v13(Audit 不拥有)
+            spec.prompt_version = HAIGUITANG_GENERATION_PROMPT_VERSION
+            spec.protocol_version = HAIGUITANG_PROTOCOL_VERSION
+            spec.requested_category = (
+                str(getattr(brief, "requested_category", "") or "").strip())
+            spec.quality_policy_version = QUALITY_POLICY_VERSION
             break
         if spec is None:
             # 结构调用两次都没拿到 payload —— 纯技术失败。
@@ -5556,7 +5660,7 @@ class PuzzleWriter:
         sv = self.verify_safety(spec=spec, should_continue=should_continue)
         if sv is not None:
             m["safety_verify_calls"] = int(sv.get("calls") or 0)
-            m["safety_prompt_version"] = SAFETY_PROMPT_VERSION
+            m["safety_audit_prompt_version"] = stage_version("audit_safety")
             if sv.get("interrupted"):
                 # ⚠️ `_bail()` 是靠 `interrupted["v"]` 决定走让路出口的
                 # (见它的实现) —— 复核自己知道的 `interrupted` 不会自动
@@ -6010,6 +6114,10 @@ class PuzzleWriter:
         self._last_review_checks = None
         self._last_review_technical = False
         bp = blueprint or spec.blueprint
+        # ---- Issue #50 §51: shared Reviewer 必须 protocol-aware ----
+        # v1 keyword2 题 -> Prompt Pack 的 audit-v1; legacy/current/
+        # curated -> 原 CHECK_SYSTEM, 逐位不变。
+        _v1_review = _is_v1(spec)
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"
                 f"【核心答案 core_answer】{spec.core_answer or '(空)'}\n"
@@ -6017,8 +6125,16 @@ class PuzzleWriter:
                 f"{spec.completion_fact_ids or '(空)'}\n"
                 f"【提示】{' / '.join(spec.hints) or '(空)'}")
         if spec.facts:
-            user += "\n【facts(判定依据)】\n" + "\n".join(
-                f"{f.id} [{f.kind}/{f.visibility}] {f.text}" for f in spec.facts)
+            if _v1_review:
+                # v1: public_text 也是同步 bundle 的一员, 审稿人必须看得见
+                user += "\n【facts(判定依据; public_text=已建立后的安全摘要)】\n" + "\n".join(
+                    f"{f.id} [{f.kind}/{f.visibility}] {f.text}"
+                    + (f" || public_text: {f.public_text}"
+                       if str(getattr(f, "public_text", "") or "").strip() else "")
+                    for f in spec.facts)
+            else:
+                user += "\n【facts(判定依据)】\n" + "\n".join(
+                    f"{f.id} [{f.kind}/{f.visibility}] {f.text}" for f in spec.facts)
         if spec.solve_atoms:
             # 带上 id 与 fact_ids —— 审稿人要**原样回传**它们
             user += ("\n【现有 solve_atoms(改了核心就重出, 否则原样带回, "
@@ -6049,6 +6165,16 @@ class PuzzleWriter:
             user += ("\n【现有 observed_signature(改完核心就**如实重判**, "
                      "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
                                                    ensure_ascii=False))
+        if _v1_review:
+            # ---- Issue #50 §41: v1 同步 bundle 的观察分类 ----
+            # 原稿的难度/主题候选给审稿人做参照; **requested_category
+            # 绝不出现**(§34: observed classification blind to requested)。
+            user += (
+                f"\n【difficulty(原稿观察; 按改后的题如实重判)】"
+                f"{spec.difficulty or '(空)'}"
+                f"\n【主题(原稿观察; 按改后的题如实重判)】"
+                f"primary={spec.primary_category or '(空)'} "
+                f"categories={spec.categories or '[]'}")
         # ---- v4(任务书 §二): curated 题**不**受 target Blueprint 约束 ----
         #
         # 这一段原先无条件印:
@@ -6206,7 +6332,10 @@ class PuzzleWriter:
                 "就**可以收**(§五 的产品裁决)。真正要拒的是'必须知道某个"
                 "特定平台渲染 / 软件行为 / 极冷门编码规则'。")
 
-        res = self.client.messages(CHECK_SYSTEM, user, max_tokens=max_tokens,
+        res = self.client.messages(
+            # ---- Issue #50 §51: v1 -> Prompt Pack audit-v1; 其余原样 ----
+            load_prompt("audit") if _v1_review else CHECK_SYSTEM,
+            user, max_tokens=max_tokens,
                                    # H4-D1 §二: schema 按题裁 —— curated 题
                                    # 只问 curated 那一套(见 `check_tool`)。
                                    tool=check_tool(spec),
@@ -6430,6 +6559,21 @@ class PuzzleWriter:
                 _v = ti.get(_name)
                 if not isinstance(_v, list) or not _v:
                     invalid_bundle.append(_name)
+        # ---- Issue #50 §41: v1 的同步 bundle 还要带观察分类 ----
+        # difficulty / primary_category / categories 是**模型拥有**的
+        # 观察结果(审稿人按改后的题如实重判); 空/缺失/类型不对 = 无效。
+        # (protocol_version / requested_category / prompt_version /
+        #  quality_policy_version 是**代码字段**, 不让模型回 —— 见重建处。)
+        if _is_v1(spec):
+            _d = ti.get("difficulty")
+            if not isinstance(_d, str) or not _d.strip():
+                invalid_bundle.append("difficulty")
+            _pc = ti.get("primary_category")
+            if not isinstance(_pc, str) or not _pc.strip():
+                invalid_bundle.append("primary_category")
+            _cs = ti.get("categories")
+            if not isinstance(_cs, list) or not _cs:
+                invalid_bundle.append("categories")
         missing_bundle = invalid_bundle
 
         # ---- v5 通关合同: 与 facts/atoms/clues **同一套** ----
@@ -6487,6 +6631,24 @@ class PuzzleWriter:
                             "completion_fact_ids/facts/solve_atoms/"
                             "fair_clues/discovery_beats 全部**非空**显式回传, "
                             "代码不会替你沿用旧值")
+
+        # ---- Issue #50 §41: v1 观察分类的解析 ----
+        # 枚举合法性**不在这里判**(那是 validate_protocol/validate_spec
+        # 的活, 紧随其后就会跑); 这里只做解析与透传, 非法值会被后面的
+        # 硬校验以明确原因拒掉。
+        # categories **原样保留**(不去重不回退 —— 与 from_dict 同一条纪律)。
+        if _is_v1(spec):
+            _v1_difficulty = str(ti.get("difficulty") or "").strip()
+            _v1_primary = str(ti.get("primary_category") or "").strip()
+            _v1_cats_raw = ti.get("categories")
+            _v1_categories = (
+                [str(x).strip() if isinstance(x, str) else x
+                 for x in _v1_cats_raw]
+                if isinstance(_v1_cats_raw, list) else [])
+        else:
+            _v1_difficulty = spec.difficulty
+            _v1_primary = spec.primary_category
+            _v1_categories = list(spec.categories or [])
 
         # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
         comp_raw = ti.get("completion_fact_ids")
@@ -6670,9 +6832,23 @@ class PuzzleWriter:
             blueprint=bp, signature=sig,
             prompt_version=spec.prompt_version,
             quality_policy_version=spec.quality_policy_version,
-            # provenance 与 metrics 都要**原样带过**。审稿只改内容,
-            # 不改"这题是怎么来的" —— 早先这里重建 spec 时漏掉它们,
-            # 于是过审的题 provenance 全变 False(和 P0-5 同一类错)。
+            # ---- Issue #50 §40/§71: v1 字段在 rebuild 中的存活 ----
+            # 这是 #50 最大风险点: `_apply_review` **重建** spec, 任何没
+            # 显式列出的字段都静默回默认值。若不带上这五样, "Contract
+            # 初稿是 v1 -> Reviewer 一 fix -> protocol_version 变 ''
+            # / categories 丢了 / public_text 丢了"的静默降级就发生了。
+            #
+            #   protocol_version / requested_category /
+            #   quality_policy_version / prompt_version = **代码字段**,
+            #   原样带过, 模型永远改不了(§36/§37/§38/§39);
+            #   difficulty / primary_category / categories = 模型**观察**
+            #   字段, 来自本次回传(v1 bundle 已强制非空), 非 v1 原样带过;
+            #   public_text 走 `PuzzleFact.from_dict`(facts 整组重出)。
+            protocol_version=spec.protocol_version,
+            requested_category=spec.requested_category,
+            difficulty=_v1_difficulty,
+            primary_category=_v1_primary,
+            categories=_v1_categories,
             blueprint_specified=spec.blueprint_specified,
             # ---- H2-F: curated 溯源也必须原样带过 ----
             # 同一类错误的第二次: `_apply_review` 是**重建** spec, 任何
@@ -7441,7 +7617,8 @@ class PuzzleWriter:
         )
         try:
             res = self.client.messages(
-                TRUTH_AUDIT_SYSTEM, user, max_tokens=800,
+                # Issue #50: system 来自 Prompt Pack(逐字迁移, 行为不变)。
+                load_prompt("audit_truthfulness"), user, max_tokens=800,
                 tool=_TOOL_TRUTH_AUDIT,
                 temperature=0,
                 timeout=timeout, max_retries=max_retries,
@@ -7579,7 +7756,9 @@ class PuzzleWriter:
             try:
                 calls += 1
                 res = self.client.messages(
-                    SAFETY_SYSTEM, user, max_tokens=400, tool=_TOOL_SAFETY,
+                    # Issue #50: system 来自 Prompt Pack(逐字迁移, 行为不变)。
+                    load_prompt("audit_safety"), user, max_tokens=400,
+                    tool=_TOOL_SAFETY,
                     temperature=0, timeout=timeout,
                     max_retries=max_retries,
                     stage="puzzle.safety")

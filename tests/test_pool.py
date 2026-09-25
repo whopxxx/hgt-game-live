@@ -2433,12 +2433,27 @@ class _R5Writer:
             return self.spec
         s = good_spec(puzzle=puzzle, answer=answer, title=title)
         # ⚠️ 真 `PuzzleWriter.structure_original_idea` 会在**成功收尾时**
-        # 把 `prompt_version` 改写成 `STORY_PROMPT_VERSION`(见 llm.py
-        # 的 provenance 段落)。替身必须照做 —— 否则"入池的 spec 自报
-        # keyword2"这条断言测的是 `good_spec()` 的默认值 `riddle-v3`,
+        # 注入 code-owned 字段: prompt_version / protocol_version /
+        # requested_category / quality_policy_version(Issue #50 §37-§39),
+        # 且 Contract 产出是**合法的 v1 spec**(completion fact 带非空
+        # public_text、分类字段齐全)。替身必须照做 —— 否则"入池的 spec
+        # 自报 v1 provenance"这条断言测的是 `good_spec()` 的默认值,
         # 与生产行为无关(第一版就是这么红的)。
-        from story.llm import STORY_PROMPT_VERSION
-        s.prompt_version = STORY_PROMPT_VERSION
+        from story.llm import HAIGUITANG_GENERATION_PROMPT_VERSION
+        from story.haiguitang_protocol import HAIGUITANG_PROTOCOL_VERSION
+        from story.quality import QUALITY_POLICY_VERSION
+        for _f in s.facts:
+            if _f.kind == "core" and not _f.public_text:
+                _f.public_text = _f.text[:12]
+        if not s.difficulty:
+            s.difficulty = "medium"
+        if not s.primary_category:
+            s.primary_category = "warm"
+        if not s.categories:
+            s.categories = ["warm"]
+        s.prompt_version = HAIGUITANG_GENERATION_PROMPT_VERSION
+        s.protocol_version = HAIGUITANG_PROTOCOL_VERSION
+        s.quality_policy_version = QUALITY_POLICY_VERSION
         return s
 
     # ---- classic ----
@@ -2534,13 +2549,23 @@ def test_r5_prefill_default_goes_through_keyword_spec():
         spec = rec if isinstance(rec, PuzzleSpec) else getattr(rec, "spec",
                                                               None)
         m = dict(getattr(spec, "metrics", None) or {})
-        check("**prompt_version == STORY_PROMPT_VERSION**",
-              getattr(spec, "prompt_version", "") == STORY_PROMPT_VERSION,
+        # ---- Issue #50: keyword2 v1 的 provenance ----
+        # spec.prompt_version = Prompt Pack 总版本(代码注入);
+        # metrics 记 Pack 版本与 stage 版本(§12: 不做 spec 字段)。
+        from story.prompt_pack import (
+            HAIGUITANG_GENERATION_PROMPT_VERSION, stage_version)
+        from story.haiguitang_protocol import HAIGUITANG_PROTOCOL_VERSION
+        check("**prompt_version == 生成 Pack 总版本**",
+              getattr(spec, "prompt_version", "")
+              == HAIGUITANG_GENERATION_PROMPT_VERSION,
               getattr(spec, "prompt_version", ""))
+        check("**protocol_version == haiguitang-v1**",
+              getattr(spec, "protocol_version", "") == HAIGUITANG_PROTOCOL_VERSION,
+              getattr(spec, "protocol_version", ""))
         check("**metrics.generation_mode == keyword2**",
               m.get("generation_mode") == "keyword2", m.get("generation_mode"))
-        check("**metrics.surface_prompt_version == SURFACE_PROMPT_VERSION**",
-              m.get("surface_prompt_version") == SURFACE_PROMPT_VERSION,
+        check("**metrics.surface_prompt_version == Pack stage 版本**",
+              m.get("surface_prompt_version") == stage_version("surface"),
               m.get("surface_prompt_version"))
         check("**metrics 有 lane**", m.get("lane") in ("red", "black"),
               m.get("lane"))

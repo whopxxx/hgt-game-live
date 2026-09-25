@@ -1409,7 +1409,10 @@ def test_stage_a_prompt_carries_answer_length():
     是前端画布的硬合同, 不是风格偏好。
     """
     print("\n[G4-R2-8] Story 展示约束进了 prompt 与 schema")
-    from story.llm import STORY_SYSTEM, _TOOL_STORY, STORY_PROMPT_VERSION
+    # Issue #50: system prompt 单一来源是 Prompt Pack(truth-v1.md)。
+    from story.llm import _TOOL_STORY, STORY_PROMPT_VERSION
+    from story.prompt_pack import load_prompt
+    STORY_SYSTEM = load_prompt("truth")
     check("**system prompt 写了 260**", "260" in STORY_SYSTEM, "没找到")
     check("**说了这是给直播念的**",
           "念" in STORY_SYSTEM, "缺少理由说明")

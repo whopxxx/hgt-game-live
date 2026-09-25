@@ -609,7 +609,8 @@ def draw_two_keywords(rng: random.Random,
 def keyword_spec(writer, bag, session_seed: int, *,
                  avoid=None, recent=None, should_continue=None,
                  corpus_version: str = "",
-                 story_timeout=None):
+                 story_timeout=None,
+                 brief=None):
     """跑一遍 `抽词 + 掷 lane -> Story -> Surface -> Structure + provenance`。
 
     返回 `(spec, reason)`:
@@ -634,9 +635,9 @@ def keyword_spec(writer, bag, session_seed: int, *,
 
     ## R4: 三段式
 
-        Story     只写完整隐藏汤底            -> answer
-        Surface   从汤底单独截一个反常瞬间    -> puzzle
-        Structure 当前 PuzzleSpec 结构化      -> spec
+        Truth      只写完整隐藏汤底            -> answer
+        Surface    从汤底单独截一个反常瞬间    -> puzzle
+        Contract   当前 PuzzleSpec 结构化      -> spec
 
     旧版是"一次调用里同时想线索、想顺序、想谜面、想谜底"(Stage A 的
     Case-first), 而 R1/R2/R3 实测证明那条链会把本该靠 Yes/No 问出来的
@@ -655,6 +656,15 @@ def keyword_spec(writer, bag, session_seed: int, *,
     直播会**一直是同一个 lane**(实测连跑 8 次全 red)。无状态派生之后,
     live / prefetch / 实验三者的调用形状完全一致, 不会再有"某条路径忘了
     传 rng"这种只在生产上出现的偏差。
+
+    ## brief(Issue #50 §17: GenerationBrief 正式接线)
+
+    `brief` 是可选的 `story.haiguitang_protocol.GenerationBrief`:
+    `requested_category` / `difficulty` 作为**创作意图**只进 Truth 的
+    user message(§18/§19), `requested_category` 由 Contract 阶段的代码
+    注进 `spec.requested_category`(§36 —— 它是 provenance, Audit 不能
+    覆盖)。`None` 等价于 `GenerationBrief()`(自由生成)。默认 keyword2
+    产出的 spec 因此正式为 `protocol_version="haiguitang-v1"`(§44)。
     """
     # ---- 让路检查 ①: Story 之前 ----
     if should_continue is not None and not should_continue():
@@ -664,7 +674,11 @@ def keyword_spec(writer, bag, session_seed: int, *,
     # quality), 而本模块在 import 期被 director/prefetch 拉起来。放模块
     # 顶层会把这个重量加到每一条 import 路径上 —— 和本文件里
     # `from .keyword_corpus import load_vocabulary` 同样的处理。
-    from .llm import STORY_PROMPT_VERSION, SURFACE_PROMPT_VERSION
+    from .prompt_pack import (
+        PROMPT_PACK_VERSION, stage_version,
+    )
+    from .haiguitang_protocol import GenerationBrief as _GB
+    _brief = brief if brief is not None else _GB()
 
     keys = bag.draw()
     keywords = list(keys["keywords"])
@@ -676,11 +690,11 @@ def keyword_spec(writer, bag, session_seed: int, *,
     if story_timeout is None:
         # live / prefill 保持原调用形状；只有 prefetch 显式传 override。
         story = writer.gen_keyword_story(
-            keywords, lane, should_continue=should_continue)
+            keywords, lane, should_continue=should_continue, brief=_brief)
     else:
         story = writer.gen_keyword_story(
             keywords, lane, should_continue=should_continue,
-            timeout=story_timeout)
+            timeout=story_timeout, brief=_brief)
     if story is None:
         return None, "gen_fail"
     if story.get("interrupted"):
@@ -704,24 +718,29 @@ def keyword_spec(writer, bag, session_seed: int, *,
     spec = writer.structure_original_idea(
         title="", puzzle=surface["puzzle"],
         answer=story["answer"], avoid=avoid, recent=recent,
-        should_continue=should_continue)
+        should_continue=should_continue, brief=_brief)
 
     # ---- provenance: 只进 metrics/archive/日志 ----
     #
-    # ⚠️ 两个 prompt version 都落盘: `spec.prompt_version` 只放得下
-    # **Story** 那一个(它决定内容), Surface 的走 metrics。少写一个,
-    # 复盘时就分不清"这题变了"是因为故事变了还是截法变了。
+    # ⚠️ Issue #50 §12: stage 级版本进 metrics(**不**做 PuzzleSpec
+    # 正式字段)。v1 起记 Prompt Pack 的 stage 版本; `spec.prompt_version`
+    # 是 Pack 总版本(代码在 Contract 阶段注入), 不在这里重复。
     try:
         spec.metrics = dict(spec.metrics or {})
         spec.metrics["generation_mode"] = "keyword2"
         spec.metrics["lane"] = lane
         spec.metrics["keywords"] = keywords
-        spec.metrics["story_prompt_version"] = STORY_PROMPT_VERSION
-        spec.metrics["surface_prompt_version"] = SURFACE_PROMPT_VERSION
+        spec.metrics["prompt_pack_version"] = PROMPT_PACK_VERSION
+        spec.metrics["truth_prompt_version"] = stage_version("truth")
+        spec.metrics["surface_prompt_version"] = stage_version("surface")
         spec.metrics["keyword_seed_version"] = KEYWORD_SEED_VERSION
         spec.metrics["keyword_corpus_version"] = corpus_version
         spec.metrics["keyword_session_seed"] = session_seed
         spec.metrics["keyword_draw_index"] = int(keys.get("index") or 0)
+        if _brief.requested_category:
+            spec.metrics["requested_category"] = _brief.requested_category
+        if _brief.difficulty:
+            spec.metrics["requested_difficulty"] = _brief.difficulty
     except Exception:                       # noqa: BLE001
         pass
 
