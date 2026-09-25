@@ -842,7 +842,7 @@ def test_answer_tool():
     print("[裁决: 强制工具]")
     fc = FakeClient([LLMResult(tool_input={
         "answers": [{"id": 7, "response_kind": "verdict", "verdict": "是", "comment": "就差一点",
-                     "touched_fact_ids": ["f1"], "solution_candidate": False}]})])
+                     "touched_fact_ids": ["f1"], "solution_candidate": False, "established_fact_ids": []}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 7, "甲", "是同伴的肉吗",
                         facts=[{"id": "f1", "text": "打嗝", "kind": "core"}])
@@ -887,7 +887,7 @@ def test_answer_enum_forced_by_schema():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
             {"id": 3, "response_kind": "verdict", "verdict": "是", "comment": "接近了",
-             "solution_candidate": True}]}),
+             "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -900,7 +900,7 @@ def test_answer_enum_forced_by_schema():
     check("确实调了裁判", names == ["emit_verdict", "emit_judgement"], names)
     # 反例: candidate=false 不调裁判
     fc2 = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 4, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]})])
+        {"id": 4, "response_kind": "verdict", "verdict": "是", "solution_candidate": False, "touched_fact_ids": [], "established_fact_ids": []}]})])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     w2.answer("谜面", "谜底", [], 4, "甲", "他是医生吗")
     check("candidate=false 不调裁判",
@@ -922,7 +922,7 @@ def test_open_question_never_solves():
     # Judge(legacy 题), 哪怕文本长着一张"开放疑问"的脸。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -940,7 +940,7 @@ def test_verdict_solve_must_pass_judge():
     # 现在「揭晓」已从枚举删掉, 通关只能由裁判确认的 candidate 产生。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": False,
                               "mechanism_hit": False}),
     ])
@@ -959,7 +959,7 @@ def test_open_question_with_hypothesis_can_solve():
     # 规则一票否决, 否则说中答案的观众永远猜不中。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -1040,7 +1040,7 @@ def test_tool_actually_requested():
     # answer() 现在会先问裁决、再问裁判(judge), 所以要多备一个 judge 结果
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": False,
                               "mechanism_hit": False}),
         LLMResult(tool_input={"hint": "h"}),
@@ -1060,7 +1060,7 @@ def test_answer_consults_judge():
     print("[裁决后按 candidate 决定是否问裁判]")
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 5, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 5, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -1074,7 +1074,7 @@ def test_answer_consults_judge():
 def test_answer_judge_not_consulted_without_answer():
     print("[无谜底时不问裁判]")
     fc = FakeClient([
-        LLMResult(tool_input={"answers": [{"id": 1, "response_kind": "verdict", "verdict": "是"}]}),
+        LLMResult(tool_input={"answers": [{"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False, "touched_fact_ids": [], "established_fact_ids": []}]}),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "", [], 1, "甲", "问题")   # answer 为空
@@ -1447,7 +1447,7 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
     # 也不能抹掉第一层的"是" —— 题目继续。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(error="网关抖动"),          # 裁判失败: 无 tool_input 无 text
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -1457,7 +1457,7 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
     # 第一层没给出可用裁决(candidate=true 但 verdict 缺失) -> 才降级
     fc2 = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 2, "response_kind": "verdict", "verdict": "", "solution_candidate": True}]}),
+            {"id": 2, "response_kind": "verdict", "verdict": "", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(error="网关抖动"),
     ])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
@@ -2105,7 +2105,7 @@ def test_judge_tech_failure_preserves_layer1_verdict():
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
             {"id": 1, "response_kind": "verdict", "verdict": "不是", "comment": "方向不对",
-             "solution_candidate": True}]}),
+             "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(error="网关抖动"),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -2119,9 +2119,9 @@ def test_judge_gate_cuts_calls():
     canned = []
     for i in range(10):
         canned.append(LLMResult(tool_input={"answers": [
-            {"id": i + 1, "verdict": "是", "solution_candidate": False}]}))
+            {"id": i + 1, "verdict": "是", "solution_candidate": False, "touched_fact_ids": [], "established_fact_ids": []}]}))
     canned.append(LLMResult(tool_input={"answers": [
-        {"id": 11, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}))
+        {"id": 11, "response_kind": "verdict", "verdict": "是", "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}))
     canned.append(LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True}))
     fc = FakeClient(canned)
@@ -2142,7 +2142,7 @@ def test_answer_uses_facts_block():
     facts = [{"id": "f1", "text": "退潮时礁石露出水面", "kind": "core"},
              {"id": "f2", "text": "灯是标礁石位置", "kind": "core"}]
     fc = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]})])
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False, "touched_fact_ids": [], "established_fact_ids": []}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
     u = fc.calls[0]["user"]
@@ -2352,7 +2352,7 @@ def test_candidate_safety_net():
     fc = FakeClient([
         # 模型说"不是候选", 即便这句明显是完整因果
         LLMResult(tool_input={"answers": [
-            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False, "touched_fact_ids": [], "established_fact_ids": []}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -2377,7 +2377,7 @@ def test_touched_fact_ids_filtered():
              {"id": "f2", "text": "灯标礁石", "kind": "core"}]
     fc = FakeClient([LLMResult(tool_input={"answers": [
         {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False,
-         "touched_fact_ids": ["f1", "f999", "f2", "f1"]}]})])
+         "touched_fact_ids": ["f1", "f999", "f2", "f1"], "established_fact_ids": []}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
     check("只留合法 id 且去重",
@@ -2385,7 +2385,7 @@ def test_touched_fact_ids_filtered():
     # 全非法 -> 清空
     fc2 = FakeClient([LLMResult(tool_input={"answers": [
         {"id": 2, "response_kind": "verdict", "verdict": "是", "solution_candidate": False,
-         "touched_fact_ids": ["f999", "f888"]}]})])
+         "touched_fact_ids": ["f999", "f888"], "established_fact_ids": []}]})])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "甲", "礁石吗", facts=facts)
     check("全非法时清空", res2[0].touched_fact_ids == [],
@@ -2897,7 +2897,7 @@ def test_qa_budget_reaches_final_judge():
     cli = FakeClient([
         LLMResult(tool_input={"answers": [
             {"id": 1, "response_kind": "verdict", "verdict": "是", "comment": "像是说中了",
-             "solution_candidate": True}]}),
+             "solution_candidate": True, "touched_fact_ids": [], "established_fact_ids": []}]}),
         # 第二层: 裁判结果
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),

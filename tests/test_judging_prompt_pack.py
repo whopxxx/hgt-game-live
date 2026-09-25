@@ -322,6 +322,132 @@ def test_tool_schemas():
     cv = _TOOL_COMPLETION_VERIFY["input_schema"]
     check("verify 只回传 matched ids",
           list(cv["properties"]) == ["matched_completion_fact_ids"])
+    # #54 review 第一轮: Schema 与 Python 门对齐 —— touched/established
+    # 必填(空数组也行), 否则"缺省当空"的洗数据通道又从 schema 侧打开。
+    check("touched_fact_ids 已进 required(schema 侧)",
+          "touched_fact_ids" in items["required"], items["required"])
+    check("established_fact_ids 已进 required(schema 侧)",
+          "established_fact_ids" in items["required"], items["required"])
+
+
+def test_strict_typing_validator():
+    """#54 review 第一轮 blocker-1: JSON Schema 之下的 Python 类型门。
+
+    `bool(x)` 的隐式转换会把 缺失/0 变 False、"false"/1 变 True ——
+    后者曾能把一句闲聊标成候选, 错误触发 Recheck / 复核 / legacy Judge。
+    同理 touched/established 缺失或类型不对**绝不**当空数组兜底。
+    """
+    print("\n[#54-R1] Python deterministic validator: 类型先于语义")
+    from story.parser import UNAVAILABLE as UNA
+
+    def run_item(item):
+        fc = FakeClient([LLMResult(tool_input={"answers": [item]},
+                                   model="m")])
+        out, _ = _run(fc, "他瞎了吗")
+        return out[0]
+
+    # ---- verdict 路径: solution_candidate 必须真的是 bool ----
+    for label, raw in (("缺失", None), ("字符串 'false'", "false"),
+                       ("字符串 'true'", "true"), ("int 0", 0), ("int 1", 1)):
+        item = {"id": 1, "response_kind": "verdict", "verdict": "是",
+                "solution_candidate": raw, "touched_fact_ids": [],
+                "established_fact_ids": []}
+        if label == "缺失":
+            del item["solution_candidate"]
+        r = run_item(item)
+        check(f"candidate {label} -> 未判定",
+              r.verdict == UNA and r.status == "unavailable",
+              (r.verdict, r.status))
+        check(f"candidate {label} 不触发任何第二层",
+              not r.solution_candidate and not r.established_fact_ids)
+    # ---- verdict 路径: touched/established 必须真的是 list ----
+    for label, patch in (
+            ("touched 缺失", ("pop_touched",)),
+            ("touched 是字符串", ("touched", "f1")),
+            ("touched 是 dict", ("touched", {"f1": True})),
+            ("established 缺失", ("pop_est",)),
+            ("established 是字符串", ("est", "f1")),
+            ("established 是数字数组", ("est", [1, 2]))):
+        item = {"id": 1, "response_kind": "verdict", "verdict": "是",
+                "solution_candidate": False, "touched_fact_ids": [],
+                "established_fact_ids": []}
+        if label == "touched 缺失":
+            del item["touched_fact_ids"]
+        elif label == "established 缺失":
+            del item["established_fact_ids"]
+        elif label.startswith("touched"):
+            item["touched_fact_ids"] = patch[1]
+        else:
+            item["established_fact_ids"] = patch[1]
+        r = run_item(item)
+        check(f"{label} -> 未判定",
+              r.verdict == UNA and r.status == "unavailable",
+              (r.verdict, r.status))
+    # 合规回包(空数组 + 真 bool)不受影响
+    r = run_item({"id": 1, "response_kind": "verdict", "verdict": "是",
+                  "solution_candidate": True, "touched_fact_ids": [],
+                  "established_fact_ids": []})
+    check("合规 verdict 回包畅通(candidate=True 真bool)",
+          r.verdict == "是" and r.solution_candidate is True)
+
+    # ---- rephrase: 必须显式 candidate=False + 两个 [] ----
+    def rephrase_item(**kw):
+        item = {"id": 1, "response_kind": "rephrase", "verdict": "",
+                "solution_candidate": False, "touched_fact_ids": [],
+                "established_fact_ids": []}
+        for k, v in kw.items():
+            if v is ...:
+                item.pop(k, None)
+            else:
+                item[k] = v
+        return item
+
+    for label, kw in (
+            ("candidate 缺失", {"solution_candidate": ...}),
+            ("candidate=true", {"solution_candidate": True}),
+            ("candidate=0", {"solution_candidate": 0}),
+            ("touched 缺失", {"touched_fact_ids": ...}),
+            ("established 缺失", {"established_fact_ids": ...}),
+            ("verdict='是'", {"verdict": "是"}),
+            ("verdict=0(非字符串伪装空)", {"verdict": 0})):
+        r = run_item(rephrase_item(**kw))
+        check(f"rephrase {label} -> 未判定",
+              r.verdict == UNA and r.status == "unavailable",
+              (r.verdict, r.status))
+    r = run_item(rephrase_item())
+    check("合规 rephrase(显式 false + 两个[])畅通",
+          r.response_kind == "rephrase" and r.verdict == ""
+          and r.status == "ok", (r.response_kind, r.verdict, r.status))
+
+    # ---- recheck 的 rephrase 分支: 带 verified -> 整条 unavailable ----
+    fc = FakeClient([_recheck_setup(),
+                     LLMResult(tool_input={
+                         "response_kind": "rephrase", "verdict": "",
+                         "solution_candidate": False,
+                         "verified_completion_fact_ids": ["f1"]},
+                         model="m")])
+    out, _ = _run(fc, "哈哈哈好笑")
+    r = out[0]
+    check("recheck rephrase + verified=['f1'] -> 未判定(不洗干净再用)",
+          r.verdict == UNA and r.status == "unavailable",
+          (r.verdict, r.status))
+    check("verified 没有被洗进结果", r.completion_verified_fact_ids == []
+          and r.established_fact_ids == [])
+    check("恰好 2 次调用, 不继续第三层", len(fc.calls) == 2)
+    fc = FakeClient([_recheck_setup(),
+                     LLMResult(tool_input={
+                         "response_kind": "rephrase", "verdict": "",
+                         "solution_candidate": False,
+                         "verified_completion_fact_ids": "f1"},
+                         model="m")])
+    out, _ = _run(fc, "哈哈哈好笑")
+    check("recheck rephrase + verified 非list -> 未判定",
+          out[0].verdict == UNA and out[0].status == "unavailable")
+    # 合规 recheck rephrase(verified 缺省/空数组)畅通
+    fc = FakeClient([_recheck_setup(), _recheck("rephrase", "", False)])
+    out, _ = _run(fc, "哈哈哈好笑")
+    check("合规 recheck rephrase 畅通",
+          out[0].response_kind == "rephrase" and out[0].status == "ok")
 
 
 # ======================================================================
@@ -753,6 +879,7 @@ def main():
     test_pack_files_and_versions()
     test_loader_negatives()
     test_tool_schemas()
+    test_strict_typing_validator()
     test_verdict_path_and_provenance()
     test_rephrase_fixture_a_soufan()
     test_verdict_fixture_b_why_because()

@@ -135,10 +135,14 @@ def test_answer_replay_returns_wrong_verdict():
             "id": fx["source"]["qid"],
             # Issue #53 §5: 现行网关的结构化输出必带 response_kind;
             # 回放的是"当下合同下的同一份裁决"。
+            # #54 review 第一轮: touched/established 也是 schema 必填,
+            # 回放适配器显式补空数组(fixture 是 2026-09-18 的冻结记录,
+            # 那时还没有这个字段 —— 适配在这里, 不在生产代码里)。
             "response_kind": "verdict",
             "verdict": real["verdict"],
             "solution_candidate": real["solution_candidate"],
             "touched_fact_ids": real["touched_fact_ids"],
+            "established_fact_ids": real.get("established_fact_ids") or [],
             "comment": real["comment"],
         }]
     })

@@ -3127,12 +3127,19 @@ _TOOL_ANSWER = {
                     },
                     "required": ["id", "response_kind",
                                  "solution_candidate",
-                                 "established_fact_ids"],
+                                 "established_fact_ids",
+                                 "touched_fact_ids"],
                     # ---- Issue #53 §9: `verdict` **不再**是无条件必填 ----
                     # 它的合法性由代码按 response_kind 做条件一致性检查
                     # (verdict -> 必须是 是/不是/无关; rephrase -> 必须为
                     # 空)。让 schema 把 verdict 设成必填会逼模型给 rephrase
                     # 伪造一个裁决 —— 那正是本合同要拆掉的混淆。
+                    #
+                    # ---- #54 review 第一轮: Schema 与 Python 门对齐 ----
+                    # touched/established 必填(空数组也行): schema 不声明,
+                    # 模型就会合法地省略, Python 的"必须是真 list"门就会把
+                    # 一批**合规**回包误杀成 unavailable。"先声明、再严查"
+                    # 是同一层合同的两半, 缺一不可。
                 },
             },
         },
@@ -6723,17 +6730,27 @@ class PuzzleWriter:
         代码: 这里**只**检查结构一致性, 绝不根据观众原文重新解释语义
         (不看"怎么/为什么", 不数"所以/因此", 不看字数)。
 
-        ## 门
+        ## 门(Schema 之上的第二层 —— Python deterministic validator)
 
             response_kind = "verdict"
                 verdict 必须 ∈ {是, 不是, 无关}(含已废弃的"揭晓"在内,
                 任何其它值都按 malformed 处理 —— 旧代码会把"揭晓"降级成
                 「是」, 那是代码替模型修语义, 已随 #53 删除)
+                solution_candidate 必须**真的是 bool**(缺失 / 0 / "false"
+                / 1 一律 malformed —— `bool("false")` 是 True, 那个隐式
+                转换曾经能把一句闲聊标成候选, 错误触发 Recheck / 复核 /
+                legacy Judge)
+                touched/established 必须真的是 list(schema 已把它们设为
+                required, 缺失 = 没按合同出牌 -> malformed, **绝不**当
+                空数组兜底 —— "自动补默认值"是洗数据的开始)
                 candidate 只信模型自报(不再 OR `_looks_like_solution`)
             response_kind = "rephrase"
-                verdict 必须为空, touched/established 必须为空,
-                candidate 必须 falsy —— 任一违反 -> 整条无效 ->
-                `_qa_unavailable`(绝不静默清字段后当正常 rephrase 用)
+                verdict 必须为空
+                touched/established 必须**显式**是空 list(schema 必填,
+                缺失同样是没按合同出牌)
+                solution_candidate 必须**显式**是 false(bool False)
+                —— 任一违反 -> 整条无效 -> `_qa_unavailable`
+                (绝不静默清掉 established 再当正常 rephrase 用)
             其它(缺失/未知)
                 -> 整条无效 -> `_qa_unavailable`
 
@@ -6747,17 +6764,33 @@ class PuzzleWriter:
             log.info("点评泄露谜底, 已丢弃: %r", cm[:30])
             cm = ""
 
+        # ---- 类型先于语义: 集中取原始值, 只做**同一性**检查, 不做
+        #      真值转换(`bool(x)` / `if x` 都会把 0/"false"/[] 混淆)。
+        raw_cand = a.get("solution_candidate")
+        raw_touched = a.get("touched_fact_ids")
+        raw_est = a.get("established_fact_ids")
+
         if rk == "rephrase":
-            verdict_raw = str(a.get("verdict", "") or "").strip()
-            touched_raw = a.get("touched_fact_ids")
-            est_raw = a.get("established_fact_ids")
-            cand_raw = a.get("solution_candidate")
-            # 沙里一个金子都不许有 —— 有任何一项越界, 整条结果不可信,
-            # fail closed 成「未判定」, 而不是把越界字段洗掉再用。
-            if (verdict_raw or touched_raw or est_raw or cand_raw):
+            # verdict 按**原始值**查空: 0 / 1 这类非字符串在 `str(x or "")`
+            # 下会伪装成"空"(falsy 数字被 or 成 "")。
+            raw_v = a.get("verdict")
+            verdict_ok = (raw_v is None
+                          or (isinstance(raw_v, str)
+                              and not raw_v.strip()))
+            bad = (
+                not verdict_ok
+                # 两数组必须**显式**为空 list: 缺失 / 非list / 非空都拒
+                or not isinstance(raw_touched, list) or raw_touched != []
+                or not isinstance(raw_est, list) or raw_est != []
+                # 必须显式 false —— `raw_cand is not False` 同时挡掉
+                # 缺失(None) / 0 / "" / "false" / True
+                or raw_cand is not False
+            )
+            if bad:
                 return self._qa_unavailable(
-                    qid, f"rephrase 带了 verdict/touched/established/"
-                         f"candidate(verdict={verdict_raw!r})", rk)
+                    qid, f"rephrase 不自洽(verdict={raw_v!r}, "
+                         f"candidate={raw_cand!r}, touched={raw_touched!r}, "
+                         f"established={raw_est!r})", rk)
             return QAResult(
                 qid=qid, verdict="", comment=cm, response_kind="rephrase",
                 touched_fact_ids=[], established_fact_ids=[],
@@ -6776,14 +6809,31 @@ class PuzzleWriter:
         # "所以/因此/是因为/字数"强行把 candidate 改成 true, 等于代码
         # 又做了一次语义判断。§48(没有"所以"也能 candidate)与 §49(有
         # "所以"但模型说 false 就必须 false)由这一行同时保证。
-        cand = bool(a.get("solution_candidate"))
+        # ---- #54 review: 类型门 ----
+        # `bool(raw)` 会把缺失/0 变 False、"false"/1 变 True —— 后者会
+        # 错误触发复核链。必须是真 bool, 其余一律 malformed。
+        if not isinstance(raw_cand, bool):
+            return self._qa_unavailable(
+                qid, f"solution_candidate={raw_cand!r} 不是 bool")
+        if not isinstance(raw_touched, list):
+            return self._qa_unavailable(
+                qid, f"touched_fact_ids={raw_touched!r} 不是 list")
+        if not isinstance(raw_est, list):
+            return self._qa_unavailable(
+                qid, f"established_fact_ids={raw_est!r} 不是 list")
+        # item 也必须是字符串: [1,2] 这种靠 str() 转换后可能撞上合法 id,
+        # 那又是一层隐式类型转换。垃圾 item -> malformed, 不洗。
+        if not all(isinstance(x, str) for x in raw_touched):
+            return self._qa_unavailable(
+                qid, f"touched_fact_ids 含非字符串项: {raw_touched!r}")
+        if not all(isinstance(x, str) for x in raw_est):
+            return self._qa_unavailable(
+                qid, f"established_fact_ids 含非字符串项: {raw_est!r}")
         return QAResult(
             qid=qid, verdict=v, comment=cm, response_kind="verdict",
-            touched_fact_ids=self._clean_fact_ids(
-                a.get("touched_fact_ids"), spec),
-            established_fact_ids=self._clean_fact_ids(
-                a.get("established_fact_ids"), spec),
-            solution_candidate=cand)
+            touched_fact_ids=self._clean_fact_ids(raw_touched, spec),
+            established_fact_ids=self._clean_fact_ids(raw_est, spec),
+            solution_candidate=raw_cand)
 
     # ------------------------------------------------------------------
     def answer(self, puzzle: str, answer: str, transcript: list, qid: int,
@@ -7174,14 +7224,32 @@ class PuzzleWriter:
             rk = str(ti.get("response_kind", "") or "").strip()
             v = str(ti.get("verdict", "") or "").strip()
             cand = ti.get("solution_candidate")
+            raw_verified = ti.get("verified_completion_fact_ids")
             if rk == "rephrase":
                 # 第一层把闲聊/索取信息错标成了完整解候选 —— 重判按新
                 # 合同改回 rephrase: 无裁决、无候选、无建立。**绝不**
                 # 为了"给个了断"伪造一个「无关」。
-                if v or cand is not False:
+                #
+                # ---- #54 review 第一轮: 这里也不能"洗干净再用" ----
+                # rephrase 却带 verified=["f1"] 是结构自相矛盾 —— 旧代码
+                # 会把 ["f1"] 清掉然后当正常 rephrase 接受, 洗掉了模型的
+                # 自相矛盾。fail closed: 整条 unavailable。
+                # verdict 也按**原始值**查: 0 / 1 这类非字符串在旧的
+                # `str(x or "")` 下会伪装成"空"。
+                bad = (
+                    (ti.get("verdict") is not None
+                     and (not isinstance(ti.get("verdict"), str)
+                          or ti.get("verdict").strip()))
+                    or cand is not False
+                    or (raw_verified is not None
+                        and (not isinstance(raw_verified, list)
+                             or raw_verified != []))
+                )
+                if bad:
                     self._recheck_failed(
                         r0, text,
-                        f"rephrase 不自洽(verdict={v!r}, cand={cand!r})")
+                        f"rephrase 不自洽(verdict={ti.get('verdict')!r}, "
+                        f"cand={cand!r}, verified={raw_verified!r})")
                     return False
                 r0.response_kind = "rephrase"
                 r0.verdict = ""
