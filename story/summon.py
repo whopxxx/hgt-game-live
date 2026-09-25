@@ -10,11 +10,29 @@
 
 ## 三条不可违反的规则(已冻结)
 
-    100 点赞 = 1 Summon
+    100 点赞 = 1 个"点赞推进 pulse"(Issue #43)
     任意真实新增礼物单位 = 1 Summon
     所有礼物同权 —— 价格/类型不参与, 不改变能力或优先级
 
-跨题不清零、reveal 不清零。
+## Issue #43: session / round 两级账
+
+一个 pulse 同时等价于两样东西, 而**两样都是"当前题"资源**:
+
+    AI 玩家当前题行动机会 +1
+    当前题有效游戏时间推进(秒数由 Engine 决定, 本模块不涉及)
+
+所以账本分两层:
+
+    session 级(跨题**不清零**):
+        likes_total_high_water / likes_bucket_consumed / likes_initialized
+        lifetime_pulses_total(遥测)
+        高水位清了的话, 换题/重连会把旧赞按新题重新算一遍 —— 重复结算。
+    round 级(新题开始时 `start_new_round()` 清零):
+        summon_earned_total / summon_consumed_total / reservation
+
+`on_like_total` 只负责高水位换算并**返回** pulse 数; 是否入账当前题由
+调用方(Engine)按 phase 决定(SETTING/QA 入账; REVEALING/REVEALED/IDLE
+只推进高水位与遥测)。本模块不认识 phase, 所以绝不替调用方做这个决定。
 
 ## 为什么 Like 用 **total 的 high-water**, 不用 count 累加
 
@@ -127,30 +145,63 @@ class Reservation:
 
 @dataclass
 class SummonLedger:
-    """召唤额度的账本。**只记账, 不调度, 不调 AI。**"""
+    """召唤额度的账本。**只记账, 不调度, 不调 AI。**
 
-    #: 累计获得(单调不减)。
-    summon_earned_total: int = 0
-    #: 累计消耗(单调不减)。
-    summon_consumed_total: int = 0
-    #: 当前占用中的预约(未结算)。
-    detective_reservation: Optional[Reservation] = None
+    字段刻意按 session / round 分组排列 —— 见模块 docstring 的两级账。
+    """
 
-    # ---- Like 侧状态 ----
+    # ---- session 级(跨题/揭晓**不清零**) ----
     #: `Like.total` 的历史最高水位。**每场直播一个**。
     likes_total_high_water: int = 0
-    #: 已经结算过的"百赞档位"数(= 从点赞里已换出的 Summon 数)。
+    #: 已经结算过的"百赞档位"数(= 已经产生过的 pulse 总桶数)。
     #: 必须是**桶数**而不是原始赞数 —— 它是"我已经发过多少个了"的账。
     likes_bucket_consumed: int = 0
     #: 是否已经用第一条 total 初始化过基线。见模块 docstring。
     likes_initialized: bool = False
+    #: 遥测: 本场一共产生过多少 pulse(单调不减)。round 级字段清零时
+    #: 它不受影响 —— 赛后对账"这场观众贡献了多少推进"靠它。
+    lifetime_pulses_total: int = 0
 
-    #: 即时反馈用的文案序号/内容(Step 13A 只维护状态, 不做前端)。
+    # ---- round 级(新题开始即清零, 见 `start_new_round`) ----
+    #: 本题已获得的 AI 玩家行动机会(= 本题入账的 pulse 数)。
+    summon_earned_total: int = 0
+    #: 本题已消耗。
+    summon_consumed_total: int = 0
+    #: 当前占用中的预约(未结算)。reservation 本身带 round + spec_key,
+    #: 跨题迟到回调在 Engine 层被身份校验挡下; `start_new_round` 会把
+    #: 上一题的预约就地失效。
+    detective_reservation: Optional[Reservation] = None
+
+    # ---- 即时反馈 ----
+    #: 即时反馈用的文案序号/内容(本模块只维护状态, 不做前端)。
     interaction_notice_seq: int = 0
     interaction_notice_text: str = ""
 
     #: 收到的 raw gift 事件数(**仅计数与保留, 绝不换算**)。
     gift_events_seen: int = 0
+
+    # ------------------------------------------------------------------
+    # round 生命周期
+    # ------------------------------------------------------------------
+    def start_new_round(self) -> None:
+        """新题开始(Engine 进入 SETTING 时调用): **round 级资源清零**。
+
+        清:
+            summon_earned_total / summon_consumed_total
+                上一题没用完的 AI opportunity 就地作废 —— 它是"当前题
+                资源", 不带进下一题(Issue #43 §4)。
+            detective_reservation
+                上一题的预约就地失效(它的额度属于上一题, 不存在"退回"
+                到哪里的说法)。
+
+        绝不清(清了就是 Issue #43 点名要防的重复结算):
+            likes_total_high_water / likes_bucket_consumed /
+            likes_initialized —— session 级高水位。
+            lifetime_pulses_total —— 遥测, 单调。
+        """
+        self.summon_earned_total = 0
+        self.summon_consumed_total = 0
+        self.detective_reservation = None
 
     # ------------------------------------------------------------------
     # 账面
@@ -179,11 +230,14 @@ class SummonLedger:
     # 通用赚取 / 预约 / 结算
     # ------------------------------------------------------------------
     def earn(self, n: int = 1) -> int:
-        """通用入账。返回本次实际增加的额度。
+        """往**当前题**入账 n 个 AI 玩家行动机会。返回本次实际入账数。
 
         ⚠️ **礼物不要走这里** —— 在 Step 12B 之前, "一条 GiftMessage 等于
         几个真实单位"是未知的。给礼物开一条独立的、需要显式 `units` 的
         入口(将来加), 而不是让它误用这个通用口。
+
+        ⚠️ Issue #43: 这是 round 级入账 —— Engine 只在 SETTING/QA 消费
+        pulse 时调用; 新题开始时 `start_new_round()` 会把它清零。
         """
         n = int(n or 0)
         if n <= 0:
@@ -289,7 +343,7 @@ class SummonLedger:
     # Like: high-water 换算
     # ------------------------------------------------------------------
     def on_like_total(self, total: int, now: Optional[float] = None) -> int:
-        """收到一条 `Like.total`。返回本次换算出的**新增** Summon 数。
+        """收到一条 `Like.total`。返回本次产生的**新增 pulse 数**。
 
         算法(见模块 docstring 的论证):
 
@@ -300,6 +354,12 @@ class SummonLedger:
 
         幂等性: 重复 total -> new_high 不变 -> 新增 0。
         倒退不 rebase: 320 < 523 时 new_high 仍是 523 -> 新增 0。
+
+        ⚠️ **返回 ≠ 入账**(Issue #43 §4): 返回值只是"产生了几个 pulse"
+        这个会话级事实(高水位/桶数/遥测已在此记下)。往**当前题**入账
+        是调用方(Engine)的职责 —— 只有 SETTING/QA 该入账; REVEALING /
+        REVEALED / IDLE 必须只保留遥测、不得带入任何一题。
+        本方法因此**绝不**自己调 `earn()`。
         """
         try:
             total = int(total or 0)
@@ -326,7 +386,8 @@ class SummonLedger:
         if new <= 0:
             return 0
         self.likes_bucket_consumed = buckets
-        self.earn(new)
+        # session 级遥测: 无论哪个 phase, "观众贡献了多少推进"都要累计。
+        self.lifetime_pulses_total += new
         return new
 
     # ------------------------------------------------------------------
@@ -362,6 +423,7 @@ class SummonLedger:
         """给 UI / 排查用的一致快照。"""
         r = self.detective_reservation
         return {
+            # round 级
             "earned": self.summon_earned_total,
             "consumed": self.summon_consumed_total,
             "unconsumed": self.unconsumed,
@@ -372,10 +434,12 @@ class SummonLedger:
                 "spec_key": r.spec_key,
                 "created_at": r.created_at,
             }),
+            # session 级
             "likes_total_high_water": self.likes_total_high_water,
             "likes_bucket_consumed": self.likes_bucket_consumed,
             "likes_initialized": self.likes_initialized,
             "likes_progress": self.likes_progress,
+            "lifetime_pulses_total": self.lifetime_pulses_total,
             "gift_events_seen": self.gift_events_seen,
             "notice_seq": self.interaction_notice_seq,
             "notice_text": self.interaction_notice_text,

@@ -139,6 +139,11 @@ jobs:
       - name: 离线套件 summon
         run: uv run tests/test_summon.py
 
+      # Issue #43: 统一点赞推进 —— pulse 入账当前题、effective elapsed、
+      # 自动揭晓的真实时间底线、旧换题指令墓碑、点赞公告事件身份。
+      - name: 离线套件 like_progress
+        run: uv run tests/test_like_progress.py
+
       # Step 12B: 本地生成的 WS bootstrap(纯函数, 外部实现用法)。
       - name: 离线套件 ws_bootstrap
         run: uv run tests/test_ws_bootstrap.py

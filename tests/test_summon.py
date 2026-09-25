@@ -57,7 +57,12 @@ def test_like_487_to_523_gives_one():
     led.on_like_total(487)
     got = led.on_like_total(523)
     check("+1", got == 1, got)
-    check("earned == 1", led.summon_earned_total == 1, led.summon_earned_total)
+    # ---- Issue #43: 返回 ≠ 入账 ----
+    # on_like_total 只产出 pulse; 往当前题入账是 Engine 按 phase 的决定。
+    check("未显式 earn 前不入账", led.summon_earned_total == 0,
+          led.summon_earned_total)
+    check("显式 earn 后入账", (led.earn(got),
+          led.summon_earned_total == 1), led.summon_earned_total)
     check("high_water == 523", led.likes_total_high_water == 523,
           led.likes_total_high_water)
     check("progress == 23", led.likes_progress == 23, led.likes_progress)
@@ -72,7 +77,8 @@ def test_like_90_to_520_gives_five():
           led.summon_earned_total)
     got = led.on_like_total(520)
     check("+5", got == 5, got)
-    check("earned == 5", led.summon_earned_total == 5,
+    led.earn(got)
+    check("显式入账后 earned == 5", led.summon_earned_total == 5,
           led.summon_earned_total)
     check("progress == 20", led.likes_progress == 20, led.likes_progress)
 
@@ -114,9 +120,11 @@ def test_like_crossing_multiple_hundreds():
     led = SummonLedger()
     led.on_like_total(487)
     led.on_like_total(523)          # +1
+    led.earn(1)
     got = led.on_like_total(601)
     check("+1", got == 1, got)
-    check("earned == 2", led.summon_earned_total == 2,
+    led.earn(got)
+    check("显式入账后 earned == 2", led.summon_earned_total == 2,
           led.summon_earned_total)
     check("progress == 1", led.likes_progress == 1, led.likes_progress)
 
@@ -381,18 +389,40 @@ def test_ledger_has_no_gift_earn_api():
 # ======================================================================
 # 跨题 / 即时反馈
 # ======================================================================
-def test_ledger_survives_puzzle_change_and_reveal():
-    """跨题不清零、reveal 不清零(账本是全局的, 不属于某一题)。"""
-    print("\n[S13-19] 跨题/揭晓不清零")
+def test_start_new_round_keeps_session_clears_round():
+    """Issue #43 §4: round 级清零, session 级绝不动。
+
+    上一题结束 Like.total=1287(桶 12); 新题里 1287->1387 只能产生
+    **1** 个新 pulse —— 若换题把高水位/桶数清了, 新题就会从旧水位
+    重新算出 12 个 pulse, 重复结算旧赞。
+    """
+    print("\n[S13-19] start_new_round: round 清零 / session 保留")
     led = SummonLedger()
     led.on_like_total(0)
-    led.on_like_total(250)          # +2
-    check("earned == 2", led.summon_earned_total == 2)
-    # 模拟"换题 / 揭晓"——账本没有这些方法, 也不该有
+    led.on_like_total(1287)             # +12
+    led.earn(12)
+    led.reserve("t1", round_index=1, spec_key="k1")
+    led.start_new_round()
+    check("round earned 清零", led.summon_earned_total == 0,
+          led.summon_earned_total)
+    check("round consumed 清零", led.summon_consumed_total == 0,
+          led.summon_consumed_total)
+    check("上一题 reservation 失效", led.detective_reservation is None)
+    check("高水位不清零", led.likes_total_high_water == 1287,
+          led.likes_total_high_water)
+    check("桶数不清零", led.likes_bucket_consumed == 12,
+          led.likes_bucket_consumed)
+    check("遥测不清零", led.lifetime_pulses_total == 12,
+          led.lifetime_pulses_total)
+    # 新题里跨一个新桶: 只产生新桶的 1 个 pulse, 不重算旧赞。
+    got = led.on_like_total(1387)
+    check("新题跨新桶只 +1", got == 1, got)
+    check("progress 按 session 高水位算", led.likes_progress == 87,
+          led.likes_progress)
+    # 旧测试的守卫仍然成立: 不存在会隐式重置的方法
     for bad in ("reset", "on_puzzle_start", "on_reveal", "clear"):
-        check(f"没有 {bad}(不会因换题/揭晓重置)",
+        check(f"没有 {bad}(重置只能显式走 start_new_round)",
               not hasattr(led, bad), bad)
-    check("earned 未变", led.summon_earned_total == 2)
 
 
 def test_notice_seq_increments():
@@ -414,6 +444,7 @@ def test_snapshot_shape():
     for key in ("earned", "consumed", "unconsumed", "available",
                 "reservation", "likes_total_high_water",
                 "likes_bucket_consumed", "likes_progress",
+                "lifetime_pulses_total",
                 "gift_events_seen", "notice_seq", "notice_text"):
         check(f"有 {key}", key in snap, sorted(snap))
     check("progress == 23", snap["likes_progress"] == 23,
@@ -450,7 +481,7 @@ def main():
         test_gift_event_never_earns,
         test_gift_combo_counts_never_reach_earned,
         test_ledger_has_no_gift_earn_api,
-        test_ledger_survives_puzzle_change_and_reveal,
+        test_start_new_round_keeps_session_clears_round,
         test_notice_seq_increments,
         test_snapshot_shape,
         test_constants,

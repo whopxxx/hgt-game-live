@@ -483,8 +483,8 @@ def test_u3_snapshot_full_is_raw_answer_not_composed():
     from director import Director
     eng, clk, sp = boot_v5(mkcfg(reveal_hold_seconds=60.0),
                            core_answer="他每天看锅, 是在确认有没有人动过他的东西。")
-    eng.submit_danmaku("u3", "甲", "#下一题")
-    eng.tick()
+    # Issue #43 后 #下一题 不再触发换题; 直接走内部转移进入揭晓。
+    eng._enter_revealing_locked(clk.t, "timeout", "")
     assert eng.phase == Phase.REVEALING, eng.phase
     # 模拟 Director 的现代路径: 传的是**组合文案**
     composed = Director._compose_reveal(sp.core_answer, sp.answer)
@@ -519,8 +519,7 @@ def test_u3_snapshot_full_empty_when_answer_missing():
     print("\n[U3-Engine] 结构化题 answer 缺失 -> full 空, 不退回组合文案")
     from director import Director
     eng, clk, sp = boot_v5(mkcfg(reveal_hold_seconds=60.0))
-    eng.submit_danmaku("u3", "甲", "#下一题")
-    eng.tick()
+    eng._enter_revealing_locked(clk.t, "timeout", "")
     assert eng.phase == Phase.REVEALING, eng.phase
     composed = Director._compose_reveal(sp.core_answer, sp.answer)
     # 把引擎的 raw answer 清掉, 模拟"raw answer 丢失但组合文案还在"
@@ -916,18 +915,31 @@ def test_hint_order_and_dedup():
 def test_commands_are_not_swallowed():
     print("[指令不被吞掉]")
     # 实测 bug: 早先的缓冲路径曾把 _accept_danmaku 的返回值丢掉,
-    # 导致 #提示 / #下一题 **彻底失效**(观众发了没反应)。
+    # 导致 #提示 **彻底失效**(观众发了没反应)。
     # Q12 删掉了缓冲, 指令现在**同步**返回动作 —— 这里钉住它仍生效。
     eng, clk = boot(mkcfg())
     clk.advance(60)          # 过掉 #提示 的 20 秒节流
     acts = eng.submit_danmaku("u1", "甲", "#提示")
     check("#提示 生效(同步返回)",
           any(a.kind == ActionKind.HINT for a in acts), kinds(acts))
-    # #下一题 同理
+    # ---- Issue #43: #下一题 已成为 deterministic tombstone ----
+    # 识别 -> 消费: 不产生 REVEAL, 也不进 QA 队列(不掉进 Answer LLM)。
     clk.advance(30)
     acts = eng.submit_danmaku("u1", "甲", "#下一题")
-    check("#下一题 生效",
-          any(a.kind == ActionKind.REVEAL for a in acts), kinds(acts))
+    check("#下一题 不再触发揭晓", acts == [], kinds(acts))
+    check("#下一题 不进 QA 队列",
+          len(eng._pending) == 0 and eng.phase == Phase.QA,
+          (len(eng._pending), eng.phase))
+    check("#下一题 被墓碑计数(观察用)", eng._legacy_skip_consumed == 1,
+          eng._legacy_skip_consumed)
+    # 其它变体同样只被消费
+    for tok in ("#下一关", "#换一题", "#跳过", "#next"):
+        acts = eng.submit_danmaku("u1", "甲", tok)
+        check(f"{tok} 也只被消费", acts == [] and eng._legacy_skip_consumed >= 1,
+              kinds(acts))
+    check("全程仍在 QA、无揭晓",
+          eng.phase == Phase.QA and eng.snapshot().ai_player is not None,
+          eng.phase)
 
 
 def test_msg_id_dedupe():
@@ -2784,9 +2796,14 @@ def test_ack_does_not_hijack_next_or_hint():
     eng.submit_danmaku("u1", "甲", "#下一题")
     clk.advance(3)
     eng.tick()
-    check("**#下一题 仍然生效(进入 REVEALING)**",
-          eng.phase == Phase.REVEALING, eng.phase)
+    # ---- Issue #43: #下一题 是墓碑 —— 被自己的分支消费掉(静默),
+    # 不再进入 REVEALING; 但"提前 return、不被 ACK 截胡"仍然成立。
+    check("**#下一题 被静默消费(不进入 REVEALING)**",
+          eng.phase == Phase.QA, eng.phase)
     check("没被当成普通 #问题 出系统行", not _sys_rows(eng))
+    check("没被当成普通 #问题 入队",
+          len(eng._pending) + len(eng._inflight) == 0,
+          (len(eng._pending), len(eng._inflight)))
 
 
 def test_ack_action_is_pure_broadcast():
@@ -3773,9 +3790,9 @@ def _ai_move(eng, p, kind, text):
 
 
 def test_ai_player_like_high_water_and_gift_zero():
-    print("\n[AI-1] Like high-water 接线；Gift 永远 +0")
+    print("\n[AI-1] Like pulse 入账当前题(QA)；Gift 永远 +0")
     from story.ingest import InteractionEvent
-    eng = RoundEngine(mkcfg())
+    eng, clk = boot(mkcfg())
     gains = []
     for total in (487, 523, 523, 320, 523, 810):
         gains.append(len(eng.submit_interaction(
@@ -3784,6 +3801,15 @@ def test_ai_player_like_high_water_and_gift_zero():
     check("487→523→810 共获得 4 次", snap["questions_earned"] == 4,
           (gains, snap))
     check("当前百赞进度 10/100", snap["likes_progress"] == 10, snap)
+    check("likes_per_progress 公开", snap["likes_per_progress"] == 100, snap)
+    notice = eng.snapshot().like_progress_notice
+    check("pulse 产生显式点赞公告(×3 聚合一条)",
+          notice and notice["pulses"] == 3 and "×3" in notice["text"]
+          and notice["round_index"] == 1 and notice["phase"] == "qa",
+          notice)
+    check("公告文案不泄露内部秒数",
+          notice and "秒" not in notice["text"] and "+30" not in notice["text"],
+          notice and notice["text"])
     for _ in range(100):
         eng.submit_interaction(InteractionEvent(
             kind="gift", combo_count=9, repeat_count=9, total_count=999))
@@ -3793,6 +3819,15 @@ def test_ai_player_like_high_water_and_gift_zero():
     check("公开快照没有 reservation 身份",
           not ({"reservation", "token", "round_index", "spec_key"}
                & set(snap)), snap)
+    # IDLE(未开局)阶段 pulse 只推进高水位, 不入账任何题(无题可入)。
+    idle = RoundEngine(mkcfg())
+    idle.submit_interaction(InteractionEvent(kind="like", total=1000))
+    check("IDLE 阶段不入账", idle._ai_player_ledger.summon_earned_total == 0,
+          idle._ai_player_ledger.snapshot())
+    check("IDLE 阶段高水位仍推进",
+          idle._ai_player_ledger.likes_total_high_water == 1000,
+          idle._ai_player_ledger.likes_total_high_water)
+    check("IDLE 阶段不发点赞公告", idle.snapshot().like_progress_notice is None)
 
 
 def test_ai_player_ask_consumes_without_human_completion():
@@ -3957,7 +3992,7 @@ def test_ai_player_priority_cooldown_failure_giveup_and_stale():
     check("give_up 后本题不再尝试",
           not any(a.kind == ActionKind.AI_PLAYER for a in fail.tick()))
 
-    # 跨题迟到回包：旧预约已释放，不能落到下一题且次数不丢。
+    # 跨题迟到回包：旧预约已失效，不能落到下一题；round 额度不跨题。
     stale, clk = boot(mkcfg(reveal_hold_seconds=1))
     old = _ai_start(stale)
     stale._enter_revealing_locked(clk.t, "skip", "")
@@ -3972,9 +4007,14 @@ def test_ai_player_priority_cooldown_failure_giveup_and_stale():
     ss = stale.snapshot()
     check("旧回包不上屏/不 solved",
           ss.qa_log == before and not ss.solved and ss.puzzle == "第二题", ss.qa_log)
-    check("旧次数已恢复", ss.ai_player["questions_available"] == 1,
-          ss.ai_player)
-    current = _ai_start(stale, credits=0)
+    # ---- Issue #43: AI 机会是**当前题**资源 ----
+    # 上一题退回的 1 次随 `start_new_round()` 作废, 新题从 0 开始。
+    check("上一题额度不跨题(Issue #43)",
+          ss.ai_player["questions_available"] == 0
+          and ss.ai_player["questions_earned"] == 0, ss.ai_player)
+    check("旧预约已随新题失效",
+          stale._ai_player_ledger.detective_reservation is None)
+    current = _ai_start(stale)
     for label, token, rnd, key in (
             ("token", "wrong", current["expect_round"],
              current["expect_spec_key"]),

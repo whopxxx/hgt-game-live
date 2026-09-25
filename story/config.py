@@ -768,6 +768,20 @@ class Config:
     ai_player_min_gap_seconds: float = 45.0
     ai_player_retry_seconds: float = 15.0
 
+    # ---- 点赞推进(Issue #43) ----
+    # 每新增 100 赞(LIKES_PER_SUMMON) -> 1 个 pulse, 同时等价于:
+    #   AI 玩家当前题行动机会 +1
+    #   当前题有效游戏时间推进 like_progress_seconds_per_bucket 秒
+    # ⚠️ 这个秒数只是**内部调参值**: 直播 UI 一律不得显示 "+30 秒" 之类
+    # 数字, 只表达"点赞助攻 / AI玩家加入 / 游戏进度加快"。
+    like_progress_seconds_per_bucket: float = 30.0
+    # 自动揭晓的**真实时间**最低保护(秒)。点赞能把 effective elapsed 推过
+    # 揭晓阈值, 但真实 QA 时长不足它就不能自动揭晓 —— 否则新题上屏 20 秒
+    # 配上一波点赞爆点会把题直接烧掉。真人真实通关(合同覆盖)**不受此限**。
+    # ⚠️ 刻意**不是** reveal_min_hold_seconds: REVEALED 的 60 秒是为 #45
+    # 评分+主题投票保留的互动窗口, 点赞绝不缩短它(Issue #43 §2)。
+    puzzle_min_qa_seconds: float = 180.0
+
     # ---- 收尾与提示(单一时间轴) ----
     #   0min 出题 -> 每 hint_seconds 给一条提示 -> 给满 max_hints 条后
     #   **再等 hint_seconds** 才揭晓。默认就是:
@@ -1479,6 +1493,18 @@ class Config:
                 f"hint_min_gap_seconds({self.hint_min_gap_seconds}) 为负, "
                 f"已按 0 处理(等于没有冷却, 提示可能连发)。"
             )
+        # Issue #43: 点赞推进的两个旋钮。负数都没有意义。
+        if self.like_progress_seconds_per_bucket < 0:
+            warns.append(
+                f"like_progress_seconds_per_bucket"
+                f"({self.like_progress_seconds_per_bucket}) 为负, "
+                f"已按 0 处理(等于点赞只给 AI 机会、不推进时间)。"
+            )
+        if self.puzzle_min_qa_seconds < 0:
+            warns.append(
+                f"puzzle_min_qa_seconds({self.puzzle_min_qa_seconds}) 为负, "
+                f"已按 0 处理(等于自动揭晓没有真实时间保护)。"
+            )
         if self.replay_guard_seconds <= 0:
             warns.append(
                 f"replay_guard_seconds({self.replay_guard_seconds}) <= 0: "
@@ -1555,6 +1581,13 @@ def build_parser() -> argparse.ArgumentParser:
                           "这条触发源, 只看时间轴), 默认 20"))
     ap.add_argument("--hint-min-gap-seconds", type=float, default=45.0,
                     help="两条提示之间的最小间隔(秒), 防止连发, 默认 45")
+    ap.add_argument("--like-progress-seconds-per-bucket", type=float,
+                    default=30.0,
+                    help="每 100 赞把本题游戏时间推进多少秒(**内部调参值**, "
+                         "直播 UI 不显示数字), 默认 30")
+    ap.add_argument("--puzzle-min-qa-seconds", type=float, default=180.0,
+                    help="自动揭晓所需的最短**真实**问答时长(秒), 默认 180; "
+                         "点赞加速绕不过它, 真人猜中不受限")
     ap.add_argument("--restate-seconds", type=float, default=120.0,
                     help="多久无人发言就重述谜面(零成本), 默认 120")
     ap.add_argument("--giveup-seconds", type=float, default=1800.0,
@@ -1754,6 +1787,9 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         max_hints=a.max_hints,
         hint_questions_per_level=a.hint_questions_per_level,
         hint_min_gap_seconds=a.hint_min_gap_seconds,
+        # ---- Issue #43: 加 flag 与接线必须同一处完成(否则是 dead config)
+        like_progress_seconds_per_bucket=a.like_progress_seconds_per_bucket,
+        puzzle_min_qa_seconds=a.puzzle_min_qa_seconds,
         tick_hz=a.tick_hz,
         stall_seconds=a.stall_seconds,
         max_puzzles=a.max_puzzles,
