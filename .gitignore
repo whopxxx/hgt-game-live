@@ -13,6 +13,11 @@ data/**/*.log
 data/**/*.png
 data/**/*.txt
 
+# director --live 的心跳文件(每次出题/答题都刷新, 纯运行时状态)。
+# `data/*.json` 不能一刀切 —— `data/keyword2_vocabulary.json` 是受版本
+# 控制的词库, 所以这里按具体文件名忽略。
+data/live_heartbeat.json
+
 # 导出/分析产物: 同样是运行时生成, 且含观众昵称。
 # 注意 `data/提示词全文.md` 和 `data/最近20题.md` 是**手工维护**的
 # 参考文档(受版本控制), 所以这里只按**具体文件名**忽略导出的那一份,
