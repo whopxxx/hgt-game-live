@@ -1390,7 +1390,7 @@ window.addEventListener('load', async () => {
     check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
     // Issue #43: 点赞不再抢占提示 —— 正在播的提示必须完整播完,
     // 点赞在它之后接上(§15: 提示/重要公告不能被点赞腰斩)。
-    send({like_progress_notice:{seq:6,round_index:1,pulses:1,phase:'qa',
+    send({like_progress_notice:{seq:6,round_index:2,pulses:1,phase:'qa',
                                 text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
     check(box.dataset.kind==='hint' && notice()==='💡 提示：注意门外的人',
           'A16 like never cuts a playing hint short');
@@ -1416,6 +1416,30 @@ window.addEventListener('load', async () => {
     send({hint_count:9,hint_text:'新题的新提示'});
     check(notice()==='💡 提示：新题的新提示', 'A16 hints still work after dropped like');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 new puzzle hint plays once');
+
+    // ---- review round 2: 跨题竞态反证 ----
+    // (a) SETTING 期间入账的点赞公告属于"正在准备的题"(round 5): 它必须
+    //     活着跨过换题帧(setting→qa + puzzle 4→5 同帧), 不能被
+    //     "先标记已见、再清掉"导致永久不播。
+    send({phase:'setting',
+          like_progress_notice:{seq:8,round_index:5,pulses:1,phase:'setting',
+                                text:'❤️ 点赞助攻已累积，新题开始后生效'}});
+    check(!notice().includes('新题开始后生效'),
+          'A16 setting-phase like notice waits while box hidden');
+    send({phase:'qa',puzzle_index:5,hint_count:0,hint_text:'',qa_log:[]});
+    check(notice().includes('新题开始后生效'),
+          'A16 setting-phase like notice survives the new-round first frame');
+    await finish();
+    check(box.dataset.kind==='leaderboard', 'A16 setting-phase like notice drains');
+    // (b) 旧 round 的迟到公告: seq 是新的, 但 round 已过去 -> 只标记已见,
+    //     永不播放(round 校验, review round 2 的另一半)。
+    send({like_progress_notice:{seq:9,round_index:4,pulses:2,phase:'qa',
+                                text:'❤️ 上一题的迟到助攻'}});
+    check(!notice().includes('迟到助攻'),
+          'A16 stale old-round notice is never played');
+    await finish();
+    check(!notice().includes('迟到助攻'),
+          'A16 stale old-round notice stays dead');
 
     // 术语分两层:
     //   ① 观众内容(原话 / 题目正文 / 贡献 quote / operator 自定义文案)逐字透传;
@@ -1460,7 +1484,7 @@ window.addEventListener('load', async () => {
     check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
           && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
           'A16 short hold fully visible');
-    send({like_progress_notice:{seq:8,round_index:1,pulses:1,phase:'qa',
+    send({like_progress_notice:{seq:10,round_index:5,pulses:1,phase:'qa',
                                 text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
     check(box.dataset.kind==='like', 'A16 like preempts active preset immediately (<1s)');
     check(anim().effect.getTiming().duration===7000,

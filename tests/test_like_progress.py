@@ -400,7 +400,8 @@ def test_legacy_skip_tokens_are_tombstones():
     """§26: 五个旧命令 -> 不 reveal / 不进 QA / 不调 LLM; #提示 照常。"""
     print("\n[LP-13] 旧换题指令墓碑")
     eng, clk = boot(mkcfg())
-    for tok in ("#下一题", "#下一关", "#换一题", "#跳过", "#next"):
+    for tok in ("#下一题", "#下一关", "#换一题", "#跳过", "#next",
+                "#下一题！", "#Next"):
         acts = eng.submit_danmaku("u1", "甲", tok)
         check(f"{tok}: 无动作", acts == [], kinds(acts))
         check(f"{tok}: 不进 QA 队列",
@@ -408,7 +409,8 @@ def test_legacy_skip_tokens_are_tombstones():
               (len(eng._pending), len(eng._inflight)))
     check("没有任何 reveal 发生",
           eng.phase == Phase.QA and eng._reveals == 0, eng.phase)
-    check("墓碑计数 = 5", eng._legacy_skip_consumed == 5,
+    # #/标点/大小写被 normalize 掉之后仍精确命中(7 条全消费)
+    check("墓碑计数 = 7", eng._legacy_skip_consumed == 7,
           eng._legacy_skip_consumed)
     # #提示 照常
     clk.advance(60)
@@ -421,6 +423,32 @@ def test_legacy_skip_tokens_are_tombstones():
     check("普通提问继续正常",
           len(eng._pending) + len(eng._inflight) == 1,
           (len(eng._pending), len(eng._inflight)))
+
+
+def test_tombstone_match_is_exact_not_substring():
+    """review round 2: 墓碑**只精确匹配**旧命令本身。
+
+    早先的子串匹配会把恰好含"跳过"/"next"的**正常提问**静默吞掉 ——
+    那是抢观众的问题, 也是"看起来像已读但其实没处理"的最恶劣形态。
+    这条是反证: 这些问题必须照常进 QA 队列, 墓碑计数不得 +1。
+    """
+    print("\n[LP-14] 墓碑精确匹配, 子串撞上的问题照常进 QA")
+    eng, clk = boot(mkcfg())
+    consumed0 = eng._legacy_skip_consumed
+    for i, tok in enumerate(("#他为什么跳过那一级台阶？",
+                             "#what happens next?",
+                             "#我要下一题",
+                             "#下一关卡是什么",
+                             "#谁能跳过这一段")):
+        acts = eng.submit_danmaku(f"u{i}", "丙", tok)
+        check(f"{tok}: 不被墓碑吞(无动作)", acts == [], kinds(acts))
+        check(f"{tok}: 作为普通提问入队",
+              len(eng._pending) + len(eng._inflight) == i + 1,
+              (len(eng._pending), len(eng._inflight)))
+        check(f"{tok}: 不触发揭晓",
+              eng.phase == Phase.QA and eng._reveals == 0, eng.phase)
+    check("墓碑计数没有增加", eng._legacy_skip_consumed == consumed0,
+          (consumed0, eng._legacy_skip_consumed))
 
 
 # ======================================================================
@@ -494,6 +522,7 @@ def main():
         test_auto_reveal_real_time_floor,
         test_human_completion_ignores_min_qa_floor,
         test_legacy_skip_tokens_are_tombstones,
+        test_tombstone_match_is_exact_not_substring,
         test_like_notice_seq_and_aggregation,
         test_config_roundtrip_and_validation,
     ]

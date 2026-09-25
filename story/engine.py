@@ -727,8 +727,15 @@ class RoundEngine:
             # QA 队列被当成普通问题送进 Answer LLM —— 那是硬要求禁止的
             # 另一条 leak 路径。轻量提示都不回(回一条也要过 phase 门),
             # 纯静默消费 + 计数观察。
-            if norm in LEGACY_SKIP_TOKENS or any(t in norm
-                                                 for t in LEGACY_SKIP_TOKENS):
+            #
+            # ⚠️ 只做**精确**匹配(review round 2): 早先的子串匹配会把
+            # 恰好含"跳过"/"next"的**正常提问**也吞掉 —— "他为什么跳过
+            # 那一级台阶？"、"what happens next?" 都会被静默消失, 那是
+            # 抢观众的问题。`simplify_for_dedupe` 已去掉 #/标点/空白并
+            # casefold, 所以 "#下一题！" / "#Next" 仍精确命中墓碑; 而多
+            # 一个字的变体("#我要下一题")回到普通 QA —— 那是提问, 不该
+            # 被系统代答成"换题"。
+            if norm in LEGACY_SKIP_TOKENS:
                 self._legacy_skip_consumed += 1
                 _detail("旧换题指令已停用, 已消费(不 reveal/不进 QA): %s",
                         norm[:20])

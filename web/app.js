@@ -659,6 +659,24 @@
       active = "";
     }
     function interval() { return (config ? config.interval_seconds : 90) * 1000; }
+    // ---- Issue #43(review round 2): round 校验的两个具名判定 ----
+    // likeRoundOf: 这个快照里"当前 round"是第几题。与 Engine 的记账一致
+    //   —— SETTING 期间 pulse 记入**正在准备的**那一题(puzzle_index+1),
+    //   其余阶段就是 puzzle_index。
+    // likeNoticeStale: 一条待播点赞公告对**这个快照**是否已经失效。
+    //   ① round 已经过去(旧 round 的迟到公告) -> 失效;
+    //   ② 它诞生于 QA 而视图已离开 QA -> 本题 QA 已结束, 公告失效
+    //     (QA 的点赞反馈不拖进揭晓/下一题, §14/§16)。
+    //   SETTING 期间入账的公告两条都不命中 —— 它合法地等待自己的 QA。
+    function likeRoundOf(s) {
+      return s.phase === "setting" ? s.puzzle_index + 1 : s.puzzle_index;
+    }
+    function likeNoticeStale(lp, s) {
+      if (!lp) return false;
+      if (Number.isSafeInteger(lp.round_index)
+          && lp.round_index < likeRoundOf(s)) return true;
+      return lp.phase === "qa" && s.phase !== "qa";
+    }
     function show(message, kind, onDone = null) {
       cancel();
       active = kind;
@@ -795,17 +813,18 @@
       }
     }
     function update(s) {
-      // ---- Issue #43: 显式点赞推进事件(seq 去重, 服务端组稿) ----
-      // 前端不再从 questions_earned 的 delta 推断"AI 被召唤" —— round 级
-      // 语义下 delta 会把换题 reset / 迟到公告误判成新事件。
+      // ---- Issue #43: 显式点赞推进事件(seq 去重 + round 校验) ----
+      // 前端不再从 questions_earned 的 delta 推断"AI 被召唤"; 也不盲收
+      // seq —— 必须**校验 round**(review round 2): 只有对当前快照仍然
+      // 有效的公告才入槽; 旧 round 的迟到公告标记已见后直接丢弃。
       const lp = s.like_progress_notice;
       if (Number.isSafeInteger(lp && lp.seq)) {
         if (!sawFirstSnapshot) {
           sawFirstSnapshot = true;
           lastLikeSeq = lp.seq; // 首帧: 只建基线, 不回放历史公告
-        } else if (lp.seq > lastLikeSeq && lp.text) {
+        } else if (lp.seq > lastLikeSeq) {
           lastLikeSeq = lp.seq;
-          likePending = lp;
+          if (lp.text && !likeNoticeStale(lp, s)) likePending = lp;
         }
       } else if (!sawFirstSnapshot) {
         sawFirstSnapshot = true; // 首帧无公告: 之后来的都是活事件
@@ -816,7 +835,11 @@
         hintPuzzle = s.puzzle_index;
         hintCount = null;
         pendingHints.length = 0;
-        likePending = null; // 旧题的点赞公告不跨题播放
+        // 换题帧的竞态(review round 2): 判定必须在**新快照**上做 ——
+        // 属于新 round 的待播公告(SETTING 期间入账那种)必须活着跨过
+        // 这帧; 只有已失效的(旧 round)才清。早先"无条件清空"会把
+        // "换题前一刻的点赞"先标记已见再清掉, 永久不播。
+        if (likeNoticeStale(likePending, s)) likePending = null;
         // 每道新题都重新从第 1 名开始滚完整 Top10。
         // 同一题内 AI / 提示覆盖排行榜后，也会重新从整条榜首开始，
         // 不再维护分页/页码状态。
@@ -844,7 +867,10 @@
       if (phase !== s.phase) {
         phase = s.phase;
         cancel();
-        likePending = null; // 换阶段不带旧公告: QA 的点赞反馈不拖进揭晓/新题
+        // 换阶段同样走失效判定(review round 2): 诞生于 QA 的公告在
+        // 视图离开 QA 时失效(不拖进揭晓); SETTING 期间入账的公告
+        // 合法跨过 setting→qa, 不能一刀切清掉。
+        if (likeNoticeStale(likePending, s)) likePending = null;
         nextPreset = performance.now() + interval();
       }
       box.classList.toggle("hidden", phase !== "qa");
