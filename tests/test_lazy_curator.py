@@ -694,7 +694,7 @@ def test_candidate_skips_unusable():
         PV = CC.CURATED_POLICY_VERSION
         bad_lic = mk_rec(eid="bad_lic", question_license="weird",
                          answer_license="weird")
-        unsafe = mk_rec(eid="unsafe", safety_flag="self_harm")
+        unsafe = mk_rec(eid="unsafe", safety_flag="gore")
         dupe = mk_rec(eid="dupe", dup_reason="near_duplicate")
         good = mk_rec(eid="good")
         got = select_candidate([bad_lic, unsafe, dupe, good], led, PV)

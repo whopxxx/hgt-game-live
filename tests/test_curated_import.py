@@ -315,14 +315,15 @@ def test_turtlebench_external_id_is_content_stable():
 # ======================================================================
 def test_safety_screen():
     print("\n[H1-A] 内容安全筛查")
-    check("自伤命中", safety_screen("他自杀了") == "self_harm")
     check("血腥命中", safety_screen("现场被碎尸") == "gore")
-    check("未成年伤害命中", safety_screen("涉及虐童") == "minor_harm")
+    check("性暴力命中", safety_screen("涉及性侵") == "sexual_violence")
+    check("自伤不再拦(2026-09-25 收窄)", safety_screen("他自杀了") == "")
+    check("虐童不再拦(同批收窄)", safety_screen("涉及虐童") == "")
     check("干净文本不命中", safety_screen("他每天看锅") == "")
     check("空文本不命中", safety_screen("") == "")
-    # 关键: 题面干净但谜底血腥 -> **仍要拦**
-    flag = safety_screen("他走进餐厅。" + "\n" + "他割腕自杀了。")
-    check("**谜底血腥也要拦(不能只看题面)**", flag == "self_harm", flag)
+    # 关键: 题面干净但谜底命中 -> **仍要拦**
+    flag = safety_screen("他走进餐厅。" + "\n" + "现场血肉模糊。")
+    check("**谜底命中也要拦(不能只看题面)**", flag == "gore", flag)
 
 
 def test_turtlebench_safety_paths():
@@ -331,13 +332,13 @@ def test_turtlebench_safety_paths():
     rows = [
         {"id": 1, "title": "干净", "surface": "他每天看锅", "bottom": "记号",
          "user_guess": "", "label": "T"},
-        {"id": 2, "title": "自伤", "surface": "他跳河自杀了", "bottom": "x",
+        {"id": 2, "title": "血腥", "surface": "x", "bottom": "现场被碎尸",
          "user_guess": "", "label": "T"},
     ]
     recs, rejected, st = TB.build_records(rows, "Apache-2.0", "api")
     check("干净的进 curated", len(recs) == 1, len(recs))
-    check("自伤的进 rejected", len(rejected) == 1, len(rejected))
-    check("安全标记被记下", rejected[0].safety_flag == "self_harm",
+    check("血腥的进 rejected", len(rejected) == 1, len(rejected))
+    check("安全标记被记下", rejected[0].safety_flag == "gore",
           rejected[0].safety_flag)
     check("**两边不重叠**",
           not ({r.external_id for r in recs}

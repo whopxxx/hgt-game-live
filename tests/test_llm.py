@@ -1488,8 +1488,9 @@ def test_v4_prompt_versions_bumped():
     from story.llm import CHECK_PROMPT_VERSION, RIDDLE_PROMPT_VERSION
     check("RIDDLE_PROMPT_VERSION 仍 == riddle-v9",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v11",
-          CHECK_PROMPT_VERSION == "check-v11", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v12",
+          CHECK_PROMPT_VERSION == "check-v12", CHECK_PROMPT_VERSION)
+
 
 
 def test_v4_signature_schema_has_new_dimensions():
@@ -1652,8 +1653,8 @@ def test_v4_policy_version_is_v4():
     """Step 04: 内容政策必须 bump —— 否则 Step 03 的隔离不会发生。"""
     print("\n[V4-9] QUALITY_POLICY_VERSION bump 到 v4")
     from story.quality import QUALITY_POLICY_VERSION
-    check("当前政策是 quality-v12",
-          QUALITY_POLICY_VERSION == "quality-v12", QUALITY_POLICY_VERSION)
+    check("当前政策是 quality-v13",
+          QUALITY_POLICY_VERSION == "quality-v13", QUALITY_POLICY_VERSION)
 
 
 # ======================================================================
@@ -3077,7 +3078,7 @@ def test_truth5_v6_pool_quarantined_but_v7_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v12", QUALITY_POLICY_VERSION == "quality-v12",
+    check("当前政策是 v13", QUALITY_POLICY_VERSION == "quality-v13",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q1pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -3181,7 +3182,7 @@ def test_q2_v7_pool_quarantined_but_v8_eligible():
     _mod = _ilu.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _pool_good_spec = _mod.good_spec
-    check("当前政策是 v12", QUALITY_POLICY_VERSION == "quality-v12",
+    check("当前政策是 v13", QUALITY_POLICY_VERSION == "quality-v13",
           QUALITY_POLICY_VERSION)
     d = tempfile.mkdtemp(prefix="q2pool_")
     cfg = Config(sim_path="x", no_llm=True, pool_enabled=True,
@@ -3308,12 +3309,12 @@ def test_q2_versions_bumped():
                            ANSWER_PROMPT_VERSION)
     from story.quality import QUALITY_POLICY_VERSION
     from story.puzzle import PuzzleSpec
-    check("QUALITY_POLICY_VERSION = quality-v12",
-          QUALITY_POLICY_VERSION == "quality-v12", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION = quality-v13",
+          QUALITY_POLICY_VERSION == "quality-v13", QUALITY_POLICY_VERSION)
     check("RIDDLE_PROMPT_VERSION = riddle-v8",
           RIDDLE_PROMPT_VERSION == "riddle-v9", RIDDLE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION = check-v11",
-          CHECK_PROMPT_VERSION == "check-v11", CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION = check-v12",
+          CHECK_PROMPT_VERSION == "check-v12", CHECK_PROMPT_VERSION)
     # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
     check("ANSWER_PROMPT_VERSION 仍是 C0 升的 answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
@@ -3938,7 +3939,7 @@ def test_r7_safety_verifier_is_a_second_and_gate():
     check("**这次发了 truth audit**", audit3 == 1, audit3)
     check("**metrics 记了复核版本**",
           (s3.metrics or {}).get("safety_prompt_version")
-          == "safety-v2",
+          == "safety-v3",
           (s3.metrics or {}).get("safety_prompt_version"))
     check("**metrics 记了复核结论**",
           (s3.metrics or {}).get("safety_verified") is True,
@@ -4139,7 +4140,8 @@ def test_r7_main_reviewer_prompt_unchanged():
 
     ## 现在守什么
 
-    1. **五条边界一条没少**(收紧的那一半没被顺手删掉);
+    1. **两条边界(性暴力 / 血腥具体伤害)在位** —— 2026-09-25 起边界
+       收窄为两条, 自伤 / 猎奇卖点 / 儿童家庭三条已**同批移除**;
     2. **泛化措辞必须消失**(R8-A 要收掉的正是"会不会变成拿惨案当乐子"
        / "宁可严一点, 拿不准判 false"这类会被模型扩张成"死亡=不安全"
        的句子);
@@ -4150,9 +4152,12 @@ def test_r7_main_reviewer_prompt_unchanged():
     d = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"][
         "properties"]["livestream_safe"]["description"]
 
-    # ---- ① 五条边界全在 ----
-    for token in ("自伤", "性暴力", "血腥", "猎奇", "儿童"):
+    # ---- ① 两条边界全在 ----
+    for token in ("性暴力", "血腥"):
         check("主审判据仍含边界「%s」" % token, token in d, d[:80])
+    # ---- ①b 收窄: 另外三条已移除 ----
+    for gone in ("自伤", "猎奇", "儿童"):
+        check("**边界已收窄, 不再列「%s」**" % gone, gone not in d, d[:120])
 
     # ---- ② 明确许可: 普通非血腥死亡/犯罪即使为核心也可 ----
     check("**明确写了普通非血腥死亡不判 false**",
@@ -4166,8 +4171,8 @@ def test_r7_main_reviewer_prompt_unchanged():
 
     # ---- ④ 复核是独立的一份 ----
     from story.llm import SAFETY_SYSTEM, SAFETY_PROMPT_VERSION
-    check("**独立版本号 safety-v2**",
-          SAFETY_PROMPT_VERSION == "safety-v2", SAFETY_PROMPT_VERSION)
+    check("**独立版本号 safety-v3**",
+          SAFETY_PROMPT_VERSION == "safety-v3", SAFETY_PROMPT_VERSION)
     check("**复核 system 是独立文案**(不是主审那段的对象)",
           "直播安全复核员" in SAFETY_SYSTEM, SAFETY_SYSTEM[:60])
     check("**复核的泛化措辞也收掉了**",
@@ -4700,11 +4705,11 @@ def test_r4r3_story_has_safety_boundary():
     Stage B** —— 旧 `livestream_safe` 的概括措辞挡不住。创作侧要少产出
     这类题, 所以 Story 加一句边界。
 
-    ## 为什么断言"只有一条"而不是"包含三类"
+    ## 为什么断言"只有一条"而不是"包含清单"
 
     与红黑那段同一条理由: 复审明确**不继续堆规则**。堆规则会把输出
     推成规范手册, 而且挡不住换说法绕过去。所以这里钉的是**形状** ——
-    一句话、带"安全边界"前缀、三类各出现一次, 不是一张清单。
+    一句话、带"安全边界"前缀、两类各出现一次, 不是一张清单。
 
     ## 反向断言: 普通死亡**仍然**可以
 
@@ -4716,10 +4721,10 @@ def test_r4r3_story_has_safety_boundary():
     # ---- ① 有"安全边界"这一句 ----
     check("**有安全边界一句**", "安全边界" in STORY_SYSTEM,
           [ln for ln in STORY_SYSTEM.splitlines() if "安全" in ln])
-    # ---- ② 三类情形各出现 ----
-    for kw, name in (("自伤", "自伤"), ("性暴力", "性暴力"),
-                     ("血腥", "血腥细节")):
+    # ---- ② 两类边界各出现(自伤边界已随 2026-09-25 收窄移除) ----
+    for kw, name in (("性暴力", "性暴力"), ("血腥", "血腥细节")):
         check(f"边界提到{name}", kw in STORY_SYSTEM)
+    check("**自伤边界已收掉**", "自伤" not in STORY_SYSTEM)
     # ---- ③ 正向许可: 普通死亡仍然可以 ----
     check("**明确普通死亡仍然可以**",
           "普通的" in STORY_SYSTEM and "死亡" in STORY_SYSTEM,
@@ -4728,9 +4733,9 @@ def test_r4r3_story_has_safety_boundary():
     line = next((ln for ln in STORY_SYSTEM.splitlines()
                  if "安全边界" in ln), "")
     check("**是一个自然段(单行)**", line.strip() and "\n" not in line.strip())
-    check("**别的行不再重复这三类**(只有一处边界)",
-          sum(1 for ln in STORY_SYSTEM.splitlines() if "自伤" in ln) == 1,
-          [ln for ln in STORY_SYSTEM.splitlines() if "自伤" in ln])
+    check("**别的行不再重复边界**(只有一处边界)",
+          sum(1 for ln in STORY_SYSTEM.splitlines() if "安全边界" in ln) == 1,
+          [ln for ln in STORY_SYSTEM.splitlines() if "安全边界" in ln])
 
 
 def _curated_checklist_text():
@@ -4787,7 +4792,7 @@ def _curated_checklist_text():
 
 
 def test_r4r3_livestream_safe_names_the_three_cases():
-    """**R4-R3**: `livestream_safe` 的判据要**指名**那三类情形。
+    """**R4-R3**: `livestream_safe` 的判据要**指名**边界情形。
 
     ## 为什么这条是本轮的核心回归
 
@@ -4796,7 +4801,9 @@ def test_r4r3_livestream_safe_names_the_three_cases():
     都判成了 true(所以它们通过了 Stage B, 进了 smoke 报告)。
 
     一个概括性判据的问题是**它把归类责任推给了模型**: "自伤算不算重口?"
-    从措辞里读不出来。所以修法是**把它读出来** —— 逐条列明三类。
+    从措辞里读不出来。所以修法是**把它读出来** —— 逐条列明边界。
+    (2026-09-25 起边界收窄为两条: 性暴力核心 / 血腥具体伤害细节;
+    函数名保留 "three_cases" 只是历史沿革, 断言已同步收窄。)
 
     ## 覆盖面: **三处**措辞, 一处都不能漏
 
@@ -4814,9 +4821,9 @@ def test_r4r3_livestream_safe_names_the_three_cases():
     第 3 处**不写死字符串**, 而是**渲染出真实的 user 文本**再断言 ——
     写死字符串会在下次改排版时假红。
     """
-    print("\n[R4-K2e] livestream_safe 指名三类情形")
+    print("\n[R4-K2e] livestream_safe 指名两类边界")
     from story.llm import _TOOL_CHECK, CHECK_SYSTEM
-    THREE = ("自伤", "性暴力", "血腥")
+    TWO = ("性暴力", "血腥")
 
     def _assert_all(src, name):
         # ⚠️ `extra` 会被 `print()` 出来, 而 CI/本地的 Windows 控制台是
@@ -4828,10 +4835,16 @@ def test_r4r3_livestream_safe_names_the_three_cases():
             return [str(ln).encode("gbk", "replace").decode("gbk")
                     for ln in lines][:3]
 
-        for kw in THREE:
+        for kw in TWO:
             check(f"[{name}] 指名「{kw}」", kw in src,
                   _safe([ln.strip()[:70] for ln in src.splitlines()
                          if "livestream" in ln or "死亡" in ln]))
+        # ---- 收窄同步: 移除的三条在三处都不得回潮 ----
+        for gone in ("自伤", "猎奇", "儿童"):
+            check(f"[{name}] **边界已收窄, 不再列「{gone}」**",
+                  gone not in src,
+                  _safe([ln.strip()[:70] for ln in src.splitlines()
+                         if gone in ln]))
         check(f"[{name}] **普通非血腥死亡仍然可以**",
               # ⚠️ 措辞演进: R4-R3 是"**普通死亡**(不涉及下面三类的)…",
               # R8-A 改成"**普通、非血腥**的死亡 / 犯罪 / … 都不因此判
@@ -5062,12 +5075,12 @@ def test_r4_versions_bumped():
           STORY_PROMPT_VERSION == "keyword2-v7", STORY_PROMPT_VERSION)
     check("SURFACE_PROMPT_VERSION == surface-v2",
           SURFACE_PROMPT_VERSION == "surface-v2", SURFACE_PROMPT_VERSION)
-    check("CHECK_PROMPT_VERSION == check-v11",
-          L.CHECK_PROMPT_VERSION == "check-v11", L.CHECK_PROMPT_VERSION)
+    check("CHECK_PROMPT_VERSION == check-v12",
+          L.CHECK_PROMPT_VERSION == "check-v12", L.CHECK_PROMPT_VERSION)
     check("RIDDLE_PROMPT_VERSION 未动(riddle-v9)",
           L.RIDDLE_PROMPT_VERSION == "riddle-v9", L.RIDDLE_PROMPT_VERSION)
-    check("QUALITY_POLICY_VERSION == quality-v12",
-          QUALITY_POLICY_VERSION == "quality-v12", QUALITY_POLICY_VERSION)
+    check("QUALITY_POLICY_VERSION == quality-v13",
+          QUALITY_POLICY_VERSION == "quality-v13", QUALITY_POLICY_VERSION)
     check("KEYWORD_IDEA_PROMPT_VERSION 已删除",
           not hasattr(L, "KEYWORD_IDEA_PROMPT_VERSION"))
     check("gen_keyword_idea 已删除",
