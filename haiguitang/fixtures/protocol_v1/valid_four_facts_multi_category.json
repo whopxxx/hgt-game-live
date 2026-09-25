@@ -1,0 +1,179 @@
+{
+  "case": "valid_four_facts_multi_category",
+  "description": "v1 四 fact 合同 + 多主题 [crime,suspense,twist] 是真合法状态; core hidden=4 会带 1 条 can_fix 注记(不是失败)",
+  "expect": "valid",
+  "expect_fixable_contains": "core hidden facts",
+  "spec": {
+    "id": "fx-gem",
+    "title": "消失的红宝石",
+    "puzzle": "珠宝展清点时少了一枚红宝石戒指。保险柜没被撬，监控没断，门禁记录只有工作人员。三天后，做展台的木工被警察带走了。戒指是怎么被拿走的？",
+    "answer": "布展时木工把戒指粘在自己制作的展台背面内侧。戒指从没离开展厅，警方从展台的做工认出制作者，在他潜回取戒指时守候带走。",
+    "core_answer": "戒指一直粘在他自己做的展台背面，警方靠做工认出了他。",
+    "completion_fact_ids": [
+      "f1",
+      "f2",
+      "f3",
+      "f4"
+    ],
+    "facts": [
+      {
+        "id": "f1",
+        "text": "戒指从没离开展厅，布展时被粘在展台背面内侧",
+        "public_text": "戒指被粘在展台背面",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f2",
+        "text": "放戒指的展台是木工亲手制作的",
+        "public_text": "展台出自木工之手",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f3",
+        "text": "木工三天后潜回取戒指时被守候的警察当场带走",
+        "public_text": "他取赃时被当场带走",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f4",
+        "text": "警方从展台的做工认出制作者，并布控守候",
+        "public_text": "警方靠做工认出了他",
+        "kind": "core",
+        "visibility": "hidden",
+        "hintable": true
+      },
+      {
+        "id": "f5",
+        "text": "保险柜与门禁正常，是因为没有人碰过保险柜",
+        "public_text": "",
+        "kind": "support",
+        "visibility": "hidden",
+        "hintable": false
+      }
+    ],
+    "solve_atoms": [
+      {
+        "id": "a1",
+        "role": "key",
+        "text": "戒指粘在展台背面",
+        "fact_ids": [
+          "f1"
+        ],
+        "required": true
+      },
+      {
+        "id": "a2",
+        "role": "key",
+        "text": "展台是木工做的",
+        "fact_ids": [
+          "f2"
+        ],
+        "required": true
+      },
+      {
+        "id": "a3",
+        "role": "mechanism",
+        "text": "三天后落网是取赃时被守候",
+        "fact_ids": [
+          "f3",
+          "f4"
+        ],
+        "required": true
+      },
+      {
+        "id": "a4",
+        "role": "support",
+        "text": "没人碰过保险柜",
+        "fact_ids": [
+          "f5"
+        ],
+        "required": false
+      }
+    ],
+    "discovery_beats": [
+      {
+        "id": "b1",
+        "text": "先确认戒指从未经过保险柜与门禁",
+        "fact_ids": [
+          "f1",
+          "f5"
+        ]
+      },
+      {
+        "id": "b2",
+        "text": "再意识到戒指是布展时就被藏起来的",
+        "fact_ids": [
+          "f1"
+        ]
+      },
+      {
+        "id": "b3",
+        "text": "把展台和制作者联系起来",
+        "fact_ids": [
+          "f2"
+        ]
+      },
+      {
+        "id": "b4",
+        "text": "理解三天后才落网是有守候",
+        "fact_ids": [
+          "f3",
+          "f4"
+        ]
+      }
+    ],
+    "fair_clues": [
+      {
+        "quote": "做展台的木工",
+        "supports_atoms": [
+          "a2"
+        ]
+      },
+      {
+        "quote": "门禁记录只有工作人员",
+        "supports_atoms": [
+          "a1"
+        ]
+      }
+    ],
+    "hints": [
+      "戒指没有离开过展厅",
+      "想想布展时谁能接触展台",
+      "三天后才落网不是巧合"
+    ],
+    "blueprint": {
+      "mechanism_family": "hidden_function",
+      "solution_shape": "hidden_function_explains_behavior",
+      "domain": "commerce",
+      "emotion_mode": "tense",
+      "time_shape": "single_day",
+      "relation": "stranger",
+      "reveal_mode": "hidden_stakes"
+    },
+    "signature": {
+      "mechanism_family": "hidden_function",
+      "solution_shape": "hidden_function_explains_behavior",
+      "domain": "commerce",
+      "emotion_mode": "tense",
+      "relation": "stranger",
+      "time_shape": "single_day"
+    },
+    "prompt_version": "",
+    "quality_policy_version": "quality-v13",
+    "protocol_version": "haiguitang-v1",
+    "difficulty": "hard",
+    "requested_category": "crime",
+    "primary_category": "crime",
+    "categories": [
+      "crime",
+      "suspense",
+      "twist"
+    ]
+  }
+}

@@ -3318,9 +3318,9 @@ def test_q2_versions_bumped():
     # Answer 在 C0 那笔已升 answer-v7, Q2 **不再动它**。
     check("ANSWER_PROMPT_VERSION 仍是 C0 升的 answer-v7",
           ANSWER_PROMPT_VERSION == "answer-v7", ANSWER_PROMPT_VERSION)
-    check("spec_version = 4",
+    check("spec_version = 5",
           PuzzleSpec(puzzle="p", answer="a").to_archive().get("spec_version")
-          == 4)
+          == 5)
 
 
 def test_truth_prompt_has_scanning_rules():

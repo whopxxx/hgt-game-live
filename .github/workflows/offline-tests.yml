@@ -47,6 +47,11 @@ jobs:
       - name: 离线套件 puzzle
         run: uv run tests/test_puzzle.py
 
+      # Issue #48: Haiguitang Protocol v1 —— 协议版本 fail closed /
+      # completion 2~4 分档 / public_text 安全门 / fixtures 全量验证。
+      - name: 离线套件 haiguitang_protocol
+        run: uv run tests/test_haiguitang_protocol.py
+
       - name: 离线套件 parser
         run: uv run tests/test_parser.py
 

@@ -10,7 +10,9 @@
 
     现在把"这道题的世界里什么是真的"固定成一份**有限事实表**:
         facts                主持人整局判断"是/不是/无关"的事实空间
-        completion_fact_ids  **通关合同** —— 房间必须真正建立的 1~2 条核心事实
+        completion_fact_ids  **通关合同** —— 房间必须真正建立的核心事实
+                             (legacy/current 1~2 条; haiguitang-v1 2~4 条,
+                              见 story/haiguitang_protocol.py)
         solve_atoms          谜底的分析拆分(提示/解释/复盘), **不是**通关条件
         fair_clues           谜面原文里已经写着、回看能指向谜底的具体事实
         hints                递进提示
@@ -162,6 +164,26 @@ class PuzzleFact:
     hintable:
       是否允许提示直接围绕这个事实引导。核心 mechanism 一般设 False,
       否则提示会变成剧透。
+    public_text:
+      Haiguitang Protocol v1(Issue #48): 这条事实被真人**正式建立之后**,
+      可以展示给直播观众看的**安全摘要**。
+
+      ⚠️ 它**不是** canonical truth(`text`)的别名:
+
+          text         = 判定真相用的完整隐藏内容(Judge/verifier 用)
+          public_text  = 已建立后给观众看的安全表述
+
+      例如:
+          text        "女人其实是死者多年失联的亲姐姐"
+          public_text "她与死者存在亲属关系"
+
+      安全边界(绝不能破):
+        - **永不允许** `public_text 为空 -> fallback text` —— 那等于把
+          隐藏真相摊给观众。v1 的 completion fact 缺 public_text 是
+          validator 硬失败(story/haiguitang_protocol.py), 不是运行时补救;
+        - 只能由 `PuzzleSpec.public_established_completion_facts` 这类
+          helper 在 fact **已建立后**输出, 且只输出 public_text;
+      legacy fact(旧 archive)没有这把键 -> 宽容读成 ""(不猜、不补)。
     """
 
     id: str
@@ -169,10 +191,13 @@ class PuzzleFact:
     kind: str = "support"
     visibility: str = "hidden"
     hintable: bool = True
+    #: 已建立后的**安全摘要**。空 = 没写过(legacy/未填), 绝不 fallback。
+    public_text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "text": self.text, "kind": self.kind,
-                "visibility": self.visibility, "hintable": bool(self.hintable)}
+                "visibility": self.visibility, "hintable": bool(self.hintable),
+                "public_text": self.public_text}
 
     @classmethod
     def from_dict(cls, d: Any) -> "PuzzleFact":
@@ -184,6 +209,9 @@ class PuzzleFact:
             kind=_pick(d.get("kind"), FACT_KINDS, "support"),
             visibility=_pick(d.get("visibility"), FACT_VISIBILITY, "hidden"),
             hintable=bool(d.get("hintable", True)),
+            # Issue #48: 老 fact 没有这把键 -> 读成 ""(未知)。
+            # **绝不** fallback 成 text —— 见字段注释的安全边界。
+            public_text=str(d.get("public_text", "") or "").strip(),
         )
 
 
@@ -550,7 +578,7 @@ class PuzzleSpec:
     #: core_answer, 揭晓可以**确定性**地先把它原样念出来(零 LLM 调用),
     #: 保证"人话"一定先出现。
     core_answer: str = ""
-    #: **通关合同** —— 观众房间必须真正建立的最小核心事实集合(1~2 条)。
+    #: **通关合同** —— 观众房间必须真正建立的最小核心事实集合。
     #:
     #: 只允许指向 `kind="core"` 且 `visibility="hidden"` 的 fact。
     #: support / exclusion **永远不得**作为通关要求 —— 它们是背景与排除项,
@@ -559,12 +587,18 @@ class PuzzleSpec:
     #: 语义与 solve_atoms **彻底分开**:
     #:     completion_fact_ids = 胜利合同(代码做集合覆盖判定)
     #:     solve_atoms         = 提示 / 解释 / 复盘结构
+    #:     discovery_beats     = 正常游戏的逐层发现节奏(没有胜负权)
+    #: 三者**不存在**一一对应关系 —— "4 beats 2 facts"与"3 beats 3 facts"
+    #: 都合法(Issue #48 协议 §9)。
     #:
     #: 这正是"共同推理"的机制: 房间已公开确认的事实会累计, 最后补齐缺口的
     #: 那位观众立即触发揭晓, 不要求他复述别人已经推出来的部分。
     #:
-    #: **1~2 条是硬上限。** 一道题若压不进 2 条, 那是题本身太绕, 应该
-    #: rewrite —— 而不是把门槛放宽成 4、5 条。
+    #: **条数合同按协议版本分档**(story/haiguitang_protocol.py):
+    #:     legacy/current (protocol_version="")     1~2 条(既有硬上限)
+    #:     haiguitang-v1                            2~4 条
+    #: 一道题若压不进 legacy 的 2 条, 那是题本身太绕, 应该 rewrite;
+    #: v1 放宽到 2~4 是**新协议的显式选择**, 不是对存量合同的放宽。
     completion_fact_ids: list = field(default_factory=list)
 
     facts: list = field(default_factory=list)          # list[PuzzleFact]
@@ -580,6 +614,29 @@ class PuzzleSpec:
 
     prompt_version: str = ""
     quality_policy_version: str = ""
+
+    # ---- Haiguitang Protocol v1 元数据(Issue #48, 全部宽容读) ----
+    #:
+    #: 这道题遵循哪套**海龟汤语义合同**:
+    #:     ""              legacy/current production schema
+    #:     haiguitang-v1   新协议(见 story/haiguitang_protocol.py)
+    #: 未知非空值由 validator **fail closed**, 绝不静默当 legacy。
+    protocol_version: str = ""
+    #: 最终难度(observed/audited)。legacy 保持 ""(未知), 绝不从
+    #: completion 条数或 content_style 推断 —— 那两条是独立轴。
+    difficulty: str = ""
+    #: **audited observed 主类别** —— 审核结果, 不是生成器自报。
+    #: 刻意**没有**第二个 observed_category 字段: primary_category 的
+    #: 语义就是 observed primary(Issue #48 §22), 否则两份"谁是真的"
+    #: 无法回答。与 `content_style`(观感标签)是**不同维度**, 不互相顶替。
+    primary_category: str = ""
+    #: 一题多主题(1~3 条, 含 primary, 无重复, 全在 11 类里)。
+    #: from_dict **不去重、不回退** —— 坏数据保留到 validator 面前。
+    categories: list = field(default_factory=list)
+    #: **provenance**: 这次生成任务当初要求什么主题(""=自由生成)。
+    #: 它是生成意图, 不是这题"是什么" —— requested != primary 合法,
+    #: 绝不进 Judge / 答题 / 通关链(Issue #48 §23/§24/§55)。
+    requested_category: str = ""
 
     # ---- 非持久化的生成元信息(usage/model 等) ----
     usage: Optional[dict] = None
@@ -712,6 +769,50 @@ class PuzzleSpec:
         """
         return bool(self.completion_fact_ids)
 
+    def public_established_completion_facts(self,
+                                            established_fact_ids) -> list:
+        """通关合同里**已建立**事实的安全展示视图(Issue #48 §7)。
+
+        输入 `established_fact_ids`(参数名就是合同 —— **绝不**接受
+        touched: 问过 ≠ 确认为真), 返回:
+
+            [
+              {"id": "f3", "text": "<f3.public_text>"},
+              {"id": "f1", "text": "<f1.public_text>"},
+              ...
+            ]
+
+        三条硬边界:
+
+            1. 只返回 `completion_fact_ids ∩ established_fact_ids`;
+            2. `text` **只**取 `public_text`, 永不 fallback 到 canonical
+               `fact.text` —— public_text 为空的(legacy/未填)**直接跳过**,
+               宁可少展示一条, 也不给隐藏真相开后门;
+            3. 顺序 = `completion_fact_ids` 的合同顺序(**不是** set /
+               facts[] 顺序) —— 后续 UI 的"🧩 已确认 2 / 4"需要稳定顺序。
+
+        本方法 Phase A 只供测试与协议验证; Snapshot / 前端接入属 Phase E
+        (Issue #48 §9)。
+        """
+        est = {str(x).strip() for x in (established_fact_ids or [])
+               if str(x).strip()}
+        by_id = self.fact_by_id()
+        out: list = []
+        for fid in (self.completion_fact_ids or []):
+            fid = str(fid).strip()
+            if not fid or fid not in est:
+                continue
+            f = by_id.get(fid)
+            if f is None:
+                continue
+            pub = str(getattr(f, "public_text", "") or "").strip()
+            if not pub:
+                # 安全门: 没有 public_text 就没有可展示的内容。
+                # **绝不**用 canonical text 顶上(那是隐藏真相本身)。
+                continue
+            out.append({"id": fid, "text": pub})
+        return out
+
     #: 序列化时**必须**带上的非内容字段。
     #:
     #: 早先 `to_dict` 只写"内容字段"(puzzle/facts/atoms/...), 把
@@ -742,6 +843,14 @@ class PuzzleSpec:
             "signature": self.signature.to_dict(),
             "prompt_version": self.prompt_version,
             "quality_policy_version": self.quality_policy_version,
+            # ---- Haiguitang Protocol v1 元数据(Issue #48) ----
+            # 随 archive 走: protocol_version 决定这道题按哪套语义合同
+            # 校验, 不落盘 -> 读回来全变成 legacy, v1 数据被静默降级。
+            "protocol_version": self.protocol_version,
+            "difficulty": self.difficulty,
+            "primary_category": self.primary_category,
+            "categories": list(self.categories or []),
+            "requested_category": self.requested_category,
             "blueprint_specified": bool(self.blueprint_specified),
             # ---- H2-F: curated 溯源 ----
             # 跟着 archive 走(归档/attribution/排查要它), 但**不进前端**。
@@ -780,7 +889,14 @@ class PuzzleSpec:
         混进来)。所以显式记一个标记。
         """
         d = self.to_dict()
-        d["spec_version"] = 4
+        # Issue #48: 4 -> 5。持久化 schema 明确增加字段
+        # (protocol_version / difficulty / primary_category / categories /
+        #  requested_category / PuzzleFact.public_text), 所以 bump。
+        # ⚠️ spec_version 与 protocol_version 是**两回事**: 前者是
+        # JSON/archive 数据结构版本, 后者是这道题的语义合同版本
+        # (spec_version=5 + protocol_version="" 是"新程序写出的
+        # legacy/current 题", 完全合法)。
+        d["spec_version"] = 5
         d["blueprint_specified"] = bool(self.blueprint_specified)
         d["signature_present"] = bool(
             self.signature and (self.signature.mechanism_family
@@ -820,6 +936,19 @@ class PuzzleSpec:
             signature=PuzzleSignature.from_dict(d.get("signature")),
             prompt_version=str(d.get("prompt_version", "") or ""),
             quality_policy_version=str(d.get("quality_policy_version", "") or ""),
+            # ---- Haiguitang Protocol v1 元数据(Issue #48) ----
+            # 宽容读: 老 archive 没有这些键 -> 全部保持未知("" / [])。
+            # **不做任何隐式升级**(不猜 difficulty / 不从 content_style
+            # 映射 categories / 不给 public_text 编内容) —— Phase A 是
+            # schema upgrade, 不是 migration。
+            # categories **不去重、不回退**: 坏数据(如 ["crime","crime"])
+            # 原样保留, 由 validator 判(parser 不做 validator 的工作)。
+            protocol_version=str(d.get("protocol_version", "") or "").strip(),
+            difficulty=str(d.get("difficulty", "") or "").strip(),
+            primary_category=str(d.get("primary_category", "") or "").strip(),
+            categories=[str(x).strip() for x in (d.get("categories") or [])
+                        if str(x).strip()],
+            requested_category=str(d.get("requested_category", "") or "").strip(),
             blueprint_specified=bool(d.get("blueprint_specified", False)),
             # ---- H2-F: curated 溯源(老 archive 没有 -> 宽容读成空) ----
             source_type=str(d.get("source_type", "") or ""),
