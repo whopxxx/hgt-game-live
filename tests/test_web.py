@@ -190,17 +190,18 @@ window.addEventListener("load", async () => {
           "缺少发言者名字");
 
     // AI 玩家只显示状态，token 数值不进入观众 UI。
+    // Issue #43: 常驻文案是"点赞推进"语义 + 服务端快照的 ❤️ 进度。
     send({puzzle_index: 2, story_index: 2, puzzle: "AI 玩家布局测试。",
           ai_player: {questions_available: 3, questions_earned: 7,
                       questions_used: 4, likes_progress: 23,
-                      likes_per_question: 100, in_flight: false},
+                      likes_per_progress: 100, in_flight: false},
           qa_log: [{qid: 1, user_name: "AI玩家", text: "地点重要吗？",
                     verdict: "是", comment: "", kind: "ai_player"}],
           qa_total: 1});
-    check(document.getElementById("stats").textContent
-            .includes("每100点赞可以召唤 AI 玩家"),
-          "应显示 AI 玩家常态而非 token 数值: "
-          + document.getElementById("stats").textContent);
+    const statsText = document.getElementById("stats").textContent;
+    check(statsText.includes("每100点赞，AI玩家助攻并加速本题")
+          && statsText.includes("❤️ 23 / 100"),
+          "应显示点赞推进文案与进度: " + statsText);
     const aiRow = document.querySelector(".qa-row.kind-ai_player");
     check(aiRow && aiRow.textContent.includes("AI玩家：地点重要吗？")
             && aiRow.textContent.includes("是"),
@@ -1301,27 +1302,43 @@ window.addEventListener('load', async () => {
     check(box.getBoundingClientRect().top === before, 'A16 QA append/scroll must not move announcer');
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'})); geometry();
     document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
-    send({ai_player:{questions_earned:21,questions_available:0,questions_used:21}});
-    check(box.dataset.kind==='ai' && notice().includes('已被召唤'), 'A16 earned delta summons even if available already 0');
+    // ---- Issue #43: 点赞推进公告(显式 like_progress_notice 事件) ----
+    // 首帧快照无公告 -> 之后收到的 seq 都是活事件, 照播。
+    send({like_progress_notice:{seq:1,round_index:1,pulses:1,phase:'qa',
+                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
+    check(box.dataset.kind==='like' && notice().includes('点赞助攻'),
+          'A16 live like notice plays');
     const first=anim();
     for(let i=0;i<20;i++) send();
     check(anim()===first, 'A16 repeated snapshots do not restart animation');
-    send({ai_player:{questions_earned:21,questions_available:1,questions_used:20,in_flight:true}});
-    check(document.getElementById('stats').textContent==='AI玩家正在推理…', 'A16 AI in-flight shows reasoning state only');
-    send({ai_player:{questions_earned:21,questions_available:0,questions_used:21,in_flight:false}});
-    check(document.getElementById('stats').textContent==='每100点赞可以召唤 AI 玩家', 'A16 available 1 -> 0 shows no numeric flicker');
-    check(anim()===first && !/\d/.test(notice()), 'A16 consumed token does not interrupt or number summon');
+    send({ai_player:{questions_available:0,questions_used:1,in_flight:true,
+                     likes_progress:5,likes_per_progress:100}});
+    check(document.getElementById('stats').textContent.includes('AI玩家正在推理…'),
+          'A16 AI in-flight shows reasoning state only');
+    send({ai_player:{questions_available:0,questions_used:1,in_flight:false,
+                     likes_progress:5,likes_per_progress:100}});
+    check(document.getElementById('stats').textContent.includes('每100点赞，AI玩家助攻并加速本题')
+          && document.getElementById('stats').textContent.includes('❤️ 5 / 100'),
+          'A16 resident copy is like-progress semantics with server progress');
+    check(anim()===first, 'A16 ai_player field updates do not interrupt like notice');
     socket.onclose(); await tick(801); send();
     check(anim()===first, 'A16 reconnect retains baseline');
     await tick(3000);
-    check(box.dataset.kind==='ai' && anim()===first, 'A16 summon survives token consumption for full hold');
+    check(box.dataset.kind==='like' && anim()===first, 'A16 like survives field updates for full hold');
     await finish();
-    check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not queue old AI');
-    send({ai_player:{questions_earned:24}});
-    check(notice().includes('AI玩家已被触发') && !/\d/.test(notice()), 'A16 delta >1 merged without numbers');
-    send({ai_player:{questions_earned:25}}); send({ai_player:{questions_earned:27}});
-    await finish(); check(notice().includes('AI玩家已被触发'), 'A16 pending AI events coalesce');
-    await finish(); check(box.dataset.kind==='leaderboard', 'A16 bounded AI queue drains');
+    check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not replay old like');
+    // 服务端已把一批 pulse 聚合成一条: ×N 一次播完。
+    send({like_progress_notice:{seq:2,round_index:1,pulses:3,phase:'qa',
+                                text:'❤️ 点赞助攻 ×3！AI玩家获得更多行动机会，游戏加速'}});
+    check(notice().includes('×3'), 'A16 burst aggregates into one ×N notice');
+    // 连续点赞事件: 单一待播槽位, 新 seq 直接覆盖 -> 只显示最新一条。
+    send({like_progress_notice:{seq:3,round_index:1,pulses:1,phase:'qa',
+                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
+    send({like_progress_notice:{seq:4,round_index:1,pulses:2,phase:'qa',
+                                text:'❤️ 点赞助攻 ×2！AI玩家获得更多行动机会，游戏加速'}});
+    check(notice().includes('×2') && !notice().includes('×3'),
+          'A16 single pending slot keeps only the newest like notice');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 no unbounded like backlog');
     send({leaderboard:[
       {rank:1,user_name:'Alice',solved_count:5},
       {rank:2,user_name:'Bob',solved_count:4},
@@ -1344,8 +1361,9 @@ window.addEventListener('load', async () => {
     check(box.dataset.motion==='marquee' && !!anim(),
           'A16 long Top10 uses one continuous marquee');
 
-    send({ai_player:{questions_earned:28}});
-    check(box.dataset.kind==='ai', 'A16 AI temporarily overlays Top10 marquee');
+    send({like_progress_notice:{seq:5,round_index:1,pulses:1,phase:'qa',
+                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
+    check(box.dataset.kind==='like', 'A16 like temporarily overlays Top10 marquee');
     await finish();
     check(box.dataset.kind==='leaderboard'
           && notice().includes('1. P1 20题')
@@ -1370,15 +1388,33 @@ window.addEventListener('load', async () => {
     send({hint_count:4,hint_text:'',qa_log:[hintRow(-3,'注意灯的方向'),hintRow(-4,'注意门外的人')],qa_total:72});
     await finish();
     check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
-    send({ai_player:{questions_earned:29,questions_available:0}});
-    check(box.dataset.kind==='ai', 'A16 AI outranks active hint');
-    await finish(); check(notice()==='💡 提示：注意门外的人', 'A16 interrupted hint returns for full reading');
-    await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated hint snapshots enqueue once only');
+    // Issue #43: 点赞不再抢占提示 —— 正在播的提示必须完整播完,
+    // 点赞在它之后接上(§15: 提示/重要公告不能被点赞腰斩)。
+    send({like_progress_notice:{seq:6,round_index:1,pulses:1,phase:'qa',
+                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
+    check(box.dataset.kind==='hint' && notice()==='💡 提示：注意门外的人',
+          'A16 like never cuts a playing hint short');
+    await finish(); check(box.dataset.kind==='like',
+          'A16 like notice plays right after the hint finishes');
+    await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated like snapshots enqueue once only');
     send({hint_count:5,hint_text:'旧题尚未播完'});
     send({puzzle_index:3,hint_count:7,hint_text:'新题首帧历史提示'});
     check(box.dataset.kind==='leaderboard', 'A16 new puzzle resets baseline and cancels old hint');
     send({hint_count:8,hint_text:'本题新提示'});
     check(notice()==='💡 提示：本题新提示', 'A16 new puzzle subsequent hint announces');
+    // 旧题的待播点赞公告不跨题: hint 播放期间排队的 like,
+    // 在换题后必须被丢弃而不是继续播(§16: 不跨题迟到)。
+    send({like_progress_notice:{seq:7,round_index:3,pulses:1,phase:'qa',
+                                text:'❤️ 旧题的点赞助攻'}});
+    check(box.dataset.kind==='hint', 'A16 like waits behind playing hint');
+    send({puzzle_index:4,hint_count:0,hint_text:'',qa_log:[]});
+    check(!notice().includes('旧题的点赞助攻'),
+          'A16 pending like from an old round is dropped on new puzzle');
+    await finish();
+    check(!notice().includes('旧题的点赞助攻'),
+          'A16 dropped like notice never plays later');
+    send({hint_count:9,hint_text:'新题的新提示'});
+    check(notice()==='💡 提示：新题的新提示', 'A16 hints still work after dropped like');
     await finish(); check(box.dataset.kind==='leaderboard', 'A16 new puzzle hint plays once');
 
     // 术语分两层:
@@ -1424,14 +1460,15 @@ window.addEventListener('load', async () => {
     check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
           && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
           'A16 short hold fully visible');
-    send({hint_count:9,hint_text:'提示应抢占预设公告'});
-    check(box.dataset.kind==='hint', 'A16 hint preempts preset without waiting for interval');
+    send({like_progress_notice:{seq:8,round_index:1,pulses:1,phase:'qa',
+                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
+    check(box.dataset.kind==='like', 'A16 like preempts active preset immediately (<1s)');
+    check(anim().effect.getTiming().duration===7000,
+          'A16 short like notice uses capped 5s hold plus symmetric 1s slides');
+    send({hint_count:12,hint_text:'提示应抢占点赞公告'});
+    check(box.dataset.kind==='hint', 'A16 hint preempts active like notice');
     check(anim().effect.getTiming().duration===7000,
           'A16 short hint uses capped 5s hold plus symmetric 1s slides');
-    send({ai_player:{questions_earned:30}});
-    check(box.dataset.kind==='ai', 'A16 AI preempts active preset immediately (<1s)');
-    check(anim().effect.getTiming().duration===7000,
-          'A16 short AI notice uses capped 5s hold plus symmetric 1s slides');
     await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
     await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
 
@@ -1553,7 +1590,7 @@ window.addEventListener('load', async () => {
 
     // Hints share exactly the same full-text marquee / static-page renderer.
     const longHint='提示内容不能被永久截断，'.repeat(10)+'最后线索';
-    send({hint_count:10,hint_text:longHint});
+    send({hint_count:13,hint_text:longHint});
     let hintPages='', pageCount=0;
     while(box.dataset.kind==='hint' && pageCount++<30) {
       hintPages+=notice();
@@ -1562,7 +1599,7 @@ window.addEventListener('load', async () => {
     }
     check(hintPages==='💡 提示：'+longHint, 'A16 reduced-motion hint preserves complete text');
     reduced=false; listeners.forEach(fn=>fn());
-    send({hint_count:11,hint_text:longHint});
+    send({hint_count:14,hint_text:longHint});
     check(box.dataset.motion==='marquee' && notice()==='💡 提示：'+longHint, 'A16 long hint uses untruncated marquee');
     check(Math.abs(anim().effect.getTiming().duration-(box.clientWidth+text.scrollWidth)/80*1000)<1,
           'A16 long hint duration uses full measured distance');

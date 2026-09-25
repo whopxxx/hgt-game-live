@@ -34,10 +34,18 @@ class Phase(str, Enum):
 CMD_PREFIX = "#"
 
 # 特殊指令(不走 LLM 提问)
-CMD_NEXT = "#下一题"
 CMD_HINT = "#提示"
-NEXT_TOKENS = frozenset({"下一题", "下一关", "换一题", "跳过", "next"})
 HINT_TOKENS = frozenset({"提示", "给点提示", "提示一下", "hint"})
+# ---- Issue #43: 旧换题指令是 deterministic tombstone ----
+#
+# 曾经这些词会直接 `_enter_revealing_locked(..., "skip", ...)`, 任何单个
+# 观众都能靠它们结束当前题 —— 已停用。
+#
+# 但**不能简单地删掉识别**: 不识别的话, `#下一题` 会掉进 Answer LLM 变成
+# 一条普通提问(那是另一条必须堵死的路)。所以保留这组词做**墓碑**:
+# Engine 识别 -> 消费 -> 不 reveal / 不进 QA / 不调 LLM。
+# 名字刻意叫 LEGACY_*: 语义是"旧命令的坟", 不是"另一条换题路径"。
+LEGACY_SKIP_TOKENS = frozenset({"下一题", "下一关", "换一题", "跳过", "next"})
 
 
 class ActionKind(str, Enum):
@@ -359,6 +367,16 @@ class Snapshot:
     # ---- AI 玩家 ----
     # 只公开计量与在途状态；reservation token / round / spec_key 永不下发。
     ai_player: dict[str, Any] = field(default_factory=dict)
+    # ---- Issue #43: 点赞推进的**显式呈现事件** ----
+    #
+    # 形如 {"seq", "round_index", "pulses", "phase", "text"}; None = 尚无。
+    # 为什么由服务端下发而不是前端从 questions_earned 的 delta 推断:
+    # round 级语义下, 换题 reset / 旧公告迟到 / 累计与当题混淆都会让
+    # delta 推断误判。硬要求(§16):
+    #   事件可去重(seq 单调) / 有 round identity / 不跨题迟到
+    #   / 一次 burst 只有一个事件(每批 pulse 一个 seq)。
+    # 前端只保留**一个**待播点赞槽位, 新 seq 覆盖旧的 —— 永不无限积压。
+    like_progress_notice: Optional[dict[str, Any]] = None
     # ---- 统计 ----
     stat_questions: int = 0                 # 本题累计提问数
     stat_answered: int = 0                  # 本题累计已答数
@@ -411,6 +429,7 @@ class Snapshot:
             "notice": self.notice,
             "phase_hint": self.phase_hint,
             "ai_player": self.ai_player,
+            "like_progress_notice": self.like_progress_notice,
             "stats": {
                 "questions": self.stat_questions,
                 "answered": self.stat_answered,

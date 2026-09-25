@@ -30,7 +30,7 @@ from typing import Any, Callable, Optional
 from .config import Config
 from . import parser as P
 from .puzzle import PuzzleSignature, PuzzleSpec, runtime_spec_key
-from .state import (CMD_PREFIX, HINT_TOKENS, NEXT_TOKENS, ActionKind,
+from .state import (CMD_PREFIX, HINT_TOKENS, LEGACY_SKIP_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
 from .summon import LIKES_PER_SUMMON, SummonLedger
@@ -284,6 +284,17 @@ class RoundEngine:
         self._ai_player_next_at = 0.0
         self._ai_player_gave_up_round = 0
 
+        # ---- Issue #43: 点赞推进(round 级资源 + 显式呈现事件) ----
+        #: 本题的**进度加成**(秒)。QA 时间轴读的是
+        #: `effective = real + bonus`; 新题开始时清零(见 `_enter_setting_locked`)。
+        self._round_progress_bonus_seconds = 0.0
+        #: 最近一条点赞推进公告(显式呈现事件, 前端按 seq 去重)。
+        #: None = 尚无 / 已随新题清除。seq 本身 session 单调, 跨题不重置。
+        self._like_notice: Optional[dict] = None
+        self._like_notice_seq = 0
+        #: 旧换题指令(墓碑)被消费的条数 —— 观察用, 不参与任何逻辑。
+        self._legacy_skip_consumed = 0
+
     # ==================================================================
     # 生命周期
     # ==================================================================
@@ -366,7 +377,27 @@ class RoundEngine:
     def submit_interaction(self, ev: Any = None,
                            now: Optional[float] = None
                            ) -> list[EngineAction]:
-        """把 Like.total 接入 AI 玩家次数；Gift 只保留 raw 计数。"""
+        """把 Like.total 换算成点赞推进 pulse；Gift 只保留 raw 计数。
+
+        ## Issue #43: pulse 的 phase 语义
+
+        `on_like_total` 返回的 N 个 pulse 是**会话级**事实(高水位与桶数
+        已经记下, 重复/倒退天然不会重算)。但 pulse 换来的两样东西都是
+        **当前题资源**, 且必须**一次性**入账(一批只产生一个公告, 绝不
+        循环 N 次发业务事件):
+
+            round AI 玩家行动机会  +N
+            round 进度加成         +N * like_progress_seconds_per_bucket
+
+        只有 SETTING / QA 消费 pulse:
+            SETTING  记入"正在准备的这一题", 进 QA 后生效; 本身不加速
+                     出题、不重复提交 RIDDLE、不派发任何 AI 动作。
+            QA       主战场: 一次性入账 + 一个聚合公告。
+        其它 phase(REVEALING / REVEALED / IDLE / STOPPED):
+            只推进高水位与遥测 —— **不入账当前题、不带入下一题、
+            不发公告**。REVEALED 的 60 秒是 #45 评分+主题投票的窗口,
+            点赞既不缩短它、也不在那里暗示"下一题更快到来"。
+        """
         with self._lock:
             kind = str(getattr(ev, "kind", "") or "").lower()
             if kind == "gift":
@@ -375,15 +406,65 @@ class RoundEngine:
             if kind != "like":
                 return []
             total = getattr(ev, "total", 0)
-            gained = self._ai_player_ledger.on_like_total(total, now=now)
-            if not gained:
+            pulses = self._ai_player_ledger.on_like_total(total, now=now)
+            if not pulses:
                 return []
-            log.info("like total=%s -> AI玩家提问次数 +%d available=%d",
-                     total, gained, self._ai_player_ledger.available)
+            led = self._ai_player_ledger
+            log.info("like total=%s -> +%d pulse (high_water=%d "
+                     "consumed_buckets=%d lifetime=%d)",
+                     total, pulses, led.likes_total_high_water,
+                     led.likes_bucket_consumed, led.lifetime_pulses_total)
+            if self.phase not in (Phase.SETTING, Phase.QA):
+                # 见 docstring: 这些阶段 pulse 只推进高水位, 已在上面发生。
+                return []
+            # ---- 一次性入账(当前题) ----
+            self._ai_player_ledger.earn(pulses)
+            self._round_progress_bonus_seconds += (
+                pulses * max(0.0, float(
+                    self.cfg.like_progress_seconds_per_bucket)))
+            self._push_like_notice_locked(pulses)
             return [EngineAction(ActionKind.BROADCAST, {
-                "ai_player_questions_gained": gained,
+                "like_progress_pulses": pulses,
                 "phase_changed": False,
             })]
+
+    # ------------------------------------------------------------------
+    # Issue #43: 点赞推进的呈现事件(服务端组稿, 前端只按 seq 去重播放)
+    # ------------------------------------------------------------------
+    def _like_notice_round_locked(self) -> int:
+        """本批 pulse 记入了哪一题(呈现事件的 round identity)。
+
+        SETTING 期间 `round_index` 仍是上一题的(它在 `submit_riddle`
+        接受谜面时才推进), 而这批 pulse 属于**正在准备的**那一题。
+        """
+        return self._puzzle_index + (1 if self.phase == Phase.SETTING else 0)
+
+    def _push_like_notice_locked(self, pulses: int) -> None:
+        """生成一条点赞推进公告(一批 pulse 恰好一条, seq 单调去重)。
+
+        文案纪律(§14):
+            QA    表达"点赞产生了有效推进 + AI 玩家加入/加码";
+            SETTING  中性准确 —— 不得谎称"AI 正在行动"(谜面还没就位);
+            绝不出现 "+30 秒" 之类的内部调参数字。
+        REVEALING / REVEALED 不走到这里(调用方已按 phase 过滤)。
+        """
+        self._like_notice_seq += 1
+        if self.phase == Phase.SETTING:
+            text = "❤️ 点赞助攻已累积，新题开始后生效"
+        elif pulses > 1:
+            text = f"❤️ 点赞助攻 ×{pulses}！AI玩家获得更多行动机会，游戏加速"
+        else:
+            text = "❤️ 点赞助攻！AI玩家加入，游戏进度加快"
+        self._like_notice = {
+            "seq": self._like_notice_seq,
+            "round_index": self._like_notice_round_locked(),
+            "pulses": int(pulses),
+            "phase": self.phase.value,
+            "text": text,
+        }
+        _detail("点赞推进公告 seq=%d round=%d pulses=%d phase=%s",
+                self._like_notice["seq"], self._like_notice["round_index"],
+                pulses, self.phase.value)
 
     def submit_danmaku(self, user_id, user_name: str, content: str,
                        now: Optional[float] = None,
@@ -639,11 +720,18 @@ class RoundEngine:
                 return []
             self._last_activity = now
 
-            # 特殊指令
-            if norm in NEXT_TOKENS or any(t in norm for t in NEXT_TOKENS):
-                if self.phase == Phase.QA and self._reveals < self.cfg.max_reveals_per_puzzle:
-                    log.info("观众请求下一题")
-                    return self._enter_revealing_locked(now, "skip", "")
+            # ---- Issue #43 §11: 旧换题指令是 deterministic tombstone ----
+            # 识别 -> 消费 -> **到此为止**: 不 reveal、不进 QA、不调 LLM。
+            # 单个观众再也不能用 #下一题/#下一关/#换一题/#跳过/#next 结束
+            # 当前题; 而识别必须留在最前面, 否则这些字符串会掉进下面的
+            # QA 队列被当成普通问题送进 Answer LLM —— 那是硬要求禁止的
+            # 另一条 leak 路径。轻量提示都不回(回一条也要过 phase 门),
+            # 纯静默消费 + 计数观察。
+            if norm in LEGACY_SKIP_TOKENS or any(t in norm
+                                                 for t in LEGACY_SKIP_TOKENS):
+                self._legacy_skip_consumed += 1
+                _detail("旧换题指令已停用, 已消费(不 reveal/不进 QA): %s",
+                        norm[:20])
                 return []
             if norm in HINT_TOKENS or any(t in norm for t in HINT_TOKENS):
                 # 观众主动要提示(#提示)。界面上不宣传这个指令(免得大家
@@ -1704,6 +1792,28 @@ class RoundEngine:
         return [self._riddle_action_locked("riddle_retry",
                                            self._setting_attempts)]
 
+    def _real_elapsed_locked(self, now: float) -> float:
+        """本题的**真实**经过时长(秒)。wall-clock, 与任何加成无关。"""
+        if self._puzzle_started is None:
+            return 0.0
+        return max(0.0, now - self._puzzle_started)
+
+    def _effective_elapsed_locked(self, now: float) -> float:
+        """本题的**有效**经过时长 = real + 点赞进度加成(Issue #43 §6)。
+
+        这是 QA 时间轴(Hint1/2/3、自动揭晓、snapshot 的 next_event_*)
+        的**唯一**时间语义 —— 不要在别处手写 `now - start + bonus`,
+        两份手写迟早漂移。
+
+        什么**不**用 effective(全部真实 wall-clock, §8):
+            hint_min_gap_seconds / ai_player_min_gap_seconds /
+            hint_retry_seconds / QA 与 LLM 超时 / 重连 guard / 去重窗口 /
+            公告 hold。`hint_min_gap_seconds` 是防信息轰炸的现实冷却,
+            点赞不能把它一起加速。
+        """
+        return self._real_elapsed_locked(now) + max(
+            0.0, self._round_progress_bonus_seconds)
+
     def _tick_qa_locked(self, now: float) -> list[EngineAction]:
         acts: list[EngineAction] = []
 
@@ -1789,12 +1899,12 @@ class RoundEngine:
 
         # ③ 收尾与提示 —— **两个触发源, 取先到的那个**:
         #
-        #    时间轴(H1 之前唯一的那条, 语义不变):
-        #      t0          出题
-        #      t0 + 1×N    提示 1
-        #      t0 + 2×N    提示 2
-        #      t0 + 3×N    提示 3        (N = hint_seconds)
-        #      t0 + 4×N    揭晓
+        #    时间轴(Issue #43 起按 **effective elapsed** 走):
+        #      t0                 出题
+        #      t0 + 1×N - bonus   提示 1
+        #      t0 + 2×N - bonus   提示 2      (N = hint_seconds,
+        #      t0 + 3×N - bonus   提示 3       bonus = 点赞进度加成)
+        #      t0 + 4×N - bonus   揭晓(**且** 真实时长 >= puzzle_min_qa_seconds)
         #
         #    H1 新增的第二条: **成功的真人裁决条数**
         #      每 hint_questions_per_level 条 -> 进一格提示
@@ -1810,18 +1920,31 @@ class RoundEngine:
         #
         #    另外: 有人猜中 -> 立即揭晓(由 submit_qa 触发)。提问条数不设上限。
         #
-        #    **计时用 _puzzle_started, 与观众活动完全无关** —— 这条时间轴
-        #    的唯一目的就是"控制一道题的总时长"。有人一直聊天也要照走,
-        #    否则题目会无限拖下去。
+        #    **计时用 effective elapsed(Issue #43 §6/§7)** —— real_elapsed
+        #    之上叠加点赞进度加成, 与观众活动完全无关。这条时间轴的唯一
+        #    目的就是"控制一道题的总时长", 有人一直聊天也要照走, 否则
+        #    题目会无限拖下去。
         #    也**不要求队列为空**: 人多时提问永远问不完, 若等队列清空,
         #    提示和揭晓就永远不来了。
-        elapsed = now - self._puzzle_started if self._puzzle_started is not None else 0.0
+        real_elapsed = self._real_elapsed_locked(now)
+        elapsed = self._effective_elapsed_locked(now)
         slot = int(elapsed // self.cfg.hint_seconds)   # 当前走到第几个时间格
         if slot >= self.cfg.max_hints + 1:
-            log.info("第 %d 题时间轴走完(%.0fs), 揭晓", self._puzzle_index,
-                     elapsed)
-            acts.extend(self._enter_revealing_locked(now, "giveup", ""))
-            return acts
+            # ---- §9: 自动揭晓的**真实时间**最低保护 ----
+            # 点赞可以让 effective 提前越过揭晓阈值, 但真实 QA 时长不足
+            # `puzzle_min_qa_seconds` 就不能揭晓 —— "新题上屏 20 秒 +
+            # 一波点赞爆点"不能把题直接烧掉。真人真实通关(合同覆盖 /
+            # legacy SOLVE)不经过这里, 不受此限。守在下面的分支里每拍
+            # 重新判, 真实时间一到自然揭晓。
+            if real_elapsed < self.cfg.puzzle_min_qa_seconds:
+                _detail("effective 已过揭晓阈值但真实 QA 不足 %.0fs "
+                        "(real=%.0fs), 揭晓被最低保护压住",
+                        self.cfg.puzzle_min_qa_seconds, real_elapsed)
+            else:
+                log.info("第 %d 题时间轴走完(有效 %.0fs / 真实 %.0fs), 揭晓",
+                         self._puzzle_index, elapsed, real_elapsed)
+                acts.extend(self._enter_revealing_locked(now, "giveup", ""))
+                return acts
         # 到点就给提示(1..max_hints 格各给一条)。
         #
         # 关键(第三轮 review P1): 这里**不**再预先把 `_hints_given` +1 ——
@@ -1909,6 +2032,18 @@ class RoundEngine:
     # ==================================================================
     def _enter_setting_locked(self, now: float, reason: str) -> list[EngineAction]:
         self._release_current_ai_player_locked()
+        # ---- Issue #43 §4: round 级资源在新题开始时清零 ----
+        # 上一题没用完的 AI opportunity / 进度加成 / 未兑现的预约全部
+        # 作废 —— 它们是"当前题"资源, 不带进下一题。**绝不清**的是
+        # session 级的 Like 高水位与桶数(在 start_new_round 里刻意保留):
+        # 清了它们, 下一题就会从旧水位重新算出一批 pulse —— 举例,
+        # 上一题结束时 total=1287(桶 12), 若清零, 新题里 1287->1387 会被
+        # 算成 +1 之外还凭空多出 12 个 pulse。重复结算正是要防的。
+        self._round_progress_bonus_seconds = 0.0
+        self._ai_player_ledger.start_new_round()
+        # 上一题的点赞公告不再随快照下发(§16: 不跨题迟到)。
+        # seq 计数器不清 —— 它是全 session 的去重序号, 必须单调。
+        self._like_notice = None
         self.phase = Phase.SETTING
         _detail("阶段 -> SETTING (第 %d 题开始出题)", self._puzzle_index + 1)
         self._setting_deadline = now + self.cfg.setting_timeout_seconds
@@ -2504,10 +2639,21 @@ class RoundEngine:
                     # 没有 deadline(理论上不该发生) -> 保守: 不显示细节。
                     detail_visible = False
                     reveal_stage = "core"
+            # ---- §17: puzzle_elapsed_ms 继续表示**真实**播放时长 ----
+            # (不是点赞加速后的虚拟时长; 前端不得从它自算加成。)
+            # 注意与下面同一条纪律: 用 `is not None` —— FakeClock 从 0
+            # 开始时 `_puzzle_started` 是 0.0, 真值判断会当成"没有开始"。
             elapsed = None
-            if self.phase in (Phase.QA, Phase.REVEALING) and self._puzzle_started:
+            if (self.phase in (Phase.QA, Phase.REVEALING)
+                    and self._puzzle_started is not None):
                 elapsed = max(0, int((now - self._puzzle_started) * 1000))
-            # 时间轴倒计时: QA 阶段告诉前端"距离下一条提示/揭晓还有多久"
+            # 时间轴倒计时: QA 阶段告诉前端"距离下一条提示/揭晓还有多久"。
+            #
+            # ⚠️ Issue #43 §7/§17: 这里必须与 `_tick_qa_locked` **同源**
+            # (同一个 `_effective_elapsed_locked`), 否则会出现"Engine 因
+            # 点赞已到 Hint1, UI 还显示 40 秒"的分裂。揭晓的倒计时还要
+            # 把 §9 的真实时间最低保护算进去 —— 取两个条件里更晚的。
+            # 前端不得自行计算 bonus。
             ev_ms = None
             ev_kind = ""
             ev_label = ""
@@ -2516,15 +2662,26 @@ class RoundEngine:
             # `_puzzle_started` 会是 0.0, 真值判断会把它当成"没有开始"。
             if self.phase == Phase.QA and self._puzzle_started is not None:
                 n = self.cfg.hint_seconds
-                slot = int((now - self._puzzle_started) // n)
-                remaining = n - ((now - self._puzzle_started) % n)
-                ev_ms = max(0, int(remaining * 1000))
+                real = self._real_elapsed_locked(now)
+                eff = self._effective_elapsed_locked(now)
+                slot = int(eff // n)
                 if slot < self.cfg.max_hints:
+                    # 距下一格提示: bonus 在两条点赞事件之间是常数,
+                    # 所以"effective 还差多少"就等于"真实还差多少"。
+                    remaining = max(0.0, (slot + 1) * n - eff)
                     ev_kind = "hint"
                     ev_label = f"距第 {slot + 1} 条提示"
                 else:
+                    remaining = max(0.0, (self.cfg.max_hints + 1) * n - eff)
+                    # §9: 自动揭晓 = effective 过阈值 **且** 真实过最低保护。
+                    remaining = max(remaining,
+                                    max(0.0, self.cfg.puzzle_min_qa_seconds - real))
                     ev_kind = "reveal"
                     ev_label = "距揭晓"
+                ev_ms = max(0, int(remaining * 1000))
+                # 揭晓可能被最低保护压住而迟迟不走 -> slot 会超过总格数;
+                # UI 时间轴按格渲染, 钳到最后一格。
+                slot = min(slot, self.cfg.max_hints + 1)
             return Snapshot(
                 phase=self.phase,
                 puzzle=self._puzzle,
@@ -2568,6 +2725,10 @@ class RoundEngine:
                 danmaku=[d.to_json() for d in self._danmaku[-40:]],
                 notice=self._notice or None,
                 phase_hint=self._phase_hint,
+                # ---- Issue #43 §13: ai_player 是**当前题**的呈现状态 ----
+                # questions_* 三个都是 round 级(新题清零); likes_progress
+                # 是 session 级高水位 % 100 —— 前端只管显示, **不得**从
+                # Like.total 自己重新算桶。
                 ai_player={
                     "questions_available": self._ai_player_ledger.available,
                     "questions_earned":
@@ -2575,10 +2736,13 @@ class RoundEngine:
                     "questions_used":
                         self._ai_player_ledger.summon_consumed_total,
                     "likes_progress": self._ai_player_ledger.likes_progress,
-                    "likes_per_question": LIKES_PER_SUMMON,
+                    "likes_per_progress": LIKES_PER_SUMMON,
                     "in_flight": bool(
                         self._ai_player_ledger.detective_reservation),
                 },
+                # 点赞推进的显式呈现事件(§16): 服务端组稿 + seq 去重,
+                # 前端不从 questions_earned 的 delta 推断"AI 被召唤"。
+                like_progress_notice=self._like_notice,
                 stat_questions=self._questions_total,
                 stat_answered=self._answered_total,
                 stat_solved=self._solved_total,

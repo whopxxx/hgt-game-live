@@ -541,7 +541,13 @@
     const ai = s.ai_player || {};
     const parts = [];
     if (s.ai_player) {
-      parts.push(ai.in_flight ? "AI玩家正在推理…" : "每100点赞可以召唤 AI 玩家");
+      // Issue #43: 点赞推进统一文案 —— 只表达"助攻/加速", 绝不显示秒数。
+      // ❤️ 进度由服务端快照给出(likes_progress 是高水位 % 100),
+      // 前端不从 Like.total 自算桶。
+      const per = Number.isFinite(ai.likes_per_progress) ? ai.likes_per_progress : 100;
+      const prog = Number.isFinite(ai.likes_progress) ? ai.likes_progress : 0;
+      parts.push((ai.in_flight ? "AI玩家正在推理…" : "每100点赞，AI玩家助攻并加速本题")
+        + "　❤️ " + prog + " / " + per);
     }
     if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
     if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
@@ -624,16 +630,24 @@
     el.debugBody.innerHTML = L.join("\n");
   }
 
-  // Session-local presentation: merged AI notice + bounded FIFO of hint notices.
+  // Session-local presentation: merged like/hint notices + bounded FIFO of hint notices.
   const announcer = (() => {
     const box = $("announcer"), text = $("announcer-text");
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
-    let config = null, phase = "", earned = null, pendingAI = 0;
+    let config = null, phase = "", hintPuzzle = null, hintCount = null;
     let active = "", lastPresetId = null;
     let nextPreset = Infinity, timer = null, animation = null;
     let currentMessage = "", measuredWidth = 0;
-    let hintPuzzle = null, hintCount = null;
     const pendingHints = [];
+    // ---- Issue #43: 点赞推进公告(单一待播槽位, 不做 pendingLikes[]) ----
+    // likePending   等待播放的最新一条(新 seq 直接覆盖旧的 -> burst 永远
+    //               只积压一条, 不会无限 FIFO);
+    // lastLikeSeq   已见过的最大 seq: 基线不回放 —— 页面刷新/重连不能把
+    //               历史公告再播一遍。
+    // ⚠️ 基线的判定: **首帧快照**里就带着的公告属于历史(页面是中途打开
+    // 的), 只记 seq 不播; 首帧没有公告的页面, 之后收到的任何 seq 都是
+    // 活事件, 照播。否则"本场第一条点赞公告"会被误当历史吞掉。
+    let likePending = null, lastLikeSeq = null, sawFirstSnapshot = false;
     let leaderboardRows = [], leaderboardKey = "";
 
     function cancel() {
@@ -756,15 +770,16 @@
 
     function pump() {
       if (phase !== "qa" || active) return;
-      if (pendingAI) {
-        const delta = pendingAI;
-        pendingAI = 0;
-        show(delta > 1 ? "AI玩家已被触发"
-          : "AI玩家已被召唤！正在思考…", "ai");
-        return;
-      }
       if (pendingHints.length) {
         show(pendingHints.shift(), "hint");
+        return;
+      }
+      // Issue #43: 点赞公告排在提示之后、preset/榜单之前 ——
+      // 提示永远优先, 点赞不会腰斩提示, 但可以打断preset/榜单。
+      if (likePending) {
+        const lp = likePending;
+        likePending = null;
+        show(lp.text, "like");
         return;
       }
       const items = config && config.enabled ? config.items.filter(x => x.enabled) : [];
@@ -780,16 +795,28 @@
       }
     }
     function update(s) {
-      const value = (s.ai_player || {}).questions_earned;
-      if (Number.isSafeInteger(value) && value >= 0) {
-        if (earned !== null && value > earned) pendingAI += value - earned;
-        earned = value; // First valid snapshot (and a server reset) is a baseline.
+      // ---- Issue #43: 显式点赞推进事件(seq 去重, 服务端组稿) ----
+      // 前端不再从 questions_earned 的 delta 推断"AI 被召唤" —— round 级
+      // 语义下 delta 会把换题 reset / 迟到公告误判成新事件。
+      const lp = s.like_progress_notice;
+      if (Number.isSafeInteger(lp && lp.seq)) {
+        if (!sawFirstSnapshot) {
+          sawFirstSnapshot = true;
+          lastLikeSeq = lp.seq; // 首帧: 只建基线, 不回放历史公告
+        } else if (lp.seq > lastLikeSeq && lp.text) {
+          lastLikeSeq = lp.seq;
+          likePending = lp;
+        }
+      } else if (!sawFirstSnapshot) {
+        sawFirstSnapshot = true; // 首帧无公告: 之后来的都是活事件
+        lastLikeSeq = 0;
       }
       if (hintPuzzle !== s.puzzle_index) {
         const hadPuzzle = hintPuzzle !== null;
         hintPuzzle = s.puzzle_index;
         hintCount = null;
         pendingHints.length = 0;
+        likePending = null; // 旧题的点赞公告不跨题播放
         // 每道新题都重新从第 1 名开始滚完整 Top10。
         // 同一题内 AI / 提示覆盖排行榜后，也会重新从整条榜首开始，
         // 不再维护分页/页码状态。
@@ -817,19 +844,18 @@
       if (phase !== s.phase) {
         phase = s.phase;
         cancel();
+        likePending = null; // 换阶段不带旧公告: QA 的点赞反馈不拖进揭晓/新题
         nextPreset = performance.now() + interval();
       }
       box.classList.toggle("hidden", phase !== "qa");
       if (phase !== "qa") return;
-      if (pendingAI && active !== "ai") {
-        // An interrupted hint still gets a full readable turn after the AI notice.
-        if (active === "hint") {
-          pendingHints.unshift(currentMessage);
-          if (pendingHints.length > 16) pendingHints.pop();
-        }
-        cancel();
-      } else if ((pendingHints.length && active !== "ai" && active !== "hint")
-                 || (changed && active === "leaderboard")) cancel();
+      // ---- 抢占规则(Issue #43 §15) ----
+      //   * 提示不被任何东西腰斩: active === "hint" 时谁都不取消,
+      //     点赞/其它公告在它播完后由 pump() 依优先级接上;
+      //   * 点赞可打断 preset/榜单; 新点赞可替换正在播/待播的旧点赞;
+      //   * 提示可打断正在播的点赞(提示更重要)。
+      if ((likePending || pendingHints.length) && active !== "hint") cancel();
+      else if (changed && active === "leaderboard") cancel();
       pump();
     }
     async function reload() {

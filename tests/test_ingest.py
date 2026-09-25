@@ -692,16 +692,20 @@ def test_engine_submit_interaction_wires_like_only() -> None:
     check("未知事件返回空动作", eng.submit_interaction(object()) == [])
     eng.submit_interaction(InteractionEvent(kind="like", total=487))
     acts = eng.submit_interaction(InteractionEvent(kind="like", total=523))
-    check("跨档 Like 返回 BROADCAST",
-          len(acts) == 1 and acts[0].kind.value == "broadcast", acts)
-    check("Like 获得 1 次",
-          eng.snapshot().ai_player["questions_available"] == 1,
+    # ---- Issue #43: 引擎还在 IDLE(没有"当前题")时, pulse 只推进
+    # session 高水位, 不入账、不发公告 —— BROADCAST 只在 SETTING/QA 出现。
+    check("IDLE 阶段跨档 Like 无动作(无题可入)", acts == [], acts)
+    check("Like 不入账(IDLE)",
+          eng.snapshot().ai_player["questions_earned"] == 0,
           eng.snapshot().ai_player)
+    led = eng._ai_player_ledger
+    check("高水位/桶数照记", led.likes_total_high_water == 523
+          and led.likes_bucket_consumed == 5, led.snapshot())
     for _ in range(100):
         eng.submit_interaction(InteractionEvent(
             kind="gift", combo_count=9, repeat_count=9, total_count=999))
     check("Gift 永远不增加次数",
-          eng.snapshot().ai_player["questions_available"] == 1,
+          eng.snapshot().ai_player["questions_earned"] == 0,
           eng.snapshot().ai_player)
     check("阶段/题号/QA 计数都没变",
           (eng.phase, eng.round_index, eng._qa_total) == before,
