@@ -428,24 +428,31 @@ class ProfileCounters:
         这是本包最有价值的一行输出: 真实送礼之后, 不需要等下播、不需要
         猜, 直接看这一路落在哪一层。
 
-            primary Gift-family = 0             -> 连接/订阅/认证层
-            primary 有但 unhandled              -> dispatch 层
+            primary GiftMessage 从未出现        -> 连接/订阅/认证层
+            primary 出现但 unhandled            -> dispatch 层
             primary handled, parse_error > 0    -> proto 层
             parse 成功, emitted = 0             -> callback / ingest 层
+
+        ⚠️ **primary 的判据是 exact `WebcastGiftMessage` 是否出现**
+        (Issue #42 review 修正)。`gift_method_seen` 是**子串**分类 ——
+        `WebcastGiftSortMessage` 也算 Gift-family, 而匿名连接实测能
+        持续收到 GiftSort 却**收不到** primary GiftMessage。若外层判据
+        用 family 计数, 那种"只有 secondary"的连接会被误判成 ok, 把
+        "匿名收不到礼物"这个最关键的现场结论洗掉。所以第一层必须看
+        `method_counts["WebcastGiftMessage"]` 本身。
 
         ⚠️ 判据的顺序**就是优先级**, 不要重排。四层是"从外往里"的漏斗:
         服务端没给 -> 给了但没进 handler -> 进了 handler 但解析炸了 ->
         解析成功但业务链没收到。顺序反了会得到自相矛盾的结论(例如同时
         "dispatch"与"proto"), 而那正是现场最难判断的形状。
 
-        ⚠️ **primary verdict 只看 primary `WebcastGiftMessage` 链**
-        (Issue #42 §8.1): `WebcastGiftSortMessage` 等其它 Gift-family
-        method 的 unhandled 只作为 secondary 诊断(见
+        ⚠️ **primary verdict 只看 primary 链**: `WebcastGiftSortMessage`
+        等其它 Gift-family method 的 unhandled 只作为 secondary 诊断(见
         `secondary_gift_family_unhandled()`), 不得把"primary 解析 +
-        回调全通"盖成 `dispatch` —— 那会让一场成功的验收被误读成失败。
+        回调全通"盖成 `dispatch`。
         """
-        if self.gift_method_seen == 0:
-            return "transport_or_auth"      # 服务端根本没给任何 Gift-family
+        if self.method_counts.get(PRIMARY_GIFT_METHOD, 0) == 0:
+            return "transport_or_auth"      # primary GiftMessage 从未出现
         if self.unhandled_counts.get(PRIMARY_GIFT_METHOD):
             return "dispatch"               # primary 自己没进 handler
         if self.parse_error_counts.get(PRIMARY_GIFT_METHOD):

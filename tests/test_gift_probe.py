@@ -1333,6 +1333,25 @@ def test_end_to_end_runner_reaches_all_four_verdict_layers():
     check("primary unhandled -> 仍是 dispatch",
           arm.counters.verdict() == "dispatch", arm.counters.verdict())
 
+    # ---- (g) Issue #42 review 修正: **只有** secondary Gift-family
+    #          (WebcastGiftSortMessage)、primary 一次都没出现 -> 仍然是
+    #          transport_or_auth ----
+    #
+    # 匿名连接的**真实情况**正是这个形状: GiftSort 持续能收, 但 primary
+    # GiftMessage 一条没有。verdict 的第一层必须以 exact
+    # `WebcastGiftMessage` 是否出现为准 —— 若按 family 计数判, 这种
+    # 连接会被误判成 ok, 把"匿名收不到礼物"洗成"礼物链正常"。
+    arm, f = build()
+    feed(f, [("WebcastGiftSortMessage", b"", 10),
+             ("WebcastGiftSortMessage", b"", 11)])
+    check("只有 secondary Gift -> 仍判 transport_or_auth",
+          arm.counters.verdict() == "transport_or_auth",
+          arm.counters.verdict())
+    check("secondary 计入诊断字段",
+          arm.counters.secondary_gift_family_unhandled()
+          == {"WebcastGiftSortMessage": 2},
+          arm.counters.secondary_gift_family_unhandled())
+
 
 def test_dry_run_handler_does_not_swallow_parse_errors():
     """GP-22: 干跑 handler **绝不能**吞掉解析异常(Blocker 2 的判据根基)。

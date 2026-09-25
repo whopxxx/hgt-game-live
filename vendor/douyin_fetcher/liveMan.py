@@ -490,8 +490,7 @@ class DouyinLiveWebFetcher:
         # local 生成路径。写死 "local-generated" 会让 reference 臂的现场
         # 输出与实际 profile 不一致, 误导排障。
         mode = str(boot.get("bootstrap_mode") or "local-generated")
-        print(f"【bootstrap】本次连接使用 {mode} now_ms={now_ms}"
-              f"   <<< B-smoke 有效性判据(应为 local-generated)", flush=True)
+        print(f"【bootstrap】本次连接使用 {mode} now_ms={now_ms}", flush=True)
         cursor = boot["cursor"]
         internal_ext = boot["internal_ext"]
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
