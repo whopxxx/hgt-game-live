@@ -28,12 +28,14 @@
       -> solution_candidate=true 时 verdict 只能是 是 / 不是
       -> solution_candidate=false 时可以是 无关(命题与 case 无关),
          也可以是 是/不是(说中一条零散事实, 但不在解释整条谜底)
-      -> verified_completion_fact_ids: 无关时必须空
+      -> verified_completion_fact_ids 必填; **无关时必须是空数组** ——
+         "与 case 无关"和"建立了通关事实"不可能同时成立, 带了任何 id
+         都会被整体拒绝, 不会被清理后接受
 
     response_kind = rephrase
       -> verdict 必须为空(不要伪造一个「无关」)
       -> solution_candidate 必须 false
-      -> verified_completion_fact_ids 必须空
+      -> verified_completion_fact_ids 必须是空数组(必填字段, 没有就给 [])
 
 【判据】仍然以【事实表】为唯一依据。
 

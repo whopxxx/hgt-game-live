@@ -2942,11 +2942,12 @@ def _recheck(verdict="是", ids=None, cand=None, kind="verdict"):
     `cand` 默认按 verdict 推断(是/不是 -> True, 无关 -> False), 需要
     构造"自相矛盾返回"的用例时显式传。
     Issue #53 §21: 工具还必须回 `response_kind`(verdict|rephrase)。
+    #54 review 第二轮: `verified_completion_fact_ids` 也是必填 ——
+    合规回包必须显式给(空数组也算显式)。
     """
     d = {"response_kind": kind, "verdict": verdict,
-         "solution_candidate": (verdict != "无关") if cand is None else cand}
-    if ids is not None:
-        d["verified_completion_fact_ids"] = list(ids)
+         "solution_candidate": (verdict != "无关") if cand is None else cand,
+         "verified_completion_fact_ids": list(ids or [])}
     return LLMResult(tool_input=d, model="m")
 
 

@@ -4199,11 +4199,16 @@ _TOOL_CANDIDATE_RECHECK = {
                     "判据与通关事实复核员**完全一致**(见特异性硬规则): "
                     "观众必须自己说出了那条 fact 的核心机制, 不能因为你看得见 "
                     "hidden fact 就替观众补全。\n"
-                    "response_kind=rephrase 或 verdict=无关 时必须留空数组。\n"
+                    "⚠️ 必填(没有就给空数组): response_kind=rephrase 或 "
+                    "verdict=无关 时**必须**是空数组 —— 带了任何 id 都会"
+                    "被整体拒绝, 不会被清理后接受。\n"
                     "这里**没有** solved 字段 —— 通关由系统按合同覆盖判定。"),
             },
         },
-        "required": ["response_kind", "solution_candidate"],
+        # ---- #54 review 第二轮: verified 也是必填 ----
+        # "缺失当空"是洗数据通道的 schema 侧入口; 与 Python 门对齐。
+        "required": ["response_kind", "solution_candidate",
+                     "verified_completion_fact_ids"],
     },
 }
 
@@ -7225,25 +7230,36 @@ class PuzzleWriter:
             v = str(ti.get("verdict", "") or "").strip()
             cand = ti.get("solution_candidate")
             raw_verified = ti.get("verified_completion_fact_ids")
+            # ---- #54 review 第二轮: verified 必须**显式** list ----
+            # 缺失不是"没确认" —— 那是没按合同出牌, 和类型不对一样属于
+            # malformed。三种 verdict 类别对它的要求:
+            #     rephrase -> 必须显式 [](且 candidate 必须 false)
+            #     无关     -> 必须显式 [](结构与"无关"自相矛盾即拒)
+            #     是/不是  -> list 合规后**才**允许进入 missing-id filtering
+            # 旧代码在这之前有两条洗数据通道: rephrase 带 verified 被
+            # 清掉后照单接受; 无关 + candidate=false + verified=["f1"]
+            # 走到下面的 `v != IRRELEVANT` 守卫把 ["f1"] 静默清成 []。
+            # 都是"坏结构 -> 洗干净 -> 当合法结果继续用", 全部 fail closed。
+            if not isinstance(raw_verified, list):
+                self._recheck_failed(
+                    r0, text,
+                    f"verified_completion_fact_ids={raw_verified!r} "
+                    f"不是 list(缺失也不行, schema 已设必填)")
+                return False
             if rk == "rephrase":
                 # 第一层把闲聊/索取信息错标成了完整解候选 —— 重判按新
                 # 合同改回 rephrase: 无裁决、无候选、无建立。**绝不**
                 # 为了"给个了断"伪造一个「无关」。
                 #
-                # ---- #54 review 第一轮: 这里也不能"洗干净再用" ----
-                # rephrase 却带 verified=["f1"] 是结构自相矛盾 —— 旧代码
-                # 会把 ["f1"] 清掉然后当正常 rephrase 接受, 洗掉了模型的
-                # 自相矛盾。fail closed: 整条 unavailable。
-                # verdict 也按**原始值**查: 0 / 1 这类非字符串在旧的
+                # ---- #54 review 第一/二轮: 这里也不能"洗干净再用" ----
+                # verdict 按**原始值**查: 0 / 1 这类非字符串在旧的
                 # `str(x or "")` 下会伪装成"空"。
                 bad = (
                     (ti.get("verdict") is not None
                      and (not isinstance(ti.get("verdict"), str)
                           or ti.get("verdict").strip()))
                     or cand is not False
-                    or (raw_verified is not None
-                        and (not isinstance(raw_verified, list)
-                             or raw_verified != []))
+                    or raw_verified != []
                 )
                 if bad:
                     self._recheck_failed(
@@ -7285,27 +7301,32 @@ class PuzzleWriter:
                 # "不是完整解候选"。这两者可以共存(说中一条零散 fact),
                 # 所以只接受, 不报错。
                 pass
+            # ---- #54 review 第二轮: 无关 + verified 非空 = 结构自相矛盾 ----
+            # "这句话与 case 无关"和"这句话建立了通关事实 f1"不可能同时
+            # 成立。旧代码在这里把 ["f1"] 静默清成 [] 然后当合法「无关」
+            # 用 —— 洗数据。fail closed: 整条 unavailable。
+            if v == P.IRRELEVANT and raw_verified:
+                self._recheck_failed(
+                    r0, text, f"无关 + verified={raw_verified!r}")
+                return False
 
             # ---- 确认 completion(自己就是 verifier, 不再转交) ----
+            # 是/不是 时 raw_verified 已通过 list 门, 进入 missing-id
+            # filtering(只接受 missing 里的真实 id —— 与
+            # `_completion_verify` 同一套: 不许借机把观众没说过的 fact
+            # 塞进来)。
             verified: list = []
             if v != P.IRRELEVANT and missing:
-                raw_ids = ti.get("verified_completion_fact_ids")
-                if raw_ids is None:
-                    raw_ids = []
-                if not isinstance(raw_ids, list):
-                    self._recheck_failed(r0, text,
-                                         "verified_completion_fact_ids 类型不对")
-                    return False
-                for x in raw_ids:
+                for x in raw_verified:
                     fid = str(x).strip()
                     # 只接受 missing 里的真实 id —— 与 `_completion_verify`
                     # 同一套过滤: 不许借机把观众没说过的 fact 塞进来。
                     if fid and fid in missing and fid not in verified:
                         verified.append(fid)
-                if len(verified) != len([x for x in raw_ids
+                if len(verified) != len([x for x in raw_verified
                                          if str(x).strip()]):
                     log.debug("重判返回了非法 completion id, 已过滤: %r -> %r",
-                              raw_ids, verified)
+                              raw_verified, verified)
 
             r0.verdict = v
             r0.solution_candidate = cand

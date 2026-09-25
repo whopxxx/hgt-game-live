@@ -136,11 +136,16 @@ def _match(ids):
                      model="m")
 
 
-def _recheck(kind="verdict", verdict="是", cand=True, verified=None):
-    return LLMResult(tool_input={
-        "response_kind": kind, "verdict": verdict,
-        "solution_candidate": cand,
-        "verified_completion_fact_ids": list(verified or [])}, model="m")
+def _recheck(kind="verdict", verdict="是", cand=True, verified=None,
+             omit_verified=False):
+    # #54 review 第二轮: verified_completion_fact_ids 是 schema 必填 ——
+    # 合规回包必须显式给(空数组也算显式); omit_verified 专门造"缺失"
+    # 的 malformed 反例。
+    d = {"response_kind": kind, "verdict": verdict,
+         "solution_candidate": cand}
+    if not omit_verified:
+        d["verified_completion_fact_ids"] = list(verified or [])
+    return LLMResult(tool_input=d, model="m")
 
 
 def _writer(client):
@@ -873,6 +878,83 @@ def test_heuristics_out_of_qa_business():
           all(c["tool"]["name"] != "emit_judgement" for c in fc.calls))
 
 
+def test_recheck_verified_contract():
+    """#54 review 第二轮: verified 必须**显式** list, 三个类别各有硬门。
+
+        rephrase -> 必须显式 []
+        无关     -> 必须显式 [](无关+verified=[f1] 是结构自相矛盾)
+        是/不是  -> list 合规后才进入 missing-id filtering
+        缺失     -> malformed -> unavailable(schema 必填 + Python 门)
+
+    旧代码有两条洗数据通道: rephrase 带 verified 被清掉后照单接受;
+    无关+candidate=false+verified=["f1"] 被 `v != IRRELEVANT` 守卫
+    静默清成 []。都是"坏结构 -> 洗干净 -> 当合法结果继续用"。
+    """
+    print("\n[#54-R2] Recheck verified_completion_fact_ids 合同")
+    from story.parser import UNAVAILABLE as UNA
+
+    # ---- review 点名的精确用例: 无关 + candidate=false + verified=["f1"] ----
+    fc = FakeClient([
+        _recheck_setup(),
+        LLMResult(tool_input={
+            "response_kind": "verdict", "verdict": "无关",
+            "solution_candidate": False,
+            "verified_completion_fact_ids": ["f1"]}, model="m")])
+    out, _ = _run(fc, "怎么做馊饭？")
+    r = out[0]
+    check("无关 + verified=[f1] -> 整条 unavailable",
+          r.verdict == UNA and r.status == "unavailable",
+          (r.verdict, r.status))
+    check("verified 没有被洗成 [] 后继续用",
+          r.completion_verified_fact_ids == []
+          and r.established_fact_ids == []
+          and r.candidate_recheck_prompt_version
+          == "candidate-recheck-v1")
+
+    # ---- verified 缺失: 三个类别都是 malformed ----
+    for kind, verdict, cand in (("verdict", "无关", False),
+                                ("verdict", "是", True),
+                                ("rephrase", "", False)):
+        fc = FakeClient([
+            _recheck_setup(),
+            _recheck(kind, verdict, cand, omit_verified=True)])
+        out, _ = _run(fc, "怎么做馊饭？")
+        check(f"verified 缺失(kind={kind} verdict={verdict!r}) -> 未判定",
+              out[0].verdict == UNA and out[0].status == "unavailable",
+              (out[0].verdict, out[0].status))
+        check(f"  缺失分支不再有第三次调用",
+              len(fc.calls) == 2, len(fc.calls))
+
+    # ---- rephrase + verified 非空(第二轮把"缺失可容"收紧为"必须[]") ----
+    fc = FakeClient([
+        _recheck_setup(),
+        _recheck("rephrase", "", False, verified=["f1"])])
+    out, _ = _run(fc, "哈哈哈好笑")
+    check("rephrase + verified=[f1] -> 未判定(不洗干净再用)",
+          out[0].verdict == UNA and out[0].status == "unavailable")
+
+    # ---- 合规形态全部畅通 ----
+    fc = FakeClient([_recheck_setup(),
+                     _recheck("verdict", "无关", False, verified=[])])
+    out, _ = _run(fc, "怎么做馊饭？")
+    check("无关 + verified=[] 畅通",
+          out[0].verdict == "无关" and out[0].status == "ok")
+    fc = FakeClient([_recheck_setup(), _recheck("rephrase", "", False)])
+    out, _ = _run(fc, "哈哈哈好笑")
+    check("rephrase + verified=[] 畅通",
+          out[0].response_kind == "rephrase" and out[0].status == "ok")
+    fc = FakeClient([_recheck_setup(),
+                     _recheck("verdict", "是", True, verified=[])])
+    out, _ = _run(fc, "随便猜的")
+    check("是 + verified=[] 畅通(空列表 = 无确认, 不是 malformed)",
+          out[0].verdict == "是" and out[0].established_fact_ids == [])
+
+    # ---- schema 侧: required 对齐 ----
+    rc = _TOOL_CANDIDATE_RECHECK["input_schema"]
+    check("schema required 含 verified_completion_fact_ids",
+          "verified_completion_fact_ids" in rc["required"], rc["required"])
+
+
 # ======================================================================
 def main():
     print("=== tests/test_judging_prompt_pack.py ===")
@@ -887,6 +969,7 @@ def main():
     test_malformed_results_fail_closed()
     test_candidate_only_from_model()
     test_recheck_two_directions()
+    test_recheck_verified_contract()
     test_recheck_failure_no_third_call()
     test_completion_verify_normal_path()
     test_completion_verify_tech_failure()
