@@ -748,6 +748,26 @@ def _capture_arm_url(profile, *, user_unique_id=None, now_ms=1789000000000,
     # 房间号与时钟都固定, 让两次调用的差异**只能**来自 profile 本身。
     f.__dict__["_DouyinLiveWebFetcher__room_id"] = room_id
 
+    # ---- #54 CI 事故修复: 这个套件的合同是"完全离线", 就必须真离线 ----
+    #
+    # `WebSocketApp` 的 stub 换得太晚: `_connectWebSocket()` 在走到
+    # `websocket.WebSocketApp(url, ...)` **之前**, 会先执行
+    # `_build_ws_cookie_header()` -> 匿名分支 -> `self.ttwid` ->
+    # `session.get("https://live.douyin.com/")` —— 真网络, 且底层
+    # requests **没有 timeout**。GitHub runner 网络一抽风, 整个 step
+    # 挂死(2026-09-26 实录: run 36176109844 停在 gift_probe 直到超时;
+    # 之前多次"随机挂 28 分钟"的 gift_probe 事故都是它)。
+    #
+    # 根修: 预置一个确定性的测试 ttwid —— `ttwid` 属性是惰性缓存,
+    # 有值就**根本不会**发 HTTP。本测试真正要测的东西(真实 bootstrap
+    # 生成、真实 signature、真实 WSS URL 拼装、真实 cookie header 拼装)
+    # 一件没少 —— ttwid 的**网络获取**本来就不属于这里的目标。
+    f.__dict__["_DouyinLiveWebFetcher__ttwid"] = "TEST_TTWID"
+    # 硬保护: 以后谁又把网络接回来, CI 立刻红(带明确原因), 而不是挂
+    # 十分钟让人以为又是玄学抖动。
+    f.session.get = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("gift_probe offline test attempted network"))
+
     captured = {"url": None, "headers": None, "stdout": None}
 
     class _StopHere(Exception):
