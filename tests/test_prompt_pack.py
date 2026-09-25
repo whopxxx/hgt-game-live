@@ -41,6 +41,7 @@ from story.prompt_pack import (  # noqa: E402
     STAGES, PromptPackError, load_prompt, stage_version,
 )
 from story.quality import QUALITY_POLICY_VERSION, validate_spec  # noqa: E402
+from story.config import Config  # noqa: E402
 
 FAIL = [0]
 
@@ -258,11 +259,15 @@ def _v1_contract_payload(n_completion=2, **overrides):
     """
     facts = [
         {"id": "f1", "text": "退潮时礁石露出水面", "kind": "core",
+         "visibility": "hidden",
          "public_text": "退潮后水下的礁石会露出来"},
         {"id": "f2", "text": "灯的真正作用是标示礁石位置", "kind": "core",
+         "visibility": "hidden",
          "public_text": "灯是在标记危险礁石的位置"},
-        {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support"},
-        {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion"},
+        {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support",
+         "visibility": "hidden"},
+        {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion",
+         "visibility": "hidden"},
     ]
     extra_ids: list = []
     for i in range(3, n_completion + 1):
@@ -683,6 +688,155 @@ def test_single_source_of_prompts():
 
 
 # ======================================================================
+# P16: v1 坏 Contract/Audit 数据不被 parser 洗干净(#51 review Blocker 1)
+# ======================================================================
+def test_v1_contract_duplicate_completion_not_washed():
+    print("\n[P16] Contract 回传 [f1,f1,f2]: 原样保留 -> 重复硬门触发")
+    from story.llm import _spec_from_tool
+    payload = _v1_contract_payload(
+        2, completion_fact_ids=["f1", "f1", "f2"])
+    spec = _spec_from_tool(payload, protocol_version=V1)
+    check("v1: 重复 id 原样保留(不被去重)",
+          spec.completion_fact_ids == ["f1", "f1", "f2"],
+          spec.completion_fact_ids)
+    vr = validate_spec(spec)
+    check("v1: 重复 completion id 硬门真的触发",
+          any("重复" in e for e in vr.errors), vr.errors)
+    check("v1: 重复合同不是合法状态(整份拒)", not vr.ok, vr.ok)
+    # 反证: legacy 路径行为不变 —— 仍去重
+    legacy = _spec_from_tool(payload)
+    check("legacy: 仍去重(逐位不变)",
+          legacy.completion_fact_ids == ["f1", "f2"],
+          legacy.completion_fact_ids)
+    # 端到端: v1 全链上这份坏 Contract 必须以 validation_reject 死掉
+    spec2, reason2, _cli2, w2 = _run_pipeline(payload)
+    check("端到端不成题", not (spec2 and spec2.puzzle), reason2)
+    check("拒因 validation_reject", _reject_of(w2) == "validation_reject",
+          _reject_of(w2))
+
+
+def test_v1_contract_missing_visibility_not_washed():
+    print("\n[P17] Contract fact 缺 visibility: 不被默认成 hidden")
+    from story.llm import _spec_from_tool
+    payload = _v1_contract_payload(2)
+    payload["facts"][1] = {"id": "f2", "text": "灯的真正作用是标示礁石位置",
+                           "kind": "core", "public_text": "灯是在标记位置"}
+    spec = _spec_from_tool(payload, protocol_version=V1)
+    f2 = next(f for f in spec.facts if f.id == "f2")
+    check("v1: 缺 visibility 保留空串(不默认 hidden)", f2.visibility == "",
+          f2.visibility)
+    vr = validate_spec(spec)
+    check("v1: validator 看见坏 visibility(不是合法状态)",
+          (not vr.ok or vr.fixable)
+          and any("visibility" in e for e in vr.errors + vr.fixable),
+          (vr.errors, vr.fixable[:1]))
+    check("legacy: 仍默认 hidden(逐位不变)",
+          next(f for f in _spec_from_tool(payload).facts
+               if f.id == "f2").visibility == "hidden",
+          "legacy 行为被改")
+    # 端到端: 坏 fact 活不到入池(reviewer pass 原样带回同样不干净)
+    spec2, reason2, _cli2, w2 = _run_pipeline(
+        payload, review_result=LLMResult(tool_input=_review_payload("pass")))
+    check("端到端不成题", not (spec2 and spec2.puzzle), reason2)
+
+
+def test_v1_reviewer_bundle_illegal_fact_not_washed():
+    print("\n[P18] Reviewer 回传非法 kind/visibility: strict 解析不归一")
+    # 审稿 fix 回传一个 kind 非法 + visibility 缺失的 fact
+    fixed = _review_payload(decision="fix", puzzle=PUZZLE)
+    fixed["facts"] = [
+        {"id": "f1", "text": "退潮时礁石露出水面", "kind": "narrative",
+         "public_text": "退潮后水下的礁石会露出来"},
+        {"id": "f2", "text": "灯的真正作用是标示礁石位置", "kind": "core",
+         "public_text": "灯是在标记危险礁石的位置"},
+        {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support"},
+        {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion"},
+    ]
+    spec, reason, _cli, w = _run_pipeline(
+        _v1_contract_payload(2),
+        review_result=LLMResult(tool_input=fixed))
+    check("坏 fact 不成题", not (spec and spec.puzzle), reason)
+    check("拒因 validation_reject(不是静默修好)",
+          _reject_of(w) == "validation_reject", _reject_of(w))
+    # 反证: 合法 bundle 照样通过(strict 不误伤)
+    ok_spec, ok_reason, _c2, _w2 = _run_pipeline(
+        _v1_contract_payload(2),
+        review_result=LLMResult(tool_input=_review_payload("pass")))
+    check("合法 bundle 照常成题", bool(ok_spec and ok_spec.puzzle), ok_reason)
+
+
+def test_v1_reviewer_duplicate_completion_not_washed():
+    print("\n[P18b] Reviewer 回传重复 completion id: 原样抵达 validator")
+    dup = _review_payload("pass",
+                          completion_fact_ids=["f1", "f1", "f2"])
+    spec, reason, _cli, w = _run_pipeline(
+        _v1_contract_payload(2),
+        review_result=LLMResult(tool_input=dup))
+    check("重复合同不成题", not (spec and spec.puzzle), reason)
+    check("拒因 validation_reject", _reject_of(w) == "validation_reject",
+          _reject_of(w))
+
+
+# ======================================================================
+# P19: 非法 GenerationBrief 在 0 次 LLM 调用前被拒(#51 review Blocker 2)
+# ======================================================================
+def test_invalid_brief_fails_closed_before_any_llm_call():
+    print("\n[P19] 非法 brief: Truth 之前确定性拒绝, 0 次模型调用")
+    from story.keyword_seed import keyword_spec as _ks
+
+    class _Bag:
+        def draw(self):  # pragma: no cover - 不应被调用
+            raise AssertionError("bag 不该被抽")
+
+    # 通过 keyword_spec 入口
+    cli = FakeClient([LLMResult(tool_input={"answer": ANSWER})])
+    w = PuzzleWriter(client=cli, runtime_cfg=Config(sim_path="x",
+                                                    no_llm=True))
+    bad_brief = GenerationBrief(requested_category="mystery",
+                                difficulty="normal")
+    raised = None
+    try:
+        _ks(w, _Bag(), 20260925, should_continue=lambda: True,
+            brief=bad_brief)
+    except ValueError as e:
+        raised = str(e)
+    check("非法 brief 抛 ValueError", raised is not None, "没抛")
+    check("错误点名两个字段", "requested_category" in (raised or "")
+          and "difficulty" in (raised or ""), raised)
+    check("**0 次 LLM 调用**", cli.calls == [], len(cli.calls))
+
+    # 单独非法 difficulty(最危险: 只影响 Truth/metrics, 可能一路入池)
+    cli2 = FakeClient([LLMResult(tool_input={"answer": ANSWER})])
+    w2 = PuzzleWriter(client=cli2, runtime_cfg=Config(sim_path="x",
+                                                      no_llm=True))
+    raised2 = None
+    try:
+        _ks(w2, _Bag(), 20260925, should_continue=lambda: True,
+            brief=GenerationBrief(difficulty="normal"))
+    except ValueError:
+        raised2 = True
+    check("非法 difficulty 抛 ValueError", raised2 is True, "没抛")
+    check("**0 次 LLM 调用(difficulty)**", cli2.calls == [], len(cli2.calls))
+
+    # writer 直调入口同样挡(防御深度)
+    w3 = PuzzleWriter(client=FakeClient([]), runtime_cfg=Config(
+        sim_path="x", no_llm=True))
+    raised3 = None
+    try:
+        w3.gen_keyword_story(["灯塔", "退潮"], "red",
+                             brief=GenerationBrief(requested_category="banana"))
+    except ValueError:
+        raised3 = True
+    check("gen_keyword_story 直调同样 fail closed", raised3 is True, "没抛")
+
+    # 合法 brief 不受影响(require_valid 返回 self)
+    check("合法 brief 通过 require_valid",
+          GenerationBrief(requested_category="sci_fi",
+                          difficulty="hard").require_valid()
+          .requested_category == "sci_fi", "合法 brief 被误拒")
+
+
+# ======================================================================
 def main():
     print("=== tests/test_prompt_pack.py ===")
     test_all_stages_load()
@@ -698,6 +852,11 @@ def main():
     test_review_bundle_missing_v1_fields_rejected()
     test_review_rewrite_lifecycle()
     test_safety_and_truthfulness_gates_still_hold()
+    test_v1_contract_duplicate_completion_not_washed()
+    test_v1_contract_missing_visibility_not_washed()
+    test_v1_reviewer_bundle_illegal_fact_not_washed()
+    test_v1_reviewer_duplicate_completion_not_washed()
+    test_invalid_brief_fails_closed_before_any_llm_call()
     test_classic_and_curated_stay_legacy()
     test_single_source_of_prompts()
     print()

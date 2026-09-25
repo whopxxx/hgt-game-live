@@ -194,14 +194,17 @@ def riddle(puzzle=None, answer="退潮时礁石露出, 亮灯是标礁石位置�
         "hints": list(hints),
         "facts": [
             # ---- Issue #50: v1 合同 fact 必须带 public_text(§27) ----
-            # 非通关的 support/exclusion 允许空串; 这里给 f1/f2 写
-            # 安全摘要, 使 scripted payload 成为合法的 v1 Contract 输出。
+            # ---- Issue #51: v1 严格解析下 visibility 必须显式给出 ----
             {"id": "f1", "text": "退潮时礁石露出水面", "kind": "core",
+             "visibility": "hidden",
              "public_text": "退潮后水下的礁石会露出来"},
             {"id": "f2", "text": "灯的真正作用是标示礁石位置", "kind": "core",
+             "visibility": "hidden",
              "public_text": "灯是在标记危险礁石的位置"},
-            {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support"},
-            {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion"},
+            {"id": "f3", "text": "涨潮后亮灯会误导船只", "kind": "support",
+             "visibility": "hidden"},
+            {"id": "f4", "text": "不是为了纪念死者", "kind": "exclusion",
+             "visibility": "hidden"},
         ],
         # ---- Issue #50 §23: Contract 的 observed 分类 ----
         "difficulty": "medium",

@@ -666,6 +666,17 @@ def keyword_spec(writer, bag, session_seed: int, *,
     覆盖)。`None` 等价于 `GenerationBrief()`(自由生成)。默认 keyword2
     产出的 spec 因此正式为 `protocol_version="haiguitang-v1"`(§44)。
     """
+    # ---- Issue #51 review Blocker 2: brief fail closed(最先执行) ----
+    # 非法 brief 在**任何 LLM 调用之前**确定性拒绝 —— 不许非法
+    # requested_category 晚到 Contract 才被拒(白烧模型调用), 更不许
+    # 非法 requested difficulty 混进 metrics 甚至一路入池。
+    # 代码/调用方错误要在**让路检查之前**就炸, 不能被 interrupted 掩盖。
+    from .prompt_pack import (
+        PROMPT_PACK_VERSION, stage_version,
+    )
+    from .haiguitang_protocol import GenerationBrief as _GB
+    _brief = (brief if brief is not None else _GB()).require_valid()
+
     # ---- 让路检查 ①: Story 之前 ----
     if should_continue is not None and not should_continue():
         return None, "interrupted"
@@ -674,11 +685,6 @@ def keyword_spec(writer, bag, session_seed: int, *,
     # quality), 而本模块在 import 期被 director/prefetch 拉起来。放模块
     # 顶层会把这个重量加到每一条 import 路径上 —— 和本文件里
     # `from .keyword_corpus import load_vocabulary` 同样的处理。
-    from .prompt_pack import (
-        PROMPT_PACK_VERSION, stage_version,
-    )
-    from .haiguitang_protocol import GenerationBrief as _GB
-    _brief = brief if brief is not None else _GB()
 
     keys = bag.draw()
     keywords = list(keys["keywords"])

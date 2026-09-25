@@ -291,12 +291,27 @@ def _clue_quotes(clues) -> list:
 
 
 def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
-                    title: Optional[str] = None) -> PuzzleSpec:
+                    title: Optional[str] = None,
+                    protocol_version: str = "") -> PuzzleSpec:
     """把生成器返回的工具字典组装成 `PuzzleSpec`。
 
     这是 Q2 的核心转换: 模型给的是**原始素材**(facts/atoms/clues/signature),
     代码负责归一、补 id、注入 blueprint、生成 spec。
+
+    ## Issue #51 review Blocker 1: 归一的**宽容度按协议版本分档**
+
+    `protocol_version == haiguitang-v1` 时走**严格解析**(fail closed):
+
+        - completion_fact_ids **不去重**: [f1, f1, f2] 原样进 spec,
+          让 validate_spec 的"重复 completion id"硬门真的看到重复;
+        - fact 的 kind / visibility **缺省不补默认值、非法值不归一**:
+          缺 visibility 不再被偷偷变成 hidden(那会把"缺字段"洗成合法)。
+
+    坏数据由 validator 以明确原因拒绝, parser 绝不偷修 —— 与
+    categories 原样保留是同一条被冻结的原则。legacy/current(默认 "")
+    保持既有宽容行为**逐位不变**(classic 链与旧调用方不受影响)。
     """
+    is_v1 = str(protocol_version or "") == HAIGUITANG_PROTOCOL_VERSION
     facts = []
     for i, raw in enumerate(d.get("facts") or []):
         if not isinstance(raw, dict):
@@ -305,15 +320,24 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
         text = str(raw.get("text", "") or "").strip()
         if not text:
             continue
-        facts.append(PuzzleFact(
-            id=fid, text=text,
-            kind=str(raw.get("kind", "") or "support").strip().lower(),
-            visibility=str(raw.get("visibility", "") or "hidden").strip().lower(),
-            hintable=bool(raw.get("hintable", True)),
-            # ---- Issue #50 §27: public_text 是 Contract 产出的一部分 ----
-            # 通关 fact 缺它会被 validate_protocol 拒(§67: 绝不由代码
-            # 拿 canonical text 补)。
-            public_text=str(raw.get("public_text", "") or "").strip()))
+        if is_v1:
+            # ---- v1 严格解析: 原样保留, 不补默认、不归一 ----
+            facts.append(PuzzleFact(
+                id=fid, text=text,
+                kind=str(raw.get("kind", "") or "").strip(),
+                visibility=str(raw.get("visibility", "") or "").strip(),
+                hintable=bool(raw.get("hintable", True)),
+                public_text=str(raw.get("public_text", "") or "").strip()))
+        else:
+            facts.append(PuzzleFact(
+                id=fid, text=text,
+                kind=str(raw.get("kind", "") or "support").strip().lower(),
+                visibility=str(raw.get("visibility", "") or "hidden").strip().lower(),
+                hintable=bool(raw.get("hintable", True)),
+                # ---- Issue #50 §27: public_text 是 Contract 产出的一部分 ----
+                # 通关 fact 缺它会被 validate_protocol 拒(§67: 绝不由代码
+                # 拿 canonical text 补)。
+                public_text=str(raw.get("public_text", "") or "").strip()))
 
     atoms = []
     for i, raw in enumerate(d.get("solve_atoms") or []):
@@ -352,11 +376,17 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
     core_answer = " ".join(
         str(d.get("core_answer", "") or "").split()).strip()
     comp_raw = d.get("completion_fact_ids") or []
-    comp_ids: list = []
-    for x in comp_raw:
-        fid = str(x).strip()
-        if fid and fid not in comp_ids:
-            comp_ids.append(fid)
+    if is_v1:
+        # ---- Issue #51 review Blocker 1: v1 原样保留, **不去重** ----
+        # [f1, f1, f2] 必须以重复的形态抵达 validator, 让"重复 completion
+        # id"硬门真的触发; 空串条目同理(会以"不存在的 fact"被拒)。
+        comp_ids = [str(x).strip() for x in comp_raw]
+    else:
+        comp_ids: list = []
+        for x in comp_raw:
+            fid = str(x).strip()
+            if fid and fid not in comp_ids:
+                comp_ids.append(fid)
 
     # ---- Haiguitang Protocol v1: 模型拥有的**观察**字段(Issue #50 §23) ----
     # difficulty / primary_category / categories 由 Contract 给出。
@@ -2927,7 +2957,8 @@ _TOOL_STRUCTURE = {
                                            "核心 mechanism 建议 false",
                         },
                     },
-                    "required": ["id", "text", "public_text", "kind"],
+                    "required": ["id", "text", "public_text", "kind",
+                                 "visibility"],
                 },
                 "description": (
                     "主持人在整局游戏里判断「是/不是/无关」的**事实空间**。"
@@ -3759,7 +3790,8 @@ def _v1_check_tool() -> dict:
             "不得比 text 多说任何真相。通关合同里的 fact "
             "**绝不能为空**。"),
     }
-    facts["items"]["required"] = ["id", "text", "public_text", "kind"]
+    facts["items"]["required"] = ["id", "text", "public_text", "kind",
+                                  "visibility"]
     facts["description"] = (
         "事实表 —— **正式 Q&A 的判定依据**。text=canonical truth, "
         "public_text=已建立后的安全摘要。改了 answer 或核心机制就必须"
@@ -5280,6 +5312,10 @@ class PuzzleWriter:
         if should_continue is not None and not should_continue():
             log.info("Story 让路(调用前, 直播已忙)")
             return {"interrupted": True}
+        # ---- Issue #51 review Blocker 2: brief fail closed ----
+        # 非法 brief 必须在**任何 LLM 调用之前**确定性拒绝(0 次调用)。
+        if brief is not None:
+            brief.require_valid()
         # ---- Issue #50: system 来自 Prompt Pack(fail closed) ----
         system = load_prompt("truth")
         text = _story_user(keywords, lane, brief=brief)
@@ -5449,6 +5485,9 @@ class PuzzleWriter:
         # ---- 组装: 走 gen_spec 同一套门, 但输入是我们自己给的 ----
         import time as _t
         t0 = _t.monotonic()
+        # ---- Issue #51 review Blocker 2: brief fail closed ----
+        if brief is not None:
+            brief.require_valid()
         m: dict = {"generation_attempts": 0, "review_calls": 0,
                    "rewrite_count": 0, "review_issues": [],
                    "review_decision": "", "generation_mode": "keyword2",
@@ -5568,7 +5607,11 @@ class PuzzleWriter:
             # **AI 原创**题被 `_is_curated()` 判成 curated, 于是审稿人按
             # 外部题库那套九条判据审它, 而且进池时会被 curated 账本门挡住
             # —— 既是 policy 错误, 也是 provenance 谎言(任务书 §二)。
-            spec = _spec_from_tool(d, blueprint=bp)
+            # ---- Issue #51 review Blocker 1: v1 走严格解析 ----
+            # 坏 Contract 数据(重复 completion id / 缺 kind / visibility)
+            # 原样进 validator, 不被 parser 洗成合法。
+            spec = _spec_from_tool(d, blueprint=bp,
+                                   protocol_version=HAIGUITANG_PROTOCOL_VERSION)
             spec.usage, spec.model = res.usage, res.model
             # ---- 代码回填 canonical 三样(§五) ----
             spec.title = str(title or "").strip()
@@ -6599,7 +6642,15 @@ class PuzzleWriter:
         # ⚠️ v5 走到这里时 bundle 已经保证非空(上面 invalid_bundle 已拒),
         # 所以下面的 `if not facts:` 兜底**只可能**为 legacy 触发 ——
         # v5 永远不会"空了就沿用旧 facts"。
-        facts = [PuzzleFact.from_dict(f) for f in (ti.get("facts") or [])]
+        #
+        # ---- Issue #51 review Blocker 1: v1 用 strict 解析 ----
+        # Reviewer 回传的 fact 缺 kind/visibility 或给了非法值时,
+        # **原样保留**交给 validator —— 不允许 from_dict 的宽容归一
+        # (缺 visibility 洗成 hidden / 非法 kind 洗成 support)把坏数据
+        # 变合法。legacy 保持宽容(老 fixture 依赖它)。
+        _v1_review = _is_v1(spec)
+        facts = [PuzzleFact.from_dict(f, strict=_v1_review)
+                 for f in (ti.get("facts") or [])]
         if not facts:
             if changed or is_v5_review:
                 bad.append("facts")
@@ -6652,13 +6703,20 @@ class PuzzleWriter:
 
         # ---- v5 通关合同: 改了就必须重出, 没改就原样沿 ----
         comp_raw = ti.get("completion_fact_ids")
-        comp = [str(x).strip() for x in (comp_raw or []) if str(x).strip()]
-        # 去重但保序 —— 重复 id 会让集合覆盖判定看着"要两条", 其实是同一条。
-        _seen_comp: list = []
-        for _fid in comp:
-            if _fid not in _seen_comp:
-                _seen_comp.append(_fid)
-        comp = _seen_comp
+        if _v1_review:
+            # ---- Issue #51 review Blocker 1: v1 原样保留, **不去重** ----
+            # Reviewer 回传 [f1, f1, f2] 时必须以重复形态抵达 validator
+            # ("重复 completion id"硬门); 去重会把坏合同洗成合法。
+            # 空串条目同理(会以"不存在的 fact"被拒)。
+            comp = [str(x).strip() for x in (comp_raw or [])]
+        else:
+            comp = [str(x).strip() for x in (comp_raw or []) if str(x).strip()]
+            # 去重但保序 —— 重复 id 会让集合覆盖判定看着"要两条", 其实是同一条。
+            _seen_comp: list = []
+            for _fid in comp:
+                if _fid not in _seen_comp:
+                    _seen_comp.append(_fid)
+            comp = _seen_comp
         if not comp:
             # v5 的 comp 非空已由 invalid_bundle 保证, 所以这条只对
             # legacy 生效 —— v5 不会"空了就沿用旧合同"。

@@ -200,14 +200,30 @@ class PuzzleFact:
                 "public_text": self.public_text}
 
     @classmethod
-    def from_dict(cls, d: Any) -> "PuzzleFact":
+    def from_dict(cls, d: Any, strict: bool = False) -> "PuzzleFact":
+        """宽容读入; `strict=True` 供 Haiguitang Protocol v1 使用。
+
+        legacy(默认): 缺 kind -> "support"、缺 visibility -> "hidden"、
+        非法值归一到默认 —— 老 archive 必须能读。
+
+        strict(Issue #51 review Blocker 1): kind / visibility **缺省保留
+        空串、非法值原样保留**, 不补默认不归一 —— v1 的坏数据必须以
+        原始形态抵达 validator(缺 visibility 被洗成 hidden 等于把
+        "缺字段"洗成合法)。public_text 两档都不做 fallback。
+        """
         if not isinstance(d, dict):
             return cls(id="", text=str(d or ""))
+        if strict:
+            kind = str(d.get("kind", "") or "").strip()
+            visibility = str(d.get("visibility", "") or "").strip()
+        else:
+            kind = _pick(d.get("kind"), FACT_KINDS, "support")
+            visibility = _pick(d.get("visibility"), FACT_VISIBILITY, "hidden")
         return cls(
             id=str(d.get("id", "") or "").strip(),
             text=str(d.get("text", "") or "").strip(),
-            kind=_pick(d.get("kind"), FACT_KINDS, "support"),
-            visibility=_pick(d.get("visibility"), FACT_VISIBILITY, "hidden"),
+            kind=kind,
+            visibility=visibility,
             hintable=bool(d.get("hintable", True)),
             # Issue #48: 老 fact 没有这把键 -> 读成 ""(未知)。
             # **绝不** fallback 成 text —— 见字段注释的安全边界。
