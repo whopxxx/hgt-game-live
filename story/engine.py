@@ -208,6 +208,12 @@ class RoundEngine:
         #: 只在本题内单调; 换题时随其它题内状态一起清零。
         self._qa_commit_seq = 0
         self._verdict_counts: dict[str, int] = {}
+        # ---- Issue #53 §29: rephrase 独立计数 ----
+        # rephrase(请改问法)不是 verdict —— 不进 `_verdict_counts`(否则
+        # 它会被算成"无关", 污染题目难度统计, 还会推动按问答数给提示的
+        # 进度)。但它是**有价值的独立信号**: "观众是不是经常不知道怎么
+        # 问"。独立记, 复盘时单独看。
+        self._rephrase_count: int = 0
         self._last_ask: dict[tuple[str, str], float] = {}   # 去重
         self._last_activity = 0.0
         self._restate_at = 0.0
@@ -978,6 +984,7 @@ class RoundEngine:
             self._qa_total = 0
             self._qa_commit_seq = 0
             self._verdict_counts.clear()
+            self._rephrase_count = 0
             self._last_ask.clear()
             self._questions_total = 0
             self._answered_total = 0
@@ -1064,7 +1071,8 @@ class RoundEngine:
                     verdict=r.verdict)
                 est = self._record_human_established_locked(
                     safe_est, verdict=r.verdict,
-                    status=r.status)
+                    status=r.status,
+                    response_kind=getattr(r, "response_kind", "verdict"))
                 # R2: 真实提交顺序。**必须在这个 lock 内自增** —— 出了这里
                 # 就可能被别的 worker 插队, 序号就不再等于提交顺序。
                 self._qa_commit_seq += 1
@@ -1093,7 +1101,18 @@ class RoundEngine:
                                 r.completion_verified_fact_ids or []) or None,
                             completion_contribution_fact_ids=(
                                 completion_contrib or None),
-                            solution_candidate=r.solution_candidate)
+                            solution_candidate=r.solution_candidate,
+                            # ---- Issue #53 §31/§34/§35 ----
+                            response_kind=getattr(r, "response_kind",
+                                                  "verdict"),
+                            judging_prompt_version=getattr(
+                                r, "judging_prompt_version", ""),
+                            answer_prompt_version=getattr(
+                                r, "answer_prompt_version", ""),
+                            candidate_recheck_prompt_version=getattr(
+                                r, "candidate_recheck_prompt_version", ""),
+                            completion_verify_prompt_version=getattr(
+                                r, "completion_verify_prompt_version", ""))
                 self._append_qa_locked(rec)
                 # 累加"观众已经探索过哪些方向"(方案 §32)。
                 # **touched ≠ discovered**: 只表示问过这个方向, 不代表已确认为真。
@@ -1102,10 +1121,15 @@ class RoundEngine:
                 if r.solution_candidate:
                     self._candidate_count += 1
                 self._answered_total += 1
-                # 「未判定」是系统故障, 不是对观众猜测的评价 ——
-                # 不进"是/不是/无关"统计, 否则复盘时会把它算成一次
-                # "无关", 污染题目难度与猜中率。
-                if r.verdict != P.UNAVAILABLE:
+                # ---- Issue #53 §29/§30: 统计三分 ----
+                #   是/不是/无关  -> `_verdict_counts`(题目难度信号)
+                #   rephrase      -> `_rephrase_count`(独立信号: 观众不
+                #                    知道怎么问; **不进** verdict 统计,
+                #                    不推动按问答数给提示的进度)
+                #   未判定        -> 两边都不进(系统技术失败)
+                if getattr(r, "response_kind", "verdict") == "rephrase":
+                    self._rephrase_count += 1
+                elif (r.verdict != P.UNAVAILABLE and r.verdict):
                     self._verdict_counts[r.verdict] = \
                         self._verdict_counts.get(r.verdict, 0) + 1
                 acts.append(EngineAction(ActionKind.BROADCAST, {
@@ -1897,6 +1921,8 @@ class RoundEngine:
                 "established_fact_ids": sorted(self._established_fact_ids),
                 "transcript": self._transcript_locked(),
                 "stats": dict(self._verdict_counts),
+                # Issue #53 §29: rephrase 单独给 worker, 不混进 verdict 统计。
+                "rephrase_count": self._rephrase_count,
                 # QA 自己的时延预算(见 config.qa_answer_timeout)。
                 # 放进 payload 而不是让 director 去读配置: 派发决策在这里,
                 # 预算就该跟这条动作一起走。
@@ -2287,7 +2313,8 @@ class RoundEngine:
         return out
 
     def _record_human_established_locked(
-            self, raw_ids, verdict: str = "", status: str = "") -> list:
+            self, raw_ids, verdict: str = "", status: str = "",
+            response_kind: str = "verdict") -> list:
         """把一条**真人 QA** 公开确认的事实并进房间共识。返回真正采纳的 id。
 
         ## 为什么必须是一个具名方法(而不是内联三行)
@@ -2323,7 +2350,23 @@ class RoundEngine:
         「未判定」是系统故障(超时/解析失败), 主持人根本没做出判断 ——
         同样不能建立任何事实。
 
-        所以判据是 `status == ok` **且** `verdict in (是, 不是)`。
+        ## Issue #53 §27: `response_kind` 也要过关(defense-in-depth)
+
+        rephrase 的语义是"模型理解了这句话, 但它没有给出可裁决的命题"
+        —— 一个**没有命题**的句子不可能建立任何 fact。上游的结构合同
+        (`_parse_answer_item`)已保证 rephrase 的 established 为空, 但
+        Engine 是通关状态的唯一写入口, 不能把胜负押在"上游永远正确"上:
+
+            status == ok AND response_kind == verdict
+            AND verdict in (是, 不是)
+
+        即使将来某个异常 producer 提交 `response_kind=rephrase +
+        established=["f2"]`, 这里也一条都不收。`response_kind` 缺省按
+        "verdict" 处理(旧 producer / 旧测试没这个字段) —— 但 verdict
+        枚举门仍然挡在后面。
+
+        所以判据是 `status == ok` **且** `response_kind == "verdict"`
+        **且** `verdict in (是, 不是)`。
         注意「不是」**可以**建立事实(它完整公开地否定了该 fact),
         这与「无关」完全不同。
 
@@ -2344,6 +2387,10 @@ class RoundEngine:
         让系统自己把题解掉。
         """
         if status != "ok":
+            return []
+        # Issue #53 §27: rephrase(或任何未知 response_kind)不建立 ——
+        # fail closed: 只有**显式** "verdict" 才放行。
+        if response_kind != "verdict":
             return []
         if verdict not in (P.YES, P.NO):
             # 「无关」/「揭晓」/「未判定」/空裁决一律不建立。

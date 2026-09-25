@@ -133,6 +133,9 @@ def test_answer_replay_returns_wrong_verdict():
     cli = _ReplayClient(tool_input={
         "answers": [{
             "id": fx["source"]["qid"],
+            # Issue #53 §5: 现行网关的结构化输出必带 response_kind;
+            # 回放的是"当下合同下的同一份裁决"。
+            "response_kind": "verdict",
             "verdict": real["verdict"],
             "solution_candidate": real["solution_candidate"],
             "touched_fact_ids": real["touched_fact_ids"],
@@ -171,7 +174,8 @@ def test_answer_prompt_does_include_canonical_facts():
     fx = load_fixture()
     facts, atoms = _spec_from_fixture(fx)
     cli = _ReplayClient(tool_input={"answers": [{
-        "id": 1, "verdict": "不是", "solution_candidate": False,
+        "id": 1, "response_kind": "verdict", "verdict": "不是",
+        "solution_candidate": False,
         "touched_fact_ids": [], "comment": ""}]})
     w = PuzzleWriter(client=cli, runtime_cfg=_RuntimeCfg())
     w.answer(puzzle=fx["puzzle"], answer=fx["answer"], transcript=[],

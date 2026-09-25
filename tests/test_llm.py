@@ -391,8 +391,10 @@ def review_rewrite(reason="没有公平推理路径", **kw):
 # UX-2: v5 通关合同 -> Answer 不做最终判定
 # ======================================================================
 def _verdict_tool(established=None, touched=None, cand=False):
+    # Issue #53 §5/§9: tool 合同带 response_kind, 缺它整条判 malformed。
     return LLMResult(tool_input={"answers": [{
-        "id": 1, "verdict": "是", "comment": "好眼力",
+        "id": 1, "response_kind": "verdict", "verdict": "是",
+        "comment": "好眼力",
         "solution_candidate": cand,
         "touched_fact_ids": list(touched or []),
         "established_fact_ids": list(established or []),
@@ -416,7 +418,8 @@ def _verdict_tool_no(established=None, touched=None, cand=False):
 def _verdict_tool_irrelevant(cand=True):
     """candidate=True 却判「无关」—— 自相矛盾结果(A2 的原料)。"""
     return LLMResult(tool_input={"answers": [{
-        "id": 1, "verdict": "无关", "comment": "发个 是/不是 的猜测",
+        "id": 1, "response_kind": "verdict", "verdict": "无关",
+        "comment": "发个 是/不是 的猜测",
         "solution_candidate": cand,
         "touched_fact_ids": [], "established_fact_ids": [],
     }]}, model="m")
@@ -838,7 +841,7 @@ def test_riddle_fallback():
 def test_answer_tool():
     print("[裁决: 强制工具]")
     fc = FakeClient([LLMResult(tool_input={
-        "answers": [{"id": 7, "verdict": "是", "comment": "就差一点",
+        "answers": [{"id": 7, "response_kind": "verdict", "verdict": "是", "comment": "就差一点",
                      "touched_fact_ids": ["f1"], "solution_candidate": False}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 7, "甲", "是同伴的肉吗",
@@ -853,20 +856,28 @@ def test_answer_tool():
 
 
 def test_answer_rejects_bad_enum():
-    print("[裁决: 非法枚举被丢弃]")
+    """Issue #53 §11: verdict 不是 是/不是/无关 -> 整条结构合同无效 ->
+    「未判定」。旧合同("跳过该条"或"把已废弃的揭晓降级为是")是代码
+    替模型修语义, 已删除。"""
+    print("[裁决: 非法枚举 -> 整条未判定(fail closed)]")
+    from story.parser import UNAVAILABLE as UNA
     fc = FakeClient([LLMResult(tool_input={
-        "answers": [{"id": 1, "verdict": "也许吧", "comment": "x"}]})])
+        "answers": [{"id": 1, "response_kind": "verdict", "verdict": "也许吧", "comment": "x"}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 1, "甲", "问题")
-    check("非法裁决被拒(返回空)", res == [], res)
-    check("带错误信息", err is not None, err)
-    # Q5: 「揭晓」已从枚举里删掉; 模型若仍吐出来, 降级为"是"而**不是**通关。
+    check("非法裁决 -> 未判定", res and res[0].verdict == UNA, res)
+    check("status=unavailable",
+          res and res[0].status == "unavailable", res)
+    check("不建立任何 fact", res and res[0].established_fact_ids == []
+          and res[0].touched_fact_ids == [])
+    # Q5: 「揭晓」已从枚举里删掉; 现在它也不是合法裁决 -> 未判定,
+    # 而不是"降级为是"(那仍是代码在替模型修语义)。
     fc2 = FakeClient([LLMResult(tool_input={
-        "answers": [{"id": 2, "verdict": "揭晓", "comment": "x"}]})])
+        "answers": [{"id": 2, "response_kind": "verdict", "verdict": "揭晓", "comment": "x"}]})])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "甲", "同伴的肉对吧")
-    check("废弃的揭晓被降级为'是'", res2 and res2[0].verdict == "是", res2)
-    check("降级后没有调裁判",
+    check("废弃的揭晓 -> 未判定", res2 and res2[0].verdict == UNA, res2)
+    check("没有调裁判",
           [c["tool"]["name"] for c in fc2.calls] == ["emit_verdict"],
           [c["tool"]["name"] for c in fc2.calls])
 
@@ -875,7 +886,7 @@ def test_answer_enum_forced_by_schema():
     print("[Q5: candidate=true 才调裁判]")
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 3, "verdict": "是", "comment": "接近了",
+            {"id": 3, "response_kind": "verdict", "verdict": "是", "comment": "接近了",
              "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
@@ -889,7 +900,7 @@ def test_answer_enum_forced_by_schema():
     check("确实调了裁判", names == ["emit_verdict", "emit_judgement"], names)
     # 反例: candidate=false 不调裁判
     fc2 = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 4, "verdict": "是", "solution_candidate": False}]})])
+        {"id": 4, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]})])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     w2.answer("谜面", "谜底", [], 4, "甲", "他是医生吗")
     check("candidate=false 不调裁判",
@@ -906,17 +917,20 @@ def test_open_question_never_solves():
     for q in ["他是不是瞎了", "同伴把肉给他吃了吗", "他是灯塔看守人吗",
               "他知道吗", "地铁上有人吗"]:
         check(f"是非题: {q}", _is_open_question(q) is False, q)
-    # 端到端: 即便模型把"#为什么"标成候选, 纯信息索取也不送裁判
+    # Issue #53 §13/§41: `_is_open_question` 退出 QA 分流 —— 词表不再
+    # 拥有"这句话是不是猜测"的裁判权。模型说 candidate=true, 代码就送
+    # Judge(legacy 题), 哪怕文本长着一张"开放疑问"的脸。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "他为什么跑")
-    check("开放疑问保持原裁决", res and res[0].verdict == "是", res)
-    check("没有调裁判(只用了 1 次调用)", len(fc.calls) == 1,
+    check("开放疑问形文本 + 模型 candidate=true -> 照常送裁判",
+          res and res[0].verdict == "揭晓", res)
+    check("模型拥有语义权(2 次调用)", len(fc.calls) == 2,
           [c["tool"]["name"] for c in fc.calls])
 
 
@@ -926,7 +940,7 @@ def test_verdict_solve_must_pass_judge():
     # 现在「揭晓」已从枚举删掉, 通关只能由裁判确认的 candidate 产生。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": False,
                               "mechanism_hit": False}),
     ])
@@ -945,7 +959,7 @@ def test_open_question_with_hypothesis_can_solve():
     # 规则一票否决, 否则说中答案的观众永远猜不中。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -966,12 +980,17 @@ def test_llm_failure_returns_unavailable_not_irrelevant():
     # 思路带偏。失败时必须给中性的"未判定"。
     from story import parser as P
     check("UNAVAILABLE 常量存在", P.UNAVAILABLE == "未判定", P.UNAVAILABLE)
-    # 工具返回不可用 -> 结果里没有裁决 -> answer() 报错(上层转"未判定")
+    # Issue #53 §14: tool 不可用 -> answer() **显式**产出
+    # status=unavailable + verdict=未判定(不再靠"空结果"让上层猜)。
     fc = FakeClient([LLMResult(error="网关抖动")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, err = w.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗")
-    check("失败时没有臆造裁决", res == [], res)
-    check("带出错误信息", err is not None, err)
+    check("失败 -> 显式未判定结果", res and res[0].verdict == P.UNAVAILABLE
+          and res[0].status == "unavailable", res)
+    check("不建立任何 fact", res and not res[0].established_fact_ids
+          and not res[0].touched_fact_ids
+          and not res[0].solution_candidate)
+    check("带出错误信息", err == "网关抖动", err)
 
 
 def test_judge():
@@ -1021,7 +1040,7 @@ def test_tool_actually_requested():
     # answer() 现在会先问裁决、再问裁判(judge), 所以要多备一个 judge 结果
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": False,
                               "mechanism_hit": False}),
         LLMResult(tool_input={"hint": "h"}),
@@ -1041,7 +1060,7 @@ def test_answer_consults_judge():
     print("[裁决后按 candidate 决定是否问裁判]")
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 5, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 5, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
@@ -1055,7 +1074,7 @@ def test_answer_consults_judge():
 def test_answer_judge_not_consulted_without_answer():
     print("[无谜底时不问裁判]")
     fc = FakeClient([
-        LLMResult(tool_input={"answers": [{"id": 1, "verdict": "是"}]}),
+        LLMResult(tool_input={"answers": [{"id": 1, "response_kind": "verdict", "verdict": "是"}]}),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "", [], 1, "甲", "问题")   # answer 为空
@@ -1428,7 +1447,7 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
     # 也不能抹掉第一层的"是" —— 题目继续。
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),          # 裁判失败: 无 tool_input 无 text
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -1438,12 +1457,19 @@ def test_judge_technical_failure_not_downgraded_to_irrelevant():
     # 第一层没给出可用裁决(candidate=true 但 verdict 缺失) -> 才降级
     fc2 = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 2, "verdict": "", "solution_candidate": True}]}),
+            {"id": 2, "response_kind": "verdict", "verdict": "", "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),
     ])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "乙", "他是盲人吗")
-    check("第一层也无裁决时才降级", res2 == [], res2)
+    # Issue #53 §11: verdict 缺失 = 结构合同无效 -> 整条未判定,
+    # 且**不送裁判**(candidate=true 不能从无效结果里"救"出一次调用)。
+    check("第一层无有效裁决 -> 显式未判定",
+          res2 and res2[0].verdict == "未判定"
+          and res2[0].status == "unavailable", res2)
+    check("无效结果不送裁判",
+          [c["tool"]["name"] for c in fc2.calls] == ["emit_verdict"],
+          [c["tool"]["name"] for c in fc2.calls])
 
 
 def test_check_tool_schema_matches_generator():
@@ -2078,7 +2104,7 @@ def test_judge_tech_failure_preserves_layer1_verdict():
     print("[Q5: 裁判技术失败不抹掉第一层裁决]")
     fc = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "不是", "comment": "方向不对",
+            {"id": 1, "response_kind": "verdict", "verdict": "不是", "comment": "方向不对",
              "solution_candidate": True}]}),
         LLMResult(error="网关抖动"),
     ])
@@ -2095,7 +2121,7 @@ def test_judge_gate_cuts_calls():
         canned.append(LLMResult(tool_input={"answers": [
             {"id": i + 1, "verdict": "是", "solution_candidate": False}]}))
     canned.append(LLMResult(tool_input={"answers": [
-        {"id": 11, "verdict": "是", "solution_candidate": True}]}))
+        {"id": 11, "response_kind": "verdict", "verdict": "是", "solution_candidate": True}]}))
     canned.append(LLMResult(tool_input={
         "is_guess": True, "cause_hit": True, "mechanism_hit": True}))
     fc = FakeClient(canned)
@@ -2116,7 +2142,7 @@ def test_answer_uses_facts_block():
     facts = [{"id": "f1", "text": "退潮时礁石露出水面", "kind": "core"},
              {"id": "f2", "text": "灯是标礁石位置", "kind": "core"}]
     fc = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "verdict": "是", "solution_candidate": False}]})])
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
     u = fc.calls[0]["user"]
@@ -2128,8 +2154,10 @@ def test_answer_uses_facts_block():
 
 
 def test_answer_forbids_inventing_facts():
-    print("[Q5: ANSWER_SYSTEM 声明 facts 是唯一依据]")
-    from story.llm import ANSWER_SYSTEM
+    print("[Q5: answer prompt 声明 facts 是唯一依据]")
+    # Issue #53: prompt 迁入 Judging Pack —— 从 Pack 加载
+    from story import prompt_pack as _PP
+    ANSWER_SYSTEM = _PP.load_prompt("answer")
     check("有'唯一依据'", "唯一依据" in ANSWER_SYSTEM, ANSWER_SYSTEM[:200])
     check("有'不得自行新增'", "不得自行新增" in ANSWER_SYSTEM, ANSWER_SYSTEM[:300])
     check("明确没有揭晓", "没有「揭晓」" in ANSWER_SYSTEM, ANSWER_SYSTEM[:300])
@@ -2313,33 +2341,30 @@ def test_check_system_teaches_rewrite():
 
 
 def test_candidate_safety_net():
-    """P1: 模型漏标 candidate 时, 句式兜底要把它救回来。
+    """Issue #53 §12/§49: 句式兜底**已删除** —— candidate 只信模型自报。
 
-    只信模型自报的话, 一旦它把**完整答案**判成 false, Final Judge
-    永远看不到 —— 观众明明说全了, 系统只回"是"。宁可多调一次裁判。
+    旧 P1 用 `_looks_like_solution(text)` 把"所以/因此"句 OR 成
+    candidate=true —— 那是代码在做第二次语义判断。新合同(§49): 文本
+    里哪怕有"所以", 模型说 false 就是 false, 不许被 OR 成 true。
+    (§48 的反面 —— "没有所以也能 candidate" —— 由
+    test_judging_prompt_pack 钉住。)
     """
     fc = FakeClient([
-        # 模型说"不是候选", 但这句明显是完整因果
+        # 模型说"不是候选", 即便这句明显是完整因果
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": False}]}),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False}]}),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲",
                       "退潮时礁石露出来所以灯是在标礁石位置")
-    check("兜底后仍调了裁判",
-          [c["tool"]["name"] for c in fc.calls]
-          == ["emit_verdict", "emit_judgement"],
+    check("模型说 false -> 不再被句式 OR 成 true(无裁判调用)",
+          [c["tool"]["name"] for c in fc.calls] == ["emit_verdict"],
           [c["tool"]["name"] for c in fc.calls])
-    check("救回了通关", res and res[0].verdict == "揭晓", res)
-    # 普通事实提问不该被兜底误伤
-    fc2 = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 2, "verdict": "是", "solution_candidate": False}]})])
-    w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
-    w2.answer("谜面", "谜底", [], 2, "甲", "他是医生吗")
-    check("短事实提问不触发兜底", len(fc2.calls) == 1,
-          [c["tool"]["name"] for c in fc2.calls])
+    check("candidate 保持 false",
+          res and res[0].solution_candidate is False, res)
+    check("第一层裁决原样保留", res and res[0].verdict == "是", res)
 
 
 def test_touched_fact_ids_filtered():
@@ -2351,7 +2376,7 @@ def test_touched_fact_ids_filtered():
     facts = [{"id": "f1", "text": "退潮礁石露出", "kind": "core"},
              {"id": "f2", "text": "灯标礁石", "kind": "core"}]
     fc = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "verdict": "是", "solution_candidate": False,
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": False,
          "touched_fact_ids": ["f1", "f999", "f2", "f1"]}]})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     res, _ = w.answer("谜面", "谜底", [], 1, "甲", "礁石吗", facts=facts)
@@ -2359,7 +2384,7 @@ def test_touched_fact_ids_filtered():
           res[0].touched_fact_ids == ["f1", "f2"], res[0].touched_fact_ids)
     # 全非法 -> 清空
     fc2 = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 2, "verdict": "是", "solution_candidate": False,
+        {"id": 2, "response_kind": "verdict", "verdict": "是", "solution_candidate": False,
          "touched_fact_ids": ["f999", "f888"]}]})])
     w2 = PuzzleWriter(client=fc2, runtime_cfg=fc2.runtime_cfg)
     res2, _ = w2.answer("谜面", "谜底", [], 2, "甲", "礁石吗", facts=facts)
@@ -2836,7 +2861,7 @@ def test_answer_passes_qa_budget_to_client():
     from story.llm import PuzzleWriter
 
     cli = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "verdict": "是", "comment": "对"}]})])
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "comment": "对"}]})])
     w = PuzzleWriter(client=cli, runtime_cfg=runtime_cfg())
     w.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗",
              timeout=8.0, max_retries=0)
@@ -2848,7 +2873,7 @@ def test_answer_passes_qa_budget_to_client():
 
     # 不传 -> None(None 表示"沿用全局", 不能悄悄变成某个默认值)
     cli2 = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "verdict": "是", "comment": "对"}]})])
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "comment": "对"}]})])
     w2 = PuzzleWriter(client=cli2, runtime_cfg=runtime_cfg())
     w2.answer("谜面", "谜底", [], 1, "甲", "他是盲人吗")
     got2 = cli2.calls[-1]
@@ -2871,7 +2896,7 @@ def test_qa_budget_reaches_final_judge():
     # 第一层: 声明 solution_candidate=True, 于是会进 Final Judge
     cli = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "comment": "像是说中了",
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "comment": "像是说中了",
              "solution_candidate": True}]}),
         # 第二层: 裁判结果
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,

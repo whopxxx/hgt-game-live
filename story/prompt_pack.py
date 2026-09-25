@@ -1,11 +1,20 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""Generation Prompt Pack loader(Issue #50 Phase B1)。
+"""Prompt Pack loader(Generation: Issue #50 Phase B1 / Judging: Issue #53)。
 
-把生成侧静态 Prompt(system instruction / 角色定义 / 阶段职责 / 硬语义
-规则 / 反例判据)从 `story/llm.py` 抽成**版本化**的 Markdown 文件,
-由本模块统一加载 —— 单一事实来源是 `haiguitang/prompts/generation/`
-下的文件, **不是** Python 常量。
+把生成侧与判题侧的静态 Prompt(system instruction / 角色定义 / 阶段职责
+/ 硬语义规则 / 反例判据)从 `story/llm.py` 抽成**版本化**的 Markdown
+文件, 由本模块统一加载 —— 单一事实来源是 `haiguitang/prompts/` 下的
+文件, **不是** Python 常量。
+
+## 两个 Pack, 两个独立总版本(Issue #53 §3)
+
+    generation -> haiguitang/prompts/generation/   haiguitang-generation-v1
+    judging    -> haiguitang/prompts/judging/      haiguitang-judging-v1
+
+"怎么出题"与"怎么理解观众的一句话"是两个独立演进的东西: 出题侧换
+prompt 不该迫使判题侧 bump 版本, 反之亦然。所以总版本**必须**分开,
+stage 名也**不许**跨 pack 重名(allowlist 全局唯一)。
 
 ## 职责边界(任务书 §5)
 
@@ -47,6 +56,13 @@ HAIGUITANG_GENERATION_PROMPT_VERSION = "haiguitang-generation-v1"
 #: 别名 —— 语义同上, 读起来更顺手的场合用。
 PROMPT_PACK_VERSION = HAIGUITANG_GENERATION_PROMPT_VERSION
 
+#: Judging Prompt Pack 的**总版本**(Issue #53 §3)。语义: "这一套判题
+#: Prompt 的版本", 写进 QA archive 的 `judging_prompt_version`。
+#: ⚠️ 与 generation 总版本**互相独立**: 任何一个判题 stage 文件变了
+#: 它才 bump; generation 侧的任何变化**不得**牵动它(反之亦然),
+#: 否则 #50 的 provenance 语义就漂移了。
+HAIGUITANG_JUDGING_PROMPT_VERSION = "haiguitang-judging-v1"
+
 #: 项目根锚点: `story/prompt_pack.py` -> 上两级 = repo root。
 #: **绝不**用 cwd —— 服务可能从任意目录启动。
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +70,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 #: Prompt Pack 根目录。测试可以用 `monkeypatch` 指到临时目录造
 #: 缺文件/空文件/坏文件的反例(生产代码**永远**不该改它)。
 PROMPT_ROOT = _PROJECT_ROOT / "haiguitang" / "prompts" / "generation"
+
+#: Judging Pack 根目录(Issue #53 §2)。与 `PROMPT_ROOT` 同级、互相
+#: 独立 —— 测试同样可以 monkeypatch 它造反例。
+JUDGING_PROMPT_ROOT = _PROJECT_ROOT / "haiguitang" / "prompts" / "judging"
 
 #: stage -> (文件名, stage 版本)。
 #:
@@ -69,6 +89,32 @@ STAGES: dict = {
                            "audit-truthfulness-v1"),
     "audit_safety": ("audit-safety-v1.md", "audit-safety-v1"),
 }
+
+#: Judging Pack 的 stage 登记(Issue #53 §2)。与 generation 的 stage
+#: 名**全局不重名** —— allowlist 查找是两级线性表, 重名会让
+#: `load_prompt("answer")` 的归属变得含糊, 直接禁止。
+JUDGING_STAGES: dict = {
+    "answer": ("answer-v1.md", "answer-v1"),
+    "candidate_recheck": ("candidate-recheck-v1.md", "candidate-recheck-v1"),
+    "completion_verify": ("completion-verify-v1.md", "completion-verify-v1"),
+}
+
+#: 共享 fragment 登记(Issue #53 §2): Candidate Recheck 与 Completion
+#: Verify 共用同一份"什么叫真正建立 completion fact"的语义合同。
+#: fragment **不是**业务 stage —— 业务代码不直接把它当 system prompt
+#: 用, 它只通过 stage 文件里的 `{{fragment:name}}` 标记展开。
+FRAGMENTS: dict = {}
+
+JUDGING_FRAGMENTS: dict = {
+    "completion_specificity": ("completion-specificity-v1.md",
+                               "completion-specificity-v1"),
+}
+
+#: fragment 展开标记: stage 文件里的一行 `{{fragment:name}}` 会在
+#: **加载时**被替换成 fragment 文件的全文。展开发生在占位符检查
+#: **之前**(标记本身含 `{}`, 不先展开就会被占位符检查误杀)。
+#: name 只允许 `[a-z0-9_]` —— 它必须能撞上登记表, 不存在"拼路径"。
+_FRAGMENT_RE = re.compile(r"\{\{fragment:([a-z0-9_]+)\}\}")
 
 #: 静态 prompt 文件里**不允许**出现的未渲染占位符(§6/§60)。
 #: Generation Pack v1 是全静态的 —— lane / requested category /
@@ -87,46 +133,111 @@ class PromptPackError(Exception):
     """
 
 
+def _pack_of(stage: str) -> str:
+    """stage -> pack 名。两个登记表都查不到 -> 明确错误。"""
+    s = str(stage or "")
+    if s in STAGES:
+        return "generation"
+    if s in JUDGING_STAGES:
+        return "judging"
+    raise PromptPackError(
+        f"unknown prompt stage: {stage!r} (allowed: "
+        f"{sorted(STAGES) + sorted(JUDGING_STAGES)})")
+
+
+def _registry(pack: str, kind: str) -> dict:
+    """pack + kind(stage|fragment) -> 登记表。"""
+    if pack == "generation":
+        return STAGES if kind == "stage" else FRAGMENTS
+    return JUDGING_STAGES if kind == "stage" else JUDGING_FRAGMENTS
+
+
+def _root_of(pack: str) -> Path:
+    """pack -> 根目录。**读 live 全局**(而不是启动时快照): 测试靠
+    monkeypatch 这两个名字注入坏目录, loader 必须每次调用时取。"""
+    return PROMPT_ROOT if pack == "generation" else JUDGING_PROMPT_ROOT
+
+
 def _stage_file(stage: str) -> tuple:
-    """查 allowlist。unknown stage -> 明确错误(不做任何路径拼接)。"""
-    entry = STAGES.get(str(stage or ""))
+    """查 allowlist。返回 (pack, 文件名, 版本)。"""
+    pack = _pack_of(stage)
+    filename, version = _registry(pack, "stage")[str(stage or "")]
+    return pack, filename, version
+
+
+def _read_pack_file(pack: str, kind: str, name: str) -> str:
+    """从登记表解析 (pack, kind, name) 并读文件。fail closed 全覆盖:
+    unknown name / 文件缺失 / 读失败 / 空 / 只有空白。"""
+    entry = _registry(pack, kind).get(str(name or ""))
     if entry is None:
         raise PromptPackError(
-            f"unknown prompt stage: {stage!r} (allowed: {sorted(STAGES)})")
-    return entry
+            f"unknown prompt {kind}: {name!r} in pack {pack!r} "
+            f"(allowed: {sorted(_registry(pack, kind))})")
+    path = _root_of(pack) / entry[0]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as e:
+        raise PromptPackError(
+            f"prompt file missing for {kind} {name!r}: {path}") from e
+    except OSError as e:
+        raise PromptPackError(
+            f"prompt file unreadable for {kind} {name!r}: {path} ({e})") from e
+    if not text.strip():
+        raise PromptPackError(
+            f"prompt file for {kind} {name!r} is empty: {path}")
+    return text
+
+
+def load_fragment(name: str) -> str:
+    """加载一个共享 fragment(单一来源的合同文本, Issue #53 §2)。
+
+    fragment 本身也要过占位符检查, 且**禁止**嵌套 include —— 共享
+    文本里再套共享文本会让展开顺序变成隐式契约, v1 不需要。
+    """
+    pack = "judging" if str(name or "") in JUDGING_FRAGMENTS else "generation"
+    text = _read_pack_file(pack, "fragment", name)
+    if _FRAGMENT_RE.search(text):
+        raise PromptPackError(
+            f"fragment {name!r} contains a nested fragment include "
+            f"(v1 forbids nesting): {name}")
+    hole = _PLACEHOLDER_RE.search(text)
+    if hole:
+        raise PromptPackError(
+            f"fragment {name!r} contains an unresolved placeholder "
+            f"{hole.group()!r}: static pack files carry no template holes")
+    return text
+
+
+def _expand_fragments(text: str, stage: str) -> str:
+    """把 stage 文本里的 `{{fragment:name}}` 展开成 fragment 全文。
+
+    在占位符检查**之前**跑(标记含 `{}`, 后跑会被误杀)。unknown /
+    空 fragment 由 `load_fragment` 统一 fail closed。
+    """
+    def _sub(m: "re.Match") -> str:
+        return load_fragment(m.group(1))
+    return _FRAGMENT_RE.subn(_sub, text)[0]
 
 
 def load_prompt(stage: str) -> str:
     """加载一个 stage 的静态 prompt 文本。
 
     fail closed: unknown stage / 文件不存在 / 读失败 / 内容为空或只有
-    空白 / 含未渲染占位符 —— 全部抛 `PromptPackError`。
+    空白 / 坏 fragment / 含未渲染占位符 —— 全部抛 `PromptPackError`。
 
     每次调用都重新读盘(本包调用频率 = 每道题每 stage 一次, 几秒级
     间隔, IO 可忽略) —— 不做缓存就没有"改了文件读到旧的"一类问题。
     """
-    filename, _version = _stage_file(stage)
-    # 文件名来自上面的登记表(字面量), 不是调用方输入 —— 没有
-    # 路径穿越面。这里仍然 resolve 一次, 让错误信息带绝对路径。
-    path = PROMPT_ROOT / filename
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError as e:
-        raise PromptPackError(
-            f"prompt file missing for stage {stage!r}: {path}") from e
-    except OSError as e:
-        raise PromptPackError(
-            f"prompt file unreadable for stage {stage!r}: {path} ({e})") from e
-    if not text.strip():
-        raise PromptPackError(
-            f"prompt file for stage {stage!r} is empty: {path}")
+    pack, _filename, _version = _stage_file(stage)
+    text = _read_pack_file(pack, "stage", stage)
+    text = _expand_fragments(text, stage)
     hole = _PLACEHOLDER_RE.search(text)
     if hole:
         raise PromptPackError(
             f"prompt file for stage {stage!r} contains an unresolved "
             f"placeholder {hole.group()!r} at offset {hole.start()} "
-            f"(Generation Pack v1 prompts are static; runtime data "
-            f"belongs in the user message): {path}")
+            f"(pack prompts are static; runtime data "
+            f"belongs in the user message)")
     return text
 
 
@@ -155,5 +266,14 @@ def render_prompt(stage: str, variables: dict) -> str:
 
 
 def stage_version(stage: str) -> str:
-    """某个 stage 文件的版本(如 `"truth-v1"`)。进 metrics, 不进 spec。"""
-    return _stage_file(stage)[1]
+    """某个 stage 文件的版本(如 `"truth-v1"` / `"answer-v1"`)。
+
+    进 metrics(QA 侧进 archive 的 prompt provenance), 不进 spec。
+    """
+    return _stage_file(stage)[2]
+
+
+def fragment_version(name: str) -> str:
+    """某个 fragment 文件的版本(如 `"completion-specificity-v1"`)。"""
+    pack = "judging" if str(name or "") in JUDGING_FRAGMENTS else "generation"
+    return _registry(pack, "fragment")[str(name or "")][1]

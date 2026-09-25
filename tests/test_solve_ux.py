@@ -40,12 +40,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
 import story.parser as P  # noqa: E402
+# Issue #53: ANSWER_SYSTEM / COMPLETION_VERIFY_SYSTEM 已迁入 Judging
+# Prompt Pack —— 测试改为从 Pack 加载(单一事实来源是文件, llm.py 里
+# 不再有这批常量)。本地别名保持下面断言的写法不变。
+import story.prompt_pack as _PP  # noqa: E402
 from story.llm import (  # noqa: E402
-    COMPLETION_VERIFY_SYSTEM, LLMResult, PuzzleWriter,
+    LLMResult, PuzzleWriter,
     _QUALITY_CHECK_FIELDS, _TOOL_ANSWER, _TOOL_CHECK,
     _TOOL_COMPLETION_VERIFY, _TOOL_RIDDLE,
-    ANSWER_SYSTEM, CHECK_SYSTEM, RIDDLE_SYSTEM,
+    CHECK_SYSTEM, RIDDLE_SYSTEM,
 )
+COMPLETION_VERIFY_SYSTEM = _PP.load_prompt("completion_verify")
+ANSWER_SYSTEM = _PP.load_prompt("answer")
 from story.puzzle import (  # noqa: E402
     DiscoveryBeat,
     FairClue, PuzzleFact, PuzzleSpec, SolveAtom, runtime_spec_key,
@@ -466,8 +472,11 @@ class FakeClient:
 
 
 def _verdict(established=None, cand=False, verdict="是"):
+    # Issue #53: tool 合同带 response_kind —— 缺它会被判 malformed ->
+    # 未判定, 所以 helper 必须带上(Issue #53 §5/§9)。
     return LLMResult(tool_input={"answers": [{
-        "id": 1, "verdict": verdict, "comment": "好眼力",
+        "id": 1, "response_kind": "verdict", "verdict": verdict,
+        "comment": "好眼力",
         "solution_candidate": cand,
         "touched_fact_ids": [],
         "established_fact_ids": list(established or []),
@@ -1877,9 +1886,11 @@ def test_v6_case10_status_must_be_ok_for_verifier():
                         and isinstance(t.value, ast.Name)
                         and t.value.id == "r0"):
                     assigned.add(t.attr)
-    check("只赋值 established_fact_ids 与 completion_verified_fact_ids",
+    check("只赋值 established/completion_verified/prompt provenance",
           assigned == {"established_fact_ids",
-                       "completion_verified_fact_ids"}, assigned)
+                       "completion_verified_fact_ids",
+                       # Issue #53 §35: provenance 观测字段, 不影响语义
+                       "completion_verify_prompt_version"}, assigned)
     check("**没有**给 r0.verdict 赋值", "verdict" not in assigned, assigned)
     check("**没有**给 r0.status 赋值", "status" not in assigned, assigned)
     # 代码里真的对 r0.status 做了 "ok" 判定(AST 级, 不是注释里的)。
@@ -1996,23 +2007,29 @@ class _CaptureLogs:
 # 两条绕过路径:
 #   1. 文本回退 —— `P.parse_answers` 的关键词表把 揭晓/完全正确/答对了
 #      都映射成 P.SOLVE, 而只有 tool 分支做了降级。
+#      **Issue #53 §14 起这条路径被整体关闭**: tool 结果缺失/不可用 ->
+#      直接「未判定」, 绝不拿自由文本猜裁决。下面的 A/B/C 按新合同
+#      重写 —— 钉的是"文本永远不能变成任何裁决", 不只是"不能变揭晓"。
 #   2. Engine —— 即使 Writer 归一了, 其它 producer 塞进来的 P.SOLVE
 #      仍会走 legacy 直通揭晓。
 # 这两个都要修, 且都要有 mutation 测试钉住。
 _SOLVE_TEXTS = ["1. 揭晓", "1. 答对了", "1. 完全正确", "1. 真相是",
                 "1. 答案是", "1. 谜底是", "1. 正确答案"]
-_TOOL_SOLVE = [{"id": 1, "verdict": "揭晓", "comment": "",
-                "solution_candidate": False, "touched_fact_ids": [],
-                "established_fact_ids": []}]
+_TOOL_SOLVE = [{"id": 1, "response_kind": "verdict", "verdict": "揭晓",
+                "comment": "", "solution_candidate": False,
+                "touched_fact_ids": [], "established_fact_ids": []}]
 
 
 def test_v6_a_text_fallback_solve_cannot_win():
-    """A: 纯文本 `1. 揭晓` 不能直接获胜。
+    """A: 纯文本 `1. 揭晓` 不能产生**任何**裁决(Issue #53 §14)。
 
-    第一层文本回退解析出 P.SOLVE, 必须被统一降级为「是」; 观众说的是
-    candidate=false 的短句, 所以连复核都不该触发, 更不该揭晓。
+    旧合同: 文本回退解析出 P.SOLVE -> 降级为「是」。
+    新合同: tool 不可用时**不存在语义结果** -> status=unavailable +
+    verdict=未判定, established/completion 全空。自由文本(哪怕写着
+    "揭晓")永远不能变成业务裁决 —— 这是 2026-09 实播事故
+    ("1|无关|发个 是/不是 的猜测"被当裁决回显)的直接修复。
     """
-    print("\n[v6 A] text fallback '揭晓' 不能直通")
+    print("\n[v6 A] text fallback '揭晓' 不能直通(整条未判定)")
     spec = auction_spec()
     for txt in _SOLVE_TEXTS:
         fc = FakeClient([LLMResult(text=txt, model="m")])
@@ -2021,15 +2038,20 @@ def test_v6_a_text_fallback_solve_cannot_win():
             spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗", spec=spec,
             completion_fact_ids=spec.completion_fact_ids,
             core_answer=spec.core_answer, room_established_fact_ids=[])
-        check(f"{txt!r} -> verdict 是「是」", out and out[0].verdict == "是",
+        check(f"{txt!r} -> 未判定", out and out[0].verdict == "未判定",
               out[0].verdict if out else None)
         check(f"{txt!r} -> 不是 P.SOLVE", out and out[0].verdict != "揭晓",
               out[0].verdict if out else None)
-        check(f"{txt!r} -> 没触发复核(candidate=false)",
+        check(f"{txt!r} -> status=unavailable",
+              out and out[0].status == "unavailable")
+        check(f"{txt!r} -> 不建立任何 fact",
+              out and not out[0].established_fact_ids
+              and not out[0].touched_fact_ids)
+        check(f"{txt!r} -> 没触发复核",
               all(c["tool"]["name"] != "emit_completion_match"
                   for c in fc.calls), [c["tool"]["name"] for c in fc.calls])
 
-    # Engine 侧: 提交这条降级后的结果, 必须仍在 QA。
+    # Engine 侧: 提交一条 unavailable 结果, 必须仍在 QA。
     eng, clk = boot(spec)
     ask(eng, clk, "u1", "甲", "他是医生吗", verdict="是",
         solution_candidate=False)
@@ -2038,12 +2060,13 @@ def test_v6_a_text_fallback_solve_cannot_win():
 
 
 def test_v6_b_text_fallback_variants_all_normalized():
-    """B: parser 的关键词不止字面 `揭晓` —— 全部都要降级。
+    """B: parser 的关键词不止字面 `揭晓` —— 但 writer 全都不再消费。
 
-    这条与 A 分开, 是因为它防的是"以后有人只给 `揭晓` 加特判"。
-    判据必须是 `verdict == P.SOLVE`, 不是某个字面量。
+    Issue #53 §14 起, 文本回退路径整体关闭: 任何文本都产生同一条
+    「未判定」。这条与 A 分开, 是因为它防的是"以后有人只给 `揭晓`
+    加特判、又悄悄接回某条文本解析路"。
     """
-    print("\n[v6 B] text fallback 的 SOLVE 变体全部降级")
+    print("\n[v6 B] text fallback 的 SOLVE 变体全部未判定")
     import story.parser as P
     spec = auction_spec()
     seen_solve = 0
@@ -2058,12 +2081,13 @@ def test_v6_b_text_fallback_variants_all_normalized():
             spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗", spec=spec,
             completion_fact_ids=spec.completion_fact_ids,
             core_answer=spec.core_answer, room_established_fact_ids=[])
-        check(f"{txt!r} 降级后不是 P.SOLVE",
-              out and out[0].verdict != P.SOLVE,
+        check(f"{txt!r} -> 未判定(不是 P.SOLVE 也不是任何裁决)",
+              out and out[0].verdict == "未判定" and out[0].verdict != P.SOLVE,
               out[0].verdict if out else None)
     check("parser 确实会把其中多条映射成 P.SOLVE(否则本测试没意义)",
           seen_solve >= 2, seen_solve)
-    # tool 分支同样归一。
+    # tool 分支: '揭晓' 不是 是/不是/无关 -> 结构合同无效 -> 未判定
+    # (旧合同是"降级为「是」"; #53 不再由代码替模型修语义, §11。)
     fc = FakeClient([LLMResult(tool_input={"answers": _TOOL_SOLVE}, model="m")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是医生吗",
@@ -2071,32 +2095,51 @@ def test_v6_b_text_fallback_variants_all_normalized():
                       completion_fact_ids=spec.completion_fact_ids,
                       core_answer=spec.core_answer,
                       room_established_fact_ids=[])
-    check("tool 分支的'揭晓'也降级为「是」",
-          out and out[0].verdict == "是", out[0].verdict if out else None)
+    check("tool 分支的'揭晓' -> 未判定(malformed)",
+          out and out[0].verdict == "未判定"
+          and out[0].status == "unavailable", out[0].verdict if out else None)
 
 
-def test_v6_c_text_fallback_candidate_still_reaches_verifier():
-    """C: candidate=true 的文本回退**仍能赢** —— 但必须经过 completion IDs。
+def test_v6_c_candidate_from_structured_result_reaches_verifier():
+    """C: candidate=true 的**结构化结果**仍能赢 —— 但必须经 completion IDs。
 
-    这是本 blocker 的关键平衡: 修完之后不能把正常通关也堵死。
-    路径: 文本\"完全正确\" -> 降级\"是\" -> `_looks_like_solution` 命中
-    -> completion 复核 -> f1/f2 -> Engine 覆盖 -> 揭晓。
+    本 blocker 的关键平衡: 修完之后不能把正常通关也堵死。
+    Issue #53 §48: candidate 只来自模型的 structured 自报 —— 这里的
+    发言**不含任何因果连词**, 模型说 candidate=true, 代码就必须触发
+    复核(文本里没有"所以"也照样能通关)。
+    路径: tool candidate=true -> completion 复核 -> f1/f2 -> Engine
+    覆盖 -> 揭晓。
     """
-    print("\n[v6 C] text fallback + 完整解 -> 经复核获胜")
+    print("\n[v6 C] 结构化 candidate -> 经复核获胜(无因果连词也行)")
     spec = auction_spec()
-    from story.llm import _looks_like_solution
-    check("这条发言确实触发句式启发式",
-          _looks_like_solution(_AUCTION_TEXT_CAUSAL), _AUCTION_TEXT_CAUSAL)
-    fc = FakeClient([LLMResult(text="1. 完全正确", model="m"),
-                     _completion_match(["f1", "f2"])])
+    # §49 对照: 同一段发言, 模型说 candidate=false -> 即使文本含"所以",
+    # 代码也不许再把它 OR 成 true(只有 1 次调用)。
+    fc_no = FakeClient([LLMResult(tool_input={"answers": [{
+        "id": 1, "response_kind": "verdict", "verdict": "是",
+        "comment": "", "solution_candidate": False,
+        "touched_fact_ids": [], "established_fact_ids": []}]}, model="m")])
+    w_no = PuzzleWriter(client=fc_no, runtime_cfg=fc_no.runtime_cfg)
+    out_no, _ = w_no.answer(
+        spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT_CAUSAL,
+        spec=spec, completion_fact_ids=spec.completion_fact_ids,
+        core_answer=spec.core_answer, room_established_fact_ids=[])
+    check("含'所以'但模型 candidate=false -> 不触发复核",
+          len(fc_no.calls) == 1, len(fc_no.calls))
+    check("candidate 保持 false", out_no and out_no[0].solution_candidate
+          is False)
+    fc = FakeClient([LLMResult(tool_input={"answers": [{
+        "id": 1, "response_kind": "verdict", "verdict": "是",
+        "comment": "", "solution_candidate": True,
+        "touched_fact_ids": [], "established_fact_ids": []}]}, model="m"),
+        _completion_match(["f1", "f2"])])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, err = w.answer(
         spec.puzzle, spec.answer, [], 1, "甲", _AUCTION_TEXT_CAUSAL, spec=spec,
         completion_fact_ids=spec.completion_fact_ids,
         core_answer=spec.core_answer, room_established_fact_ids=[])
-    check("第一层先降级为「是」", out and out[0].verdict == "是",
+    check("第一层 verdict 是「是」", out and out[0].verdict == "是",
           out[0].verdict if out else None)
-    check("句式像完整解 -> 触发了复核", len(fc.calls) == 2, len(fc.calls))
+    check("candidate=true -> 触发了复核", len(fc.calls) == 2, len(fc.calls))
     check("第二层是 completion 复核",
           fc.calls[1]["tool"]["name"] == "emit_completion_match",
           [c["tool"]["name"] for c in fc.calls])
@@ -2224,17 +2267,21 @@ def test_v6_first_layer_never_owns_victory():
 def test_v6_candidate_not_gated_by_answer_presence():
     """candidate 的判定不该被"谜底有没有记录"左右。
 
-    修 blocker 时顺带发现的**潜伏 bug**: 文本回退里
-    `r.solution_candidate = _looks_like_solution(text)` 原先嵌在
-    `if answer:` 里面。于是**谜底缺失**时这条路谁都不会被标成候选,
-    一个说得完全正确的观众永远走不到复核 —— 而谜底本来就只是用来做
-    泄漏检查的, 不该决定 candidate。
+    历史背景: 旧文本回退里 `r.solution_candidate = _looks_like_solution
+    (text)` 原先嵌在 `if answer:` 里, 谜底缺失时谁都不会被标成候选。
+
+    Issue #53 §12/§14: 文本回退已整体删除, candidate **只**来自模型的
+    结构化自报。但同一条语义仍然要成立 —— `_leaks_answer` 只删点评,
+    绝不反噬 candidate: 有没有谜底, candidate 都原样保留、复核照样触发。
     """
     print("\n[v6] candidate 不受 answer 有无影响")
     spec = auction_spec()
     for ans in ["", spec.answer]:
-        fc = FakeClient([LLMResult(text="1. 完全正确", model="m"),
-                         _completion_match(["f1", "f2"])])
+        fc = FakeClient([LLMResult(tool_input={"answers": [{
+            "id": 1, "response_kind": "verdict", "verdict": "是",
+            "comment": "c", "solution_candidate": True,
+            "touched_fact_ids": [], "established_fact_ids": []}]}, model="m"),
+            _completion_match(["f1", "f2"])])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, _ = w.answer(
             spec.puzzle, ans, [], 1, "甲", _AUCTION_TEXT_CAUSAL, spec=spec,
@@ -2854,7 +2901,7 @@ def test_a1_candidate_mode_can_rescue_missing():
 def test_a1_completion_verify_prompt_has_specificity_rule():
     """prompt 里必须有"不是判相关性, 是判观众是否已经知道完整命题"。"""
     print("\n[A1-prompt] 复核 prompt 的特异性硬规则")
-    from story.llm import COMPLETION_VERIFY_SYSTEM as S
+    S = COMPLETION_VERIFY_SYSTEM  # Pack 别名(Issue #53)
     check("明确否定'判相关性'", "不是" in S and "有没有关系" in S, S[:200])
     check("有'画框有问题'反例", "画框有问题" in S, "缺具体反例")
     check("有'报警感应结构'", "报警感应结构" in S)
@@ -2888,14 +2935,15 @@ def test_a1_ordering_is_stable_and_reference_ordered():
 # ======================================================================
 # A2: candidate=True 却判「无关」-> 定向重判
 # ======================================================================
-def _recheck(verdict="是", ids=None, cand=None):
+def _recheck(verdict="是", ids=None, cand=None, kind="verdict"):
     """A2/C0 重判的 canned 返回。
 
     C0 起工具同时回 `verdict` + `solution_candidate` + 已确认的 completion。
     `cand` 默认按 verdict 推断(是/不是 -> True, 无关 -> False), 需要
     构造"自相矛盾返回"的用例时显式传。
+    Issue #53 §21: 工具还必须回 `response_kind`(verdict|rephrase)。
     """
-    d = {"verdict": verdict,
+    d = {"response_kind": kind, "verdict": verdict,
          "solution_candidate": (verdict != "无关") if cand is None else cand}
     if ids is not None:
         d["verified_completion_fact_ids"] = list(ids)
@@ -3015,18 +3063,25 @@ def test_c0_recheck_self_contradictory_reply_fails_closed():
     spec = auction_spec()
     for label, bad in (
             ("无关+candidate=true",
-             LLMResult(tool_input={"verdict": "无关",
+             LLMResult(tool_input={"response_kind": "verdict",
+                                   "verdict": "无关",
                                    "solution_candidate": True}, model="m")),
             ("candidate 缺失",
-             LLMResult(tool_input={"verdict": "是"}, model="m")),
+             LLMResult(tool_input={"response_kind": "verdict",
+                                   "verdict": "是"}, model="m")),
             ("candidate 类型不对",
-             LLMResult(tool_input={"verdict": "是",
+             LLMResult(tool_input={"response_kind": "verdict",
+                                   "verdict": "是",
                                    "solution_candidate": "yes"}, model="m")),
             ("verified ids 类型不对",
-             LLMResult(tool_input={"verdict": "是",
+             LLMResult(tool_input={"response_kind": "verdict",
+                                   "verdict": "是",
                                    "solution_candidate": True,
                                    "verified_completion_fact_ids": "f2"},
-                       model="m"))):
+                       model="m")),
+            ("response_kind 缺失(Issue #53)",
+             LLMResult(tool_input={"verdict": "是",
+                                   "solution_candidate": True}, model="m"))):
         fc = FakeClient([_verdict(cand=True, verdict="无关"), bad])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
@@ -3077,7 +3132,8 @@ def test_a2_recheck_failure_becomes_unavailable():
             ("空 tool input", LLMResult(tool_input=None, model="m")),
             ("超时", LLMResult(error="timeout", model="m")),
             ("verdict 非法",
-             LLMResult(tool_input={"verdict": "或许",
+             LLMResult(tool_input={"response_kind": "verdict",
+                                   "verdict": "或许",
                                    "solution_candidate": True}, model="m")),
             ("schema 不符", LLMResult(tool_input={"other": 1}, model="m"))):
         fc = FakeClient([_verdict(cand=True, verdict="无关"), bad])
@@ -3279,8 +3335,8 @@ def test_a2_recheck_verdict_definition_frozen_in_prompt():
     硬判成「不是」, 给观众另一条错误信息。这条测试冻结修正后的语义。
     """
     print("\n[A2-prompt] verdict 边界写进 prompt")
-    from story.llm import ANSWER_SYSTEM as S
-    from story.llm import CANDIDATE_RECHECK_SYSTEM as R
+    S = ANSWER_SYSTEM  # Pack 别名(Issue #53)
+    R = _PP.load_prompt("candidate_recheck")
     from story.llm import _TOOL_CANDIDATE_RECHECK as T
     check("有「还不足以解题 != 无关」",
           "不足以解题" in S and "无关" in S, S[:200])
@@ -3298,7 +3354,7 @@ def test_a2_recheck_verdict_definition_frozen_in_prompt():
     check("重判 enum 含 是/不是", "是" in enum and "不是" in enum, enum)
     # C0: 重判自带 completion 语义确认 —— 特异性规则必须嵌进去,
     # 而不是让模型自己猜一套。
-    from story.llm import COMPLETION_SPECIFICITY_RULES as SP
+    SP = _PP.load_fragment("completion_specificity")  # Pack 别名
     check("**重判 prompt 嵌入共享的特异性规则**", SP in R)
     check("共享规则含画框反例", "画框" in SP and "不建立" in SP)
 
@@ -3460,9 +3516,9 @@ def test_j1_2_verifier_must_reject_the_no_leap():
           out[0].completion_verified_fact_ids if out else None)
 
     # ---- prompt contract 冻结 ----
-    from story.llm import (COMPLETION_SPECIFICITY_RULES as SP,
-                           COMPLETION_VERIFY_SYSTEM as CV,
-                           CANDIDATE_RECHECK_SYSTEM as CR)
+    SP = _PP.load_fragment("completion_specificity")
+    CV = COMPLETION_VERIFY_SYSTEM
+    CR = _PP.load_prompt("candidate_recheck")
     check("共享规则含否定蕴含章节",
           "否定回答的直接蕴含规则" in SP, SP[:200])
     check("  **两个消费者都拿到同一份**",
@@ -3543,7 +3599,7 @@ def test_j1_6_keyword_hit_is_not_proposition():
     所以同时冻结文案。
     """
     print("\n[J1-6] 关键词命中不等于命题成立")
-    from story.llm import COMPLETION_SPECIFICITY_RULES as SP
+    SP = _PP.load_fragment("completion_specificity")  # Pack 别名
     check("规则写明主体/位置被换掉就是另一个命题",
           "关键词相关不等于命题成立" in SP or
           "关键词命中 ≠ 命题成立" in SP or
@@ -3733,7 +3789,7 @@ def main():
         # ---- v6 blocker: 第一层绝不拥有通关权 ----
         test_v6_a_text_fallback_solve_cannot_win,
         test_v6_b_text_fallback_variants_all_normalized,
-        test_v6_c_text_fallback_candidate_still_reaches_verifier,
+        test_v6_c_candidate_from_structured_result_reaches_verifier,
         test_v6_d_engine_rejects_solve_bypass_with_contract,
         test_v6_e_legacy_solve_still_wins,
         test_v6_first_layer_never_owns_victory,

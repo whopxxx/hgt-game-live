@@ -395,6 +395,8 @@
   let lastRenderedSig = null;   // 上次渲染内容的指纹, 没变就不动 DOM
   // 连续「无关」只显示最近 KEEP_IRRELEVANT 条, 其余折叠成一行小字。
   // 观众问偏了是常事, 但一屏全是"无关"太难看, 也会把有用的问答顶走。
+  // Issue #53 §31: rephrase(请改问法)**不参与**这里的折叠 —— 它不是
+  // 「无关」, 混进去会把"不知道怎么问"和"问偏了"两种信号搅在一起。
   const KEEP_IRRELEVANT = 2;
 
   function rowKey(r) {
@@ -486,7 +488,15 @@
       who.textContent = r.user_name + "：";
       q.appendChild(who);
       q.appendChild(document.createTextNode(r.text));
-      if (r.verdict) {
+      // Issue #53 §31/§32: rephrase 不是 verdict —— 只读服务端下发的
+      // `response_kind` 渲染"请改问法"徽章。JS 不做任何语义判断
+      // (不检查文本里有没有"怎么/为什么"), 前端只是渲染。
+      if (r.response_kind === "rephrase") {
+        const v = document.createElement("span");
+        v.className = "verdict v-rephrase";
+        v.textContent = "请改问法";
+        q.appendChild(v);
+      } else if (r.verdict) {
         const v = document.createElement("span");
         v.className = "verdict v-" + r.verdict;
         v.textContent = r.verdict;
