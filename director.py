@@ -341,11 +341,14 @@ class Director:
             # ---- Q10: AI 试玩(默认关闭) ----
             # 装配权在这里, 不在 PoolPrefetcher 里 —— 因为 Playtester 需要
             # (a) host_writer = 上面那个 pf_writer, (b) should_continue =
-            # 引擎的压力探针, 两者都是本层的协作者。
+            # 后台补池自己的生命周期谓词(`_background_should_continue`),
+            # 两者都是本层的协作者。
             #
-            # `should_continue` 复用 `_low_pressure_for_playtest`: 试玩比
-            # 单次 gen_spec 长得多(2N 次 LLM 调用), 所以它每步之前都要
-            # 重查一次"房间还空着吗"。一旦不空, 立刻以 interrupted 让路。
+            # ⚠️ Phase C: should_continue 不再是"房间还空着吗"的压力探针。
+            # 试玩与生成链一样, 只因为本次运行正式结束(停止)而中止 ——
+            # 直播忙不忙不再拥有"打断后台"的权力。谓词取的是 prefetcher
+            # 的方法本身(而不是快照一个 bool): 它在试玩的每一轮之前被重新
+            # 调用, 所以 `request_stop()` 立即生效。
             playtester = None
             if (getattr(cfg, "playtest_enabled", False)
                     and pf_writer is not None):
@@ -353,15 +356,16 @@ class Director:
                 playtester = Playtester(
                     player_client=pf_client,
                     host_writer=pf_writer,
-                    should_continue=self._playtest_should_continue,
+                    should_continue=self._prefetcher_should_continue,
                     max_turns=getattr(cfg, "playtest_max_turns", 10))
 
             self._prefetcher = PoolPrefetcher(
                 cfg=cfg, pool=self.pool, writer=pf_writer,
-                probe=self.engine.pressure,
                 probe_inputs=self.engine.snapshot_generation_inputs,
                 pick_blueprint=self._pick_blueprint,
-                rng=pf_rng, playtester=playtester)
+                rng=pf_rng)
+            if playtester is not None:
+                self._prefetcher.set_playtester(playtester)
 
         # ---- Batch H3-B: Lazy Curator(按需审外部题) ----
         #
@@ -459,29 +463,27 @@ class Director:
         return self._kw_bag, self._kw_bag_meta, self._kw_session_seed
 
     # ------------------------------------------------------------------
-    def _playtest_should_continue(self) -> bool:
-        """试玩让路谓词: 房间还空着才继续。
+    def _prefetcher_should_continue(self) -> bool:
+        """后台补池的**生命周期**谓词 —— 供 Q10 试玩复用。
 
-        用 `engine.pressure()` 而不是另起一个探针 —— 补池启动试玩时用的
-        就是它, 复用同一个判定边界, 免得"能开始试玩"和"能继续试玩"两套
-        标准漂移。试玩**开跑**的条件已经由 prefetcher 的 `_low_pressure()`
-        保证, 这里只负责"跑着跑着房间忙了就让路"。
+        Phase C 之后这不再是"房间还空着吗"的压力探针: 试玩与生成链
+        一样, 只会因为**本次运行正式结束**而中止, 不会因为直播切了
+        相位 / 弹幕在途而被丢掉。谓词本体在 `PoolPrefetcher`
+        (`_background_should_continue`, 即 `not shutdown_event`), 这里
+        只是转发一次 —— 因为试玩器是 Director 建的, 需要拿到 prefetcher
+        的方法；而 prefetcher 建在 playtester **之后**, 所以不能在这里
+        直接抓实例, 改用惰性查找。
+
+        fail closed: prefetcher 还没建好 / 已拆掉时返回 False(停手)。
         """
+        pf = self._prefetcher
+        if pf is None:
+            return False
         try:
-            p = self.engine.pressure()
+            return bool(pf._background_should_continue())
         except Exception:                       # noqa: BLE001
-            log.exception("试玩压力探针异常, 当作中断")
+            log.exception("补池生命周期谓词异常, 当作中断")
             return False
-        if not p or p.get("stopped"):
-            return False
-        from story.state import Phase
-        if p.get("phase") != Phase.QA:
-            return False
-        if p.get("pending") or p.get("inflight"):
-            return False
-        if p.get("hint_inflight") or p.get("reveal_inflight"):
-            return False
-        return True
 
     # ------------------------------------------------------------------
     def _build_source(self):
@@ -1643,10 +1645,10 @@ class Director:
             return
         # ---- G4-R1: `--no-llm` / 无 client 时**根本不该预热** ----
         #
-        # ⚠️ 这一条是 P0 修好之后才**暴露出来**的: 之前预热在 IDLE 下
+        # ⚠️ 这一条是 P0 修好之后才**暴露出来**的: 之前预热在启动相位下
         # 立刻就 `interrupted` 了(见 `prewarm_should_continue` 的说明),
         # 于是它**从来没走到** writer 那一步 —— 而 `--no-llm` 时
-        # `writer is None`。把让路修好之后, 预热真的往下走, 就在
+        # `writer is None`。把预热谓词修对之后, 预热真的往下走, 就在
         # Stage A 那一步撞上了 `NoneType` 属性错误。
         #
         # (这里刻意**不写出那个方法名** —— `test_prefetch` 有一条源码级
@@ -1654,7 +1656,7 @@ class Director:
         # 路径不许调 Stage A。注释里写出名字会把它误判成违规。)
         #
         # 也就是说: 旧的那个 bug **掩盖**了这一个。两个都得修 ——
-        # 修了让路却不修这个, 冒烟立刻出现 Traceback。
+        # 修了预热谓词却不修这个, 冒烟立刻出现 Traceback。
         #
         # 判定复用 prefetcher 自己的 `_enabled()`(它已经正确处理了
         # `writer is None` / `pool is None` / `pool_prefetch_enabled`),
@@ -1715,15 +1717,15 @@ class Director:
             "预热单次 LLM timeout=%.0fs retries=%d",
             max_rounds, budget, _prewarm_timeout, _prewarm_retries)
         t0 = time.monotonic()
-        # ---- G4-R1: 预热必须注入**它自己的**让路谓词 ----
+        # ---- G4-R1: 预热必须注入**它自己的**谓词 ----
         #
-        # ⚠️ 不注入的话这条路径在真实环境里**一道题都出不来**: 预热跑在
-        # `engine.start()` 之前, 此刻 `engine.phase == Phase.IDLE`, 而后台
-        # 判据 `_should_continue` 只认 QA / REVEALED —— 于是 Stage A 的
-        # 第一笔调用还没发出就已经 `interrupted`。
+        # ⚠️ 稳态后台的谓词是纯 stop-only(`_background_should_continue`),
+        # 而预热是**启动路径**上的一次性动作: 它跑在 `engine.start()` 之前,
+        # 而且不能无限等 —— 所以它多一条**总预算**(deadline)。两者是不同
+        # 的东西, 不能互相替代。
         #
         # 谓词的语义见 `PoolPrefetcher.prewarm_should_continue`: 只看
-        # "停了吗 / 预算到了吗", **不看相位**(预热期间本来就没有直播在跑)。
+        # "停了吗 / 预算到了吗", **不看直播状态**(预热期间本来就没有直播在跑)。
         try:
             sc = self._prefetcher.prewarm_should_continue(
                 deadline=t0 + budget, should_abort=self._stop.is_set)
@@ -1778,6 +1780,29 @@ class Director:
             self.hub.publish(self.engine.snapshot().to_json())
         except Exception as e:
             log.error("push 失败: %s", e)
+
+    # ------------------------------------------------------------------
+    def _request_prefetch_stop(self) -> None:
+        """通知后台补池停手(**只置停止信号, 不做资源回收**)。
+
+        Phase C 把"通知停止"和"资源回收"拆开了, 因为两者该发生的时刻不同:
+
+            run() 离开主循环 / Ctrl-C  -> 立刻 request_stop()   <- 这里
+            finally                    -> prefetcher.shutdown() <- 回收
+
+        为什么不能只靠 `finally`: 主循环检测到 `Phase.STOPPED` 后还要 sleep
+        0.5s + 3s 才 break, 而删掉相位门之后那段时间里后台理论上仍能起新
+        候选。停止信号必须在那之前生效。
+
+        幂等, 且对 `None` / 测试替身安全 —— 它可能被调用多次。
+        """
+        pf = self._prefetcher
+        if pf is None:
+            return
+        try:
+            pf.request_stop()
+        except Exception:                       # noqa: BLE001
+            log.exception("补池停止信号置位异常(忽略)")
 
     # ------------------------------------------------------------------
     def run(self) -> int:
@@ -1985,7 +2010,8 @@ class Director:
         #
         #     * **不是**补到 target(默认 5)。补满要 3~5 轮, 每轮几十秒 ——
         #       那是"开播前先静默三分钟", 对直播来说不可接受。1 道就够
-        #       把第一题顶过去, 剩下的由后台补池在 REVEALED 窗口续。
+        #       把第一题顶过去, 剩下的由后台补池在稳态调度里续(Phase C
+        #       之后后台不再等"REVEALED 窗口", 只要库存低就补)。
         #     * 有**明确总预算**, 不能无限等。
         #     * 失败(网关抖 / 出的题都不合格)**不阻止启动** —— 按
         #       emergency fallback 处理, 与"池空"完全同一条路径。预热
@@ -1995,6 +2021,20 @@ class Director:
         # 已经 playable >= 1 时**一次生成都不发**(§九-9): 那正是"预热"
         # 这个词的反面 —— 已经在跑的后台补池不需要人来踢一脚。
         self._prewarm()
+
+        # ---- Phase C: 预热结束 -> 正式激活后台补池 ----
+        #
+        # ⚠️ 顺序是**硬约束**, 不是风格问题。scheduler 线程在上面已经起了,
+        # 而 `_prewarm()` 是**直接**调 `_generate_one_inner()` 的 —— 它绕过
+        # `_future` 单飞。若此刻后台已经被激活, scheduler 会在预热跑着的
+        # 同时再提交一条后台生成, `max_workers=1` / `_future` 都挡不住,
+        # "后台最多一条"当场破功。
+        #
+        # 所以激活口单独放在预热**返回之后**: 预热期间 `_background_active`
+        # 是 False, `on_tick()` 直接 return, 从而天然不会与预热并发。
+        # 这是**生命周期**闸门, 不是相位闸门 —— 它不认识 QA/REVEALED。
+        if self._prefetcher is not None:
+            self._prefetcher.activate_background()
 
         # 开场: 触发第一段
         for a in self.engine.start():
@@ -2007,13 +2047,21 @@ class Director:
                     if self.engine.phase == Phase.STOPPED:
                         # 直播结束后仍让页面可见一会儿
                         log.info("已停止, 3 秒后退出")
+                        # ⚠️ Phase C: 立刻通知后台补池停手。这里到 `finally`
+                        # 之间还有 3 秒, 删掉相位门之后那 3 秒里 scheduler 理论上
+                        # 还能起新候选 —— "停止"必须在离开主循环那一刻生效。
+                        # 唯一允许感知的相位就是 `Phase.STOPPED`: 它是**生命
+                        # 周期终止**, 不是直播压力。
+                        self._request_prefetch_stop()
                         time.sleep(3)
                         break
                 time.sleep(0.3)
         except KeyboardInterrupt:
             log.info("收到 Ctrl-C, 退出")
+            self._request_prefetch_stop()
         finally:
             self._stop.set()
+            self._request_prefetch_stop()
             self._stop_live_heartbeat()
             if self.source:
                 try:

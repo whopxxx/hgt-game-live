@@ -672,12 +672,10 @@ def test_prefetch_playtest_disabled_by_default():
         # 默认: 不注入 playtester
         pf = PoolPrefetcher(
             cfg=cfg, pool=pool, writer=w,
-            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                           "hint_inflight": False, "reveal_inflight": False,
-                           "stopped": False},
             probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
             pick_blueprint=lambda recent, rng=None: None,
             executor=_Ex())
+        pf.activate_background()      # Phase C: 后台需先激活
         check("**默认没有 playtester**", pf._playtester is None)
         pf.on_tick()
         pf.on_tick()
@@ -939,12 +937,13 @@ def _mkpf_with_pt(playtester, **cfgkw):
     pool = PuzzlePool.open(cfg)
     pf = PoolPrefetcher(
         cfg=cfg, pool=pool, writer=_W(),
-        probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                       "hint_inflight": False, "reveal_inflight": False,
-                       "stopped": False},
         probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
         pick_blueprint=lambda recent, rng=None: None,
-        clock=_Clk(), executor=_Ex(), playtester=playtester)
+        clock=_Clk(), executor=_Ex())
+    # Phase C: playtester 走薄装配口, 且后台要先激活(等价于 prewarm 结束)。
+    if playtester is not None:
+        pf.set_playtester(playtester)
+    pf.activate_background()
     return pf, pf.writer, pf._clock, d
 
 

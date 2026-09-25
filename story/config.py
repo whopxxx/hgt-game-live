@@ -862,35 +862,6 @@ class Config:
     # 所以补池要同时看 playable —— `stock >= target` 但 `playable <
     # playable_min` 时**仍然**补。
     pool_playable_min: int = 3
-    # ---- 揭晓窗口专用目标(60 秒是**最富裕**的补池窗口) ----
-    # QA 期间仍然单飞让路，但库存水位已前移(target=12/playable=3)。
-    # REVEALED 是引擎**完全空闲**的 60 秒 —— 观众在看答案, 没有任何
-    # 在途请求。这时把目标抬高, 让"看答案 -> 下一题直接出现"真正成立
-    # (而不是 60 秒后又回到现场生成、观众干等)。
-    # 仍然单飞串行 + 受 pool_max_size 约束, 不并行生成多个。
-    pool_reveal_target_size: int = 12
-    pool_reveal_playable_target: int = 3
-    # 距下一题不足这个秒数就不再**启动**新请求(在途的不用强杀)。
-    #
-    # ⚠️ G1: 它必须**至少覆盖一轮补池的完整预算**(prefetch budget +
-    # 安全余量), 否则等于没挡 —— 实播事故:
-    #
-    #     18:45:07 揭晓结束、下一题开始(SETTING)
-    #     18:44:49 启动的那次 prefetch 还在跑
-    #     18:45:58 它才跑完第 4 稿失败
-    #
-    # 也就是 live 现场生成与后台补池**同时**占了 51 秒的网关。当时
-    # guard 只有 15s, 而一轮 prefetch 可能跑几十秒 —— "只剩 18 秒"
-    # 照样会启动一个最多几十秒的后台任务, 那个任务注定跨过 deadline,
-    # 与下一题的现场生成正面相撞。
-    #
-    # Story 现在单独允许到 45s，因此默认 guard 同步抬到 50s
-    # (= max(prefetch budget 25, Story 45) + 5s 余量)。PoolPrefetcher 仍会
-    # 动态取 max 兜底，避免以后只调 timeout 却忘了调 guard。
-    pool_reveal_start_guard_seconds: float = 50.0
-    # 一轮 prefetch 的**安全余量**: guard 至少要比 budget 多这么多,
-    # 让"启动的那次生成"有希望在 deadline 之前真的结束。
-    pool_prefetch_guard_margin_seconds: float = 5.0
     # 补池的硬上限: 库存到这儿就停, **即使 playable 仍然是 0**。
     # 为什么必须有: 若那批题是被"某个窗口条件"整体挡住的(比如最近
     # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
@@ -921,7 +892,7 @@ class Config:
     # 不够长(问题不是瞬时的), 也不够短(真想恢复时又白等 30 秒)。
     #
     # 改成递增: 30 -> 60 -> 120 -> 240 -> 300, 之后封顶 300。
-    # 成功入池**立刻重置**回第一档; `interrupted`(让路)**不算失败**,
+    # 成功入池**立刻重置**回第一档; `interrupted`(停止收手)**不算失败**,
     # 不动这个序列。
     pool_prefetch_backoff_schedule_s: tuple = (30.0, 60.0, 120.0, 240.0,
                                                300.0)
@@ -1147,8 +1118,9 @@ class Config:
     #: 单条预算(秒)。超了记 technical_defer(**不是** rejected)——
     #: 一道题卡住不该吃掉整个后台窗口, 也不该被永久判死。
     curated_budget_seconds: float = 45.0
-    #: 临近下一题多少秒内不再启动新的审题。与 `pool_reveal_start_guard_seconds`
-    #: 同一个思路: 启动一个注定跨过 deadline 的调用是纯浪费。
+    #: 临近下一题多少秒内不再启动新的审题。这是 **LazyCurator 自己的**
+    #: 策略 —— 它管的是"按需审题"这条独立链, 与本轮解耦的 PoolPrefetcher
+    #: 无关(后者已彻底不看直播相位, 见 Issue #55)。
     curated_start_guard_seconds: float = 15.0
     #: 候选语料(**只读**)。默认就是 H1-D 的产出。
     curated_corpus_path: str = os.path.join(
@@ -1333,23 +1305,6 @@ class Config:
                 f"reveal_hold_seconds({self.reveal_hold_seconds}) <= 0: "
                 f"揭晓会瞬间跳过, 观众看不到答案。"
             )
-        if self.pool_reveal_target_size < self.pool_target_size:
-            warns.append(
-                f"pool_reveal_target_size({self.pool_reveal_target_size}) < "
-                f"pool_target_size({self.pool_target_size}): 揭晓窗口是"
-                f"最富裕的补池时机, 目标不该比 QA 期间还低。"
-            )
-        if self.pool_reveal_target_size > self.pool_max_size:
-            warns.append(
-                f"pool_reveal_target_size({self.pool_reveal_target_size}) > "
-                f"pool_max_size({self.pool_max_size}): 揭晓目标高于硬上限, "
-                f"永远补不到。"
-            )
-        if self.pool_reveal_start_guard_seconds < 0:
-            warns.append(
-                f"pool_reveal_start_guard_seconds("
-                f"{self.pool_reveal_start_guard_seconds}) 为负, 已按 0 处理。"
-            )
         if self.pool_prefetch_backoff_s <= 0:
             warns.append(
                 f"pool_prefetch_backoff_s({self.pool_prefetch_backoff_s}) <= 0: "
@@ -1419,30 +1374,6 @@ class Config:
             warns.append(
                 f"pool_prewarm_llm_max_retries("
                 f"{self.pool_prewarm_llm_max_retries}) < 0: 已按 0 次重试处理。"
-            )
-        if self.pool_prefetch_guard_margin_seconds < 0:
-            warns.append(
-                f"pool_prefetch_guard_margin_seconds("
-                f"{self.pool_prefetch_guard_margin_seconds}) 为负, 已按 0 处理。"
-            )
-        # guard 必须覆盖“一轮预算”和“单次 Story 最坏在途时间”中更大的
-        # 那一个。keyword2 的 25s budget 不能取消已经发出的 HTTP 请求；
-        # Story 若允许 45s，就不能仍按 25+5=30s 判断还能否启动。
-        _story_timeout = min(
-            float(self.llm.timeout),
-            max(0.0, float(self.pool_prefetch_story_timeout_seconds)))
-        _guard_work = max(self.pool_prefetch_budget_seconds, _story_timeout)
-        _min_guard = _guard_work + self.pool_prefetch_guard_margin_seconds
-        if 0 < self.pool_reveal_start_guard_seconds < _min_guard:
-            warns.append(
-                f"pool_reveal_start_guard_seconds("
-                f"{self.pool_reveal_start_guard_seconds}) < 补池最坏在途预算"
-                f"({_min_guard:.0f}s = max(budget "
-                f"{self.pool_prefetch_budget_seconds:.0f}, story_timeout "
-                f"{_story_timeout:.0f}) + 余量 "
-                f"{self.pool_prefetch_guard_margin_seconds:.0f}): 实际生效值"
-                f"会被抬到 {_min_guard:.0f}s。否则临近 deadline 启动的 "
-                f"Story 可能跨到下一题，与现场生成抢网关。"
             )
         _sched = tuple(self.pool_prefetch_backoff_schedule_s or ())
         if not _sched:
@@ -1664,10 +1595,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prefetch-budget", type=float, default=25.0,
                     help="后台补池每道题的秒预算(默认 25)。与直播现场出题的"
                          "90s 分开, 免得一轮后台生成跨过下一题的 deadline")
-    ap.add_argument("--pool-reveal-guard", type=float, default=30.0,
-                    help="距下一题不足这个秒数就不再启动新的补池请求"
-                         "(默认 30)。必须 >= --prefetch-budget, 否则会取 max()"
-                         "抬高")
     ap.add_argument("--playtest", dest="playtest_enabled",
                     action="store_true",
                     help="后台补池时先用 AI 玩家试玩一遍, 只有猜得中才入池"
@@ -1805,7 +1732,6 @@ def from_args(argv: Optional[list[str]] = None) -> Config:
         pool_keyword_seed_enabled=a.pool_keyword_seed_enabled,
         keyword_corpus_path=a.keyword_corpus_path,
         keyword_session_seed=a.keyword_session_seed,
-        pool_reveal_start_guard_seconds=a.pool_reveal_guard,
         playtest_enabled=a.playtest_enabled,
         playtest_max_turns=a.playtest_max_turns,
         max_question_len=a.max_question_len,

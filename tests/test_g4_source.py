@@ -776,9 +776,9 @@ def test_prewarm_real_idle_phase_generates_one():
         dr, w = _mk_real_prefetch_director(d, pool_prewarm_max_rounds=2)
         check("**相位确实是 IDLE**", dr.engine.phase == Phase.IDLE,
               dr.engine.phase)
-        check("反证: 后台让路判据在 IDLE 下是 False",
-              dr._prefetcher._should_continue() is False,
-              "若这条变了, 说明 P0 的成因描述已经过时")
+        check("反证: Phase C 之后后台判据**不再读相位**(读相位的 _should_continue 已删)",
+              not hasattr(dr._prefetcher, "_should_continue"),
+              "若这条变了, 说明 Phase C 的删除被回滚了")
         before = dr._prefetcher._playable(
             dr._prefetcher._generation_inputs())
         check("冷启动 playable == 0", before == 0, before)
@@ -926,29 +926,36 @@ def test_prewarm_skipped_when_prefetch_disabled():
 def test_prewarm_predicate_ignores_phase_but_respects_budget():
     """预热谓词与后台谓词是**两个东西**, 各自的边界都要钉住。
 
-    | 条件 | `_should_continue` | `prewarm_should_continue` |
-    |---|---|---|
-    | IDLE(开播前) | False | **True**(预算内) |
-    | 预算已过 | — | **False** |
-    | stop 已置 | False | **False** |
+    Phase C 之后后台谓词是**纯 stop**(不读相位); 预热谓词是 stop + **预算**。
+    两者绝不能合并(见 `PoolPrefetcher._background_should_continue` 的说明)。
 
-    第一行是 P0 的修法; 后两行是"预热仍然**有界**"的证明 —— 否则
-    "让它能跑"就变成了"让它无限跑"。
+    | 条件 | `_background_should_continue` | `prewarm_should_continue` |
+    |---|---|---|
+    | 正常(IDLE, 未停止) | **True** | **True**(预算内) |
+    | 预算已过 | True(它没有预算概念) | **False** |
+    | stop 已置 | **False** | **False** |
+
+    第二行是"两者不能互换"的证明: 后台谓词根本没有 deadline 概念, 所以
+    把预热接到它上面会让预热变成**无限等待**; 反过来把后台接到预热上则
+    会让常驻补池凭空获得一个不存在的截止时间。
     """
     print("\n[G4-R1-P0c] 预热谓词: 不看相位, 但看预算与停止")
     import time as _t
     with tmpdir() as d:
         dr, _w = _mk_real_prefetch_director(d)
         pf = dr._prefetcher
-        check("后台判据在 IDLE 下 False", pf._should_continue() is False)
+        check("**后台判据是纯 stop(不受相位/预算影响)**",
+              pf._background_should_continue() is True)
         sc = pf.prewarm_should_continue(
             deadline=_t.monotonic() + 30.0, should_abort=dr._stop.is_set)
-        check("**预热判据在 IDLE 下 True**", sc() is True)
+        check("**预热判据在预算内 True**", sc() is True)
         sc_expired = pf.prewarm_should_continue(
             deadline=_t.monotonic() - 1.0)
         check("**预算已过 -> False**", sc_expired() is False)
+        check("**预算过不影响后台判据(两者不通用)**",
+              pf._background_should_continue() is True)
         dr._stop.set()
-        check("**stop 已置 -> False**", sc() is False)
+        check("**stop 已置 -> 预热判据 False**", sc() is False)
 
 
 # ======================================================================
@@ -2363,31 +2370,35 @@ def test_reject_labels_survive_to_stats():
 
 
 def test_cooperative_cancellation_not_regressed():
-    """**§8-15**: normal background / live / prewarm 的协作取消**不回退**。
+    """**§8-15 / Phase C**: 三条链的协作取消**不回退**。
 
-    G4-R2 动了 Stage B 的调用次数与退避调度, 所以这里把三条链的让路
-    判据再钉一遍 —— 新增一次"技术重试"最容易犯的错就是让它绕过了
-    `_should_continue`(§8-7 单测那一处), 或者在空池紧急档下把
-    "直播忙"也一起解禁了。
+    Phase C 把"后台让路"的判据从"直播忙"换成了"本次运行结束(stop)"。
+    这里钉的是**取消能力本身没有丢**:
+      * 后台: `request_stop()` 之后谓词 False(不再有"直播忙"这一说);
+      * 预热: 仍然同时看预算与 stop(它与后台谓词不可互换);
+      * 空池**不**解禁停止 —— 池子空不是"忽略停止信号"的理由。
+
+    前身断言的是"SETTING 让路"。那条现在**是反需求**: 直播相位不再
+    拥有后台的抢占权(见模块 docstring / 任务书 §4)。
     """
     print("\n[G4-R2-15] 协作取消不回退")
-    from story.state import Phase
     with tmpdir() as d:
         cfg = mkcfg(d, pool_prefetch_enabled=True)
         pf = _mk_bare_prefetcher(cfg)
-        # ---- 后台: 直播忙(SETTING) -> 让路 ----
-        pf._probe = lambda: {"phase": Phase.SETTING, "pending": 0,
-                             "inflight": 0}
-        check("**后台在 SETTING 让路**", pf._should_continue() is False,
-              pf._should_continue())
-        # ---- 空池**不**解禁让路: 池子空不是抢网关的理由 ----
+        # ---- 后台: 只认 stop, 不认相位 ----
+        check("**未停止时后台谓词 True**",
+              pf._background_should_continue() is True)
+        pf.request_stop()
+        check("**request_stop 后后台谓词 False**",
+              pf._background_should_continue() is False)
+        # ---- 空池**不**解禁停止: 池子空不是忽略停止信号的理由 ----
         pf._stock = lambda *a, **k: 0
         pf._playable = lambda *a, **k: 0
-        check("**空池下仍然让路(紧急档只换退避)**",
-              pf._should_continue() is False, pf._should_continue())
+        check("**空池下仍然停止(紧急档只换退避)**",
+              pf._background_should_continue() is False,
+              pf._background_should_continue())
         check("**空池确实被认出来了**", pf._is_empty() is True, "")
         # ---- 预热: 不检查相位, 只看 stop + 预算 ----
-        pf._probe = lambda: {"phase": Phase.IDLE, "pending": 0, "inflight": 0}
         sc = pf.prewarm_should_continue(deadline=None, should_abort=None)
         check("**预热在 IDLE 下继续**", sc() is True, sc())
         sc2 = pf.prewarm_should_continue(deadline=0.0, should_abort=None)
@@ -2406,7 +2417,6 @@ def _mk_bare_prefetcher(cfg):
     """
     from story.prefetch import PoolPrefetcher
     return PoolPrefetcher(cfg=cfg, pool=None, writer=None,
-                          probe=lambda: {},
                           probe_inputs=lambda: {},
                           pick_blueprint=lambda *a, **k: None,
                           clock=lambda: 1000.0)
