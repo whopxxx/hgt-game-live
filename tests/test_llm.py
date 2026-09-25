@@ -3348,7 +3348,9 @@ def test_q2_versions_bumped():
 def test_truth_prompt_has_scanning_rules():
     """audit prompt 必须点名那批绝对断言词与归属例外。"""
     print("\n[Q1-prompt] audit prompt 的扫描清单")
-    from story.llm import TRUTH_AUDIT_SYSTEM as S
+    # Issue #50: 审计 prompt 单一来源是 Prompt Pack 文件。
+    from story.prompt_pack import load_prompt
+    S = load_prompt("audit_truthfulness")
     for w in ("并没有", "从未", "绝不", "唯一", "同一个", "还没有"):
         check(f"扫描词 {w}", w in S, "缺")
     for d in ("身份", "动作", "方向", "前后顺序", "时间", "数量", "地点"):
@@ -4194,9 +4196,13 @@ def test_r7_main_reviewer_prompt_unchanged():
         check("**泛化措辞已收掉: %r**" % bad, bad not in d, d[:160])
 
     # ---- ④ 复核是独立的一份 ----
-    from story.llm import SAFETY_SYSTEM, SAFETY_PROMPT_VERSION
-    check("**独立版本号 safety-v3**",
-          SAFETY_PROMPT_VERSION == "safety-v3", SAFETY_PROMPT_VERSION)
+    # Issue #50: safety 复核 prompt 迁入 Prompt Pack(逐字迁移);
+    # 旧 SAFETY_PROMPT_VERSION 退役为历史标签, stage 版本在 Pack。
+    from story.prompt_pack import load_prompt, stage_version
+    SAFETY_SYSTEM = load_prompt("audit_safety")
+    check("**Pack stage 版本 = audit-safety-v1**",
+          stage_version("audit_safety") == "audit-safety-v1",
+          stage_version("audit_safety"))
     check("**复核 system 是独立文案**(不是主审那段的对象)",
           "直播安全复核员" in SAFETY_SYSTEM, SAFETY_SYSTEM[:60])
     check("**复核的泛化措辞也收掉了**",
@@ -5044,7 +5050,9 @@ def test_r4_core_answer_means_core_anomaly():
     for bad in ("回答谜面末尾那个问题", "回答谜面最后那个问题",
                 "回答谜面末尾的问题", "回答谜面最后的问题"):
         check(f"schema 不含「{bad}」", bad not in blob)
-    for text, name in ((L.STRUCTURE_SYSTEM, "STRUCTURE_SYSTEM"),
+    # Issue #50: STRUCTURE_SYSTEM 迁入 Prompt Pack(contract-v1.md)。
+    from story.prompt_pack import load_prompt
+    for text, name in ((load_prompt("contract"), "contract-v1"),
                        (L.CHECK_SYSTEM, "CHECK_SYSTEM"),
                        (L.RIDDLE_SYSTEM, "RIDDLE_SYSTEM")):
         for bad in ("回答谜面末尾那个问题", "回答谜面最后那个问题"):
@@ -5158,13 +5166,16 @@ def test_r4_keyword_spec_runs_three_stages():
           [c["tool"]["name"] for c in fc.calls])
     m = spec.metrics or {}
     check("lane 落进 metrics", m.get("lane") in ("red", "black"), m.get("lane"))
-    check("story 版本落盘", m.get("story_prompt_version") == "keyword2-v7")
-    check("surface 版本落盘", m.get("surface_prompt_version") == "surface-v2")
+    # Issue #50 §12: stage 版本改记 Prompt Pack 的 truth/surface 版本。
+    from story.prompt_pack import PROMPT_PACK_VERSION, stage_version
+    check("truth 版本落盘", m.get("truth_prompt_version") == stage_version("truth"))
+    check("surface 版本落盘", m.get("surface_prompt_version") == stage_version("surface"))
+    check("Pack 总版本落盘", m.get("prompt_pack_version") == PROMPT_PACK_VERSION)
     check("keywords 落盘", m.get("keywords"), m.get("keywords"))
     check("draw_index 落盘", int(m.get("keyword_draw_index") or 0) >= 1,
           m.get("keyword_draw_index"))
-    check("spec.prompt_version == keyword2-v7",
-          spec.prompt_version == "keyword2-v7", spec.prompt_version)
+    check("spec.prompt_version == 生成 Pack 版本",
+          spec.prompt_version == PROMPT_PACK_VERSION, spec.prompt_version)
 
 
 def test_r4_lane_varies_across_real_keyword_spec_calls():
