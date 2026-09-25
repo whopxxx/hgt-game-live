@@ -269,6 +269,23 @@ class GenerationBrief:
                         f"或空=不指定)")
         return errs
 
+    def require_valid(self) -> "GenerationBrief":
+        """fail closed 入口: 非法 brief 直接抛 `ValueError`(Issue #51)。
+
+        接线纪律(#50 任务书 §17 + #51 review Blocker 2): brief 已进入
+        真实生成链, 非法值必须在**任何 LLM 调用之前**确定性拒绝 ——
+        否则非法 requested_category 要到 Contract/audit 才撞上 validator
+        (白烧几次模型调用), 而非法 requested difficulty 只影响 Truth
+        创作方向与 metrics, 甚至可能一路成功入池。
+
+        返回 self(方便链式); 调用方**不得**把 ValueError 当成可重试的
+        LLM 技术失败 —— 它是代码/调用方错误。
+        """
+        errs = self.validate()
+        if errs:
+            raise ValueError("invalid GenerationBrief: " + "; ".join(errs))
+        return self
+
     def to_dict(self) -> dict:
         return {"requested_category": self.requested_category,
                 "difficulty": self.difficulty}

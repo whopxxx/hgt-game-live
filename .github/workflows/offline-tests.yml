@@ -52,6 +52,11 @@ jobs:
       - name: 离线套件 haiguitang_protocol
         run: uv run tests/test_haiguitang_protocol.py
 
+      # Issue #50: Generation Prompt Pack —— loader fail closed /
+      # FakeClient 全链(Truth->Surface->Contract->Audit)产 v1 clean 过池门。
+      - name: 离线套件 prompt_pack
+        run: uv run tests/test_prompt_pack.py
+
       - name: 离线套件 parser
         run: uv run tests/test_parser.py
 

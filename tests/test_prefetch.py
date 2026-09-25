@@ -2866,7 +2866,8 @@ class _KeywordWriter:
 
     # ---- R4: Story / Surface 两段(取代旧的一段 Stage A) ----
     def gen_keyword_story(self, keywords, lane, *, should_continue=None,
-                          max_attempts=None, temperature=None, timeout=None):
+                          max_attempts=None, temperature=None, timeout=None,
+                          brief=None):  # Issue #50: keyword2 链现在带 brief
         """Story 阶段替身: 只交 `{"answer": ...}`。
 
         ⚠️ 让路语义与生产件同构, 见下面 `structure_original_idea` 那段
@@ -2903,7 +2904,7 @@ class _KeywordWriter:
 
     def structure_original_idea(self, *, title, puzzle, answer, avoid=None,
                                 recent=None, should_continue=None,
-                                max_attempts=None):
+                                max_attempts=None, brief=None):
         self.structure_calls.append({
             "title": title, "puzzle": puzzle, "answer": answer,
             "avoid": avoid, "recent": recent,
@@ -3069,10 +3070,14 @@ def test_g2_keyword_provenance():
             check("**lane 也记进了 metrics**",
                   (s.metrics or {}).get("lane") in ("red", "black"),
                   (s.metrics or {}).get("lane"))
-            check("**story/surface 两个 prompt version 都落盘**",
-                  (s.metrics or {}).get("story_prompt_version") == "keyword2-v7"
+            # Issue #50 §12: stage 版本改记 Prompt Pack 的
+            # truth/surface stage 版本(不再是 story_prompt_version 旧标签)。
+            from story.prompt_pack import stage_version as _pv
+            check("**truth/surface 两个 prompt version 都落盘**",
+                  (s.metrics or {}).get("truth_prompt_version")
+                  == _pv("truth")
                   and (s.metrics or {}).get("surface_prompt_version")
-                  == "surface-v2", s.metrics)
+                  == _pv("surface"), s.metrics)
             check("**source_type 为空(是 generated, 不是 curated)**",
                   not getattr(s, "source_type", ""), repr(getattr(s, "source_type", "")))
             check("**没有 curated_policy_version**",
@@ -3715,7 +3720,8 @@ def test_stable_refill_candidate_never_adds_after_live_appears():
             return {"keywords": ["门", "雨"], "index": 1}
 
     class Writer:
-        def gen_keyword_story(self, keywords, lane, should_continue=None):
+        def gen_keyword_story(self, keywords, lane, should_continue=None,
+                              **kw):  # Issue #50: 兼容 brief 关键字
             return {"answer": "完整背景使这个反常行为成立。"}
 
         def gen_surface(self, answer, should_continue=None):
@@ -3762,7 +3768,8 @@ def test_stable_refill_prefill_default_path_still_adds():
             return {"keywords": ["门", "雨"], "index": 1}
 
     class Writer:
-        def gen_keyword_story(self, keywords, lane, should_continue=None):
+        def gen_keyword_story(self, keywords, lane, should_continue=None,
+                              **kw):  # Issue #50: 兼容 brief 关键字
             return {"answer": "完整背景使这个反常行为成立。"}
 
         def gen_surface(self, answer, should_continue=None):
