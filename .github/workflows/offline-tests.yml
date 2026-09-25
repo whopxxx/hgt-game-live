@@ -57,6 +57,12 @@ jobs:
       - name: 离线套件 prompt_pack
         run: uv run tests/test_prompt_pack.py
 
+      # Issue #53: Judging Prompt Pack —— 判题侧 prompt 单一来源 /
+      # response_kind 合同 / rephrase 与无关分离 / tool 失败不猜语义 /
+      # Engine defense-in-depth。实播事故 fixture 全钉。
+      - name: 离线套件 judging_prompt_pack
+        run: uv run tests/test_judging_prompt_pack.py
+
       - name: 离线套件 parser
         run: uv run tests/test_parser.py
 
@@ -174,8 +180,13 @@ jobs:
       #     长得一模一样;
       #   * **诊断关闭时生产计数逐字不变** —— 拿基线与诊断类跑同一个响应,
       #     比对 method/unhandled/parse_error 三个计数与业务回调序列。
+      # 最后一道防死锁保险: gift_probe 的 URL 构造测试已在测试侧 stub 掉
+      # ttwid 网络获取(#54 CI 事故根修), 并有 session.get 联网即抛的守卫;
+      # 这里再给 step 本身一个硬上限 —— 正常 ~15s, 30s 还没跑完就说明
+      # 有东西在等一个永远不回来的外部响应, 直接杀掉让它红得明明白白,
+      # 而不是挂到 job 超时拖死整个 PR 的 CI。
       - name: 离线套件 gift_probe
-        run: uv run tests/test_gift_probe.py
+        run: timeout 30s uv run tests/test_gift_probe.py
 
       # Issue #42: 礼物**识别 + 结构化记录**的回归 —— 正常直播链
       # (keep_all=False)收得到 Gift、字段映射正确、gifts.jsonl 一条

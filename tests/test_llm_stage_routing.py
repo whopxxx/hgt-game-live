@@ -990,7 +990,9 @@ def test_qa_stages_route_independently():
 
     # ---- qa.answer ----
     cli = FakeClient([LLMResult(tool_input={"answers": [
-        {"id": 1, "verdict": "是", "comment": "对"}]}, model="m")])
+        {"id": 1, "response_kind": "verdict", "verdict": "是", "comment": "对",
+         "solution_candidate": False, "touched_fact_ids": [],
+         "established_fact_ids": []}]}, model="m")])
     w = PuzzleWriter(client=cli, runtime_cfg=cfg)
     s = _stage_of_last(w, w.answer, "谜面", "谜底", [], 1, "甲", "他是盲人吗")
     check("**answer -> qa.answer**", s == "qa.answer", s)
@@ -998,7 +1000,8 @@ def test_qa_stages_route_independently():
     # ---- qa.judge(answer() 内部在 judge_solve=True 时会调 judge) ----
     cli_j = FakeClient([
         LLMResult(tool_input={"answers": [
-            {"id": 1, "verdict": "是", "solution_candidate": True}]}, model="m"),
+            {"id": 1, "response_kind": "verdict", "verdict": "是", "solution_candidate": True,
+             "touched_fact_ids": [], "established_fact_ids": []}]}, model="m"),
         LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                               "mechanism_hit": True}, model="m")])
     wj = PuzzleWriter(client=cli_j, runtime_cfg=cfg)

@@ -137,6 +137,22 @@ class QAResult:
     #: 只进 archive(`QARec.to_archive`), **不进前端 JSON**。
     completion_verified_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
+    # ---- Issue #53 §5/§7: 语义类别与裁决分离 ----
+    # response_kind = "verdict" -> 这条结果是一次可裁决命题的裁判,
+    # verdict ∈ {是, 不是, 无关} 有意义。
+    # response_kind = "rephrase" -> 模型理解了这句话, 但它没有给出可
+    # 裁决的命题(开放索取/要求解释/闲聊); verdict 为空, 不建立任何
+    # fact。旧数据/旧调用方缺字段 -> 默认 "verdict"(archive 向后兼容)。
+    # ⚠️ "unavailable"(未判定)不是 response_kind —— 那是 status 上的
+    # **技术失败**, 只能由代码产生, 模型永远不能把它当语义类别。
+    response_kind: str = "verdict"
+    # ---- Issue #53 §35: 判题 Prompt provenance(只进 archive) ----
+    # 用于以后对比 answer-v1 vs answer-v2 的 rephrase rate /
+    # unavailable rate / rescue rate。旧数据缺字段 -> 空串。
+    judging_prompt_version: str = ""
+    answer_prompt_version: str = ""
+    candidate_recheck_prompt_version: str = ""
+    completion_verify_prompt_version: str = ""
 
 
 @dataclass
@@ -200,6 +216,16 @@ class QARec:
     #: 只进 `to_archive()`, **绝不进 `to_json()`** —— 前端永远不看 fact ID。
     completion_contribution_fact_ids: Optional[list] = None
     solution_candidate: Optional[bool] = None
+    # ---- Issue #53 §7/§31/§33/§34/§35 ----
+    #: 语义类别(见 `QAResult.response_kind`)。旧 archive 缺字段时按
+    #: legacy 语义兼容 -> 默认 "verdict"。
+    response_kind: str = "verdict"
+    #: 判题 Prompt provenance: 总版本 + 各次实际调用的 stage 版本。
+    #: 只进 `to_archive()`(复盘/对比实验用), 不上前端。
+    judging_prompt_version: str = ""
+    answer_prompt_version: str = ""
+    candidate_recheck_prompt_version: str = ""
+    completion_verify_prompt_version: str = ""
 
     def to_json(self) -> dict[str, Any]:
         # 上屏用: 只给前端展示需要的字段(不暴露内部判定细节)
@@ -207,7 +233,11 @@ class QARec:
         # ⚠️ `established_fact_ids` **刻意不进这里**: 它是通关状态,
         # 前端不需要、也不该看到内部 fact id。要复盘请用 `to_archive()`。
         # `completion_verified_fact_ids` 同理 —— 它是分析字段, 更不该外露。
-        return {
+        #
+        # Issue #53 §31: `response_kind` **要**进这里 —— rephrase 不是
+        # 任何一种 verdict, 前端必须能独立渲染"请改问法"徽章, 而不是
+        # 把它显示成「无关」。
+        d = {
             "qid": self.qid,
             "user_name": self.user_name,
             "text": self.text,
@@ -215,6 +245,9 @@ class QARec:
             "comment": self.comment,
             "kind": self.kind,
         }
+        if self.response_kind and self.response_kind != "verdict":
+            d["response_kind"] = self.response_kind
+        return d
 
     def to_archive(self) -> dict[str, Any]:
         """落盘用: 展示字段 + 覆盖结果, 供赛后复盘。"""
@@ -235,11 +268,31 @@ class QARec:
             "completion_contribution_fact_ids":
                 self.completion_contribution_fact_ids,
             "solution_candidate": self.solution_candidate,
+            # ---- Issue #53 §34/§35 ----
+            # QA record 扩展, **不是** PuzzleSpec schema 变化 ——
+            # 不 bump spec_version。response_kind 缺省即 "verdict",
+            # 旧消费者把它当不存在即可。
+            "response_kind": self.response_kind,
+            "judging_prompt_version": self.judging_prompt_version,
+            "answer_prompt_version": self.answer_prompt_version,
+            "candidate_recheck_prompt_version":
+                self.candidate_recheck_prompt_version,
+            "completion_verify_prompt_version":
+                self.completion_verify_prompt_version,
         })
         return d
 
     def to_line(self) -> str:
-        """喂回 LLM 的一行。"""
+        """喂回 LLM 的一行。
+
+        Issue #53 §33: rephrase 不是 verdict, 但也**不能**被记录成
+        "→ " 后面空空如也(丢语义)。展示层 label 是"请改问法" —— 它是
+        transcript 展示 label, **不是** verdict enum 的新成员。
+        """
+        if self.response_kind == "rephrase":
+            c = f" ({self.comment})" if self.comment else ""
+            return (f"[{self.qid}] {self.user_name}：{self.text} "
+                    f"→ 请改问法{c}")
         c = f" ({self.comment})" if self.comment else ""
         return f"[{self.qid}] {self.user_name}：{self.text} → {self.verdict}{c}"
 
