@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-26 19:28:17",
+  "generated_at": "2026-09-26 19:42:46",
   "issue": 60,
   "milestone": "Live-ready Theme v1",
   "criteria": {
@@ -9,27 +9,38 @@
   "observed": {
     "distinct_stock_count": 53,
     "stock_by_category": {
-      "logic": 20,
+      "logic": 18,
       "suspense": 25,
-      "horror": 13,
-      "emotion": 29,
-      "brainstorm": 14
+      "horror": 10,
+      "emotion": 30,
+      "brainstorm": 16
     },
     "distinct_v2_unplayed": 45,
     "per_category_counts_multi_label": {
-      "logic": 20,
+      "logic": 18,
       "suspense": 25,
-      "horror": 13,
-      "emotion": 29,
-      "brainstorm": 14
+      "horror": 10,
+      "emotion": 30,
+      "brainstorm": 16
     }
   },
   "criteria_met": true,
   "prefill": {
     "command": "uv run prefill_pool.py --live-ready --concurrency 5 --seed 20260926",
+    "runs": [
+      {
+        "at": "2026-09-26 19:00-19:21",
+        "attempts": 71,
+        "added": 45
+      },
+      {
+        "at": "2026-09-26 19:35-19:38",
+        "attempts": 10,
+        "added": 8,
+        "note": "补回开发期 8 次诊断性 pop 意外消耗的库存(air=False), 非直播消耗"
+      }
+    ],
     "live_heartbeat_check": "inactive (refused if active)",
-    "attempts_used": 71,
-    "added_this_run": 45,
     "log": "data/audit/prefill_run_live_ready.log"
   },
   "inventory": [
@@ -40,7 +51,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "emotional_motive",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -52,7 +62,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -64,7 +73,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -76,7 +84,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -88,7 +95,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "object_misuse",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -100,7 +106,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "information_gap",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -112,7 +117,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "information_gap",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -124,7 +128,6 @@
       "primary_category": "",
       "difficulty": "",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": false,
       "added_source": "prefetch"
@@ -139,24 +142,7 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "b6e030302d205637",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "suspense",
-        "emotion",
-        "logic"
-      ],
-      "primary_category": "suspense",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "information_gap",
       "eligible_v2": true,
       "added_source": "prefill"
     },
@@ -171,7 +157,6 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -186,7 +171,6 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "goal_reversal",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -201,7 +185,6 @@
       "primary_category": "suspense",
       "difficulty": "hard",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "information_gap",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -216,7 +199,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -231,7 +213,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -246,7 +227,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "social_rule",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -261,7 +241,6 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "observer_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -276,69 +255,7 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "dcdd5ee2ce6ad9bf",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "horror",
-        "emotion"
-      ],
-      "primary_category": "horror",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "33ce2a01c77a6852",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "horror",
-        "suspense",
-        "emotion"
-      ],
-      "primary_category": "horror",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "ae8f806f77c2e809",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "horror",
-        "suspense"
-      ],
-      "primary_category": "horror",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "240ada21b461eded",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "logic",
-        "suspense"
-      ],
-      "primary_category": "logic",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
     },
@@ -352,7 +269,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "object_misuse",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -367,7 +283,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "observer_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -382,7 +297,6 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -397,7 +311,6 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "object_misuse",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -412,7 +325,6 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "object_misuse",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -427,7 +339,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "observer_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -443,7 +354,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "observer_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -459,7 +369,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -475,7 +384,6 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "causal_reversal",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -491,7 +399,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -506,7 +413,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "rule_constraint",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -522,7 +428,6 @@
       "primary_category": "brainstorm",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "time_reinterpretation",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -537,7 +442,6 @@
       "primary_category": "horror",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -552,23 +456,7 @@
       "primary_category": "brainstorm",
       "difficulty": "easy",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "ebb31e6a5859893d",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "brainstorm",
-        "logic"
-      ],
-      "primary_category": "brainstorm",
-      "difficulty": "medium",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "space_reinterpretation",
       "eligible_v2": true,
       "added_source": "prefill"
     },
@@ -582,7 +470,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "emotional_motive",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -598,23 +485,7 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "observer_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "84cd6dfef5de7b4f",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "emotion",
-        "logic"
-      ],
-      "primary_category": "emotion",
-      "difficulty": "hard",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "emotional_motive",
       "eligible_v2": true,
       "added_source": "prefill"
     },
@@ -628,7 +499,6 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "information_gap",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -643,7 +513,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "object_misuse",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -658,7 +527,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -673,7 +541,6 @@
       "primary_category": "emotion",
       "difficulty": "easy",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "hidden_function",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -688,7 +555,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -703,7 +569,6 @@
       "primary_category": "brainstorm",
       "difficulty": "easy",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -718,7 +583,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -733,7 +597,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -748,7 +611,6 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "information_gap",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -763,24 +625,7 @@
       "primary_category": "emotion",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "identity_misread",
-      "eligible_v2": true,
-      "added_source": "prefill"
-    },
-    {
-      "pool_key": "98286aa6174fb479",
-      "protocol_version": "haiguitang-v2",
-      "categories": [
-        "emotion",
-        "suspense",
-        "logic"
-      ],
-      "primary_category": "emotion",
-      "difficulty": "hard",
-      "quality_policy_version": "quality-v13",
-      "source": "",
-      "mechanism_family": "emotional_motive",
       "eligible_v2": true,
       "added_source": "prefill"
     },
@@ -795,7 +640,6 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
       "mechanism_family": "rule_constraint",
       "eligible_v2": true,
       "added_source": "prefill"
@@ -810,7 +654,119 @@
       "primary_category": "suspense",
       "difficulty": "medium",
       "quality_policy_version": "quality-v13",
-      "source": "",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "beaaae15b7b6b202",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "emotion",
+        "logic",
+        "suspense"
+      ],
+      "primary_category": "emotion",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "acc6a03422e06266",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "logic",
+        "suspense"
+      ],
+      "primary_category": "logic",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "313e560c08a8138f",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "suspense",
+        "logic"
+      ],
+      "primary_category": "suspense",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "48a931be2c73e900",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "primary_category": "emotion",
+      "difficulty": "easy",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "53e36cb522b45ad4",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "brainstorm",
+        "emotion"
+      ],
+      "primary_category": "brainstorm",
+      "difficulty": "easy",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "658cfc67084c8102",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "primary_category": "emotion",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "time_reinterpretation",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "7d9afb065344ce2a",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "primary_category": "emotion",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
+      "mechanism_family": "space_reinterpretation",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "c2d7e7496039b75c",
+      "protocol_version": "haiguitang-v2",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "primary_category": "emotion",
+      "difficulty": "medium",
+      "quality_policy_version": "quality-v13",
       "mechanism_family": "identity_misread",
       "eligible_v2": true,
       "added_source": "prefill"

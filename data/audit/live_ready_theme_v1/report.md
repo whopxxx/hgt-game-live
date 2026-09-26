@@ -13,7 +13,7 @@
 | 指标 | 要求 | 实测 |
 | --- | --- | --- |
 | distinct current-policy 未播库存 | ≥ 50 | **53** |
-| 五类各 eligible(haiguitang-v2, 多标签重复计) | 每类 ≥ 10 | logic 20 / suspense 25 / horror 13 / emotion 29 / brainstorm 14 |
+| 五类各 eligible(haiguitang-v2, 多标签重复计) | 每类 ≥ 10 | logic 18 / suspense 25 / horror 10 / emotion 30 / brainstorm 16 |
 
 - distinct 按题计数(多标签只算一次); 分类按 `stock_by_category()`(v2 多标签每类各计一次)。
 - distinct 53 中 45 道为 v2(本次 prefill 产物); 其余 8 道为基线运行遗留的
@@ -30,9 +30,10 @@
 - 抽词: 整进程**一只** `KeywordBag`(session_seed=3491600036384432028, corpus_version=keyword2-vocab-v2, keyword_count=1134), `draw()` 内部持锁(§15 并发安全)
 - 生成入口: `keyword_seed.keyword_spec()`(生产唯一入口), requested_category 经 `GenerationBrief` 定向, 未复制 Prompt/Truth/Surface/Contract 逻辑
 - 入池: `pool.add_with_final_admission()`(§16 atomic final admission, check 与写入同一把锁)
-- 结果: **71 次尝试, 45 道入池**(keyword2 未成题 22 / final admission 拒相似 4 / 其余为网关技术抖动重试)
-- 用时: 19:00:44 → 19:21:31(约 21 分钟)
-- 运行日志: `data/audit/prefill_run_live_ready.log`(gitignored)
+- 运行记录(日志: `data/audit/prefill_run_live_ready.log`, gitignored):
+  1. 19:00–19:21: 71 次尝试, 45 道入池(keyword2 未成题 22 / final admission 拒相似 4 / 其余为网关技术抖动重试)
+  2. 19:35–19:38: 10 次尝试, 8 道入池 —— 开发期 8 次诊断性 `pop_next`(直连正式池的只读意图, 但 pop 本身是交付语义)意外消耗了 8 道题; 用真实 LLM 补回。**直播流程零泄漏**(此间无直播运行, heartbeat 全程 inactive); 这也是 dry-run 一律在临时副本池上执行的原因。
+- 用时合计: 约 25 分钟
 
 ## 库存构成(元数据)
 
