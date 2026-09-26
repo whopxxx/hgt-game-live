@@ -338,7 +338,7 @@ def test_write_outputs_no_production_files():
                "observed_distribution": {c: {} for c in
                                          ("logic", "suspense", "horror",
                                           "emotion", "brainstorm")}},
-           "total_llm_calls": 3, "usage": {}, "elapsed_s": 0.1, "model": "m",
+           "total_message_calls": 3, "usage": {}, "elapsed_s": 0.1, "model": "m",
            "shortfall": {c: (0 if c == "logic" else 1) for c in
                          ("logic", "suspense", "horror", "emotion",
                           "brainstorm")},
