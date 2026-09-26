@@ -249,12 +249,12 @@ html, body {
 #reveal-interaction {
   flex: 0 0 auto;
   display: flex; flex-direction: row; justify-content: center;
-  gap: 28px; flex-wrap: nowrap;
+  gap: 16px 28px; flex-wrap: wrap;
   padding: 8px 0 0;
 }
 #reveal-interaction.hidden { display: none; }
 #rating-box, #theme-box {
-  display: flex; flex-direction: column; align-items: center;
+  flex: 0 0 auto; display: flex; flex-direction: column; align-items: center;
   gap: 6px; min-width: 0;
 }
 #rating-box.hidden { display: none; }
@@ -312,20 +312,20 @@ html, body {
   content: ""; flex: 1 1 auto; height: 1px;
   background: linear-gradient(90deg, transparent, rgba(212,175,110,.28), transparent);
 }
+.puzzle-category { color: #f0d9a8; font-size: 30px; font-weight: 600; }
 #puzzle-meta::before { content: "· "; }
 #fact-progress {
-  flex: 0 0 auto; max-height: 126px; overflow: hidden;
+  flex: 0 0 auto; max-height: 200px; overflow: hidden;
   padding: 8px 16px; border-top: 1px solid rgba(212,175,110,.35);
   border-bottom: 1px solid rgba(212,175,110,.35);
-  color: #f2e5c7; font-size: 25px; line-height: 1.25;
+  color: #f2e5c7; font-size: 24px; line-height: 1.25;
 }
 #fact-progress.hidden { display: none; }
 #fact-progress-head { display: flex; justify-content: space-between; gap: 12px; }
 #fact-progress-title { color: #ffd98a; font-size: 28px; }
 #fact-progress-dots { color: #d4af6e; white-space: nowrap; letter-spacing: 4px; }
-#fact-progress-list { display: flex; gap: 5px 16px; flex-wrap: wrap; }
+#fact-progress-list { display: flex; flex-direction: column; gap: 4px; }
 #fact-progress-list > div { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fact-progress-more { color: #ad9d82; font-size: 22px; white-space: nowrap; }
 #fact-progress.new-fact { animation: factGlow 1.8s ease-out; }
 @keyframes factGlow { from { background: rgba(212,175,110,.28); } to { background: transparent; } }
 /* 问答流(滚动区) */

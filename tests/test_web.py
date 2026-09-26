@@ -1411,7 +1411,7 @@ window.addEventListener('load', async () => {
       {text:'第一条已确认核心事实解释了他到车站的原因'},
       {text:'第二条已确认核心事实解释了广播出现的时机'},
       {text:'第三条已确认核心事实解释了车票的用途'},
-      {text:'第四条已确认核心事实解释了最后的选择'}]},
+      {text:'第四条已确认核心事实解释了最后的选择，以及他为什么撕碎车票'.repeat(3)}]},
     ai_player: {likes_progress: 63, likes_per_progress: 100, in_flight: false},
     leaderboard: [{rank:1,user_name:'很长的排行榜观众名字',solved_count:9}],
     stats: {questions: 20, answered: 18, solved: 3, dropped: 0, viewers_seen: 200},
@@ -1455,7 +1455,17 @@ window.addEventListener('load', async () => {
     check(footer && qa.bottom <= footer.top + 1, 'W4 footer intrudes into QA');
     check(qa.height >= 360, 'W5 QA viewport <360px: ' + qa.height);
     check(qa.height >= 300, 'W5b QA viewport below hard floor: ' + qa.height);
-    check(fact.height <= 126, 'W5c fact rail exceeds compact cap: ' + fact.height);
+    const factRows = [...document.querySelectorAll('#fact-progress-list > div')];
+    check(factRows.length === 4 &&
+          factRows.every((row, i) => row.textContent.includes(['第一','第二','第三','第四'][i] + '条')),
+      'W5c all four established facts must appear in order');
+    check(fact.height <= 200, 'W5d fact rail exceeds compact cap: ' + fact.height);
+    check(factRows.every(row => row.getBoundingClientRect().bottom <=
+          document.getElementById('fact-progress').getBoundingClientRect().bottom + 1),
+      'W5e a fact row is clipped below the rail');
+    check(factRows.length === 4 && factRows.every(row => row.getBoundingClientRect().height <= 34) &&
+          getComputedStyle(factRows[3]).textOverflow === 'ellipsis',
+      'W5f each fact must stay on one ellipsized line');
     check(Math.abs(qa.height-before.height) <= 1 &&
           eventStyle.position === 'absolute',
           'W6 transient event changed bottom flex geometry');
@@ -1465,19 +1475,37 @@ window.addEventListener('load', async () => {
           lastRect.bottom <= qaRect.bottom + 1, 'W9 latest QA not fully visible');
     check(document.documentElement.scrollWidth <= innerWidth + 1 &&
           stage.scrollWidth <= 1080 + 1, 'W10 horizontal overflow');
-    send({phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',
+    const revealPayload = {phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',
       revealed_core_answer:'广播揭示了车票的真实用途。',
       revealed_full_answer:'车票并非普通乘车凭证。',
       reveal_stage:'contribution', solved:true, solved_by:'观众甲',
       next_puzzle_ms:10000, reveal_contributors:[
         {qid:1,user_name:'观众甲',text:'广播和车票有关吗？',verdict:'是',is_final:false},
-        {qid:2,user_name:'观众乙',text:'他知道票的真实用途了吗？',verdict:'是',is_final:true}],
-      reveal_interaction:{rating_open:false,theme_vote_open:true,
+        {qid:2,user_name:'观众乙',text:'他知道票的真实用途了吗？',verdict:'是',is_final:true}]};
+    const interaction = {rating_open:true,theme_vote_open:true,
         theme_options:[{code:'a',label:'逻辑',category:'logic',votes:2},
           {code:'b',label:'悬疑',category:'suspense',votes:1},
           {code:'c',label:'恐怖',category:'horror',votes:3},
           {code:'d',label:'情感',category:'emotion',votes:0},
-          {code:'e',label:'脑洞',category:'brainstorm',votes:1}]}});
+          {code:'e',label:'脑洞',category:'brainstorm',votes:1}]};
+    send({...revealPayload, reveal_interaction:interaction});
+    await wait(80);
+    const ratingOpen = rect('rating-box'), themeOpen = rect('theme-box');
+    const separate = ratingOpen.right <= themeOpen.left + 1 ||
+      themeOpen.right <= ratingOpen.left + 1 ||
+      ratingOpen.bottom <= themeOpen.top + 1 ||
+      themeOpen.bottom <= ratingOpen.top + 1;
+    check(separate, 'W11a rating and theme groups overlap');
+    for (const pill of document.querySelectorAll('.rating-pill, .theme-pill')) {
+      const p = pill.getBoundingClientRect(), panel = document.getElementById('reveal').getBoundingClientRect();
+      check(p.left >= panel.left - 1 && p.right <= panel.right + 1,
+        'W11b vote pill outside reveal panel: ' + pill.textContent);
+    }
+    check(rect('reveal-interaction').bottom <= rect('reveal-contrib').top + 1 &&
+          rect('reveal-contrib').bottom <= rect('reveal-next').top + 1 &&
+          rect('reveal-next').bottom <= rect('reveal').bottom + 1,
+      'W11c vote, contribution, or countdown overlap or clip');
+    send({...revealPayload, reveal_interaction:{...interaction, rating_open:false}});
     await wait(80);
     const contribution = rect('reveal-contrib');
     const theme = rect('theme-box');

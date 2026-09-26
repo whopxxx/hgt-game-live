@@ -204,9 +204,19 @@
   function renderPuzzleMeta(s) {
     const meta = (s.puzzle_meta && typeof s.puzzle_meta === "object")
       ? s.puzzle_meta : {};
-    const parts = [meta.primary_category_label, meta.difficulty_label].filter(Boolean);
-    const text = parts.join(" · ");
-    if (el.puzzleMeta.textContent !== text) el.puzzleMeta.textContent = text;
+    const category = meta.primary_category_label || "";
+    const difficulty = meta.difficulty_label || "";
+    const text = [category, difficulty].filter(Boolean).join(" · ");
+    if (el.puzzleMeta.textContent !== text) {
+      el.puzzleMeta.replaceChildren();
+      if (category) {
+        const label = document.createElement("span");
+        label.className = "puzzle-category";
+        label.textContent = category;
+        el.puzzleMeta.append(label);
+      }
+      if (difficulty) el.puzzleMeta.append((category ? " · " : "") + difficulty);
+    }
     el.puzzleMeta.classList.toggle("hidden", !text);
   }
 
@@ -556,14 +566,7 @@
     el.factProgressDots.textContent = "●".repeat(p.established) + "○".repeat(Math.max(0, p.total - p.established));
     el.factProgressList.replaceChildren();
     const facts = p.facts || [];
-    const recent = facts.slice(-2);
-    if (facts.length > 2) {
-      const more = document.createElement("span");
-      more.className = "fact-progress-more";
-      more.textContent = "另有 " + (facts.length - 2) + " 条已确认";
-      el.factProgressList.appendChild(more);
-    }
-    for (const fact of recent) {
+    for (const fact of facts) {
       const row = document.createElement("div");
       row.textContent = "✓ " + fact.text;
       el.factProgressList.appendChild(row);
