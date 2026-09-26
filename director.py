@@ -633,6 +633,9 @@ class Director:
             # 增强功能: 写失败 log error 并 **fail-open**, 绝不影响直播。
             # Engine 是权威, 这里只搬运; 每题恰好一个动作(幂等由 Engine 保证)。
             self._write_round_closeout(action.payload)
+        elif k == ActionKind.THEME_DEMAND:
+            if self._prefetcher is not None:
+                self._prefetcher.request_category(action.payload["category"])
         elif k == ActionKind.REVEAL:
             # 真人猜中在 Engine 内已经只计一次；这里把同一事实持久化。
             # event_id = session + round 做第二层幂等，防异常重派同一 action

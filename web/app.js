@@ -41,6 +41,9 @@
     themeOptions: $("theme-options"),
     top: $("top"), bottom: $("bottom"), content: $("content"),
     qa: $("qa"), qaBody: $("qa-body"),
+    factProgress: $("fact-progress"),
+    factProgressTitle: $("fact-progress-title"),
+    factProgressList: $("fact-progress-list"),
     thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
     stats: $("stats"), toast: $("toast"),
     debug: $("debug"), debugBody: $("debug-body"), conn: $("conn"),
@@ -539,6 +542,30 @@
     while (rows.length > MAX_ROWS) el.qaBody.removeChild(rows[0]);
     el.qa.scrollTop = el.qa.scrollHeight;
     requestAnimationFrame(function () { el.qa.scrollTop = el.qa.scrollHeight; });
+  }
+
+  function renderFactProgress(s) {
+    const p = s.phase === "qa" ? s.fact_progress : null;
+    const visible = p && Number.isInteger(p.total) && p.total > 0;
+    el.factProgress.classList.toggle("hidden", !visible);
+    if (!visible) {
+      el.factProgressTitle.textContent = "";
+      el.factProgressList.replaceChildren();
+      return;
+    }
+    el.factProgressTitle.textContent = "已确认核心事实 " + p.established + " / " + p.total;
+    el.factProgressList.replaceChildren();
+    for (const fact of (p.facts || [])) {
+      const row = document.createElement("div");
+      row.textContent = "✓ " + fact.text;
+      el.factProgressList.appendChild(row);
+    }
+    if (p.established < p.total) {
+      const row = document.createElement("div");
+      row.className = "fact-progress-more";
+      row.textContent = "其余真相继续追问…";
+      el.factProgressList.appendChild(row);
+    }
   }
 
   function buildFoldRow(n) {
@@ -1055,6 +1082,7 @@
     renderPuzzle(s);
     renderTimer(s);
     renderQa(s);
+    renderFactProgress(s);
     renderReveal(s);
     renderThinking(s);
     renderHint(s);

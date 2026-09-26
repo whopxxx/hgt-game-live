@@ -319,6 +319,7 @@ class RoundEngine:
         # `next_category` 带进下一轮 RIDDLE。
         self._rating_ledger = RatingLedger()
         self._theme_ledger = ThemeVoteLedger()
+        self._theme_demand_sent: set[str] = set()
         #: REVEALED 进入时刻(monotonic)。评分窗口(前 30s)与
         #: snapshot 的 `rating_open` 都从它推 —— 与 `_next_puzzle_deadline`
         #: 同源(进入 REVEALED 时 `now + reveal_hold_seconds`)。
@@ -799,8 +800,14 @@ class RoundEngine:
                     acted = self._record_theme_vote_locked(
                         wid, user_name, theme_tok, now)
                 if acted:
-                    return [EngineAction(ActionKind.BROADCAST, {
-                        "phase_changed": False})]
+                    actions = []
+                    if theme_tok is not None and theme_tok not in self._theme_demand_sent:
+                        self._theme_demand_sent.add(theme_tok)
+                        actions.append(EngineAction(ActionKind.THEME_DEMAND,
+                                                    {"category": theme_tok}))
+                    actions.append(EngineAction(ActionKind.BROADCAST,
+                                                {"phase_changed": False}))
+                    return actions
                 return []
 
             if norm in HINT_TOKENS or any(t in norm for t in HINT_TOKENS):
@@ -1450,6 +1457,7 @@ class RoundEngine:
             # 评分前 30s / 主题票整个 60s; `_closeout_sent` 复位。
             self._revealed_at = now
             self._closeout_sent = False
+            self._theme_demand_sent.clear()
             reason = self._reveal_pending_reason
             if reason in ("solved", "ai_solved") and self._solved_by:
                 self._notice = f"{self._solved_by} 猜中了！汤底揭晓"
@@ -3018,6 +3026,14 @@ class RoundEngine:
                 # ---- Issue #60 §5: REVEALED 互动权威状态 ----
                 # 前端只认这份快照判断窗口开放, 不从 next_puzzle_ms 自推。
                 reveal_interaction=self._reveal_interaction_snapshot_locked(now),
+                fact_progress=(
+                    {"established": len(self._completion_fact_ids & self._established_fact_ids),
+                     "total": len(self._completion_fact_ids),
+                     "facts": [{"text": fact["text"]} for fact in
+                               self._spec.public_established_completion_facts(
+                                   self._established_fact_ids)]}
+                    if self.phase == Phase.QA and self._spec is not None
+                    else {}),
                 stat_questions=self._questions_total,
                 stat_answered=self._answered_total,
                 stat_solved=self._solved_total,

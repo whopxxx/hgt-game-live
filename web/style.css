@@ -310,6 +310,17 @@ html, body {
   content: ""; flex: 1 1 auto; height: 1px;
   background: linear-gradient(90deg, transparent, rgba(212,175,110,.28), transparent);
 }
+#fact-progress {
+  flex: 0 0 auto; max-height: 260px; overflow: hidden;
+  padding: 14px 20px; border: 1px solid rgba(212,175,110,.35);
+  border-radius: 12px; background: rgba(212,175,110,.08);
+  color: #f2e5c7; font-size: 28px; line-height: 1.45;
+}
+#fact-progress.hidden { display: none; }
+#fact-progress-title { color: #ffd98a; font-size: 30px; margin-bottom: 6px; }
+#fact-progress-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 18px; }
+#fact-progress-list > div { min-width: 0; overflow-wrap: anywhere; }
+.fact-progress-more { color: #ad9d82; font-size: 25px; }
 /* 问答流(滚动区) */
 #qa {
   flex: 1 1 auto; min-height: 0;

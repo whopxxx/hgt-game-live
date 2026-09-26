@@ -90,6 +90,23 @@ window.addEventListener("load", async () => {
   }, o))});
 
   try {
+    // PR #61: QA progress stays outside the scrolling QA list and uses snapshot text.
+    send({fact_progress: {established: 2, total: 4,
+      facts: [{text: '公开线索一'}, {text: '公开线索二'}]}, qa_log: mkQa(20)});
+    const progress = document.getElementById('fact-progress');
+    check(!progress.classList.contains('hidden') &&
+          progress.textContent.includes('已确认核心事实 2 / 4') &&
+          progress.textContent.includes('公开线索二'),
+          'F10 QA renders authoritative fact progress');
+    check(!document.getElementById('qa').contains(progress) &&
+          progress.getBoundingClientRect().height <= 260,
+          'F10 fact progress is fixed above QA scroller and bounded at 1080x1920');
+    send({phase: 'revealing', fact_progress: {established: 2, total: 4,
+      facts: [{text: '公开线索一'}]}});
+    check(progress.classList.contains('hidden'), 'F10 REVEALING hides progress');
+    send({phase: 'setting', fact_progress: {established: 2, total: 4,
+      facts: [{text: '公开线索一'}]}});
+    check(progress.classList.contains('hidden'), 'F10 SETTING hides progress');
     // ⓪ 飘屏弹幕已移除(UI cleanup)
     //
     // 飘屏弹幕整个删掉了 —— 它的速度/轨道状态机(P1/P2 那一整套)也一并

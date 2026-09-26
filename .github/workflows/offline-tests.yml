@@ -87,6 +87,9 @@ jobs:
       - name: 离线套件 engine
         run: uv run tests/test_engine.py
 
+      - name: PR #61 live-ready blocker regressions
+        run: uv run tests/test_live_ready_blockers.py
+
       - name: 离线套件 ingest
         run: uv run tests/test_ingest.py
 

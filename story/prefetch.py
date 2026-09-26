@@ -328,9 +328,10 @@ class PoolPrefetcher:
         self._init_keyword_bag(cfg)
 
         # 自己起 executor(不借 Director 的): 它是本模块的内部实现细节,
-        # 而且 max_workers=1 只是第二道防线, 单飞由 _future 保证。
+        # 执行线程数与实际可占用 slot 数一致。
+        self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="prefetch")
+            max_workers=self._concurrency, thread_name_prefix="prefetch")
 
         # ---- 状态(全部由下面这把锁保护) ----
         # 刻意**不**复用 Director 的 _narrating: 那个锁是出题用的, 补池
@@ -477,17 +478,21 @@ class PoolPrefetcher:
         # ---- Issue #60 §14: 每 slot 独立 writer(状态齐了再建) ----
         self._writers = [self._make_writer(i)
                          for i in range(self._concurrency)]
+        if (self._owns_executor and self._concurrency > 1
+                and len({id(w) for w in self._writers if w is not None})
+                    != len([w for w in self._writers if w is not None])):
+            raise ValueError("concurrent prefetch writers must be independent")
 
     def _make_writer(self, slot: int) -> Any:
-        """slot i 的 writer。factory 给了就按 slot 建, 否则共享 base。"""
+        """slot i 的 writer。并发时 factory 必须提供独立实例。"""
         if self._writer_factory is not None:
-            try:
-                w = self._writer_factory(slot)
-                if w is not None:
-                    return w
-            except Exception:                   # noqa: BLE001
-                log.exception("prefetch writer_factory(%d) 失败, "
-                              "该 slot 回退共享 writer", slot)
+            w = self._writer_factory(slot)
+            if w is None and self._concurrency > 1 and self._base_writer is not None:
+                raise ValueError("prefetch writer_factory returned None")
+            return w
+        if (self._concurrency > 1 and self._owns_executor
+                and self._base_writer is not None):
+            raise ValueError("concurrent prefetch requires writer_factory")
         return self._base_writer
 
     @property
