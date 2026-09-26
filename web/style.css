@@ -71,6 +71,17 @@ html, body {
 }
 #puzzle-timer.soon { color: #e8684a; }   /* 快到点了变红 */
 #puzzle-timer.hidden { display: none; }
+/* 题目元数据(5 大类协议 v2): "中等 · 悬疑 · 脑洞"。
+   辅助识别题型, 视觉层级刻意**弱于**倒计时(不抢谜面), 同一行内排布,
+   max-width 限宽防止长分类把 header 挤出屏幕。 */
+#puzzle-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: rgba(212,175,110,.65);
+  font-size: 26px; letter-spacing: 2px;
+}
+#puzzle-meta.hidden { display: none; }
 #puzzle-viewport {
   flex: 0 1 auto;
   width: 100%; max-height: 100%;

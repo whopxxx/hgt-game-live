@@ -32,7 +32,8 @@ from .puzzle import (
     has_meta_text, is_first_person, quote_in_puzzle,
 )
 from .haiguitang_protocol import (
-    PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS, completion_bounds, validate_protocol,
+    PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS, PROTOCOL_V1_STYLE, completion_bounds,
+    validate_protocol,
 )
 
 log = logging.getLogger(__name__)
@@ -793,7 +794,7 @@ def validate_spec(spec: PuzzleSpec,
         # 又钻了回来。
         #
         # 硬拒照旧, 只改**为什么拒、下一稿该怎么修**。
-        if proto != "haiguitang-v1" and not (p_lo <= len(comp) <= p_hi):
+        if proto not in PROTOCOL_V1_STYLE and not (p_lo <= len(comp) <= p_hi):
             r.fail(f"completion_fact_ids 有 {len(comp)} 条, 应为 {p_lo}~"
                    f"{p_hi} 条。通关合同写得过细: 请收窄为 "
                    f"core_answer 的最小 {p_lo}~{p_hi} 条核心语义; "
@@ -885,7 +886,7 @@ def validate_spec(spec: PuzzleSpec,
     # 不写清楚的话, 它会顺手改谜面 / 改谜底 / 删事实来"把数字凑对" ——
     # 那是改题, 不是改分类。
     n_core = len(spec.core_hidden_facts())
-    if proto == "haiguitang-v1":
+    if proto in PROTOCOL_V1_STYLE:
         n_core_max = max(max_core_hidden, PROTOCOL_V1_MAX_CORE_HIDDEN_FACTS)
     else:
         n_core_max = max_core_hidden

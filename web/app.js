@@ -25,7 +25,7 @@
   const el = {
     stage: $("stage"),
     puzzleIndex: $("puzzle-index"), puzzleElapsed: $("puzzle-elapsed"),
-    puzzleTimer: $("puzzle-timer"),
+    puzzleTimer: $("puzzle-timer"), puzzleMeta: $("puzzle-meta"),
     puzzleViewport: $("puzzle-viewport"), puzzle: $("puzzle"),
     reveal: $("reveal"), revealBody: $("reveal-body"), revealNext: $("reveal-next"),
     revealLabel: $("reveal-label"),
@@ -182,6 +182,29 @@
     requestAnimationFrame(timerLoop);
   })();
 
+  // 题目元数据(5 大类协议 v2): 只渲染服务端下发的 label。
+  //
+  // ⚠️ 前端**不**维护任何 enum->中文映射 —— 中文 label 由后端
+  // (haiguitang_protocol.public_puzzle_meta)单一拥有, 这里只拼接。
+  // 防 stale: 渲染完全依据当前快照的 `puzzle_meta` —— SETTING 阶段
+  // 服务端已把它清空, 所以这里**立即**清掉旧题的显示(不能等
+  // puzzle_index 变: SETTING 期间下一题还没拿到, 新题号不一定已递增)。
+  // 分类之间用 " · " 分隔, 缺哪段就少哪段, 绝不输出多余分隔符。
+  function renderPuzzleMeta(s) {
+    const meta = (s.puzzle_meta && typeof s.puzzle_meta === "object")
+      ? s.puzzle_meta : {};
+    const parts = [];
+    if (meta.difficulty_label) parts.push(meta.difficulty_label);
+    if (Array.isArray(meta.category_labels)) {
+      for (const c of meta.category_labels) {
+        if (c) parts.push(c);
+      }
+    }
+    const text = parts.join(" · ");
+    if (el.puzzleMeta.textContent !== text) el.puzzleMeta.textContent = text;
+    el.puzzleMeta.classList.toggle("hidden", !text);
+  }
+
   function renderPuzzle(s) {
     if (s.puzzle_index !== lastPuzzleIndex) {
       const isFirst = lastPuzzleIndex === undefined;
@@ -202,6 +225,7 @@
     const txt = s.puzzle || "";
     if (el.puzzle.textContent !== txt) el.puzzle.textContent = txt;
     el.puzzleElapsed.textContent = s.phase === "qa" ? fmtElapsed(s.puzzle_elapsed_ms) : "";
+    renderPuzzleMeta(s);
   }
 
   // 换题过渡提示(短暂显示后淡出)

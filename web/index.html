@@ -15,6 +15,12 @@
       <section id="top">
         <div id="puzzle-head">
           <span id="puzzle-index"></span>
+          <!--
+            题目元数据(5 大类协议 v2): "中等 · 悬疑 · 脑洞" 形式。
+            内容完全由服务端 puzzle_meta 下发(中文 label 后端拥有),
+            空时整个元素隐藏 —— 不显示"未知 · 未分类"。
+          -->
+          <span id="puzzle-meta" class="hidden"></span>
           <span id="puzzle-timer"></span>
           <span id="puzzle-elapsed"></span>
         </div>

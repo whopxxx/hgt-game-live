@@ -24,11 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from story.config import Config  # noqa: E402
 from story.engine import RoundEngine  # noqa: E402
 from story.haiguitang_protocol import (  # noqa: E402
-    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION as V1,
+    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION,
     LEGACY_MAX_COMPLETION_FACTS, LEGACY_MIN_COMPLETION_FACTS,
+    PROTOCOL_V1 as V1, PROTOCOL_V2 as V2,
     PROTOCOL_V1_MAX_COMPLETION_FACTS, PROTOCOL_V1_MIN_COMPLETION_FACTS,
-    SUPPORTED_PROTOCOL_VERSIONS, GenerationBrief, completion_bounds,
-    validate_protocol,
+    SUPPORTED_PROTOCOL_VERSIONS, V1_CATEGORIES, V2_CATEGORIES,
+    GenerationBrief, categories_for, completion_bounds,
+    public_puzzle_meta, validate_protocol,
 )
 from story.puzzle import (  # noqa: E402
     PuzzleFact, PuzzleSpec, quote_in_puzzle,
@@ -160,8 +162,13 @@ def _patch_spec(spec, **kw):
 # ======================================================================
 def test_version_contract():
     print("\n[P1] protocol_version fail closed")
-    check("受支持集合 = ('', haiguitang-v1)",
-          SUPPORTED_PROTOCOL_VERSIONS == ("", V1), SUPPORTED_PROTOCOL_VERSIONS)
+    check("受支持集合 = ('', haiguitang-v1, haiguitang-v2)",
+          SUPPORTED_PROTOCOL_VERSIONS == ("", V1, V2),
+          SUPPORTED_PROTOCOL_VERSIONS)
+    check("当前协议版本 = haiguitang-v2",
+          HAIGUITANG_PROTOCOL_VERSION == V2, HAIGUITANG_PROTOCOL_VERSION)
+    check("v1 已冻结为历史(不等于当前版本)",
+          V1 != HAIGUITANG_PROTOCOL_VERSION, (V1, HAIGUITANG_PROTOCOL_VERSION))
     check("legacy('') 协议层零附加约束",
           validate_protocol(PuzzleSpec()) == [])
     errs = validate_protocol(_patch_spec(PuzzleSpec(),
@@ -365,19 +372,50 @@ def test_difficulty():
 # P8: categories
 # ======================================================================
 def test_categories():
-    print("\n[P8] 固定 11 类 / 1~3 条 / 含 primary / 无重复")
-    check("11 类精确", len(CATEGORIES) == 11 and
-          set(CATEGORIES) == {"logic", "suspense", "horror", "twist",
-                              "brainstorm", "family", "crime", "tragedy",
-                              "warm", "comedy", "sci_fi"}, CATEGORIES)
-    ok_cases = [
+    print("\n[P8] v1 历史 11 类 / v2 五类 / 1~3 条 / 含 primary / 无重复")
+    # ---- v1 历史 11 类冻结(不改拼写不删改) ----
+    check("v1 11 类精确", len(V1_CATEGORIES) == 11 and
+          set(V1_CATEGORIES) == {"logic", "suspense", "horror", "twist",
+                                 "brainstorm", "family", "crime", "tragedy",
+                                 "warm", "comedy", "sci_fi"}, V1_CATEGORIES)
+    # ---- v2 五类冻结 ----
+    check("v2 五类精确", len(V2_CATEGORIES) == 5 and
+          set(V2_CATEGORIES) == {"logic", "suspense", "horror", "emotion",
+                                 "brainstorm"}, V2_CATEGORIES)
+    check("当前 alias = v2 五类", CATEGORIES == V2_CATEGORIES, CATEGORIES)
+    check("categories_for 查表", categories_for(V1) == V1_CATEGORIES
+          and categories_for(V2) == V2_CATEGORIES
+          and categories_for("") == (), categories_for(V1))
+    # ---- v1 + 旧 11 类: 合法(历史语义保持) ----
+    ok_cases_v1 = [
         ("crime", ["crime"]),
         ("crime", ["crime", "suspense", "twist"]),
         ("warm", ["warm"]),
+        ("sci_fi", ["sci_fi", "horror"]),
     ]
-    for prim, cats in ok_cases:
+    for prim, cats in ok_cases_v1:
         errs = validate_protocol(_v1_spec(2, primary=prim, categories=cats))
-        check(f"{prim}/{cats} 合法", errs == [], errs)
+        check(f"v1 {prim}/{cats} 合法", errs == [], errs)
+    # ---- v1 + 新五类独有的 emotion: 非法(不属于 v1 枚举) ----
+    errs = validate_protocol(_v1_spec(2, primary="emotion",
+                                      categories=("emotion",)))
+    check("v1 + emotion 非法(v1 枚举里没有)",
+          any(("primary_category 非法" in e or "含非法值" in e)
+              for e in errs), errs)
+    # ---- v2 + 五类: 合法(requested 也必须是五类或空) ----
+    for prim in V2_CATEGORIES:
+        errs = validate_protocol(_v1_spec(2, protocol=V2, primary=prim,
+                                          categories=(prim,),
+                                          requested=prim))
+        check(f"v2 {prim} 合法", errs == [], errs)
+    # ---- v2 + 旧 11 类: 非法(历史枚举不能带进 v2) ----
+    for prim in ("crime", "family", "twist", "sci_fi", "comedy"):
+        errs = validate_protocol(_v1_spec(2, protocol=V2, primary=prim,
+                                          categories=(prim,)))
+        check(f"v2 + {prim} 非法",
+              any(("primary_category 非法" in e or "含非法值" in e)
+                  for e in errs), errs)
+    # ---- 结构合同(1~3 / 含 primary / 无重复 / 非法值)对 v1 / v2 同样生效 ----
     bad_cases = [
         ("crime", [], "categories 有 0 条"),
         ("crime", ["crime", "crime"], "categories 有重复"),
@@ -388,7 +426,19 @@ def test_categories():
     ]
     for prim, cats, frag in bad_cases:
         errs = validate_protocol(_v1_spec(2, primary=prim, categories=cats))
-        check(f"{prim}/{cats} 被拒({frag})",
+        check(f"v1 {prim}/{cats} 被拒({frag})",
+              any(frag in e for e in errs), errs)
+    bad_cases_v2 = [
+        ("horror", [], "categories 有 0 条"),
+        ("horror", ["horror", "horror"], "categories 有重复"),
+        ("horror", ["suspense"], "必须在 categories 里"),
+        ("horror", ["mystery"], "categories 含非法值"),
+        ("mystery", ["logic"], "primary_category 非法"),
+    ]
+    for prim, cats, frag in bad_cases_v2:
+        errs = validate_protocol(_v1_spec(2, protocol=V2, primary=prim,
+                                          categories=cats, requested=""))
+        check(f"v2 {prim}/{cats} 被拒({frag})",
               any(frag in e for e in errs), errs)
 
 
@@ -422,14 +472,25 @@ def test_requested_mismatch():
 # P10: GenerationBrief
 # ======================================================================
 def test_generation_brief():
-    print("\n[P10] GenerationBrief 契约")
+    print("\n[P10] GenerationBrief 契约(新生成请求只收 v2 五类)")
     check("全空 = 自由生成, 合法", GenerationBrief().validate() == [], "")
-    b = GenerationBrief(requested_category="sci_fi", difficulty="hard")
-    check("sci_fi/hard 合法", b.validate() == [], b.validate())
-    check("frozen(不可变)", _frozen_ok(b), "应不可变")
-    check("非法 category 被确定性拒绝",
+    # ---- v2 五类全部合法 ----
+    for cat in V2_CATEGORIES:
+        b = GenerationBrief(requested_category=cat, difficulty="hard")
+        check(f"{cat}/hard 合法", b.validate() == [], b.validate())
+    # ---- 旧 11 类里 v2 没有的值: 非法 ----
+    for cat in ("crime", "family", "twist", "sci_fi", "comedy", "warm"):
+        errs = GenerationBrief(requested_category=cat).validate()
+        check(f"{cat} 非法(v2 只收五类)",
+              any("requested_category 非法" in e for e in errs), errs)
+    check("mystery 非法",
           any("requested_category 非法" in e for e in
               GenerationBrief(requested_category="mystery").validate()), "")
+    b = GenerationBrief(requested_category="emotion")
+    check("frozen(不可变)", _frozen_ok(b), "应不可变")
+    check("非法 difficulty 被确定性拒绝",
+          any("difficulty 非法" in e for e in
+              GenerationBrief(difficulty="normal").validate()), "")
     check("非法 difficulty 被确定性拒绝",
           any("difficulty 非法" in e for e in
               GenerationBrief(difficulty="normal").validate()), "")
@@ -500,6 +561,15 @@ def test_pool_eligibility_unchanged():
     check("unknown protocol_version 在池门 fail closed", not ok4, why4)
     ok5, why5 = PuzzlePool._validate_pool_spec(_v1_spec(2))
     check("合法 v1 spec 也可入池(协议层不打折)", ok5, why5)
+    ok7, why7 = PuzzlePool._validate_pool_spec(
+        _v1_spec(2, protocol=V2, primary="suspense",
+                 categories=("suspense", "brainstorm"), requested=""))
+    check("合法 v2 spec 也可入池", ok7, why7)
+    ok8, why8 = PuzzlePool._validate_pool_spec(
+        _patch_spec(_v1_spec(2), protocol_version=V2,
+                    primary_category="crime", categories=["crime"],
+                    requested_category=""))
+    check("v2 spec 带旧类目在池门 fail closed", not ok8, why8)
     # ---- Issue #49 review Blocker 1 反证 ----
     # 4-fact v1 曾因"core hidden>3 被标 can_fix + 池门拒一切 fixable"
     # 陷入不可修状态, 永远进不了题池。core 上限 protocol-aware 之后,
@@ -741,6 +811,193 @@ def test_style_fields_not_repurposed():
 
 
 # ======================================================================
+# P18: public_puzzle_meta —— v2 直读 / v1 legacy 展示映射 / fail safe
+# ======================================================================
+def test_public_puzzle_meta():
+    print("\n[P18] public_puzzle_meta presentation-safe 元数据")
+
+    # ---- v2: 直接用 observed 五类, primary 排第一 ----
+    v2 = _v1_spec(2, protocol=V2, difficulty="medium", primary="suspense",
+                  categories=("suspense", "brainstorm"), requested="logic")
+    m = public_puzzle_meta(v2)
+    check("v2: difficulty/label", m["difficulty"] == "medium"
+          and m["difficulty_label"] == "中等", m)
+    check("v2: primary + label", m["primary_category"] == "suspense"
+          and m["primary_category_label"] == "悬疑", m)
+    check("v2: categories 顺序稳定(primary 第一)",
+          m["categories"] == ["suspense", "brainstorm"]
+          and m["category_labels"] == ["悬疑", "脑洞"], m)
+    check("v2: 不含 requested_category(生成意图绝不外露)",
+          "requested_category" not in m
+          and all("requested" not in k for k in m), m)
+    check("v2: 不含 hidden truth 键",
+          not ({"answer", "facts", "completion_fact_ids", "core_answer"}
+               & set(m)), m)
+
+    # ---- v1: 确定性 legacy display mapping(原始 spec 不被修改) ----
+    cases = [
+        ("crime", "suspense", "悬疑"),
+        ("suspense", "suspense", "悬疑"),
+        ("family", "emotion", "情感"),
+        ("tragedy", "emotion", "情感"),
+        ("warm", "emotion", "情感"),
+        ("twist", "brainstorm", "脑洞"),
+        ("comedy", "brainstorm", "脑洞"),
+        ("sci_fi", "brainstorm", "脑洞"),
+        ("logic", "logic", "逻辑"),
+        ("horror", "horror", "恐怖"),
+    ]
+    for v1_cat, want_key, want_label in cases:
+        v1 = _v1_spec(2, primary=v1_cat, categories=(v1_cat,),
+                      requested="")
+        m1 = public_puzzle_meta(v1)
+        check(f"v1 {v1_cat} -> {want_key}/{want_label}",
+              m1["primary_category"] == want_key
+              and m1["primary_category_label"] == want_label, m1)
+        # 原始 spec 不被映射改写(不改盘原则)
+        check(f"v1 {v1_cat}: spec 原样保留",
+              v1.primary_category == v1_cat
+              and v1.categories == [v1_cat], v1.primary_category)
+
+    # 多类目 v1: 映射后去重 + primary 第一
+    v1m = _v1_spec(2, primary="crime", categories=("crime", "twist", "warm"),
+                   requested="")
+    mm = public_puzzle_meta(v1m)
+    check("v1 多类目: 映射后去重且 primary 第一",
+          mm["categories"] == ["suspense", "brainstorm", "emotion"], mm)
+
+    # ---- legacy / unknown: 整体空 metadata(前端安静隐藏) ----
+    # (review 5324564684 Blocker 3: legacy/unknown 连难度也不下发 ——
+    #  半套元数据等于暗示"这题有合法分类数据"。)
+    check("legacy 无分类 -> {}",
+          public_puzzle_meta(_legacy_spec(2)) == {},
+          public_puzzle_meta(_legacy_spec(2)))
+    check("legacy + difficulty=medium -> 仍 {}(难度也不下发)",
+          public_puzzle_meta(
+              _patch_spec(_legacy_spec(2), difficulty="medium")) == {},
+          public_puzzle_meta(
+              _patch_spec(_legacy_spec(2), difficulty="medium")))
+    check("v2 只带分类 -> 无难度键(难度缺就不编)",
+          "difficulty" not in public_puzzle_meta(
+              _patch_spec(_v1_spec(2, protocol=V2, difficulty="",
+                                   primary="horror", categories=("horror",),
+                                   requested=""))),
+          "缺难度时不得编造")
+    # ---- 非法数据 fail safe: 绝不从坏数据猜分类 ----
+    # primary 非法/为空 -> 分类四把键整体不出现, **绝不**把 secondary
+    # "晋升"成新的 primary(review Blocker 3)。
+    bad = _patch_spec(_v1_spec(2, protocol=V2, primary="mystery",
+                               categories=("mystery",), requested=""))
+    mb = public_puzzle_meta(bad)
+    check("非法类目被丢弃(不编造分类)",
+          "primary_category" not in mb and "categories" not in mb, mb)
+    check("非法类目不影响合法的 difficulty",
+          mb.get("difficulty_label") == "中等", mb)
+    # primary 缺席(空)但 secondary 合法: 不得晋升 secondary
+    no_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="",
+                                      categories=("suspense", "brainstorm"),
+                                      requested=""))
+    mn = public_puzzle_meta(no_primary)
+    check("primary 为空 -> 无分类键(不晋升 secondary)",
+          not ({"primary_category", "primary_category_label",
+                "categories", "category_labels"} & set(mn)), mn)
+    check("primary 为空时 difficulty 仍下发",
+          mn.get("difficulty_label") == "中等", mn)
+    # primary 非法但 secondary 合法: 同样不晋升
+    bad_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="crime",
+                                       categories=("suspense",),
+                                       requested=""))
+    mbp = public_puzzle_meta(bad_primary)
+    check("primary 非法(v2 无此值)且 categories 不含 primary 映射 -> "
+          "无分类键(不晋升)",
+          not ({"primary_category", "primary_category_label"}
+               & set(mbp)), mbp)
+    # primary 合法但缺席于 categories 声明: 不自洽 -> 整体不给
+    orphan_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="horror",
+                                          categories=("suspense",),
+                                          requested=""))
+    mo = public_puzzle_meta(orphan_primary)
+    check("primary 不在 categories 里 -> 无分类键(不自洽不猜)",
+          not ({"primary_category", "primary_category_label"}
+               & set(mo)), mo)
+    unknown = _patch_spec(_legacy_spec(2), protocol_version="banana")
+    check("unknown protocol -> 空 metadata",
+          public_puzzle_meta(unknown) == {}, public_puzzle_meta(unknown))
+    # 中英文 label 表: 五类 + 难度, 单一来源
+    from story.haiguitang_protocol import (CATEGORY_LABELS, DIFFICULTY_LABELS,
+                                           LEGACY_V1_DISPLAY_CATEGORY)
+    check("CATEGORY_LABELS 精确五类",
+          CATEGORY_LABELS == {"logic": "逻辑", "suspense": "悬疑",
+                              "horror": "恐怖", "emotion": "情感",
+                              "brainstorm": "脑洞"}, CATEGORY_LABELS)
+    check("DIFFICULTY_LABELS 三档",
+          DIFFICULTY_LABELS == {"easy": "简单", "medium": "中等",
+                                "hard": "困难"}, DIFFICULTY_LABELS)
+    check("LEGACY_V1_DISPLAY_CATEGORY 覆盖全部 v1 类且值都在五类里",
+          set(LEGACY_V1_DISPLAY_CATEGORY) == set(V1_CATEGORIES)
+          and set(LEGACY_V1_DISPLAY_CATEGORY.values()) <= set(V2_CATEGORIES),
+          LEGACY_V1_DISPLAY_CATEGORY)
+
+
+# ======================================================================
+# P19: Snapshot puzzle_meta —— Engine 接线(阶段/清空/保留)
+# ======================================================================
+def test_snapshot_puzzle_meta_lifecycle():
+    print("\n[P19] Snapshot.puzzle_meta 按 phase 下发/清空")
+
+    def _v2_spec():
+        return _v1_spec(2, protocol=V2, difficulty="medium",
+                        primary="suspense", categories=("suspense",
+                                                        "brainstorm"),
+                        requested="")
+
+    # ---- QA: 正常下发 ----
+    eng, clk = _boot_with_spec(_v2_spec())
+    snap = eng.snapshot()
+    m = snap.puzzle_meta
+    check("QA: 下发完整 metadata", m["difficulty_label"] == "中等"
+          and m["primary_category_label"] == "悬疑"
+          and m["category_labels"] == ["悬疑", "脑洞"], m)
+    check("QA: to_json 包含正式 puzzle_meta(不进 debug)",
+          snap.to_json().get("puzzle_meta") == m
+          and "puzzle_meta" not in snap.to_json()["debug"], "to_json 缺字段")
+    check("QA: 快照不泄露 requested_category",
+          "requested_category" not in snap.to_json()["puzzle_meta"],
+          snap.to_json()["puzzle_meta"])
+
+    # ---- REVEALING / REVEALED: 仍保留本题 metadata ----
+    for fid in ("f1", "f2"):
+        _qa(eng, clk, f"线索{fid}", "是", [fid])
+    check("补齐合同后 REVEALING", eng.phase == Phase.REVEALING, eng.phase)
+    m_r = eng.snapshot().puzzle_meta
+    check("REVEALING: 保留本题 metadata",
+          m_r["primary_category_label"] == "悬疑", m_r)
+    eng.submit_reveal("汤底揭晓", expect_round=1)
+    check("进入 REVEALED", eng.phase == Phase.REVEALED, eng.phase)
+    check("REVEALED: 保留本题 metadata",
+          eng.snapshot().puzzle_meta["difficulty_label"] == "中等",
+          eng.snapshot().puzzle_meta)
+
+    # ---- SETTING: 上一题 metadata 立即清空 ----
+    clk.advance(10.0)          # 过 reveal_hold_seconds, 揭晓展示结束
+    eng.tick()
+    check("回到 SETTING", eng.phase == Phase.SETTING, eng.phase)
+    check("SETTING: puzzle_meta 为空(不残留上一题)",
+          eng.snapshot().puzzle_meta == {}, eng.snapshot().puzzle_meta)
+
+    # ---- legacy/fallback 无 spec: 空 dict ----
+    eng2, _clk2 = _boot_with_spec(_legacy_spec(1))
+    check("legacy 题 -> 空 metadata(前端安静隐藏)",
+          eng2.snapshot().puzzle_meta == {}, eng2.snapshot().puzzle_meta)
+    # 无 spec 的兜底交付(submit_riddle 不带 spec)
+    eng3 = RoundEngine(Config(sim_path="x", no_llm=True), clock=FakeClock())
+    eng3.start()
+    eng3.submit_riddle("谜面？", "谜底", ["提示"])
+    check("无 spec 交付 -> 空 metadata",
+          eng3.snapshot().puzzle_meta == {}, eng3.snapshot().puzzle_meta)
+
+
+# ======================================================================
 def main():
     print("=== tests/test_haiguitang_protocol.py ===")
     test_version_contract()
@@ -760,6 +1017,8 @@ def main():
     test_judging_fixtures()
     test_parser_preserves_bad_data()
     test_style_fields_not_repurposed()
+    test_public_puzzle_meta()
+    test_snapshot_puzzle_meta_lifecycle()
     print()
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} check(s)")

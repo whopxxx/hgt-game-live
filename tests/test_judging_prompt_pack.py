@@ -209,8 +209,11 @@ def test_pack_files_and_versions():
     check("共享 fragment 可加载", "特异性硬规则" in frag)
     check("judging 总版本", PP.HAIGUITANG_JUDGING_PROMPT_VERSION
           == "haiguitang-judging-v1")
-    check("generation 总版本未漂移", PP.HAIGUITANG_GENERATION_PROMPT_VERSION
-          == "haiguitang-generation-v1" and PP.PROMPT_PACK_VERSION
+    # 5 大类协议 v2: generation 侧 Contract/Audit 分类语义变化 ->
+    # generation 总版本 bump(判题侧未变, 不受牵动)。
+    check("generation 总版本 = haiguitang-generation-v2",
+          PP.HAIGUITANG_GENERATION_PROMPT_VERSION
+          == "haiguitang-generation-v2" and PP.PROMPT_PACK_VERSION
           == PP.HAIGUITANG_GENERATION_PROMPT_VERSION)
     check("两套总版本互相独立",
           PP.HAIGUITANG_JUDGING_PROMPT_VERSION

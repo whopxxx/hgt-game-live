@@ -30,9 +30,11 @@ from typing import Callable, Optional
 from . import parser as P
 from .config import LLMConfig
 from .haiguitang_protocol import (
-    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION,
-    MAX_CATEGORIES, MIN_CATEGORIES,
+    CATEGORIES, CATEGORY_LABELS, DIFFICULTIES, DIFFICULTY_LABELS,
+    HAIGUITANG_PROTOCOL_VERSION,
+    MAX_CATEGORIES, MIN_CATEGORIES, PROTOCOL_V1, PROTOCOL_V1_STYLE,
     PROTOCOL_V1_MAX_COMPLETION_FACTS, PROTOCOL_V1_MIN_COMPLETION_FACTS,
+    V2_CATEGORIES, V1_CATEGORIES, categories_for,
     GenerationBrief,
 )
 from .prompt_pack import (
@@ -300,19 +302,21 @@ def _spec_from_tool(d: dict, blueprint: Optional[PuzzleBlueprint] = None,
     代码负责归一、补 id、注入 blueprint、生成 spec。
 
     ## Issue #51 review Blocker 1: 归一的**宽容度按协议版本分档**
-
-    `protocol_version == haiguitang-v1` 时走**严格解析**(fail closed):
-
-        - completion_fact_ids **不去重**: [f1, f1, f2] 原样进 spec,
-          让 validate_spec 的"重复 completion id"硬门真的看到重复;
-        - fact 的 kind / visibility **缺省不补默认值、非法值不归一**:
-          缺 visibility 不再被偷偷变成 hidden(那会把"缺字段"洗成合法)。
-
-    坏数据由 validator 以明确原因拒绝, parser 绝不偷修 —— 与
-    categories 原样保留是同一条被冻结的原则。legacy/current(默认 "")
-    保持既有宽容行为**逐位不变**(classic 链与旧调用方不受影响)。
+    ##
+    ## `protocol_version` 属于 v1 时代结构合同(haiguitang-v1 或 v2)时走
+    ## **严格解析**(fail closed) —— v2 延续 v1 的全部结构合同, 只换了
+    ## 类别枚举, 所以解析宽容度与 v1 完全一致:
+    ##
+    ##     - completion_fact_ids **不去重**: [f1, f1, f2] 原样进 spec,
+    ##       让 validate_spec 的"重复 completion id"硬门真的看到重复;
+    ##     - fact 的 kind / visibility **缺省不补默认值、非法值不归一**:
+    ##       缺 visibility 不再被偷偷变成 hidden(那会把"缺字段"洗成合法)。
+    ##
+    ## 坏数据由 validator 以明确原因拒绝, parser 绝不偷修 —— 与
+    ## categories 原样保留是同一条被冻结的原则。legacy/current(默认 "")
+    ## 保持既有宽容行为**逐位不变**(classic 链与旧调用方不受影响)。
     """
-    is_v1 = str(protocol_version or "") == HAIGUITANG_PROTOCOL_VERSION
+    is_v1 = str(protocol_version or "") in PROTOCOL_V1_STYLE
     facts = []
     for i, raw in enumerate(d.get("facts") or []):
         if not isinstance(raw, dict):
@@ -653,15 +657,46 @@ def _is_v2(spec: "PuzzleSpec") -> bool:
 
 
 def _is_v1(spec: "PuzzleSpec") -> bool:
-    """这道题是不是 Haiguitang Protocol v1(Issue #50 §51)。
+    """这道题是不是 Haiguitang Protocol **v1**(历史 11 类协议)。
 
-    **shared Reviewer / 审计必须按它分派行为**: v1 keyword2 题走
-    Prompt Pack 的 audit-v1 与 v1 同步 bundle(2~4 completion +
-    public_text + difficulty/categories); legacy/current/curated 题
-    走原 CHECK_SYSTEM 与原 schema, 逐位不变。绝不能"全局一律 v1"。
+    ⚠️ 5 大类协议(v2)落地后, 这里**只**表达"历史 v1", 不再表达
+    "当前正式协议"。判断"这道题走不走 v1 时代的结构合同
+    (严格解析 / 2~4 completion / public_text / 观察分类 bundle)"
+    请用 `_is_v1_style`; 判断"该用哪套类别枚举"请用
+    `_protocol_categories`。三者不要混。
     """
     return (str(getattr(spec, "protocol_version", "") or "")
-            == HAIGUITANG_PROTOCOL_VERSION)
+            == PROTOCOL_V1)
+
+
+def _is_v1_style(spec: "PuzzleSpec") -> bool:
+    """这道题走不走 **v1 时代结构合同**(haiguitang-v1 或 v2)。
+
+    v2 延续 v1 的全部结构合同(completion 2~4 / public_text 硬门 /
+    严格解析 / 观察分类同步 bundle), 只把类别枚举换成五类 —— 所以
+    Reviewer 分派、schema 裁切、bundle 校验都要用**这个**判据,
+    而不是 `_is_v1`(那只匹配历史 v1)。legacy/current/curated 仍走
+    原路径, 逐位不变。
+    """
+    return (str(getattr(spec, "protocol_version", "") or "")
+            in PROTOCOL_V1_STYLE)
+
+
+def _protocol_categories(spec: Any) -> tuple:
+    """这道题的 observed 分类应该按**哪个枚举**解释/回传。
+
+    单一查表处: v1 -> 11 类(历史合同), v2 -> 5 类(当前合同),
+    其它 -> 空。Reviewer 的 schema enum 与回传值都以它为准 ——
+    绝不让"当前 alias"悄悄覆盖历史 v1 的枚举。
+
+    `spec` 可以是 PuzzleSpec, 也可以是任何带 `protocol_version` 的对象
+    / dict(测试用探针)。
+    """
+    if isinstance(spec, dict):
+        version = spec.get("protocol_version", "")
+    else:
+        version = getattr(spec, "protocol_version", "")
+    return categories_for(str(version or ""))
 
 
 def _core_fix_scope_violation(old: "PuzzleSpec", new: "PuzzleSpec",
@@ -2343,7 +2378,7 @@ _TOOL_RIDDLE = {
 }
 
 #: Contract 阶段的 system prompt **已迁到 Prompt Pack**(Issue #50):
-#:     haiguitang/prompts/generation/contract-v1.md   (via load_prompt("contract"))
+#:     haiguitang/prompts/generation/contract-v2.md   (via load_prompt("contract"))
 #: 迁移时按 Haiguitang Protocol v1 适配: completion 2~4、facts 带
 #: public_text(text vs public_text 的语义)、difficulty/categories 的
 #: 盲观察规则(§29: 看不到 requested)。单一事实来源是文件; `load_prompt`
@@ -2747,13 +2782,10 @@ def _story_user(keywords, lane: str,
 
 
 #: canonical 枚举的中文展示名 —— **纯展示**(进 Truth 的创作意图行),
-#: 不参与任何协议判定; 枚举本身的单一来源在 haiguitang_protocol.py。
-_CATEGORY_LABELS = {
-    "logic": "逻辑", "suspense": "悬疑", "horror": "恐怖", "twist": "反转",
-    "brainstorm": "脑洞", "family": "亲情", "crime": "罪案",
-    "tragedy": "悲剧", "warm": "温暖", "comedy": "喜剧", "sci_fi": "科幻",
-}
-_DIFFICULTY_LABELS = {"easy": "简单", "medium": "中等", "hard": "困难"}
+#: 不参与任何协议判定。单一来源是 `haiguitang_protocol.CATEGORY_LABELS`
+#: (当前五类); 这里只是别名引用, 绝不再复制第二份映射。
+_CATEGORY_LABELS = CATEGORY_LABELS
+_DIFFICULTY_LABELS = DIFFICULTY_LABELS
 
 
 def _surface_user(answer: str) -> str:
@@ -2961,7 +2993,7 @@ _TOOL_STRUCTURE = {
                 "type": "string",
                 "enum": list(CATEGORIES),
                 "description": (
-                    "这道题**最主要**的 canonical 主题(11 选 1, enum 见 "
+                    "这道题**最主要**的 canonical 主题(五大类选 1, enum 见 "
                     "schema)。是**观察结果**, 不是创作指令。"),
             },
             "categories": {
@@ -3681,23 +3713,26 @@ _TOOL_CHECK = {
 #: (早先这里写成一个中间变量 `_CHECK_REQUIRED_FIELDS`, 但它在
 #: `_TOOL_CHECK` 之后才定义 -> 模块加载即 NameError。教训: `_TOOL_CHECK`
 #: 是个字面量字典, 它只能引用**已经在它之前**定义的名字。)
-def _v1_check_tool() -> dict:
-    """v1 keyword2 题的审稿 tool schema(Issue #50 §25/§26/§41)。
+def _v1_check_tool(cats_enum=None) -> dict:
+    """v1 时代结构合同(haiguitang-v1 / v2)的审稿 tool schema。
 
     在 `_TOOL_CHECK`(自由生成形态)上做三件事, 其余逐位不动:
 
-        1. completion_fact_ids 的 minItems/maxItems 改成 Protocol v1
+        1. completion_fact_ids 的 minItems/maxItems 改成 Protocol
            常量(2~4) —— 不再手写 1~2;
         2. facts[].public_text 进 items.properties + items.required
            (通关 fact 空 public_text 会被 validator 整份拒绝, reviewer
            必须回传它才能同步);
         3. 顶层增加 difficulty / primary_category / categories(观察值,
-           §41: v1 同步 bundle 的组成部分), 并加入顶层 required。
+           同步 bundle 的组成部分), 并加入顶层 required。
 
-    枚举与区间**全部来自 story.haiguitang_protocol** —— 协议常量改了,
-    这里自动跟着变(§26)。
+    ⚠️ 类别枚举按**被审题目自己的 protocol_version** 来: v1 题 -> 11 类
+    (历史合同), v2 题 -> 5 大类(当前合同)。`cats_enum` 由 `check_tool`
+    传入; 直接调用时默认当前五类。绝不复制魔法值 —— 协议常量改了,
+    这里自动跟着变。
     """
     import copy as _copy
+    cats = tuple(cats_enum) if cats_enum else tuple(CATEGORIES)
     tool = _copy.deepcopy(_TOOL_CHECK)
     sch = tool["input_schema"]["properties"]
     comp = sch["completion_fact_ids"]
@@ -3732,14 +3767,14 @@ def _v1_check_tool() -> dict:
             "不要照抄原稿 —— 改了谜底难度可能变。"),
     }
     sch["primary_category"] = {
-        "type": "string", "enum": list(CATEGORIES),
+        "type": "string", "enum": list(cats),
         "description": (
             "按**改后**的题如实重判的最主要 canonical 主题。不要照抄原稿。"),
     }
     sch["categories"] = {
         "type": "array",
         "minItems": MIN_CATEGORIES, "maxItems": MAX_CATEGORIES,
-        "items": {"type": "string", "enum": list(CATEGORIES)},
+        "items": {"type": "string", "enum": list(cats)},
         "description": (
             "按**改后**的题如实重判的 canonical 主题, 1~3 个, "
             "必须包含 primary_category。"),
@@ -3780,23 +3815,24 @@ def check_tool(spec: Any = None) -> dict:
 
     `spec=None` 按自由生成处理(向后兼容: 老调用点没有 spec)。
 
-    ## Issue #50: Protocol v1 是第三种分派
+    ## v1 时代结构合同(haiguitang-v1 / v2)是第三种分派
 
-    v1 keyword2 题(`_is_v1(spec)`)在"自由生成"的 quality_checks 之上,
-    同步 bundle 还要带 v1 协议字段, 且 completion 区间是 2~4:
+    keyword2 题(`_is_v1_style(spec)`)在"自由生成"的 quality_checks 之上,
+    同步 bundle 还要带协议字段, 且 completion 区间是 2~4:
 
         completion_fact_ids  minItems/maxItems = Protocol 常量(2~4)
         facts[].public_text  必填(通关 fact 空 public_text 会被拒)
         difficulty           enum = Protocol DIFFICULTIES
-        primary_category     enum = Protocol CATEGORIES
-        categories           1~3, enum = Protocol CATEGORIES
+        primary_category     enum = **该题 protocol_version 自己的枚举**
+                             (v1 = 11 类, v2 = 5 大类)
+        categories           1~3, enum 同上
 
-    枚举与区间**全部引用 story.haiguitang_protocol**(§26: 不复制魔法值,
+    枚举与区间**全部引用 story.haiguitang_protocol**(不复制魔法值,
     测试钉死 schema == 协议常量)。legacy/current/curated 分支**逐位不变**。
     """
     import copy as _copy
-    if spec is not None and _is_v1(spec):
-        return _v1_check_tool()
+    if spec is not None and _is_v1_style(spec):
+        return _v1_check_tool(cats_enum=_protocol_categories(spec))
     props = _TOOL_CHECK["input_schema"]["properties"]["quality_checks"]
     curated = spec is not None and _is_curated(spec)
     keep = (set(_CURATED_HARD_CHECK_FIELDS) | set(_CURATED_SIGNAL_FIELDS)
@@ -5381,9 +5417,10 @@ class PuzzleWriter:
             # 分不出这题是哪条链产的, 而且溯源("这题是怎么来的")整个丢失。
             #
             # ---- Issue #50 §37/§38/§39/§36: code-owned 字段 ----
-            # keyword2 v1 路径的全部版本/协议/来源字段由**代码**注入,
+            # keyword2 路径的全部版本/协议/来源字段由**代码**注入,
             # 模型的 tool schema 里根本没有它们:
-            #   protocol_version        = haiguitang-v1(默认 keyword2 正式激活)
+            #   protocol_version        = haiguitang-v2(5 大类协议,
+            #                             代码拥有, 模型不输出它)
             #   requested_category      = 原 GenerationBrief(Audit 不能改)
             #   prompt_version          = 生成 Prompt Pack 总版本
             #   quality_policy_version  = quality-v13(Audit 不拥有)
@@ -5916,9 +5953,9 @@ class PuzzleWriter:
         self._last_review_technical = False
         bp = blueprint or spec.blueprint
         # ---- Issue #50 §51: shared Reviewer 必须 protocol-aware ----
-        # v1 keyword2 题 -> Prompt Pack 的 audit-v1; legacy/current/
-        # curated -> 原 CHECK_SYSTEM, 逐位不变。
-        _v1_review = _is_v1(spec)
+        # v1 时代结构合同(haiguitang-v1 / v2)的题 -> Prompt Pack 的
+        # audit stage; legacy/current/curated -> 原 CHECK_SYSTEM, 逐位不变。
+        _v1_review = _is_v1_style(spec)
         user = (f"【谜面】{spec.puzzle}\n"
                 f"【谜底】{spec.answer or '(空)'}\n"
                 f"【核心答案 core_answer】{spec.core_answer or '(空)'}\n"
@@ -5967,7 +6004,7 @@ class PuzzleWriter:
                      "不要照抄)】\n" + json.dumps(spec.signature.to_dict(),
                                                    ensure_ascii=False))
         if _v1_review:
-            # ---- Issue #50 §41: v1 同步 bundle 的观察分类 ----
+            # ---- Issue #50 §41: v1 时代结构合同的观察分类 bundle ----
             # 原稿的难度/主题候选给审稿人做参照; **requested_category
             # 绝不出现**(§34: observed classification blind to requested)。
             user += (
@@ -6134,8 +6171,16 @@ class PuzzleWriter:
                 "特定平台渲染 / 软件行为 / 极冷门编码规则'。")
 
         res = self.client.messages(
-            # ---- Issue #50 §51: v1 -> Prompt Pack audit-v1; 其余原样 ----
-            load_prompt("audit") if _v1_review else CHECK_SYSTEM,
+            # ---- Issue #50 §51: v1 时代结构合同 -> Prompt Pack audit; 其余原样 ----
+            # ---- review 5324564684 Blocker 2: audit 文字与 schema 同版本 ----
+            # 历史 v1 题 -> audit-v1.md(11 类文字), 与它那套 11 类
+            # tool schema 配对; v2 题 -> audit-v2.md(五类文字), 与五类
+            # schema 配对。system prompt 与 check_tool(spec) 的类别
+            # 枚举**必须**由同一个 protocol_version 决定, 绝不允许
+            # "v2 五类 prompt + v1 11 类 schema"(或反过来)打架。
+            # legacy/current/curated 仍走 CHECK_SYSTEM, 逐位不变。
+            load_prompt("audit_v1" if _is_v1(spec) else "audit")
+            if _v1_review else CHECK_SYSTEM,
             user, max_tokens=max_tokens,
                                    # H4-D1 §二: schema 按题裁 —— curated 题
                                    # 只问 curated 那一套(见 `check_tool`)。
@@ -6360,12 +6405,13 @@ class PuzzleWriter:
                 _v = ti.get(_name)
                 if not isinstance(_v, list) or not _v:
                     invalid_bundle.append(_name)
-        # ---- Issue #50 §41: v1 的同步 bundle 还要带观察分类 ----
+        # ---- Issue #50 §41: v1 时代结构合同的同步 bundle 带观察分类 ----
         # difficulty / primary_category / categories 是**模型拥有**的
         # 观察结果(审稿人按改后的题如实重判); 空/缺失/类型不对 = 无效。
         # (protocol_version / requested_category / prompt_version /
         #  quality_policy_version 是**代码字段**, 不让模型回 —— 见重建处。)
-        if _is_v1(spec):
+        # ⚠️ 判据是 `_is_v1_style`: v2 与 v1 共用这套 bundle 合同。
+        if _is_v1_style(spec):
             _d = ti.get("difficulty")
             if not isinstance(_d, str) or not _d.strip():
                 invalid_bundle.append("difficulty")
@@ -6401,12 +6447,13 @@ class PuzzleWriter:
         # 所以下面的 `if not facts:` 兜底**只可能**为 legacy 触发 ——
         # v5 永远不会"空了就沿用旧 facts"。
         #
-        # ---- Issue #51 review Blocker 1: v1 用 strict 解析 ----
+        # ---- Issue #51 review Blocker 1: v1 时代结构合同用 strict 解析 ----
         # Reviewer 回传的 fact 缺 kind/visibility 或给了非法值时,
         # **原样保留**交给 validator —— 不允许 from_dict 的宽容归一
         # (缺 visibility 洗成 hidden / 非法 kind 洗成 support)把坏数据
-        # 变合法。legacy 保持宽容(老 fixture 依赖它)。
-        _v1_review = _is_v1(spec)
+        # 变合法。v2 与 v1 共用这套严格解析(结构合同相同)。legacy 保持
+        # 宽容(老 fixture 依赖它)。
+        _v1_review = _is_v1_style(spec)
         facts = [PuzzleFact.from_dict(f, strict=_v1_review)
                  for f in (ti.get("facts") or [])]
         if not facts:
@@ -6441,12 +6488,13 @@ class PuzzleWriter:
                             "fair_clues/discovery_beats 全部**非空**显式回传, "
                             "代码不会替你沿用旧值")
 
-        # ---- Issue #50 §41: v1 观察分类的解析 ----
+        # ---- Issue #50 §41: v1 时代结构合同的观察分类解析 ----
         # 枚举合法性**不在这里判**(那是 validate_protocol/validate_spec
         # 的活, 紧随其后就会跑); 这里只做解析与透传, 非法值会被后面的
         # 硬校验以明确原因拒掉。
         # categories **原样保留**(不去重不回退 —— 与 from_dict 同一条纪律)。
-        if _is_v1(spec):
+        # ⚠️ v2 与 v1 共用这个 bundle 路径(结构合同相同)。
+        if _is_v1_style(spec):
             _v1_difficulty = str(ti.get("difficulty") or "").strip()
             _v1_primary = str(ti.get("primary_category") or "").strip()
             _v1_cats_raw = ti.get("categories")

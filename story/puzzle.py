@@ -646,7 +646,9 @@ class PuzzleSpec:
     #: 语义就是 observed primary(Issue #48 §22), 否则两份"谁是真的"
     #: 无法回答。与 `content_style`(观感标签)是**不同维度**, 不互相顶替。
     primary_category: str = ""
-    #: 一题多主题(1~3 条, 含 primary, 无重复, 全在 11 类里)。
+    #: 一题多主题(1~3 条, 含 primary, 无重复, 全在**该协议版本自己的
+    #: 类别枚举**里 —— v1 历史 11 类 / v2 当前 5 大类, 见
+    #: story/haiguitang_protocol.py)。
     #: from_dict **不去重、不回退** —— 坏数据保留到 validator 面前。
     categories: list = field(default_factory=list)
     #: **provenance**: 这次生成任务当初要求什么主题(""=自由生成)。

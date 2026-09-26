@@ -2448,9 +2448,11 @@ class _R5Writer:
         if not s.difficulty:
             s.difficulty = "medium"
         if not s.primary_category:
-            s.primary_category = "warm"
+            # 新生成协议是 haiguitang-v2(五类): "warm" 只属于 v1 历史
+            # 枚举, 替身必须给 v2 合法类, 否则入池门正确地拒掉它。
+            s.primary_category = "suspense"
         if not s.categories:
-            s.categories = ["warm"]
+            s.categories = ["suspense"]
         s.prompt_version = HAIGUITANG_GENERATION_PROMPT_VERSION
         s.protocol_version = HAIGUITANG_PROTOCOL_VERSION
         s.quality_policy_version = QUALITY_POLICY_VERSION
@@ -2559,7 +2561,7 @@ def test_r5_prefill_default_goes_through_keyword_spec():
               getattr(spec, "prompt_version", "")
               == HAIGUITANG_GENERATION_PROMPT_VERSION,
               getattr(spec, "prompt_version", ""))
-        check("**protocol_version == haiguitang-v1**",
+        check("**protocol_version == haiguitang-v2**",
               getattr(spec, "protocol_version", "") == HAIGUITANG_PROTOCOL_VERSION,
               getattr(spec, "protocol_version", ""))
         check("**metrics.generation_mode == keyword2**",

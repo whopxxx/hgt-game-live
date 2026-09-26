@@ -344,6 +344,19 @@ class Snapshot:
     puzzle_title: str = ""
     puzzle_index: int = 0                   # 第几题(从 1 开始); 前端据此清空问答流
     puzzle_elapsed_ms: Optional[int] = None  # 本题已进行毫秒
+    #: **当前题的展示元数据**(难度/主题, 5 大类协议 v2 起下发)。
+    #:
+    #: 由 `haiguitang_protocol.public_puzzle_meta(spec)` 生成 ——
+    #: presentation-safe:
+    #:     v2 题      直接给 observed 五类 + 中文 label;
+    #:     历史 v1    走确定性 legacy display mapping(不改原始 spec);
+    #:     无分类     **空 dict** —— 前端安静隐藏, 绝不显示"未知 · 未分类"。
+    #:
+    #: ⚠️ 这是正式产品状态, **不进** debug。同样**绝不**携带
+    #: `requested_category`(生成意图不是分类事实)/ fact id / hidden
+    #: truth。SETTGING 期间必须为空(上一题的元数据已随 `_enter_setting`
+    #: 清除), 不能残留"AI 正在出第 13 题, 顶部还写着第 12 题的难度"。
+    puzzle_meta: dict[str, Any] = field(default_factory=dict)
     revealed_answer: str = ""               # 谜底; 非空 = 已揭晓
     solved: bool = False
     solved_by: str = ""
@@ -453,6 +466,8 @@ class Snapshot:
             "puzzle_title": self.puzzle_title,
             "puzzle_index": self.puzzle_index,
             "puzzle_elapsed_ms": self.puzzle_elapsed_ms,
+            # 5 大类协议 v2: 当前题的展示元数据(可能为空 dict -> 前端隐藏)。
+            "puzzle_meta": self.puzzle_meta,
             "revealed_answer": self.revealed_answer,
             # U1: 核心答案 / 完整解释分开下发 + 是否显示细节。
             "revealed_core_answer": self.revealed_core_answer,
