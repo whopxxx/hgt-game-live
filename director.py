@@ -264,6 +264,9 @@ class Director:
         # ---- Issue #65 §9: 同题同问成功结果 cache ----
         # key=(round, spec_key, normalized_text) -> QAResult。身份里带
         # round+spec, 换题自然失效; 有界(防长直播内存增长)。
+        # 写入只发生在 **Engine 回执 accepted 之后**(review B1);
+        # 所有读写/淘汰收口进专用锁(review B2), 锁内不做 LLM/Engine 调用。
+        self._qa_cache_lock = threading.Lock()
         self._qa_verdict_cache: dict = {}
 
         self.engine.model_requested = cfg.llm.model
@@ -759,22 +762,41 @@ class Director:
         也省一次调用。只缓存成功结果; 未判定/技术失败不缓存(下一次
         同问会重新调)。换题(round/spec 变化)自然失效。
         """
-        # ---- 同问一致性 cache 查询(确定性, 无 LLM) ----
+        # ---- 同问一致性 cache 查询(确定性, 无 LLM; B2: 专用锁) ----
         key = self._qa_cache_key(payload)
         if key is not None:
-            cached = self._qa_verdict_cache.get(key)
+            with self._qa_cache_lock:
+                cached = self._qa_verdict_cache.get(key)
             if cached is not None:
                 qid = payload["qid"]
                 log.info("同问复用(Issue #65): %r -> %s (qid=%d)",
                          payload.get("text", "")[:20], cached.verdict, qid)
+                # ---- B3: 复用**完整** semantic result, 不重新解释 ----
+                # provenance 四字段原样保留(cache hit 的 archive 与首次
+                # 一致); solution_candidate / status / 覆盖字段原样保留;
+                # 只有 qid / user_name 换成本次提问的。
+                # established/completion_verified 原样带回 —— Engine 的
+                # `_record_human_established_locked` 幂等合并(已建立的 id
+                # 只是不再新增), completion 贡献仍由 Engine 的 before-diff
+                # 决定, 不会重复记功。
                 r = QAResult(
-                    qid=qid, verdict=cached.verdict,
+                    qid=qid,
+                    verdict=cached.verdict,
                     comment=cached.comment,
+                    status=cached.status,
                     response_kind=cached.response_kind,
+                    solution_candidate=cached.solution_candidate,
                     touched_fact_ids=list(cached.touched_fact_ids or []),
-                    established_fact_ids=[],
-                    completion_verified_fact_ids=[],
-                    solution_candidate=False)
+                    established_fact_ids=list(cached.established_fact_ids
+                                              or []),
+                    completion_verified_fact_ids=list(
+                        cached.completion_verified_fact_ids or []),
+                    judging_prompt_version=cached.judging_prompt_version,
+                    answer_prompt_version=cached.answer_prompt_version,
+                    candidate_recheck_prompt_version=(
+                        cached.candidate_recheck_prompt_version),
+                    completion_verify_prompt_version=(
+                        cached.completion_verify_prompt_version))
                 self._dispatch(self.engine.submit_qa(
                     [r],
                     expect_round=payload.get("expect_round"),
@@ -785,12 +807,17 @@ class Director:
         if pool is None:
             # --no-llm: 用固定裁决, 但仍要回填, 否则提问会一直挂着
             verdict = self._fake_verdict(payload.get("text", ""))
-            self._maybe_cache_qa(payload, QAResult(
-                qid=payload["qid"], verdict=verdict))
+            r = QAResult(qid=payload["qid"], verdict=verdict)
+            # ---- B1: 与 LLM 路径同一条纪律 —— 先 submit 拿回执, Engine
+            # 确认接受后才进 cache。no_llm 路径的 engine 同样可能已超时。
+            receipt: dict = {}
             self._dispatch(self.engine.submit_qa(
-                [QAResult(qid=payload["qid"], verdict=verdict)],
+                [r],
                 expect_round=payload.get("expect_round"),
-                expect_spec_key=payload.get("expect_spec_key")))
+                expect_spec_key=payload.get("expect_spec_key"),
+                receipt=receipt))
+            if receipt.get(payload["qid"]) is True:
+                self._maybe_cache_qa(payload, r)
             self.push()
             return
         pool.submit(self._answer_work, payload)
@@ -812,12 +839,32 @@ class Director:
     # 规范化后完全相同的文本命中。身份里有 round+spec, 换题自然失效,
     # 不需要显式清理; 容量有上限防长直播内存增长。
     #
-    # ## 只缓存成功结果
+    # ## 只缓存**被 Engine 接受**的成功结果(review B1)
     #
-    #     缓存: status=ok 且 response_kind ∈ {verdict, rephrase}
-    #     不缓存: 未判定 / timeout / transport error / malformed
+    #     缓存: Engine 回执 accepted 且 status=ok 且
+    #           response_kind ∈ {verdict, rephrase}
+    #     不缓存: 未判定 / timeout / transport error / malformed /
+    #             **被 Engine 丢弃的迟到结果**
     #
-    # 技术失败缓存住会让"再发一次吧"变成永久故障 —— 失败必须可重试。
+    # "LLM 返回 ok" ≠ "业务提交成功": 该 qid 可能早已超时, 观众已经
+    # 看到"未判定", Engine 会把迟到的 ok 结果静默忽略。若只看 LLM 状态
+    # 就写 cache, 迟到的"成功"会变成下一次同问的答案 —— 恰好违反
+    # "第一次未判定 -> 第二次必须重新判断"。所以写 cache 的唯一入口
+    # 是 `submit_qa(..., receipt=)` 回执为 accepted 之后。
+    #
+    # ## 并发(review B2)
+    #
+    # `_answer_work` 跑在多个线程里, cache 读(调度线程 `_answer`)与
+    # 写/淘汰(多个 answer worker)并发。全部 get/set/eviction 收口进
+    # **专用** `_qa_cache_lock`(不滥用 Engine lock); 锁内**只做内存
+    # dict 操作, 绝不调 LLM / Engine** —— 否则持锁阻塞会把 tick 线程
+    # 卡住。淘汰在同一临界区内完成, "两个线程选中同一个旧 key"的
+    # KeyError 竞态从结构上不可能再发生。
+    #
+    # ## 复用语义(review B3)
+    #
+    # cache 存的是**完整 QAResult**(含 provenance 四字段); 命中时只换
+    # qid, 其余原样复用 —— 见 `_answer` 里的注释。
     _QA_CACHE_MAX = 64
 
     @staticmethod
@@ -835,7 +882,12 @@ class Director:
         return (int(rnd), str(sk), self._qa_normalize(payload.get("text", "")))
 
     def _maybe_cache_qa(self, payload: dict, result: QAResult) -> None:
-        """成功语义结果进 cache。只写 status=ok 的 verdict/rephrase。"""
+        """**Engine 已接受**的成功语义结果进 cache(review B1+B2)。
+
+        调用时机: `submit_qa(..., receipt=)` 回执确认 accepted **之后**。
+        本方法自己只再做语义形状门(ok / 三态 / rephrase), 锁内只做
+        dict 写 + 淘汰, 无任何 LLM / Engine 调用。
+        """
         if getattr(result, "status", "ok") != "ok":
             return
         rk = getattr(result, "response_kind", "verdict")
@@ -847,10 +899,12 @@ class Director:
         key = self._qa_cache_key(payload)
         if key is None:
             return
-        self._qa_verdict_cache[key] = result
-        # 简单容量护栏: dict 保持插入序, 超限丢最早的。
-        while len(self._qa_verdict_cache) > self._QA_CACHE_MAX:
-            self._qa_verdict_cache.pop(next(iter(self._qa_verdict_cache)))
+        with self._qa_cache_lock:
+            self._qa_verdict_cache[key] = result
+            # 容量护栏: dict 保持插入序, 超限丢最早的(同一临界区内淘汰,
+            # 消除并发 pop 同 key 的 KeyError 竞态)。
+            while len(self._qa_verdict_cache) > self._QA_CACHE_MAX:
+                self._qa_verdict_cache.pop(next(iter(self._qa_verdict_cache)))
 
     def _answer_work(self, payload: dict) -> None:
         qid = payload["qid"]
@@ -889,16 +943,23 @@ class Director:
                 results = [QAResult(qid=qid, verdict=P.UNAVAILABLE,
                                     comment="刚才网络抖了一下，再发一次吧",
                                     status="unavailable")]
-            else:
-                # ---- Issue #65 §9: 只缓存成功结果 ----
-                # 未判定/技术失败**不缓存**(下一次同问必须重新调 LLM);
-                # 复核改判后的最终 verdict 才是可复用的一致答案。
-                self._maybe_cache_qa(payload, results[0])
+            # ---- Issue #65 review B1: 先 submit 拿回执, 后写 cache ----
+            #
+            # 顺序不能反。该 qid 可能早已被 Engine 判超时(观众已经看到
+            # "未判定", inflight 已清), 这时迟到回一个 status=ok 的结果,
+            # Engine 会整条忽略 —— 但若我们先写了 cache, 下一位观众问
+            # 同一句话就会吃到这份"从未真正发生过"的裁决, 0 次 LLM。
+            # 只有回执 accepted=True(Engine 真把这条 rec 落账了)才允许
+            # 进 cache; 未判定/技术失败本来就不缓存, 与 §9 一致。
+            receipt: dict = {}
             self._dispatch(self.engine.submit_qa(
                 results, error=err,
                 model=getattr(self.writer.client.cfg, "model", None),
                 expect_round=payload.get("expect_round"),
-                expect_spec_key=payload.get("expect_spec_key")))
+                expect_spec_key=payload.get("expect_spec_key"),
+                receipt=receipt))
+            if receipt.get(qid) is True:
+                self._maybe_cache_qa(payload, results[0])
         except Exception as e:
             log.exception("回答异常: %s", e)
             self._dispatch(self.engine.submit_qa(

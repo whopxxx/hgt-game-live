@@ -1074,16 +1074,43 @@ class RoundEngine:
                   error: Optional[str] = None, usage: Optional[dict] = None,
                   model: Optional[str] = None, now: Optional[float] = None,
                   expect_round: Optional[int] = None,
-                  expect_spec_key: Optional[str] = None
+                  expect_spec_key: Optional[str] = None,
+                  receipt: Optional[dict] = None
                   ) -> list[EngineAction]:
+        """提交 LLM 对提问的裁决。返回动作; 可选 `receipt` 带回**回执**。
+
+        ## Issue #65 review B1: 逐条接受回执(`receipt`)
+
+        `receipt` 是调用方传入的 dict, Engine 在 lock 内按结果逐条回填:
+
+            receipt[qid] = True    # 这条结果**实际被接受**: 在途命中、
+                                   # phase==QA、rec 已写、统计已记
+            receipt[qid] = False   # 这条被忽略: qid 已超时/不在途, 或
+                                   # phase 已不是 QA(迟到/串题)
+
+        为什么不用"返回动作是否非空"判断: 整包被忽略时 Engine 仍会返回
+        一条 notice BROADCAST(见函数尾部) —— 那是给观众的"这次没答上"
+        提示, 不是"结果被接受"。上游(如 Director 的同问 cache)必须依据
+        这个显式回执决定"能不能把这条结果当成可复用的成功答案", 否则
+        迟到的 status=ok 结果会在观众已经看到"未判定"之后污染 cache。
+        回执在 `self._lock` 内回填 —— 它写的是 Engine 接受那一刻的权威
+        状态。
+        """
         now = self._now(now)
         with self._lock:
             if self._stopped:
+                # ---- B1 回执: 整包作废 -> 全部"未被接受" ----
+                if receipt is not None:
+                    for r in (answers or []):
+                        receipt[r.qid] = False
                 return []
             # Batch B closeout: 这道题已经被换掉 -> 整个回包作废。
             # 注意这不是"忽略某一条", 而是**整包丢弃**: 一个回包里的
             # 裁决都属于同一个 worker, 它算的是同一道题。
             if not self._identity_ok(expect_round, expect_spec_key):
+                if receipt is not None:
+                    for r in (answers or []):
+                        receipt[r.qid] = False
                 return []
             self._touch_meta(usage, model, error)
             acts: list[EngineAction] = []
@@ -1093,8 +1120,13 @@ class RoundEngine:
                 q = self._inflight.pop(r.qid, None)
                 self._inflight_at.pop(r.qid, None)
                 if q is None:
+                    # ---- B1 回执: 迟到/重复 -> 明确"未被接受" ----
+                    if receipt is not None:
+                        receipt[r.qid] = False
                     continue                   # 不在途(过期/重复): 忽略
                 if self.phase != Phase.QA:
+                    if receipt is not None:
+                        receipt[r.qid] = False
                     continue
                 # ---- v5: 只有**真人问答**能建立事实 ----
                 #
@@ -1185,6 +1217,10 @@ class RoundEngine:
                             completion_verify_prompt_version=getattr(
                                 r, "completion_verify_prompt_version", ""))
                 self._append_qa_locked(rec)
+                # ---- B1 回执: rec 已写、统计已记 -> 这一条**确实被接受** ----
+                # 这是上游"可以把这条结果当成功答案"的唯一权威信号。
+                if receipt is not None:
+                    receipt[r.qid] = True
                 # 累加"观众已经探索过哪些方向"(方案 §32)。
                 # **touched ≠ discovered**: 只表示问过这个方向, 不代表已确认为真。
                 for fid in (r.touched_fact_ids or []):
