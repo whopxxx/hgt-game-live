@@ -566,14 +566,7 @@
     el.factProgressDots.textContent = "●".repeat(p.established) + "○".repeat(Math.max(0, p.total - p.established));
     el.factProgressList.replaceChildren();
     const facts = p.facts || [];
-    const recent = facts.slice(-2);
-    if (facts.length > 2) {
-      const more = document.createElement("span");
-      more.className = "fact-progress-more";
-      more.textContent = "另有 " + (facts.length - 2) + " 条已确认";
-      el.factProgressList.appendChild(more);
-    }
-    for (const fact of recent) {
+    for (const fact of facts) {
       const row = document.createElement("div");
       row.textContent = "✓ " + fact.text;
       el.factProgressList.appendChild(row);

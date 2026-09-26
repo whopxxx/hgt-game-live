@@ -1411,7 +1411,7 @@ window.addEventListener('load', async () => {
       {text:'第一条已确认核心事实解释了他到车站的原因'},
       {text:'第二条已确认核心事实解释了广播出现的时机'},
       {text:'第三条已确认核心事实解释了车票的用途'},
-      {text:'第四条已确认核心事实解释了最后的选择'}]},
+      {text:'第四条已确认核心事实解释了最后的选择，以及他为什么撕碎车票'.repeat(3)}]},
     ai_player: {likes_progress: 63, likes_per_progress: 100, in_flight: false},
     leaderboard: [{rank:1,user_name:'很长的排行榜观众名字',solved_count:9}],
     stats: {questions: 20, answered: 18, solved: 3, dropped: 0, viewers_seen: 200},
@@ -1455,7 +1455,17 @@ window.addEventListener('load', async () => {
     check(footer && qa.bottom <= footer.top + 1, 'W4 footer intrudes into QA');
     check(qa.height >= 360, 'W5 QA viewport <360px: ' + qa.height);
     check(qa.height >= 300, 'W5b QA viewport below hard floor: ' + qa.height);
-    check(fact.height <= 126, 'W5c fact rail exceeds compact cap: ' + fact.height);
+    const factRows = [...document.querySelectorAll('#fact-progress-list > div')];
+    check(factRows.length === 4 &&
+          factRows.every((row, i) => row.textContent.includes(['第一','第二','第三','第四'][i] + '条')),
+      'W5c all four established facts must appear in order');
+    check(fact.height <= 200, 'W5d fact rail exceeds compact cap: ' + fact.height);
+    check(factRows.every(row => row.getBoundingClientRect().bottom <=
+          document.getElementById('fact-progress').getBoundingClientRect().bottom + 1),
+      'W5e a fact row is clipped below the rail');
+    check(factRows.length === 4 && factRows.every(row => row.getBoundingClientRect().height <= 34) &&
+          getComputedStyle(factRows[3]).textOverflow === 'ellipsis',
+      'W5f each fact must stay on one ellipsized line');
     check(Math.abs(qa.height-before.height) <= 1 &&
           eventStyle.position === 'absolute',
           'W6 transient event changed bottom flex geometry');
