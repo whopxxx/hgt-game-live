@@ -249,6 +249,28 @@ def test_probe_offline_run(tmp=False):
           and run["prompt_version"].startswith("haiguitang-generation-v"),
           (run["protocol_version"], run["prompt_version"]))
 
+    # ---- review 5324929975 Blocker 1/2: 审计证据 ----
+    check("call_log 存在且每条带 stage/model/usage/latency",
+          all(set(("stage", "model", "usage", "latency_s")) <= set(c)
+              for c in run["call_log"]),
+          "call_log 字段缺")
+    check("total_llm_calls == len(call_log)",
+          run["total_llm_calls"] == len(run["call_log"]),
+          (run["total_llm_calls"], len(run["call_log"])))
+    check("usage 从全量调用汇总(含失败)",
+          isinstance(run["usage"], dict), run["usage"])
+    check("stage_stats 按 stage 聚合",
+          all("calls" in v and "errors" in v
+              for v in (run["stage_stats"] or {}).values()),
+          run["stage_stats"])
+    check("失败记录带 reject/review_technical/calls",
+          all(("reject" in s and "review_technical" in s and "calls" in s)
+              for s in run["samples"] if not s.get("ok")),
+          [k for s in run["samples"] if not s.get("ok")
+           for k in ("reject", "review_technical", "calls") if k not in s])
+    check("失败记录带 category_attempt",
+          all("category_attempt" in s for s in run["samples"]))
+
     # ---- 报告渲染 ----
     md = mod.render_report(run, run["samples"])
     check("report 渲染 puzzle/answer",
@@ -301,8 +323,9 @@ def test_write_outputs_no_production_files():
         out = str(Path(td) / "audit")
         mod.write_outputs(json.loads(json.dumps(run)), out)
         names = sorted(p.name for p in Path(out).iterdir())
-        check("恰好三件输出", names == ["report.md", "run.json",
-                                        "samples.jsonl"], names)
+        check("恰好四件输出(call_log 新增)", names == ["calls.jsonl",
+                                                        "report.md", "run.json",
+                                                        "samples.jsonl"], names)
         md = (Path(out) / "report.md").read_text(encoding="utf-8")
         check("run.json 可读", json.loads(
             (Path(out) / "run.json").read_text(encoding="utf-8"))[

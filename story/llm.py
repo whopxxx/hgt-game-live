@@ -1192,6 +1192,38 @@ class AnthropicMessagesClient:
                         u.get("input_tokens", "?"), u.get("output_tokens", "?"),
                         r.error or "无",
                         _clip(r.tool_input if r.tool_input is not None else r.text, 500))
+                # ---- review 5324929975: 空 tool_input 的**纯技术**可靠性 ----
+                #
+                # baseline-0 实测: `puzzle.structure` 5 次返回
+                # `stop=tool_use` 但 input 为空(网关在长结构化 tool_use
+                # 上的抖动, G4-CF 已有前科), 应用层的"1 次正常 + 1 次技术
+                # 重试"连第二次也空 -> 整个 attempt 白烧。
+                #
+                # 处理: **非触顶**的空 tool_input(stop=tool_use 且输出
+                # 远未到预算)与 HTTP 5xx 同类 —— 是网关抖动, 不是模型
+                # 语义判断。把它并入**同一层的传输重试**(退避后原样重发
+                # 同一个请求体)。边界不变:
+                #   * `max_tokens` 触顶的截断**不**走这里(那是预算问题,
+                #     Truth 已单独修, 重发只会再截断一次);
+                #   * 语义拒绝(validate_spec / Reviewer / audit)发生在
+                #     这个循环之外, **绝不**被本重试波及;
+                #   * 重发的是**同一个请求体**, puzzle/answer/idea 一个字
+                #     不变 —— 不是恢复多稿生成。
+                if (want_tool and r.error and "空 input" in r.error
+                        and "max_tokens" not in r.error):
+                    last_err = f"empty tool_input: {r.error}"
+                    if attempt < mr:
+                        log.warning(
+                            "LLM 空 tool_input(网关抖动) provider=%s "
+                            "stage=%s model=%s, 第 %d/%d 次重试…",
+                            route.provider, stage or "(未标注)",
+                            requested_model, attempt + 1, mr)
+                        backoff = (2 ** attempt) + random.uniform(0, 0.5)
+                        time.sleep(min(backoff, 8.0))
+                        continue
+                    # 重试配额内的最后一次也空 -> 把错误交回调用方
+                    # (应用层的技术重试边界保持原样)。
+                    return r
                 return r
             except urllib.error.HTTPError as e:
                 code = e.code
@@ -5128,8 +5160,18 @@ class PuzzleWriter:
         text = _story_user(keywords, brief=brief)
         last_err = ""
         for attempt in range(1, max(1, int(max_attempts)) + 1):
+            # ---- Truth 输出预算(review 5324929975)----
+            # baseline-0: 硬编码 1500 被 3 次撞满截断(tool call 没写完)。
+            # 现在从 runtime Config 读 `story_max_tokens`(默认 3000,
+            # 可配置) —— **输出预算**与 Truth 的内容合同(2~4 句 /
+            # <=260 中文字)是两回事, 后者一个字不改。
+            story_budget = 3000
+            _c = self._cfg()
+            if _c is not None:
+                story_budget = int(getattr(_c, "story_max_tokens", 3000)
+                                   or 3000)
             res = self.client.messages(
-                system, text, max_tokens=1500, tool=_TOOL_STORY,
+                system, text, max_tokens=story_budget, tool=_TOOL_STORY,
                 temperature=(temperature if temperature is not None
                              else self._temperature("generate_temperature")),
                 timeout=timeout,

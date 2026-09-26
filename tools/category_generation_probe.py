@@ -74,19 +74,30 @@ def run_probe(args) -> dict:
 
     cfg = Config()
     client = AnthropicMessagesClient(cfg.llm)
-    # 调用计数: 包一层 messages(生产 client 原样透传, 只 +1 计数)。
+    # 调用审计(review 5324929975 Blocker 1): 包一层 messages, 每次调用
+    # 记 stage / model / usage / error —— **含失败调用**。总 usage 由此
+    # 汇总(而不是只从 accepted 样本拿), 保证"这轮到底花了多少"可审计。
     # **必须线程安全**(与 G1 工具同一约定)。
     import threading
-    calls = {"n": 0}
+    calls: list = []
     _lock = threading.Lock()
     _orig = client.messages
 
-    def _counting(*a, **kw):
+    def _auditing(*a, **kw):
+        t = time.monotonic()
+        r = _orig(*a, **kw)
         with _lock:
-            calls["n"] += 1
-        return _orig(*a, **kw)
+            calls.append({
+                "stage": str(kw.get("stage") or "(未标注)"),
+                "model": r.model or "",
+                "error": r.error or "",
+                "usage": dict(r.usage or {}),
+                "latency_s": round(time.monotonic() - t, 2),
+                "tool": ((kw.get("tool") or {}).get("name") or ""),
+            })
+        return r
 
-    client.messages = _counting  # type: ignore[assignment]
+    client.messages = _auditing  # type: ignore[assignment]
     writer = PuzzleWriter(client=client, runtime_cfg=cfg)
 
     # ---- 生产 bag: 与 live/prefetch 同一条 load_bag 路径 ----
@@ -125,6 +136,7 @@ def run_probe(args) -> dict:
             attempts += 1
             # 每次 attempt 从生产 KeywordBag 抽**新的** 2 个关键词
             # (keyword_spec 内部是唯一 draw 点, 这里只递 bag)。
+            calls_before = len(calls)
             brief = GenerationBrief(requested_category=cat,
                                     difficulty=brief_difficulty)
             try:
@@ -134,22 +146,29 @@ def run_probe(args) -> dict:
                                      brief=brief)
             except Exception as e:                  # noqa: BLE001
                 fails["other"] += 1
-                samples.append(_fail_record(cat, attempts, brief, f"exc:{e}"))
+                samples.append(_fail_record(
+                    cat, attempts, brief, f"exc:{e}",
+                    writer=writer, calls=calls[calls_before:]))
                 continue
             if spec is None:
                 fails.setdefault(why or "gen_fail", 0)
                 fails[why or "gen_fail"] += 1
-                samples.append(_fail_record(cat, attempts, brief,
-                                            why or "gen_fail"))
+                samples.append(_fail_record(
+                    cat, attempts, brief, why or "gen_fail",
+                    writer=writer, calls=calls[calls_before:]))
                 continue
             accepted += 1
-            samples.append(_ok_record(cat, brief, spec))
+            samples.append(_ok_record(cat, attempts, brief, spec))
         per_cat_attempts[cat] = attempts
         per_cat_accepted[cat] = accepted
         per_cat_fail[cat] = fails
 
     elapsed = time.monotonic() - t0
-    usage = _sum_usage(samples)
+    # ---- 总 usage(review 5324929975 Blocker 1): **含失败调用** ----
+    # 从调用审计日志汇总(accepted 样本的 usage 只覆盖成功链)。
+    usage = _sum_call_usage(calls)
+    # 每 stage 的调用/失败分布 —— 技术瓶颈定位用。
+    stage_stats = _stage_stats(calls)
     from story.keyword_seed import KEYWORD_SEED_VERSION
     return {
         "protocol_version": "haiguitang-v2",
@@ -164,8 +183,10 @@ def run_probe(args) -> dict:
         "accepted": per_cat_accepted,
         "fails": per_cat_fail,
         "requested_to_observed": _hit_stats(samples),
-        "total_llm_calls": calls["n"],
+        "total_llm_calls": len(calls),
         "usage": usage,
+        "stage_stats": stage_stats,
+        "call_log": calls,
         "elapsed_s": round(elapsed, 1),
         "model": getattr(getattr(client, "cfg", None), "model", ""),
         "shortfall": {c: max(0, int(args.accepted_per_category)
@@ -186,10 +207,14 @@ def _prompt_version() -> str:
     return HAIGUITANG_GENERATION_PROMPT_VERSION
 
 
-def _ok_record(cat: str, brief, spec) -> dict:
+def _ok_record(cat: str, attempt_no: int, brief, spec) -> dict:
     m = dict(getattr(spec, "metrics", None) or {})
     return {
         "category": cat,
+        # category_attempt = 本类内第几次 attempt; attempt = 全局 draw 序号
+        # (keyword_draw_index)。两者分开 —— 审计时要同时能对上
+        # "第几试"与"抽的第几组词"。
+        "category_attempt": attempt_no,
         "attempt": m.get("keyword_draw_index"),
         "ok": True,
         "requested_category": brief.requested_category,
@@ -213,11 +238,64 @@ def _ok_record(cat: str, brief, spec) -> dict:
     }
 
 
-def _fail_record(cat: str, attempt_no: int, brief, why: str) -> dict:
-    return {"category": cat, "attempt": attempt_no, "ok": False,
-            "requested_category": brief.requested_category,
-            "requested_difficulty": brief.difficulty,
-            "reason": why}
+def _fail_record(cat: str, attempt_no: int, brief, why: str,
+                 writer=None, calls=None) -> dict:
+    """失败 attempt 的**完整审计记录**(review 5324929975 Blocker 1/2)。
+
+    侧信道语义与 G4-R2 §六 同一套: `_last_reject` 是 writer 上"最后一次
+    Stage B 失败的原因标签"(structure_technical_fail / review_rewrite /
+    truth_reject / validation_reject), 失败时才写, 成功时不清 —— 所以
+    读不到时记空串, **绝不编造**。`calls` 是本次 attempt 期间的调用审计
+    切片(stage/model/usage/error), 让"这次 attempt 死在哪个 stage"可查。
+    """
+    reject = str(getattr(writer, "_last_reject", "") or "")
+    review_tech = bool(getattr(writer, "_last_review_technical", False))
+    rec = {
+        "category": cat,
+        "category_attempt": attempt_no,
+        "attempt": attempt_no,
+        "ok": False,
+        "requested_category": brief.requested_category,
+        "requested_difficulty": brief.difficulty,
+        "reason": why,
+        "reject": reject,
+        "review_technical": review_tech,
+        "calls": list(calls or []),
+    }
+    # 失败 attempt 的关键词/draw_index: 从调用审计里找本 attempt 的
+    # Truth(story)调用拿不到(它是服务端状态), 侧面从 bag 拿不到 ——
+    # keyword_spec 是唯一 draw 点, 失败稿被丢弃。诚实处理: 这两个键在
+    # 失败记录里缺省, 由 session_seed + attempt 顺序可复现
+    # (同 seed 重放 bag.draw() 序列即得, 与 r4_smoke 的 replay 同一约定)。
+    return rec
+
+
+def _sum_call_usage(calls: list) -> dict:
+    """**全部调用**(含失败)的 usage 汇总 —— 总账以它为准。"""
+    tot: dict = {}
+    for c in calls:
+        for k, v in (c.get("usage") or {}).items():
+            if isinstance(v, (int, float)):
+                tot[k] = tot.get(k, 0) + v
+    return tot
+
+
+def _stage_stats(calls: list) -> dict:
+    """按 stage 聚合: 调用数 / 失败数 / 输出 token —— 瓶颈定位用。"""
+    stats: dict = {}
+    for c in calls:
+        s = stats.setdefault(c.get("stage") or "(未标注)",
+                             {"calls": 0, "errors": 0, "output_tokens": 0,
+                              "latency_s": 0.0})
+        s["calls"] += 1
+        if c.get("error"):
+            s["errors"] += 1
+        u = c.get("usage") or {}
+        s["output_tokens"] += int(u.get("output_tokens") or 0)
+        s["latency_s"] += float(c.get("latency_s") or 0)
+    for s in stats.values():
+        s["latency_s"] = round(s["latency_s"], 1)
+    return stats
 
 
 def _hit_stats(samples) -> dict:
@@ -237,23 +315,18 @@ def _hit_stats(samples) -> dict:
             "observed_distribution": observed_dist}
 
 
-def _sum_usage(samples) -> dict:
-    tot: dict = {}
-    for s in samples:
-        if not s.get("ok"):
-            continue
-        for k, v in (s.get("usage") or {}).items():
-            if isinstance(v, (int, float)):
-                tot[k] = tot.get(k, 0) + v
-    return tot
-
-
 def write_outputs(run: dict, out_dir: str) -> None:
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
     samples = run.pop("samples")
+    call_log = run.pop("call_log", [])
     (d / "run.json").write_text(
         json.dumps(run, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 逐调用审计日志(review 5324929975): 每次 LLM 调用的
+    # stage/model/usage/error/latency —— **含失败调用**。
+    with (d / "calls.jsonl").open("w", encoding="utf-8") as f:
+        for c in call_log:
+            f.write(json.dumps(c, ensure_ascii=False) + "\n")
     with (d / "samples.jsonl").open("w", encoding="utf-8") as f:
         for s in samples:
             f.write(json.dumps(s, ensure_ascii=False) + "\n")
@@ -291,6 +364,17 @@ def render_report(run: dict, samples: list) -> str:
     if shortfall:
         P("")
         P(f"**shortfall(如实暴露, 不补样本)**: {shortfall}")
+    # ---- stage 级技术统计(review 5324929975)----
+    ss = run.get("stage_stats") or {}
+    if ss:
+        P("")
+        P("### stage 级调用/失败(技术瓶颈定位)")
+        P("")
+        P("| stage | calls | errors | output_tokens | latency_s |")
+        P("|---|---|---|---|---|")
+        for st, v in ss.items():
+            P(f"| {st} | {v['calls']} | {v['errors']} | "
+              f"{v['output_tokens']} | {v['latency_s']} |")
     P("")
     n = 0
     for c in CATEGORY_ORDER:

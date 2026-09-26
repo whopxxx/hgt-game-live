@@ -1191,6 +1191,16 @@ class Config:
     review_temperature: float = 0.2
     generate_temperature: float = 0.8
 
+    # ---- Truth(Story)阶段的输出 token 预算(reliability, review
+    # 5324929975)----
+    # baseline-0 实测: glm 在 Truth 阶段 3 次撞满硬编码 1500 被截断,
+    # tool call 没写完 -> 整个 attempt 白烧。这里是**输出预算**, 不是
+    # 内容合同 —— Truth 的"汤底 2~4 句 / <=260 中文字"合同一个字不改,
+    # 只是给 tool call 的 JSON 包络(约 30~60 token)+ 模型偶发的长
+    # 思考留足空间, 避免它在**完成工具调用之前**撞死。
+    # 可配置(operator 可按模型调), 有测试钉住默认值与下限。
+    story_max_tokens: int = 3000
+
     # ---- 上下文 ----
     qa_max_records: int = 60              # 喂回 LLM 的问答记录条数上限
     qa_max_chars: int = 2200              # 喂回 LLM 的问答记录字符上限
