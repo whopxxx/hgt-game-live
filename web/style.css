@@ -292,7 +292,7 @@ html, body {
    这件事在 DOM 层就是真的, 而不是靠另一个元素遮挡来实现的。 */
 #bottom.hidden { display: none; }
 #announcer {
-  position: absolute; left: 80px; right: 80px; height: 52px;
+  position: relative; flex: 0 0 52px; width: 100%;
   z-index: 5; pointer-events: none;
   overflow: hidden; white-space: nowrap;
   background: rgba(212,175,110,.12); border-radius: 10px;
