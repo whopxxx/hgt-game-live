@@ -611,7 +611,7 @@ def keyword_spec(writer, bag, session_seed: int, *,
                  corpus_version: str = "",
                  story_timeout=None,
                  brief=None):
-    """跑一遍 `抽词 + 掷 lane -> Story -> Surface -> Structure + provenance`。
+    """跑一遍 `抽词 -> Story -> Surface -> Structure + provenance`。
 
     返回 `(spec, reason)`:
 
@@ -646,16 +646,15 @@ def keyword_spec(writer, bag, session_seed: int, *,
     ⚠️ `observed_clues` / `event_chain` **不在链上了** —— 它们不是
     被降级, 是从创作里删掉了。
 
-    ## lane
+    ## lane(已退役, Generation v3 / Issue #58)
 
-    lane 由 **(session_seed, bag.draw() 的 index) 无状态派生**(见
-    `draw_lane`), **不需要调用方持有任何 RNG**。
-
-    ⚠️ 第一版是"调用方传一把持久 `lane_rng`, 不给就现建一把"。两个真实
-    调用方都没传, 于是每次都用同一个 seed 新建 RNG 取第一项 —— 同一场
-    直播会**一直是同一个 lane**(实测连跑 8 次全 red)。无状态派生之后,
-    live / prefetch / 实验三者的调用形状完全一致, 不会再有"某条路径忘了
-    传 rng"这种只在生产上出现的偏差。
+    **生产不再掷 lane**。旧版在这里按 `(session_seed, draw_index)`
+    无状态派生 red/black(见 `draw_lane`), 并把"类型：红汤/黑汤 +
+    方向句"塞进 Truth user message。那条独立随机创作轴与
+    `requested_category` 互相抢方向, 已整体移除 —— 五大类是 Truth
+    唯一的题型/创作风格轴, 红/黑/清只存在于五类创作 Brief 的自然
+    语言里(`story/category_briefs.py`)。历史 helper 退役为历史实验
+    工具范围, 生产链不再读取。
 
     ## brief(Issue #50 §17: GenerationBrief 正式接线)
 
@@ -688,18 +687,23 @@ def keyword_spec(writer, bag, session_seed: int, *,
 
     keys = bag.draw()
     keywords = list(keys["keywords"])
-    draw_index = int(keys.get("index") or 0)
 
-    # ---- lane: 50/50, 无状态派生(不复用 bag 的抽词 rng) ----
-    lane = draw_lane(session_seed, draw_index)
+    # ---- Generation v3(Issue #58): 生产不再掷 lane ----
+    # 旧版在这里按 (session_seed, draw_index) 无状态派生 red/black 并把
+    # "类型：红汤/黑汤 + 方向句"塞进 Truth user message。那条独立随机
+    # 创作轴与 requested_category 互相抢方向, 已整体移除: 五大类是
+    # Truth 唯一的题型/创作风格轴, 红黑清只存在于五类创作 Brief 的
+    # 自然语言里(story/category_briefs.py)。
+    # 历史 helper(LANES / derive_lane_seed / draw_lane)**退役为历史实验
+    # 工具范围**, 生产 keyword_spec / live / prefetch 不再读取它们。
 
     if story_timeout is None:
         # live / prefill 保持原调用形状；只有 prefetch 显式传 override。
         story = writer.gen_keyword_story(
-            keywords, lane, should_continue=should_continue, brief=_brief)
+            keywords, should_continue=should_continue, brief=_brief)
     else:
         story = writer.gen_keyword_story(
-            keywords, lane, should_continue=should_continue,
+            keywords, should_continue=should_continue,
             timeout=story_timeout, brief=_brief)
     if story is None:
         return None, "gen_fail"
@@ -734,7 +738,12 @@ def keyword_spec(writer, bag, session_seed: int, *,
     try:
         spec.metrics = dict(spec.metrics or {})
         spec.metrics["generation_mode"] = "keyword2"
-        spec.metrics["lane"] = lane
+        # ---- Generation v3(Issue #58 §11): lane 不再是新生成事实 ----
+        # 历史兼容: archive 里历史题带 `lane` 键, 新题**不再写**真实
+        # lane 决策(生产已无 lane); 这里写空串 deprecated 占位, 让
+        # archive 白名单搬运(director)与盘点工具拿到确定性的 "" 而不是
+        # KeyError。**不得**再据它做任何行为。
+        spec.metrics["lane"] = ""
         spec.metrics["keywords"] = keywords
         spec.metrics["prompt_pack_version"] = PROMPT_PACK_VERSION
         spec.metrics["truth_prompt_version"] = stage_version("truth")

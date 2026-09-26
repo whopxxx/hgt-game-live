@@ -2508,7 +2508,7 @@ class _KeywordWriter:
         self._a_none = stage_a_none
 
     # ---- R4: Story / Surface 两段(取代旧的一段 Stage A) ----
-    def gen_keyword_story(self, keywords, lane, *, should_continue=None,
+    def gen_keyword_story(self, keywords, *, should_continue=None,
                           max_attempts=None, temperature=None, timeout=None,
                           brief=None):  # Issue #50: keyword2 链现在带 brief
         """Story 阶段替身: 只交 `{"answer": ...}`。
@@ -2517,7 +2517,7 @@ class _KeywordWriter:
         长注释(调用前/返回后各问一次谓词; 让路返回 `{"interrupted": True}`
         而不是 None)。
         """
-        self.keyword_calls.append((list(keywords), lane))
+        self.keyword_calls.append((list(keywords),))
         self.story_timeouts.append(timeout)
         if self._a_none:
             return None
@@ -2651,7 +2651,7 @@ def test_g2_keyword_path_draws_two_keys_and_adds():
         check("**prefetch 每次 Story 都拿到 45s 专属预算**",
               all(t == 45.0 for t in w.story_timeouts), w.story_timeouts)
         check("**每次恰好 2 个关键词**",
-              all(len(k) == 2 for k in w.keyword_calls), w.keyword_calls)
+              all(len(k[0]) == 2 for k in w.keyword_calls), w.keyword_calls)
         check("调了 Stage B", len(w.structure_calls) >= 1, w.structure_calls)
         check("**Stage B 每次都收到 Stage A 的原文**",
               all(c["puzzle"] == w._stage_a["puzzle"]
@@ -2704,15 +2704,16 @@ def test_g2_keyword_provenance():
             check("generation_mode == keyword2",
                   (s.metrics or {}).get("generation_mode") == "keyword2",
                   s.metrics)
-            # ⚠️ R4: `keyword_calls` 现在记的是 `(keywords, lane)` 二元组
-            # (Story 阶段多收一个 lane), 而 metrics 里只放 keywords 列表。
+            # R4: `keyword_calls` 记的是 keywords 元组(Generation v3
+            # 起无 lane), metrics 里同样只放 keywords 列表。
             _kws = list(w.keyword_calls[0][0])
             check("keywords 记进了 metrics",
                   (s.metrics or {}).get("keywords") == _kws,
                   (s.metrics or {}).get("keywords"))
-            check("**lane 也记进了 metrics**",
-                  (s.metrics or {}).get("lane") in ("red", "black"),
-                  (s.metrics or {}).get("lane"))
+            # ---- Generation v3(Issue #58): 新题 lane 恒空串 ----
+            check("**新题 lane 是空串(deprecated)**",
+                  (s.metrics or {}).get("lane") == "",
+                  repr((s.metrics or {}).get("lane")))
             # Issue #50 §12: stage 版本改记 Prompt Pack 的
             # truth/surface stage 版本(不再是 story_prompt_version 旧标签)。
             from story.prompt_pack import stage_version as _pv
@@ -3038,7 +3039,7 @@ def test_g2_quota_wall_still_hard_rejects_keyword_candidate():
                      LLMResult(tool_input=st),
                      LLMResult(tool_input=review_ok())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    story = w.gen_keyword_story(["图书馆", "上楼"], "red")
+    story = w.gen_keyword_story(["图书馆", "上楼"])
     surf = w.gen_surface(story["answer"])
     i = {"title": "", "puzzle": surf["puzzle"], "answer": story["answer"]}
     # 造一个 recent 窗口: 同一 (mechanism_family, solution_shape) 已满。
@@ -3160,8 +3161,8 @@ def test_g4_vocab_missing_never_falls_back_to_bank():
             super().__init__()
             self.keyword_calls = []
 
-        def gen_keyword_story(self, keywords, lane, **kw):
-            self.keyword_calls.append((list(keywords), lane))
+        def gen_keyword_story(self, keywords, **kw):
+            self.keyword_calls.append((list(keywords),))
             raise AssertionError("**降级后不该调 gen_keyword_story**")
 
         def gen_surface(self, answer, **kw):
@@ -3371,7 +3372,7 @@ def test_stable_refill_candidate_never_adds_after_live_appears():
             return {"keywords": ["门", "雨"], "index": 1}
 
     class Writer:
-        def gen_keyword_story(self, keywords, lane, should_continue=None,
+        def gen_keyword_story(self, keywords, *, should_continue=None,
                               **kw):  # Issue #50: 兼容 brief 关键字
             return {"answer": "完整背景使这个反常行为成立。"}
 
@@ -3419,7 +3420,7 @@ def test_stable_refill_prefill_default_path_still_adds():
             return {"keywords": ["门", "雨"], "index": 1}
 
     class Writer:
-        def gen_keyword_story(self, keywords, lane, should_continue=None,
+        def gen_keyword_story(self, keywords, *, should_continue=None,
                               **kw):  # Issue #50: 兼容 brief 关键字
             return {"answer": "完整背景使这个反常行为成立。"}
 

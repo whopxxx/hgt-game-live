@@ -2478,7 +2478,7 @@ def test_r4_smoke_draws_keywords_exactly_once():
     text = src
     check("**从 writer.last_keywords 取关键词**",
           "last_keywords" in text)
-    check("**从 writer.last_lane 取 lane**", "last_lane" in text)
+    # Generation v3(Issue #58): 生产无 lane —— 包装器不再观测 lane。
     # ---- ③ 包装器在**调用前**记录实参 ----
     #
     # ⚠️ 顺序很关键: 先记后调, 这样 `_inner` 抛异常时报告里仍然有
@@ -2544,7 +2544,8 @@ def test_r4_provenance_reaches_live_archive():
         sp.prompt_version = "keyword2-v7"
         sp.metrics = {
             "generation_mode": "keyword2", "ok": True,
-            "lane": "black",
+            # Generation v3(Issue #58): 新题 lane 恒空串(deprecated 占位)
+            "lane": "",
             "keywords": ["新作", "掘坟"],
             "story_prompt_version": "keyword2-v7",
             "surface_prompt_version": "surface-v2",
@@ -2561,7 +2562,8 @@ def test_r4_provenance_reaches_live_archive():
         rec = json.loads(_io.open(out, encoding="utf-8").read().strip())
         m = rec.get("metrics") or {}
         # 逐项断言 —— 不用"有没有 metrics"这种恒真替代。
-        check("**archive.metrics.lane**", m.get("lane") == "black", m.get("lane"))
+        check("**archive.metrics.lane(新题恒空串)**", m.get("lane") == "",
+              repr(m.get("lane")))
         check("**archive.metrics.keywords**",
               list(m.get("keywords") or []) == ["新作", "掘坟"], m.get("keywords"))
         check("**archive.metrics.story_prompt_version**",

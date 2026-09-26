@@ -3646,19 +3646,22 @@ def test_r4_story_stage_returns_answer_only():
     print("\n[R4-K1] Story: 只生成完整汤底")
     fc = FakeClient([LLMResult(tool_input=_kw_story())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    story = w.gen_keyword_story(["图书馆", "上楼"], "red")
+    story = w.gen_keyword_story(["图书馆", "上楼"])
     check("**只返回 answer**", set(story) == {"answer"}, sorted(story))
     check("answer 非空", bool(story["answer"]))
     check("用的是 emit_core_story",
           fc.calls[0]["tool"]["name"] == "emit_core_story",
           fc.calls[0]["tool"]["name"])
-    from story.llm import STORY_LANE_DIRECTION
-    check("system 是 STORY_SYSTEM(带 lane 方向)",
-          fc.calls[0]["system"] == STORY_SYSTEM.format(
-              lane=STORY_LANE_DIRECTION["red"]))
-    check("user 里带 lane 行与关键词",
-          "类型：红汤。" in fc.calls[0]["user"]
-          and "图书馆" in fc.calls[0]["user"], fc.calls[0]["user"][:40])
+    # ---- Generation v3(Issue #58): system 是静态 truth-v2 全文 ----
+    from story.prompt_pack import load_prompt as _lp
+    check("system 是 truth-v2 静态全文(无 lane 方向)",
+          fc.calls[0]["system"] == _lp("truth"))
+    check("user 里带关键词",
+          "图书馆" in fc.calls[0]["user"], fc.calls[0]["user"][:40])
+    check("user 里没有旧 lane 行「类型：红汤/黑汤」",
+          "类型：红汤" not in fc.calls[0]["user"]
+          and "类型：黑汤" not in fc.calls[0]["user"],
+          fc.calls[0]["user"][:40])
     check("**user 里没有'谜面'/'谜底'**(这段不写谜面)",
           "谜面" not in fc.calls[0]["user"], fc.calls[0]["user"][:60])
 
@@ -3668,7 +3671,7 @@ def test_r4_story_timeout_override_is_forwarded():
     print("\n[R4-K1b] Story timeout override 透传")
     fc = FakeClient([LLMResult(tool_input=_kw_story())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    story = w.gen_keyword_story(["图书馆", "上楼"], "red", timeout=45.0)
+    story = w.gen_keyword_story(["图书馆", "上楼"], timeout=45.0)
     check("Story 正常返回", bool(story and story.get("answer")), story)
     check("**45s override 传到 client.messages**",
           fc.calls[0]["timeout"] == 45.0, fc.calls[0]["timeout"])
@@ -3677,16 +3680,19 @@ def test_r4_story_timeout_override_is_forwarded():
 
 
 def test_r4_story_lane_direction_is_short():
-    """lane 方向**极短**(两类各一句话), 不是规则手册。"""
-    print("\n[R4-K2] lane 方向要短")
-    from story.llm import STORY_LANE_DIRECTION
-    check("两个 lane 都有方向", set(STORY_LANE_DIRECTION) == {"red", "black"},
-          sorted(STORY_LANE_DIRECTION))
-    for k, v in STORY_LANE_DIRECTION.items():
-        check(f"{k} 方向 <= 60 字", len(v) <= 60, f"实际 {len(v)} 字")
-        # 必须是**判据**, 不是禁用清单。
-        for bad in ("不要写", "禁止", "不许", "至少", "必须包含"):
-            check(f"{k} 不含「{bad}」", bad not in v, v)
+    """**(已退役)** 生产随机 lane 删除后, 方向句表不存在。
+
+    Generation v3(Issue #58)删除了 `STORY_LANE_DIRECTION` 与生产
+    `draw_lane` —— 五大类是 Truth 唯一的题型/创作风格轴。这里钉住
+    "退役"本身: 生产链上不得再有这个随机轴的入口。
+    """
+    print("\n[R4-K2] lane 方向已退役(Generation v3)")
+    import story.llm as L
+    check("STORY_LANE_DIRECTION 已删除",
+          not hasattr(L, "STORY_LANE_DIRECTION"))
+    check("STORY_SYSTEM(静态 truth-v2)不含 lane 方向句",
+          "风格偏红汤" not in STORY_SYSTEM
+          and "风格偏黑汤" not in STORY_SYSTEM)
 
 
 def test_r4_story_center_is_anomaly_not_darkness():
@@ -3708,17 +3714,11 @@ def test_r4_story_center_is_anomaly_not_darkness():
     check("说了'先只写真相'", "先只写真相" in STORY_SYSTEM)
     # ---- ② 情绪目标**退出** system ----
     #
-    # 只查 lane 方向那段不够: 上一版把"反转/冲击"写在 lane 里, 而
-    # `_story_system()` 会把它渲染进来。所以查**渲染后的完整文本**。
-    for lane in ("red", "black"):
-        rendered = _story_system(lane)
-        for bad in ("反转", "冲击", "极端"):
-            check(f"[{lane}] 渲染后不含情绪目标「{bad}」", bad not in rendered,
-                  [ln for ln in rendered.splitlines() if bad in ln])
-    # ---- ③ lane 只是**色调**, 不是题材要求 ----
-    from story.llm import STORY_LANE_DIRECTION
-    for k, v in STORY_LANE_DIRECTION.items():
-        check(f"{k} 只描述色调(带'风格偏')", "风格偏" in v, v)
+    # 只查静态文本: 上一版把"反转/冲击"写在 lane 方向句里, 现在 lane
+    # 已退役(Gen v3), system 是全静态 truth-v2 —— 直接查全文。
+    for bad in ("反转", "冲击", "极端"):
+        check(f"渲染后不含情绪目标「{bad}」", bad not in STORY_SYSTEM,
+              [ln for ln in STORY_SYSTEM.splitlines() if bad in ln])
 
 
 def test_r4_story_prompt_does_not_suppress_background():
@@ -5148,33 +5148,13 @@ def test_r4_versions_bumped():
 
 
 def test_r4_keyword_spec_runs_three_stages():
-    """**整链**: 抽词 + lane -> Story -> Surface -> Structure, 且 provenance 齐。"""
+    """**整链**: 抽词 -> Story -> Surface -> Structure, 且 provenance 齐。
+
+    Generation v3(Issue #58): 生产不再掷 lane —— 旧的 lane 派生/分布
+    断言已替换为"无 lane"断言(见 `test_r4_production_has_no_lane`)。
+    """
     print("\n[R4-K11] keyword_spec 三段式")
-    from story.keyword_seed import (keyword_spec, KeywordBag, draw_lane, LANES)
-    check("LANES == red/black", tuple(LANES) == ("red", "black"))
-
-    # ---- ⚠️ lane 必须**逐 draw 变化**, 且同 seed 可重放 ----
-    #
-    # R4-R1 的 blocker: 第一版让调用方传一把持久 `lane_rng`, 而 live /
-    # prefetch **都没传** —— 于是每次都用同一个 session_seed 现建 RNG、
-    # 取第一项, **同一场直播永远同一个 lane**(实测连跑 8 次全 red)。
-    #
-    # 这条用例直接钉住修法: lane 由 `(session_seed, draw_index)` 无状态
-    # 派生, 所以(a)连续 draw 会变、(b)同 seed 同 index 必然重放。
-    ss = 14047211878561490874
-    seq = [draw_lane(ss, i) for i in range(1, 13)]
-    check("**lane 逐 draw 会变化(不是永远同一个)**",
-          len(set(seq)) == 2, seq)
-    check("**同 seed 同 index 可重放**",
-          [draw_lane(ss, i) for i in range(1, 5)]
-          == [draw_lane(ss, i) for i in range(1, 5)])
-    check("**不是前 N 项全同**", seq[:5] != [seq[0]] * 5, seq[:5])
-    # 长期大致 50/50(不要求精确 —— 只挡"一边倒")。
-    from collections import Counter as _C
-    dist = _C(draw_lane(ss, i) for i in range(1, 401))
-    check("**400 draw 两个 lane 都出现且不一边倒**",
-          min(dist.values()) > 120, dict(dist))
-
+    from story.keyword_seed import keyword_spec, KeywordBag
     # 整链(用假 client)。
     fc = FakeClient([
         LLMResult(tool_input=_kw_story()),      # Story
@@ -5193,7 +5173,10 @@ def test_r4_keyword_spec_runs_three_stages():
           == ["emit_core_story", "emit_surface", "emit_structure"],
           [c["tool"]["name"] for c in fc.calls])
     m = spec.metrics or {}
-    check("lane 落进 metrics", m.get("lane") in ("red", "black"), m.get("lane"))
+    # ---- Generation v3(Issue #58 §11): lane 不再是新生成事实 ----
+    # 历史兼容: archive 白名单搬运仍读 `lane` 键, 新题写空串 deprecated。
+    check("新题 lane 是空串(deprecated 占位, 不是真实决策)",
+          m.get("lane") == "", repr(m.get("lane")))
     # Issue #50 §12: stage 版本改记 Prompt Pack 的 truth/surface 版本。
     from story.prompt_pack import PROMPT_PACK_VERSION, stage_version
     check("truth 版本落盘", m.get("truth_prompt_version") == stage_version("truth"))
@@ -5206,20 +5189,43 @@ def test_r4_keyword_spec_runs_three_stages():
           spec.prompt_version == PROMPT_PACK_VERSION, spec.prompt_version)
 
 
-def test_r4_lane_varies_across_real_keyword_spec_calls():
-    """**真实 keyword_spec 连续调用**: lane 不会永远重复第一项。
+def test_r4_production_has_no_lane():
+    """**Generation v3(Issue #58)§18-A: production 无 lane**(行为+源码)。
 
-    与上一条的区别: 这条走**真的** `keyword_spec`, 连续跑多次、调用方
-    **不传任何 rng** —— 上一版的 bug 正是在这个形状下才暴露(单看一次
-    调用永远是对的)。
+    旧断言"lane 逐 draw 变化 / 连续调用分布"描述的是被删除的行为 ——
+    按 §18-A 用"无 lane"的五类创作轴测试**替换**, 不只删测试:
+
+        * `keyword_spec` 源码不再调用 `draw_lane` / 派生 lane;
+        * `gen_keyword_story` 签名不再收 lane;
+        * Truth user message 不再输出"类型：红汤/黑汤"与旧方向句;
+        * 连续 production `keyword_spec` 不存在"lane 分布"行为 ——
+          新题 lane 恒为空串(deprecated 占位)。
     """
-    print("\n[R4-K11b] 连续 keyword_spec: lane 真的会变")
+    print("\n[R4-K11b] production 无 lane(Generation v3)")
+    import story.keyword_seed as KS
+    import ast as _ast
+    src = Path(__file__).resolve().parents[1] / "story" / "keyword_seed.py"
+    tree = _ast.parse(src.read_text(encoding="utf-8"))
+    kfn = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == "keyword_spec":
+            kfn = node
+            break
+    check("keyword_spec 存在", kfn is not None)
+    called = {n.func.id for n in _ast.walk(kfn)
+              if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
+    check("**keyword_spec 不调用 draw_lane**", "draw_lane" not in called,
+          sorted(called))
+    check("keyword_spec 源码不再引用 draw_lane/LANES",
+          "draw_lane" not in KS.keyword_spec.__code__.co_names
+          and "LANES" not in KS.keyword_spec.__code__.co_names)
+    # 真链连续调用: 每道新题 lane 恒空, user message 无红黑文案。
     from story.keyword_seed import keyword_spec, KeywordBag
     words = ["图书馆", "上楼", "灯塔", "礁石", "退潮", "守望",
              "钥匙", "雨伞", "停电", "发烧"]
     bag = KeywordBag(words, 20260925)
-    lanes = []
-    for _ in range(10):
+    lanes, users = [], []
+    for _ in range(4):
         fc = FakeClient([
             LLMResult(tool_input=_kw_story()),
             LLMResult(tool_input=_kw_surface()),
@@ -5230,24 +5236,15 @@ def test_r4_lane_varies_across_real_keyword_spec_calls():
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         spec, _why = keyword_spec(w, bag, 20260925)
         lanes.append(str((spec.metrics or {}).get("lane") or ""))
-    check("**10 次里两个 lane 都出现过**",
-          set(lanes) == {"red", "black"}, lanes)
-    # ---- 可重放: 换一个**全新的 bag**(同 session seed)会得到同一序列 ----
-    bag2 = KeywordBag(words, 20260925)
-    lanes2 = []
-    for _ in range(10):
-        fc = FakeClient([
-            LLMResult(tool_input=_kw_story()),
-            LLMResult(tool_input=_kw_surface()),
-            LLMResult(tool_input=_kw_structure_payload()),
-            LLMResult(tool_input=review_ok()),
-            _truth_tool(),
-        ])
-        w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-        spec, _why = keyword_spec(w, bag2, 20260925)
-        lanes2.append(str((spec.metrics or {}).get("lane") or ""))
-    check("**同 session seed 可重放同一 lane 序列**", lanes == lanes2,
-          f"{lanes} vs {lanes2}")
+        users.append(fc.calls[0]["user"])
+    check("**连续 production keyword_spec: lane 恒空串(无分布行为)**",
+          set(lanes) == {""}, lanes)
+    for u in users:
+        check("Truth user 不含旧 lane 类型行",
+              "类型：红汤" not in u and "类型：黑汤" not in u, u[:40])
+        check("Truth user 不含旧方向句文案",
+              "风格偏红汤" not in u and "风格偏黑汤" not in u
+              and "危险、阴暗" not in u and "诡异、不安" not in u)
 
 
 def test_r4_story_and_surface_only_called_by_keyword_spec():
@@ -5299,7 +5296,7 @@ def test_r4_story_fails_closed_on_missing_answer():
     print("\n[R4-K14] Story fail-closed")
     fc = FakeClient([LLMResult(tool_input={"answer": "  "})])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    out = w.gen_keyword_story(["a", "b"], "black")
+    out = w.gen_keyword_story(["a", "b"])
     check("空 answer -> None", out is None, out)
     check("**恰好 1 次调用**", len(fc.calls) == 1, len(fc.calls))
     # Surface 同理。
@@ -5314,7 +5311,7 @@ def test_r4_story_and_surface_interrupt_checks():
     print("\n[R4-K15] Story/Surface 让路")
     fc = FakeClient([LLMResult(tool_input=_kw_story())])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
-    out = w.gen_keyword_story(["a", "b"], "red", should_continue=lambda: False)
+    out = w.gen_keyword_story(["a", "b"], should_continue=lambda: False)
     check("调用前让路 -> 0 次调用", len(fc.calls) == 0, len(fc.calls))
     check("返回 interrupted", out == {"interrupted": True}, out)
 
@@ -5325,7 +5322,7 @@ def test_r4_story_and_surface_interrupt_checks():
     def _sc():
         calls["n"] += 1
         return calls["n"] < 2          # 调用前 True, 返回后 False
-    out2 = w2.gen_keyword_story(["a", "b"], "red", should_continue=_sc)
+    out2 = w2.gen_keyword_story(["a", "b"], should_continue=_sc)
     check("返回后让路 -> 丢弃结果", out2 == {"interrupted": True}, out2)
 
     fc3 = FakeClient([LLMResult(tool_input=_kw_surface())])
@@ -6218,8 +6215,248 @@ def test_g4_fix_reasons_never_guesses():
           ValidationResult().fix_reasons())
 
 
+# ======================================================================
+# review 5325160597 Blocker 3: transport 层 empty-tool 重试 + 总账口径
+# (变异敏感矩阵 —— 打桩 urlopen 观察**真实**发出的 HTTP 次数)
+# ======================================================================
+def _tool_resp(name: str, payload: dict, out_tokens: int = 50):
+    import json as _json
+    return ('{"content":[{"type":"tool_use","name":"' + name + '","input":'
+            + _json.dumps(payload, ensure_ascii=False) + "}],"
+            '"stop_reason":"tool_use",'
+            '"usage":{"input_tokens":10,"output_tokens":' + str(out_tokens)
+            + "}}").encode("utf-8")
+
+
+def _empty_tool_resp(name: str, out_tokens: int = 50):
+    # 截断/抖动的关键形状: stop_reason + 空 dict input
+    return ('{"content":[{"type":"tool_use","name":"' + name + '","input":{}}],'
+            '"stop_reason":"tool_use",'
+            '"usage":{"input_tokens":10,"output_tokens":' + str(out_tokens)
+            + "}}").encode("utf-8")
+
+
+_TOOL_S = {"name": "emit_core_story", "description": "d",
+           "input_schema": {"type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"]}}
+
+
+def _raw_resp(raw: bytes):
+    """urlopen 返回的**上下文管理器**替身(生产代码用 with 语句)。"""
+    class _R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return raw
+    return _R()
+
+
+def test_transport_empty_tool_retry_matrix():
+    """empty tool_input 的 transport 重试矩阵(review 5325160597)。
+
+    打桩 urlopen 数**真实 HTTP 次数**, 每个分支都是变异敏感的:
+
+        正常 tool_input        -> 恰好 1 次, 不重试
+        empty tool_input       -> 1 + max_retries 次
+        max_retries=0          -> 恰好 1 次
+        max_tokens 触顶的空    -> 恰好 1 次(预算问题, 重发必再截断)
+        transport_attempts/usage 总账正确(含已消耗的重试)
+    """
+    print("\n[TX-1] transport empty-tool 重试矩阵")
+    import urllib.request
+    import time as _t
+    from story.llm import AnthropicMessagesClient
+    from story.config import LLMConfig
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None            # 跳过退避
+    try:
+        cfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                        timeout=5.0, max_retries=2)
+        c = AnthropicMessagesClient(cfg)
+
+        # ---- ① 正常 tool_input -> 不重试 ----
+        state = {"n": 0}
+
+        def ok_resp(req, timeout=None):
+            state["n"] += 1
+            return _raw_resp(_tool_resp("emit_core_story",
+                                        {"answer": "汤底"}))
+        urllib.request.urlopen = ok_resp
+        r = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                       stage="puzzle.story")
+        check("正常 tool_input -> 恰好 1 次 HTTP", state["n"] == 1, state["n"])
+        check("正常路径 transport_attempts == 1",
+              r.transport_attempts == 1, r.transport_attempts)
+        check("正常路径 transport_usage == usage(单次)",
+              r.transport_usage == r.usage, (r.transport_usage, r.usage))
+
+        # ---- ② empty tool_input -> 1 + max_retries 次原样重发 ----
+        state["n"] = 0
+        bodies = []
+
+        def empty_resp(req, timeout=None):
+            state["n"] += 1
+            bodies.append(req.data)
+            return _raw_resp(_empty_tool_resp("emit_core_story"))
+        urllib.request.urlopen = empty_resp
+        r2 = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("empty tool_input -> 1 + max_retries(2) 次 HTTP",
+              state["n"] == 3, state["n"])
+        check("重发的是**同一个请求体**(不是多稿)",
+              len(set(bodies)) == 1, f"{len(set(bodies))} 种 body")
+        check("耗尽后 error 交回调用方",
+              r2.error and "空 input" in r2.error, r2.error)
+        check("transport_attempts == 3(含已消耗的重试)",
+              r2.transport_attempts == 3, r2.transport_attempts)
+        check("transport_usage 累加 3 次(usage 只剩最后一次)",
+              (r2.transport_usage or {}).get("output_tokens") == 150
+              and (r2.usage or {}).get("output_tokens") == 50,
+              (r2.transport_usage, r2.usage))
+
+        # ---- ③ max_retries=0 -> 不重发 ----
+        cfg0 = LLMConfig(api_key="x", base_url="http://x", model="m",
+                         timeout=5.0, max_retries=0)
+        c0 = AnthropicMessagesClient(cfg0)
+        state["n"] = 0
+        urllib.request.urlopen = empty_resp
+        r3 = c0.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                         stage="puzzle.story")
+        check("max_retries=0 -> 恰好 1 次 HTTP", state["n"] == 1, state["n"])
+        check("mr=0 transport_attempts == 1",
+              r3.transport_attempts == 1, r3.transport_attempts)
+
+        # ---- ④ max_tokens 触顶的空 tool_input -> **不**当抖动重试 ----
+        state["n"] = 0
+
+        def ceiling_resp(req, timeout=None):
+            state["n"] += 1
+            # max_tokens=100 的预算, 实出 100 -> 触顶截断
+            return _raw_resp(_empty_tool_resp("emit_core_story",
+                                              out_tokens=100))
+        urllib.request.urlopen = ceiling_resp
+        r4 = c.messages("s", "u", max_tokens=100, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("触顶空 input -> 恰好 1 次(不当网关抖动重试)",
+              state["n"] == 1, state["n"])
+        check("触顶错误点名 max_tokens(与应用层区分)",
+              r4.error and "max_tokens" in r4.error, r4.error)
+
+        # ---- ⑤ 网络错误重试的 transport_attempts 也正确 ----
+        state["n"] = 0
+
+        def neterr(req, timeout=None):
+            state["n"] += 1
+            raise TimeoutError("timed out")
+        urllib.request.urlopen = neterr
+        r5 = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("网络错误 1 + max_retries 次", state["n"] == 3, state["n"])
+        check("耗尽 transport_attempts == 3",
+              r5.transport_attempts == 3, r5.transport_attempts)
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+
+
+def test_transport_retry_never_touches_semantics():
+    """语义拒绝(Reviewer 重写/validate)发生在 messages() 之外,
+    transport 重试结构上碰不到它; latency-critical 调用显式
+    max_retries=0 时不会被 transport 重试偷偷加次。"""
+    print("\n[TX-2] transport 重试不碰语义路径")
+    import urllib.request
+    import time as _t
+    from story.llm import AnthropicMessagesClient
+    from story.config import LLMConfig
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None
+    try:
+        # ① Reviewer 语义拒稿: 返回的是**合法 tool_input**(decision=reject),
+        #    messages() 层看起来"成功" —— 绝无重试, 恰好 1 次 HTTP。
+        state = {"n": 0}
+
+        def reject_resp(req, timeout=None):
+            state["n"] += 1
+            return _raw_resp(_tool_resp(
+                "emit_review",
+                {"decision": "rewrite", "issues": ["谜底泄底"],
+                 "puzzle": "改后谜面", "answer": "改后汤底"}))
+        urllib.request.urlopen = reject_resp
+        cfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                        timeout=5.0, max_retries=3)
+        c = AnthropicMessagesClient(cfg)
+        review_tool = {"name": "emit_review", "description": "d",
+                       "input_schema": {"type": "object", "properties": {}}}
+        c.messages("s", "u", max_tokens=4000, tool=review_tool,
+                   stage="puzzle.review")
+        check("Reviewer 语义拒稿(合法 tool_input) -> 恰好 1 次 HTTP",
+              state["n"] == 1, state["n"])
+
+        # ② 文本调用(不带 tool)从不触发 empty-tool 重试
+        state["n"] = 0
+        urllib.request.urlopen = reject_resp
+        c.messages("s", "u", max_tokens=100, stage="probe")
+        check("无 tool 调用 -> 恰好 1 次", state["n"] == 1, state["n"])
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+
+
+def test_story_max_tokens_budget():
+    """story_max_tokens 生产预算(review 5324929975 -> 5325160597):
+    默认 3000 真实传到 puzzle.story; 自定义 Config 覆盖生效。"""
+    print("\n[TX-3] story_max_tokens 预算接线")
+    import urllib.request
+    import json as _json
+    import time as _t
+    from story.llm import AnthropicMessagesClient, PuzzleWriter
+    from story.config import LLMConfig, Config
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None
+    seen = {"max_tokens": []}
+    try:
+        def capture(req, timeout=None):
+            body = _json.loads(req.data)
+            seen["max_tokens"].append(body.get("max_tokens"))
+            return _raw_resp(_tool_resp("emit_core_story",
+                                        {"answer": "汤底"}))
+        urllib.request.urlopen = capture
+
+        # ① 默认 3000
+        llmcfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                           timeout=5.0, max_retries=0)
+        client = AnthropicMessagesClient(llmcfg)
+        rt = Config(sim_path="x", no_llm=True)
+        w = PuzzleWriter(client=client, runtime_cfg=rt)
+        w.gen_keyword_story(["a", "b"])
+        check("默认 story_max_tokens=3000 传到 puzzle.story",
+              seen["max_tokens"][-1] == 3000, seen["max_tokens"])
+
+        # ② 自定义覆盖
+        rt2 = Config(sim_path="x", no_llm=True, story_max_tokens=4096)
+        w2 = PuzzleWriter(client=client, runtime_cfg=rt2)
+        w2.gen_keyword_story(["a", "b"])
+        check("自定义 story_max_tokens 覆盖生效",
+              seen["max_tokens"][-1] == 4096, seen["max_tokens"])
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+    from story.config import Config as _C
+    check("Config 默认值就是 3000", _C(sim_path="x",
+                                       no_llm=True).story_max_tokens == 3000)
+
+
 def main():
-    for t in (test_riddle_tool,
+    for t in (test_transport_empty_tool_retry_matrix,
+              test_transport_retry_never_touches_semantics,
+              test_story_max_tokens_budget,
+              test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
               test_ux_g_v5_skips_final_judge,
               test_ai_player_ask_is_exactly_one_host_call,
@@ -6364,7 +6601,7 @@ def main():
               test_r4_stage_b_ignores_model_puzzle,
               test_r4_versions_bumped,
               test_r4_keyword_spec_runs_three_stages,
-              test_r4_lane_varies_across_real_keyword_spec_calls,
+              test_r4_production_has_no_lane,
               test_r4_story_and_surface_only_called_by_keyword_spec,
               test_r4_no_scaffold_anywhere_in_production,
               test_r4_story_fails_closed_on_missing_answer,

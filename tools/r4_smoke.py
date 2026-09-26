@@ -8,7 +8,7 @@
 production 链, 看它跑不跑得通、产出什么样。所以:
 
     * 完全走生产入口 `keyword_spec()`(不经任何替身);
-    * 真实网关、真实 `KeywordBag` 抽词、真实 lane 掷骰;
+    * 真实网关、真实 `KeywordBag` 抽词(Generation v3 起生产无 lane);
     * **不重抽** —— 失败就照实记失败;
     * 不做自动评分 / 排名 / 判定器。
 
@@ -50,11 +50,8 @@ log = logging.getLogger(TAG)
 
 #: 每组 seed 跑几次(**跑之前写死**)。两组共 10 draws。
 #:
-#: ⚠️ **不是"5 红 + 5 黑"** —— lane 由 `(session_seed, draw_index)` 无状态
-#: 派生, 与这里的组名**无关**。SEED_A / SEED_B 只是两组不同的抽词序列,
-#: 每组内部会红黑混出(实测如此)。把它叫成"红组/黑组"会让报告读起来像
-#: "这一组应该是红的", 而生产上根本不是那样 —— 那正是 R4-R1 那个
-#: "整场只出一个 lane" bug 的思维残留。
+#: SEED_A / SEED_B 只是两组不同的抽词序列(Generation v3 起生产已无
+#: lane 轴 —— 旧"红组/黑组"的说法随生产 lane 一起退役)。
 N_PER_TYPE = 5
 
 #: 两组的 base seed(生产同款 `derive_session_seed` 派生)。
@@ -90,8 +87,7 @@ class ObservingPuzzleWriter:
 
     现在 `keyword_spec()` 是**唯一**的 draw 点。关键词只能从
     `gen_keyword_story()` 的实参里拿 —— 那是"模型真正看到的那两个词"
-    的定义。lane 同理: 它不经过 writer, 但可以按生产同一条
-    `draw_lane(session_seed, draw_index)` 重算出来核对。
+    的定义。(lane 已随 Generation v3 退役, 生产不再掷。)
 
     ## 为什么用包装器而不是改 `keyword_spec`
 
@@ -113,14 +109,13 @@ class ObservingPuzzleWriter:
         self.last_surface = None
         #: 最近一次 `gen_keyword_story` 的**实际实参**(模型真正看到的)。
         self.last_keywords = None
-        self.last_lane = ""
 
-    def gen_keyword_story(self, keywords, lane, **kw):
+    def gen_keyword_story(self, keywords, **kw):
         # ⚠️ 先记实参再调用: 即使 `_inner` 抛异常, 报告里也有"用哪两个
-        # 关键词试过"可查。这正是双抽 bug 遮住的那一层信息。
+        # 关键词试过"可查。这正是双抽 bug 遮住的那层信息。
+        # Generation v3(Issue #58): 生产无 lane —— 旧 `lane` 形参删除。
         self.last_keywords = [str(k) for k in (keywords or [])]
-        self.last_lane = str(lane or "")
-        out = self._inner.gen_keyword_story(keywords, lane, **kw)
+        out = self._inner.gen_keyword_story(keywords, **kw)
         if isinstance(out, dict) and out.get("answer"):
             self.last_story = dict(out)
         return out
@@ -155,7 +150,7 @@ def _one(writer, bag, session_seed: int, corpus_meta: dict) -> dict:
     """跑**一次生产链**。失败照实记, 但**保留 Story / Surface 原文**。
 
     ⚠️ **R4-R2: 这里不再自己 `bag.draw()`。** `keyword_spec()` 是唯一的
-    抽词点, 关键词 / lane 从 `ObservingPuzzleWriter` 抄到的**实参**里取
+    抽词点, 关键词从 `ObservingPuzzleWriter` 抄到的**实参**里取
     —— 也就是模型真正看到的那两个词。上一版在这里先抽一次记录、`keyword_spec`
     内部再抽一次, 报告上的关键词与实际生成用的不是同一组, 还白跳过一组词。
     """
@@ -164,7 +159,8 @@ def _one(writer, bag, session_seed: int, corpus_meta: dict) -> dict:
         "keywords": [], "draw_index": 0,
         "session_seed": session_seed,
         "corpus_version": corpus_meta.get("corpus_version", ""),
-        "ok": False, "reason": "", "lane": "",
+        "ok": False, "reason": "",
+        "lane": "",  # deprecated(Generation v3): 恒空串, 不再是有效维度
         "answer": "", "puzzle": "", "puzzle_len": 0,
         "prompt_version": "", "stage_b": {},
     }
@@ -172,7 +168,6 @@ def _one(writer, bag, session_seed: int, corpus_meta: dict) -> dict:
     writer.last_story = None
     writer.last_surface = None
     writer.last_keywords = None
-    writer.last_lane = ""
     t0 = time.monotonic()
     spec, why = keyword_spec(writer, bag, session_seed,
                              corpus_version=corpus_meta.get("corpus_version", ""))
@@ -182,12 +177,14 @@ def _one(writer, bag, session_seed: int, corpus_meta: dict) -> dict:
     # 这是这次改动的**要点**: Stage B 拒了之后, Story answer 与 Surface
     # puzzle 仍然在报告里, 复审才能判断"该拒"还是"误杀"。
     #
-    # ⚠️ keywords / lane 也来自这里 —— 即 `gen_keyword_story` 的**实参**,
+    # ⚠️ keywords 也来自这里 —— 即 `gen_keyword_story` 的**实参**,
     # 而不是 smoke 自己抽的。它们是"关键词到底有没有起作用"的唯一可信来源。
     story = writer.last_story or {}
     surface = writer.last_surface or {}
     rec["keywords"] = list(writer.last_keywords or [])
-    rec["lane"] = str(writer.last_lane or "")
+    # Generation v3(Issue #58): 生产不再掷 lane —— 新题 lane 恒空串
+    # (deprecated 占位, 不再是有效维度)。
+    rec["lane"] = ""
     rec["story_answer"] = str(story.get("answer") or "")
     rec["surface_puzzle"] = str(surface.get("puzzle") or "")
     rec["surface_puzzle_len"] = len(rec["surface_puzzle"])
@@ -202,8 +199,8 @@ def _one(writer, bag, session_seed: int, corpus_meta: dict) -> dict:
     m = dict(getattr(spec, "metrics", None) or {})
     rec.update({
         "ok": bool(getattr(spec, "puzzle", "")),
-        # metrics 里的 lane/keywords 与实参一致; 实参拿不到时才回落到它。
-        "lane": rec["lane"] or str(m.get("lane") or ""),
+        # Generation v3: lane 不再是新生成事实 —— 报告里恒空串(deprecated)。
+        "lane": "",
         "keywords": rec["keywords"] or list(m.get("keywords") or []),
         "draw_index": int(m.get("keyword_draw_index") or 0),
         "answer": getattr(spec, "answer", "") or rec["story_answer"],
@@ -240,14 +237,14 @@ def _write_report(records: list) -> None:
     P("")
     P(f"- 共 `{len(records)}` 道, 成题 `{len(ok)}`")
     P("")
-    P("| # | lane | keywords | draw# | puzzle 长度 | 结果 |")
-    P("|---|---|---|---|---|---|")
+    P("| # | keywords | draw# | puzzle 长度 | 结果 |")
+    P("|---|---|---|---|---|")
     for i, r in enumerate(records, 1):
         res = "ok" if r["ok"] else f"未成题({r.get('reason')})"
         kw = "、".join(r["keywords"]) if r["keywords"] else "_(未抽到)_"
         # ⚠️ 失败题的 `draw_index` 取自 replay(metrics 拿不到), 见 _one 注释。
         di = r.get('draw_index') or r.get('draw_index_replay') or '-'
-        P(f"| {i} | {r.get('lane') or '-'} | {kw} | "
+        P(f"| {i} | {kw} | "
           f"{di} | {r['puzzle_len']} | {res} |")
     P("")
     P("---")
@@ -255,8 +252,7 @@ def _write_report(records: list) -> None:
     for i, r in enumerate(records, 1):
         kw = "、".join(r["keywords"]) if r["keywords"] else "(未抽到)"
         di = r.get('draw_index') or r.get('draw_index_replay') or '-'
-        P(f"## {i}. {r.get('lane') or '(无 lane)'} — "
-          f"关键词: {kw} (draw#{di})")
+        P(f"## {i}. 关键词: {kw} (draw#{di})")
         P("")
         # ---- ⚠️ 先把 Story / Surface 原文列出来(**失败也要**) ----
         #
@@ -364,10 +360,8 @@ def main() -> int:
         # 抽词序列的独立复算基准 —— 见 `--check-draws` 的说明。
         replay = load_bag(str(DEFAULT_CORPUS_PATH), ss)[0]
         for i in range(1, N_PER_TYPE + 1):
-            # ⚠️ **不传 lane_rng** —— lane 现在由 keyword_spec 按
-            # (session_seed, draw_index) 无状态派生, 与 live/prefetch 的
-            # 调用形状**完全一致**。上一版 smoke 自己手工传了一把持久
-            # RNG, 反而把"生产上永远同一个 lane"那个 bug 遮住了。
+            # Generation v3(Issue #58): 生产已无 lane —— 调用形状与
+            # live/prefetch 完全一致(只有 writer/bag/seed)。
             rec = _one(writer, bag, ss, meta)
             rec["type"] = kind
             # ---- 抽词一致性自检(不阻断, 只记录) ----
@@ -395,8 +389,8 @@ def main() -> int:
                             kind, i, rec["keywords"], rec["draw_index"],
                             rec["keywords_replay"], rec["draw_index_replay"])
             if rec["ok"]:
-                log.info("[%s%d] lane=%s kw=%s puzzle=%d字",
-                         kind, i, rec["lane"], rec["keywords"],
+                log.info("[%s%d] kw=%s puzzle=%d字",
+                         kind, i, rec["keywords"],
                          rec["puzzle_len"])
             else:
                 log.warning("[%s%d] 未成题: %s | stage=%s | story=%d字 "

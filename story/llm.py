@@ -1080,6 +1080,37 @@ class LLMResult:
     #: `model` 的语义**没变**: 它始终是"返回体里那个模型"。
     stage: Optional[str] = None
     requested_model: Optional[str] = None
+    #: ---- transport 层总账(review 5325160597 Blocker 3)----
+    #:
+    #: 一次业务层 `messages()` 可能内部发 2~N 次 HTTP 请求(empty tool_input
+    #: 的 transport 退避重试 / 5xx 重试)。`usage` 只是**最后一次**请求的
+    #: 用量, 直接拿它做总账会漏掉重试里已消耗的 token。
+    #:
+    #: `transport_attempts` = 实际发出的 HTTP/model 请求次数(>=1)。
+    #: `transport_usage` = 全部 attempt 的 usage **逐项累加**(不是最后
+    #: 一次的) —— probe/审计方以它为准, `usage` 保持原语义不动。
+    #: 只在真实 transport 层路径上写; 旧调用方构造的 LLMResult 保持
+    #: None(缺省), 不受影响。
+    transport_attempts: Optional[int] = None
+    transport_usage: Optional[dict] = None
+
+
+def _merge_usage(usages: list) -> Optional[dict]:
+    """把多次 HTTP attempt 的 usage **逐项累加**成一份总账。
+
+    数字键求和, 其它键取最后一次非空值; 空列表返回 None(与
+    `usage` 缺省一致)。只做纯累加, 无副作用。
+    """
+    if not usages:
+        return None
+    tot: dict = {}
+    for u in usages:
+        for k, v in dict(u or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                tot[k] = tot.get(k, 0) + v
+            elif v is not None:
+                tot[k] = v
+    return tot or None
 
 
 class AnthropicMessagesClient:
@@ -1173,16 +1204,24 @@ class AnthropicMessagesClient:
                 route.alias or requested_model, requested_model,
                 max_tokens or self.cfg.max_tokens,
                 len(system), len(user), _clip(user, 500))
+        # ---- transport 总账(review 5325160597 Blocker 3)----
+        # 每次 HTTP attempt 的 usage 累加到这里; 最终结果带
+        # `transport_attempts` / `transport_usage` 回给调用方。
+        _attempts_made = 0
+        _all_usage: list[dict] = []
         for attempt in range(mr + 1):
             try:
                 req = urllib.request.Request(request_url, data=data,
                                             headers=headers, method="POST")
+                _attempts_made += 1
                 with urllib.request.urlopen(req, timeout=to) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 r = self._parse(raw, want_tool=tool is not None,
                                 budget=body.get("max_tokens") or 0,
                                 stage=stage, requested_model=requested_model,
                                 requested_provider=route.provider)
+                if r.usage:
+                    _all_usage.append(r.usage)
                 u = r.usage or {}
                 _detail("← LLM %s provider=%s stage=%s requested_model=%s "
                         "actual_model=%s %.1fs in=%s out=%s err=%s\n      结果=%s",
@@ -1192,6 +1231,42 @@ class AnthropicMessagesClient:
                         u.get("input_tokens", "?"), u.get("output_tokens", "?"),
                         r.error or "无",
                         _clip(r.tool_input if r.tool_input is not None else r.text, 500))
+                # ---- review 5324929975: 空 tool_input 的**纯技术**可靠性 ----
+                #
+                # baseline-0 实测: `puzzle.structure` 5 次返回
+                # `stop=tool_use` 但 input 为空(网关在长结构化 tool_use
+                # 上的抖动, G4-CF 已有前科), 应用层的"1 次正常 + 1 次技术
+                # 重试"连第二次也空 -> 整个 attempt 白烧。
+                #
+                # 处理: **非触顶**的空 tool_input(stop=tool_use 且输出
+                # 远未到预算)与 HTTP 5xx 同类 —— 是网关抖动, 不是模型
+                # 语义判断。把它并入**同一层的传输重试**(退避后原样重发
+                # 同一个请求体)。边界不变:
+                #   * `max_tokens` 触顶的截断**不**走这里(那是预算问题,
+                #     Truth 已单独修, 重发只会再截断一次);
+                #   * 语义拒绝(validate_spec / Reviewer / audit)发生在
+                #     这个循环之外, **绝不**被本重试波及;
+                #   * 重发的是**同一个请求体**, puzzle/answer/idea 一个字
+                #     不变 —— 不是恢复多稿生成。
+                if (tool is not None and r.error and "空 input" in r.error
+                        and "max_tokens" not in r.error):
+                    last_err = f"empty tool_input: {r.error}"
+                    if attempt < mr:
+                        log.warning(
+                            "LLM 空 tool_input(网关抖动) provider=%s "
+                            "stage=%s model=%s, 第 %d/%d 次重试…",
+                            route.provider, stage or "(未标注)",
+                            requested_model, attempt + 1, mr)
+                        backoff = (2 ** attempt) + random.uniform(0, 0.5)
+                        time.sleep(min(backoff, 8.0))
+                        continue
+                    # 重试配额内的最后一次也空 -> 把错误交回调用方
+                    # (应用层的技术重试边界保持原样)。
+                    r.transport_attempts = _attempts_made
+                    r.transport_usage = _merge_usage(_all_usage)
+                    return r
+                r.transport_attempts = _attempts_made
+                r.transport_usage = _merge_usage(_all_usage)
                 return r
             except urllib.error.HTTPError as e:
                 code = e.code
@@ -1204,7 +1279,9 @@ class AnthropicMessagesClient:
                     log.warning("LLM HTTP %s provider=%s (不重试): %s",
                                 code, route.provider, snippet[:120])
                     return LLMResult(error=f"HTTP {code}: {snippet}",
-                                     stage=stage, requested_model=requested_model)
+                                     stage=stage, requested_model=requested_model,
+                                     transport_attempts=_attempts_made,
+                                     transport_usage=_merge_usage(_all_usage))
                 last_err = f"HTTP {code}: {snippet}"
                 if attempt < mr:
                     log.warning(
@@ -1238,7 +1315,9 @@ class AnthropicMessagesClient:
                 time.sleep(min(backoff, 8.0))
 
         return LLMResult(error=f"重试耗尽: {last_err}",
-                         stage=stage, requested_model=requested_model)
+                         stage=stage, requested_model=requested_model,
+                         transport_attempts=_attempts_made,
+                         transport_usage=_merge_usage(_all_usage))
 
     # ------------------------------------------------------------------
     def probe_temperature(self) -> tuple[bool, str]:
@@ -2629,10 +2708,14 @@ SURFACE_PROMPT_VERSION = "surface-v2"
 #: 说明"危险 + 反转"这个措辞被读成了**题材要求**, 于是模型去堆刺激度,
 #: 而不是去构造"乍看反常、讲通后合理"的结构。题材刺激度是风格的**副产品**,
 #: 不是目标, 所以这里只描述色调, 不再提"反转/冲击"。
-STORY_LANE_DIRECTION = {
-    "red": "风格偏红汤，整体可以更危险、阴暗。",
-    "black": "风格偏黑汤，整体可以更诡异、不安。",
-}
+#: ---- Generation v3(Issue #58): STORY_LANE_DIRECTION 已删除 ----
+#:
+#: 旧的 `STORY_LANE_DIRECTION`(red/black 各一句方向句)随生产随机
+#: lane 一起退役: 五大类是 Truth 唯一的题型/创作风格轴, 红/黑/清
+#: 只存在于五类创作 Brief 的自然语言里(`story/category_briefs.py`),
+#: 不再是独立的随机变量, 也不是任何 Schema / Protocol 字段。
+#: 历史 lane helper(`story/keyword_seed.py` 的 LANES / derive_lane_seed /
+#: draw_lane)退役为历史实验工具范围, 生产链不再读取。
 
 #: Story 阶段的 system —— **只写隐藏故事, 不写谜面**。
 #:
@@ -2746,37 +2829,46 @@ _TOOL_SURFACE = {
 }
 
 
-def _story_user(keywords, lane: str,
-                brief: Optional[GenerationBrief] = None) -> str:
-    """Story(Truth)阶段的 user message。
+def _story_user(keywords, brief: Optional[GenerationBrief] = None) -> str:
+    """Story(Truth)阶段的 user message(Generation v3, Issue #58)。
 
-    ## v1(Issue #50): lane 方向与 GenerationBrief 意图都在这里
+    ## v3: 五类创作 Brief 是唯一的题型/风格轴
 
-    Prompt Pack 化之后 system(`truth-v1.md`)是**全静态**的, 所有运行时
+    Prompt Pack 化之后 system(`truth-v2.md`)是**全静态**的, 所有运行时
     数据都从这条 user message 进:
 
-        类型行        lane(红/黑)—— 既有行为
-        关键词行      抽到的 2 个词 —— 既有行为
-        方向句        STORY_LANE_DIRECTION 的一句话(原 `{lane}` 占位符)
-        创作意图      brief.requested_category / brief.difficulty(§17~§19)
+        目标类型      requested_category 非空时 -> 该类的完整创作卡
+                      (story/category_briefs.py, 单一来源)
+        关键词行      抽到的 2 个词
+        目标难度      brief.difficulty 非空时
 
-    ⚠️ requested 是**创作目标**, 不是分类答案: 这里只告诉模型"本次希望
-    主方向偏向什么"。Contract/Audit 的 observed 分类**看不到**这条
-    message(它们只看冻结的成品), 所以不会污染 `primary_category`。
+    requested 为空(自由生成)时**不**随机选一个五类, 也**不再**掷
+    red/black lane(旧独立随机创作轴已删, §6) —— 只给通用创作要求 +
+    两个随机关键词, 最终它是什么类由 Contract/Audit 的 observed
+    classification 决定。
+
+    ⚠️ requested 是**创作目标**, 不是分类答案: 创作卡**只进**这条
+    message。Contract/Audit 的 observed 分类**看不到**它(它们只看
+    冻结的成品), 所以不会污染 `primary_category`。
     """
     words = [str(k).strip() for k in (keywords or []) if str(k).strip()]
-    road = "红汤" if str(lane or "").strip().lower() == "red" else "黑汤"
-    direction = STORY_LANE_DIRECTION.get(
-        str(lane or "").strip().lower(), STORY_LANE_DIRECTION["red"])
     b = brief if brief is not None else GenerationBrief()
-    lines = ["类型：" + road + "。",
-             "关键词：" + "，".join(words)]
+    lines: list = []
     if b.requested_category:
-        lines.append(f"本次希望主方向偏向 {b.requested_category}"
-                     f"（{_CATEGORY_LABELS.get(b.requested_category, '')}）。")
+        # ---- 五类创作卡: 单一来源 story/category_briefs.py ----
+        # 只注入**当前 requested**那一类, 不混入其它类的卡。
+        from .category_briefs import creative_brief
+        card = creative_brief(b.requested_category)
+        lines.append("【目标类型】"
+                     f"{b.requested_category}"
+                     f"（{_CATEGORY_LABELS.get(b.requested_category, '')}）")
+        if card:
+            lines.append(card)
+    lines.append("【随机关键词】" + "，".join(words))
     if b.difficulty:
-        lines.append(f"希望整体推理难度偏 {_DIFFICULTY_LABELS.get(b.difficulty, b.difficulty)}。")
-    lines += ["", direction,
+        lines.append("【目标难度】"
+                     f"{_DIFFICULTY_LABELS.get(b.difficulty, b.difficulty)}")
+    lines += ["",
               "请围绕这几个关键词构思一个完整的中文海龟汤隐藏故事。"]
     return "\n".join(lines)
 
@@ -5049,13 +5141,14 @@ class PuzzleWriter:
     # ------------------------------------------------------------------
     # Story 阶段 —— **只生成完整隐藏汤底**
     # ------------------------------------------------------------------
-    def gen_keyword_story(self, keywords, lane: str, *, should_continue=None,
+    def gen_keyword_story(self, keywords, *, should_continue=None,
                           max_attempts: int = 1,
                           temperature: Optional[float] = None,
                           timeout: Optional[float] = None,
                           brief: Optional[GenerationBrief] = None,
                           ) -> Optional[dict]:
-        """围绕 2 个关键词 + 一个方向(lane)写一个**完整隐藏故事**。
+        """围绕 2 个随机关键词(+ 可选 requested 创作意图)写一个
+        **完整隐藏故事**。
 
         返回 `{"answer": str}` 或 `{"interrupted": True}` 或 `None`。
 
@@ -5069,13 +5162,12 @@ class PuzzleWriter:
         现在这段**只做一件事**: 事情真正发生了什么。汤面由 `gen_surface`
         从这段的产出里**单独**截。
 
-        ## lane
+        ## lane(已退役, Generation v3 / Issue #58)
 
-        `lane` 只认 `"red"` / `"black"`, 用来在 **user message** 里放
-        `STORY_LANE_DIRECTION` 那**两句话**的方向提示(v1 起方向句从
-        system 移到 user —— Prompt Pack 的 system 全静态)。它**不是**
-        质量政策 —— 没有"跑题就 reject"这种门; 方向对不对由人读产物
-        判断, 不是代码判。
+        旧签名里的 `lane: str` 参数(红/黑)与 `STORY_LANE_DIRECTION`
+        方向句已删除 —— 生产不再掷 lane, 五大类是 Truth 唯一的题型/
+        创作风格轴(requested 非空时经 user message 注入该类创作卡,
+        见 `_story_user`)。历史 helper 退役为历史实验工具范围。
 
         ## brief(GenerationBrief, Issue #50 §17 首次接线)
 
@@ -5112,11 +5204,21 @@ class PuzzleWriter:
             brief.require_valid()
         # ---- Issue #50: system 来自 Prompt Pack(fail closed) ----
         system = load_prompt("truth")
-        text = _story_user(keywords, lane, brief=brief)
+        text = _story_user(keywords, brief=brief)
         last_err = ""
         for attempt in range(1, max(1, int(max_attempts)) + 1):
+            # ---- Truth 输出预算(review 5324929975)----
+            # baseline-0: 硬编码 1500 被 3 次撞满截断(tool call 没写完)。
+            # 现在从 runtime Config 读 `story_max_tokens`(默认 3000,
+            # 可配置) —— **输出预算**与 Truth 的内容合同(2~4 句 /
+            # <=260 中文字)是两回事, 后者一个字不改。
+            story_budget = 3000
+            _c = self._cfg()
+            if _c is not None:
+                story_budget = int(getattr(_c, "story_max_tokens", 3000)
+                                   or 3000)
             res = self.client.messages(
-                system, text, max_tokens=1500, tool=_TOOL_STORY,
+                system, text, max_tokens=story_budget, tool=_TOOL_STORY,
                 temperature=(temperature if temperature is not None
                              else self._temperature("generate_temperature")),
                 timeout=timeout,

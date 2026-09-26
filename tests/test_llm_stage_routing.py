@@ -900,7 +900,7 @@ def test_keyword2_stages_route_correctly():
 
     cli = FakeClient([LLMResult(tool_input={"answer": "汤底"}, model="m")])
     w = PuzzleWriter(client=cli, runtime_cfg=cfg)
-    s = _stage_of_last(w, w.gen_keyword_story, ["钥匙", "锁"], "live")
+    s = _stage_of_last(w, w.gen_keyword_story, ["钥匙", "锁"])
     check("**gen_keyword_story -> puzzle.story**", s == "puzzle.story", s)
 
     cli2 = FakeClient([LLMResult(tool_input={"puzzle": "谜面"}, model="m")])
