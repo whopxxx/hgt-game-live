@@ -1209,7 +1209,7 @@ class AnthropicMessagesClient:
                 #     这个循环之外, **绝不**被本重试波及;
                 #   * 重发的是**同一个请求体**, puzzle/answer/idea 一个字
                 #     不变 —— 不是恢复多稿生成。
-                if (want_tool and r.error and "空 input" in r.error
+                if (tool is not None and r.error and "空 input" in r.error
                         and "max_tokens" not in r.error):
                     last_err = f"empty tool_input: {r.error}"
                     if attempt < mr:
