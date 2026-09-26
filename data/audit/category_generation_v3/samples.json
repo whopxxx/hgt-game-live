@@ -1,7 +1,6 @@
 [
  {
   "category": "logic",
-  "attempt": 1,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -32,11 +31,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 1,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "勇气",
+     "光芒"
+    ],
+    "keyword_draw_index": 1,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "logic",
-  "attempt": 2,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -68,11 +78,22 @@
    "谜面是第一人称叙事，按硬约束改为第三人称客观陈述（她/她自己/那盆花）。"
   ],
   "keyword_draw_index": 2,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "中毒",
+     "打嗝"
+    ],
+    "keyword_draw_index": 2,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "logic",
-  "attempt": 3,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -104,11 +125,22 @@
    "solve_atoms 的 a2 文本混入排版噪声：`政府聘他当遗迹看护员，\",维持原状\"成了他的职务。` 多出一个 `\",`，语义无误但影响可读性。"
   ],
   "keyword_draw_index": 3,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "遗迹",
+     "工作"
+    ],
+    "keyword_draw_index": 3,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
-  "attempt": 4,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -141,19 +173,49 @@
    "谜底里的“保鲜”带引号像在提示这是丈夫的说法，读起来含混，容易误读。"
   ],
   "keyword_draw_index": 4,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "保鲜",
+     "地球仪"
+    ],
+    "keyword_draw_index": 4,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
-  "attempt": 2,
   "ok": false,
   "requested_category": "suspense",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "留学",
+   "过生日"
+  ],
+  "keyword_draw_index": 5,
+  "draws": [
+   {
+    "keywords": [
+     "留学",
+     "过生日"
+    ],
+    "keyword_draw_index": 5,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "suspense",
-  "attempt": 6,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -187,19 +249,49 @@
    "observed_signature.time_shape 自报 single_day 与谜面“这周第三次报修”“一直藏在她家阁楼里”不符，应为 habitual。"
   ],
   "keyword_draw_index": 6,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "故障",
+     "手印"
+    ],
+    "keyword_draw_index": 6,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
-  "attempt": 4,
   "ok": false,
   "requested_category": "suspense",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "夜班",
+   "空无一人"
+  ],
+  "keyword_draw_index": 7,
+  "draws": [
+   {
+    "keywords": [
+     "夜班",
+     "空无一人"
+    ],
+    "keyword_draw_index": 7,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "suspense",
-  "attempt": 8,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -232,19 +324,49 @@
    "原谜面『我从小到大的小名』与 core_answer/facts 中的『她小名』略有出入，统一为『她的小名』"
   ],
   "keyword_draw_index": 8,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "再遇",
+     "汤面"
+    ],
+    "keyword_draw_index": 8,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "horror",
-  "attempt": 1,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "饭圈",
+   "建筑"
+  ],
+  "keyword_draw_index": 9,
+  "draws": [
+   {
+    "keywords": [
+     "饭圈",
+     "建筑"
+    ],
+    "keyword_draw_index": 9,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "horror",
-  "attempt": 10,
   "ok": true,
   "requested_category": "horror",
   "requested_difficulty": "",
@@ -274,43 +396,130 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 10,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "英语",
+     "家人们"
+    ],
+    "keyword_draw_index": 10,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "horror",
-  "attempt": 3,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "幽灵船",
+   "复仇"
+  ],
+  "keyword_draw_index": 11,
+  "draws": [
+   {
+    "keywords": [
+     "幽灵船",
+     "复仇"
+    ],
+    "keyword_draw_index": 11,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "horror",
-  "attempt": 4,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "陌生",
+   "海底洞穴"
+  ],
+  "keyword_draw_index": 12,
+  "draws": [
+   {
+    "keywords": [
+     "陌生",
+     "海底洞穴"
+    ],
+    "keyword_draw_index": 12,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "horror",
-  "attempt": 5,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "爆胎",
+   "数字"
+  ],
+  "keyword_draw_index": 13,
+  "draws": [
+   {
+    "keywords": [
+     "爆胎",
+     "数字"
+    ],
+    "keyword_draw_index": 13,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "horror",
-  "attempt": 6,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "捉迷藏",
+   "火柴"
+  ],
+  "keyword_draw_index": 14,
+  "draws": [
+   {
+    "keywords": [
+     "捉迷藏",
+     "火柴"
+    ],
+    "keyword_draw_index": 14,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "emotion",
-  "attempt": 15,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -340,11 +549,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 15,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "东西",
+     "细节"
+    ],
+    "keyword_draw_index": 15,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "emotion",
-  "attempt": 16,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -373,27 +593,76 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 16,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "瓜农",
+     "黑暗"
+    ],
+    "keyword_draw_index": 16,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "emotion",
-  "attempt": 3,
   "ok": false,
   "requested_category": "emotion",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "散步",
+   "亮"
+  ],
+  "keyword_draw_index": 17,
+  "draws": [
+   {
+    "keywords": [
+     "散步",
+     "亮"
+    ],
+    "keyword_draw_index": 17,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "emotion",
-  "attempt": 4,
   "ok": false,
   "requested_category": "emotion",
   "requested_difficulty": "",
-  "reason": "gen_fail"
+  "reason": "gen_fail",
+  "telemetry_schema": "legacy-message-level",
+  "keywords": [
+   "古老书籍",
+   "尖叫"
+  ],
+  "keyword_draw_index": 18,
+  "draws": [
+   {
+    "keywords": [
+     "古老书籍",
+     "尖叫"
+    ],
+    "keyword_draw_index": 18,
+    "draw_seq": 1
+   }
+  ],
+  "calls": [],
+  "audit_fields_reconstructed_from_seed": true,
+  "reject": "",
+  "review_technical": false
  },
  {
   "category": "emotion",
-  "attempt": 19,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -424,11 +693,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 19,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "监视",
+     "超生"
+    ],
+    "keyword_draw_index": 19,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
-  "attempt": 20,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -458,11 +738,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 20,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "小熊",
+     "笑"
+    ],
+    "keyword_draw_index": 20,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
-  "attempt": 21,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -493,11 +784,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 21,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "器官捐献",
+     "鱼雷"
+    ],
+    "keyword_draw_index": 21,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
-  "attempt": 22,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -527,6 +829,18 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 22,
-  "keyword_session_seed": 20260926
+  "keyword_session_seed": 20260926,
+  "telemetry_schema": "legacy-message-level",
+  "draws": [
+   {
+    "keywords": [
+     "婚礼",
+     "神秘符号"
+    ],
+    "keyword_draw_index": 22,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  }
 ]

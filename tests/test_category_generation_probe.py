@@ -251,18 +251,27 @@ def test_probe_offline_run(tmp=False):
 
     # ---- review 5324929975 Blocker 1/2: 审计证据 ----
     check("call_log 存在且每条带 stage/model/usage/latency",
-          all(set(("stage", "model", "usage", "latency_s")) <= set(c)
+          all(set(("stage", "model", "usage", "latency_s",
+                   "transport_attempts")) <= set(c)
               for c in run["call_log"]),
           "call_log 字段缺")
-    check("total_llm_calls == len(call_log)",
-          run["total_llm_calls"] == len(run["call_log"]),
-          (run["total_llm_calls"], len(run["call_log"])))
+    check("total_message_calls == len(call_log)",
+          run["total_message_calls"] == len(run["call_log"]),
+          (run["total_message_calls"], len(run["call_log"])))
+    check("total_transport_attempts == sum(transport_attempts)",
+          run["total_transport_attempts"] == sum(
+              c.get("transport_attempts") or 1 for c in run["call_log"]),
+          run["total_transport_attempts"])
     check("usage 从全量调用汇总(含失败)",
           isinstance(run["usage"], dict), run["usage"])
-    check("stage_stats 按 stage 聚合",
-          all("calls" in v and "errors" in v
+    check("stage_stats 双口径聚合",
+          all("message_calls" in v and "transport_attempts" in v
+              and "errors" in v
               for v in (run["stage_stats"] or {}).values()),
           run["stage_stats"])
+    check("双口径一致性(离线无 retry 时相等)",
+          run["total_message_calls"] == run["total_transport_attempts"],
+          (run["total_message_calls"], run["total_transport_attempts"]))
     check("失败记录带 reject/review_technical/calls",
           all(("reject" in s and "review_technical" in s and "calls" in s)
               for s in run["samples"] if not s.get("ok")),
@@ -364,11 +373,64 @@ def test_write_outputs_no_production_files():
             check(f"report 含{frag}", frag in md)
 
 
+def test_aggregation_dual_accounting():
+    """review 5325204415 Blocker 2: harness 聚合层双口径。
+
+    一条 messages() 结果带 transport_attempts=3(即内部重发了 2 次)时,
+    聚合必须统计成 message_calls=1 / transport_attempts=3, 且 usage 是
+    三次累计 —— 不能把 message 调用数当成 HTTP 请求数。
+    """
+    print("\n[G-P5] probe 聚合双口径(message vs transport)")
+    mod = _load_tool_module()
+
+    calls = [
+        {"stage": "puzzle.story", "model": "m", "error": "",
+         "usage": {"input_tokens": 100, "output_tokens": 50},
+         "transport_attempts": 3, "latency_s": 1.0, "tool": "t"},
+        {"stage": "puzzle.surface", "model": "m", "error": "boom",
+         "usage": {"input_tokens": 10, "output_tokens": 5},
+         "transport_attempts": 1, "latency_s": 0.5, "tool": "t2"},
+    ]
+    run = {"stage_stats": mod._stage_stats(calls)}
+    story = run["stage_stats"]["puzzle.story"]
+    surface = run["stage_stats"]["puzzle.surface"]
+    check("story: message_calls=1", story["message_calls"] == 1, story)
+    check("story: transport_attempts=3(内部重试被计入)",
+          story["transport_attempts"] == 3, story)
+    check("surface: message_calls=1 / transport_attempts=1",
+          surface["message_calls"] == 1 and surface["transport_attempts"] == 1,
+          surface)
+    check("surface: error 仍被记账", surface["errors"] == 1, surface)
+
+    # 顶层聚合
+    total_message = len(calls)
+    total_attempts = sum(int(c.get("transport_attempts") or 1)
+                         for c in calls)
+    check("聚合: message_calls=1+1=2", total_message == 2, total_message)
+    check("聚合: transport_attempts=3+1=4", total_attempts == 4,
+          total_attempts)
+    check("两口径在有 retry 时**不相等**(正是要暴露的)",
+          total_message != total_attempts)
+
+    # usage 走 transport_usage(三次累计)时的汇总
+    usage = mod._sum_call_usage(calls)
+    check("usage 累加含重试消耗",
+          usage["output_tokens"] == 55 and usage["input_tokens"] == 110,
+          usage)
+
+    # 旧 client(无 transport_attempts 字段)回退 1 次, 不编造
+    legacy = [{"stage": "s", "usage": {"output_tokens": 1}}]
+    ls = mod._stage_stats(legacy)
+    check("legacy call 缺 transport_attempts -> 按 1 计",
+          ls["s"]["transport_attempts"] == 1, ls)
+
+
 def main():
     test_structure_uses_production_chain()
     test_cli_and_fixed_order()
     test_probe_offline_run()
     test_write_outputs_no_production_files()
+    test_aggregation_dual_accounting()
     if FAIL[0]:
         print(f"\nFAILED: {FAIL[0]} check(s)")
         return 1

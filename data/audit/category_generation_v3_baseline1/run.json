@@ -1,142 +1,144 @@
 {
-  "protocol_version": "haiguitang-v2",
-  "prompt_version": "haiguitang-generation-v3",
-  "session_seed": 20260928,
-  "corpus_version": "keyword2-vocab-v2",
-  "keyword_seed_version": "keyword2-vocab-v2",
-  "difficulty": "",
-  "accepted_per_category_target": 3,
-  "max_attempts_per_category": 6,
-  "attempts": {
-    "logic": 5,
-    "suspense": 4,
-    "horror": 4,
-    "emotion": 5,
-    "brainstorm": 3
+ "protocol_version": "haiguitang-v2",
+ "prompt_version": "haiguitang-generation-v3",
+ "session_seed": 20260928,
+ "corpus_version": "keyword2-vocab-v2",
+ "keyword_seed_version": "keyword2-vocab-v2",
+ "difficulty": "",
+ "accepted_per_category_target": 3,
+ "max_attempts_per_category": 6,
+ "attempts": {
+  "logic": 5,
+  "suspense": 4,
+  "horror": 4,
+  "emotion": 5,
+  "brainstorm": 3
+ },
+ "accepted": {
+  "logic": 3,
+  "suspense": 3,
+  "horror": 3,
+  "emotion": 3,
+  "brainstorm": 3
+ },
+ "fails": {
+  "logic": {
+   "gen_fail": 2,
+   "interrupted": 0,
+   "other": 0
   },
-  "accepted": {
-    "logic": 3,
-    "suspense": 3,
-    "horror": 3,
-    "emotion": 3,
-    "brainstorm": 3
+  "suspense": {
+   "gen_fail": 1,
+   "interrupted": 0,
+   "other": 0
   },
-  "fails": {
-    "logic": {
-      "gen_fail": 2,
-      "interrupted": 0,
-      "other": 0
-    },
-    "suspense": {
-      "gen_fail": 1,
-      "interrupted": 0,
-      "other": 0
-    },
-    "horror": {
-      "gen_fail": 1,
-      "interrupted": 0,
-      "other": 0
-    },
-    "emotion": {
-      "gen_fail": 2,
-      "interrupted": 0,
-      "other": 0
-    },
-    "brainstorm": {
-      "gen_fail": 0,
-      "interrupted": 0,
-      "other": 0
-    }
+  "horror": {
+   "gen_fail": 1,
+   "interrupted": 0,
+   "other": 0
   },
-  "requested_to_observed": {
-    "hits": {
-      "logic": 1,
-      "suspense": 2,
-      "horror": 3,
-      "emotion": 2,
-      "brainstorm": 2
-    },
-    "accepted_totals": {
-      "logic": 3,
-      "suspense": 3,
-      "horror": 3,
-      "emotion": 3,
-      "brainstorm": 3
-    },
-    "observed_distribution": {
-      "logic": {
-        "logic": 1,
-        "brainstorm": 2
-      },
-      "suspense": {
-        "emotion": 1,
-        "suspense": 2
-      },
-      "horror": {
-        "horror": 3
-      },
-      "emotion": {
-        "brainstorm": 1,
-        "emotion": 2
-      },
-      "brainstorm": {
-        "brainstorm": 2,
-        "emotion": 1
-      }
-    }
+  "emotion": {
+   "gen_fail": 2,
+   "interrupted": 0,
+   "other": 0
   },
-  "total_llm_calls": 115,
-  "usage": {
-    "input_tokens": 78262,
-    "cache_creation_input_tokens": 0,
-    "cache_read_input_tokens": 299264,
-    "output_tokens": 91227
-  },
-  "stage_stats": {
-    "puzzle.story": {
-      "calls": 21,
-      "errors": 2,
-      "output_tokens": 19769,
-      "latency_s": 1740.0
-    },
-    "puzzle.surface": {
-      "calls": 19,
-      "errors": 0,
-      "output_tokens": 2505,
-      "latency_s": 196.1
-    },
-    "puzzle.structure": {
-      "calls": 19,
-      "errors": 0,
-      "output_tokens": 25889,
-      "latency_s": 187.9
-    },
-    "puzzle.review": {
-      "calls": 20,
-      "errors": 0,
-      "output_tokens": 38762,
-      "latency_s": 153.6
-    },
-    "puzzle.safety": {
-      "calls": 18,
-      "errors": 0,
-      "output_tokens": 1695,
-      "latency_s": 35.2
-    },
-    "puzzle.truth_audit": {
-      "calls": 18,
-      "errors": 0,
-      "output_tokens": 2607,
-      "latency_s": 37.4
-    }
-  },
-  "elapsed_s": 2350.5,
-  "model": "ds",
-  "shortfall": {
-    "logic": 0,
-    "suspense": 0,
-    "horror": 0,
-    "emotion": 0,
-    "brainstorm": 0
+  "brainstorm": {
+   "gen_fail": 0,
+   "interrupted": 0,
+   "other": 0
   }
+ },
+ "requested_to_observed": {
+  "hits": {
+   "logic": 1,
+   "suspense": 2,
+   "horror": 3,
+   "emotion": 2,
+   "brainstorm": 2
+  },
+  "accepted_totals": {
+   "logic": 3,
+   "suspense": 3,
+   "horror": 3,
+   "emotion": 3,
+   "brainstorm": 3
+  },
+  "observed_distribution": {
+   "logic": {
+    "logic": 1,
+    "brainstorm": 2
+   },
+   "suspense": {
+    "emotion": 1,
+    "suspense": 2
+   },
+   "horror": {
+    "horror": 3
+   },
+   "emotion": {
+    "brainstorm": 1,
+    "emotion": 2
+   },
+   "brainstorm": {
+    "brainstorm": 2,
+    "emotion": 1
+   }
+  }
+ },
+ "usage": {
+  "input_tokens": 78262,
+  "cache_creation_input_tokens": 0,
+  "cache_read_input_tokens": 299264,
+  "output_tokens": 91227
+ },
+ "stage_stats": {
+  "puzzle.story": {
+   "calls": 21,
+   "errors": 2,
+   "output_tokens": 19769,
+   "latency_s": 1740.0
+  },
+  "puzzle.surface": {
+   "calls": 19,
+   "errors": 0,
+   "output_tokens": 2505,
+   "latency_s": 196.1
+  },
+  "puzzle.structure": {
+   "calls": 19,
+   "errors": 0,
+   "output_tokens": 25889,
+   "latency_s": 187.9
+  },
+  "puzzle.review": {
+   "calls": 20,
+   "errors": 0,
+   "output_tokens": 38762,
+   "latency_s": 153.6
+  },
+  "puzzle.safety": {
+   "calls": 18,
+   "errors": 0,
+   "output_tokens": 1695,
+   "latency_s": 35.2
+  },
+  "puzzle.truth_audit": {
+   "calls": 18,
+   "errors": 0,
+   "output_tokens": 2607,
+   "latency_s": 37.4
+  }
+ },
+ "elapsed_s": 2350.5,
+ "model": "ds",
+ "shortfall": {
+  "logic": 0,
+  "suspense": 0,
+  "horror": 0,
+  "emotion": 0,
+  "brainstorm": 0
+ },
+ "total_message_calls": 115,
+ "total_transport_attempts": 115,
+ "telemetry_schema": "legacy-message-level"
 }

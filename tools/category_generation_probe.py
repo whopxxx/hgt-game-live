@@ -218,7 +218,14 @@ def run_probe(args) -> dict:
         "accepted": per_cat_accepted,
         "fails": per_cat_fail,
         "requested_to_observed": _hit_stats(samples),
-        "total_llm_calls": len(calls),
+        # ---- 双口径(review 5325204415 Blocker 2)----
+        # total_message_calls      顶层 client.messages() 次数
+        # total_transport_attempts 实际 HTTP/model 请求次数(含重试)
+        # 两者只在零 transport retry 时相等; 总账以 attempts 为准。
+        "total_message_calls": len(calls),
+        "total_transport_attempts": sum(
+            int(c.get("transport_attempts") or 1) for c in calls),
+        "telemetry_schema": "message+transport-attempts",
         "usage": usage,
         "stage_stats": stage_stats,
         "call_log": calls,
@@ -331,13 +338,19 @@ def _sum_call_usage(calls: list) -> dict:
 
 
 def _stage_stats(calls: list) -> dict:
-    """按 stage 聚合: 调用数 / 失败数 / 输出 token —— 瓶颈定位用。"""
+    """按 stage 聚合(双口径, review 5325204415 Blocker 2):
+
+        message_calls      顶层 messages() 次数
+        transport_attempts 实际 HTTP/model 请求次数(含重试, 累加)
+    """
     stats: dict = {}
     for c in calls:
         s = stats.setdefault(c.get("stage") or "(未标注)",
-                             {"calls": 0, "errors": 0, "output_tokens": 0,
+                             {"message_calls": 0, "transport_attempts": 0,
+                              "errors": 0, "output_tokens": 0,
                               "latency_s": 0.0})
-        s["calls"] += 1
+        s["message_calls"] += 1
+        s["transport_attempts"] += int(c.get("transport_attempts") or 1)
         if c.get("error"):
             s["errors"] += 1
         u = c.get("usage") or {}
@@ -419,13 +432,14 @@ def render_report(run: dict, samples: list) -> str:
     ss = run.get("stage_stats") or {}
     if ss:
         P("")
-        P("### stage 级调用/失败(技术瓶颈定位)")
+        P("### stage 级调用/失败(双口径: message calls vs transport attempts)")
         P("")
-        P("| stage | calls | errors | output_tokens | latency_s |")
-        P("|---|---|---|---|---|")
+        P("| stage | message_calls | transport_attempts | errors | "
+          "output_tokens | latency_s |")
+        P("|---|---|---|---|---|---|")
         for st, v in ss.items():
-            P(f"| {st} | {v['calls']} | {v['errors']} | "
-              f"{v['output_tokens']} | {v['latency_s']} |")
+            P(f"| {st} | {v['message_calls']} | {v['transport_attempts']} | "
+              f"{v['errors']} | {v['output_tokens']} | {v['latency_s']} |")
     P("")
     n = 0
     for c in CATEGORY_ORDER:

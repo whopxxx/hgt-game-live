@@ -5,7 +5,8 @@
   "error": "重试耗尽: TimeoutError: timed out",
   "usage": {},
   "latency_s": 248.22,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -13,7 +14,8 @@
   "error": "重试耗尽: TimeoutError: timed out",
   "usage": {},
   "latency_s": 247.73,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -26,7 +28,8 @@
    "output_tokens": 1552
   },
   "latency_s": 53.66,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -39,7 +42,8 @@
    "output_tokens": 99
   },
   "latency_s": 8.88,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -52,7 +56,8 @@
    "output_tokens": 1429
   },
   "latency_s": 6.84,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -65,7 +70,8 @@
    "output_tokens": 1959
   },
   "latency_s": 7.52,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -78,7 +84,8 @@
    "output_tokens": 90
   },
   "latency_s": 2.08,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -91,7 +98,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.95,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -104,7 +112,8 @@
    "output_tokens": 877
   },
   "latency_s": 171.75,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -117,7 +126,8 @@
    "output_tokens": 206
   },
   "latency_s": 12.22,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -130,7 +140,8 @@
    "output_tokens": 1456
   },
   "latency_s": 6.66,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -143,7 +154,8 @@
    "output_tokens": 2075
   },
   "latency_s": 8.52,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -156,7 +168,8 @@
    "output_tokens": 85
   },
   "latency_s": 2.05,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -169,7 +182,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.75,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -182,7 +196,8 @@
    "output_tokens": 489
   },
   "latency_s": 83.78,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -195,7 +210,8 @@
    "output_tokens": 84
   },
   "latency_s": 7.73,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -208,7 +224,8 @@
    "output_tokens": 1179
   },
   "latency_s": 5.84,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -221,7 +238,8 @@
    "output_tokens": 1610
   },
   "latency_s": 6.25,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -234,7 +252,8 @@
    "output_tokens": 87
   },
   "latency_s": 1.91,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -247,7 +266,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.92,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -260,7 +280,8 @@
    "output_tokens": 896
   },
   "latency_s": 52.58,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -273,7 +294,8 @@
    "output_tokens": 111
   },
   "latency_s": 12.16,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -286,7 +308,8 @@
    "output_tokens": 1477
   },
   "latency_s": 7.64,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -299,7 +322,8 @@
    "output_tokens": 1930
   },
   "latency_s": 7.5,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -312,7 +336,8 @@
    "output_tokens": 100
   },
   "latency_s": 1.75,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -325,7 +350,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.97,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -338,7 +364,8 @@
    "output_tokens": 632
   },
   "latency_s": 26.48,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -351,7 +378,8 @@
    "output_tokens": 103
   },
   "latency_s": 9.34,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -364,7 +392,8 @@
    "output_tokens": 1442
   },
   "latency_s": 16.22,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -377,7 +406,8 @@
    "output_tokens": 1994
   },
   "latency_s": 7.86,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -390,7 +420,8 @@
    "output_tokens": 98
   },
   "latency_s": 1.94,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -403,7 +434,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.86,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -416,7 +448,8 @@
    "output_tokens": 725
   },
   "latency_s": 28.3,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -429,7 +462,8 @@
    "output_tokens": 101
   },
   "latency_s": 9.55,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -442,7 +476,8 @@
    "output_tokens": 1351
   },
   "latency_s": 6.62,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -455,7 +490,8 @@
    "output_tokens": 1777
   },
   "latency_s": 6.61,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -468,7 +504,8 @@
    "output_tokens": 93
   },
   "latency_s": 1.81,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -481,7 +518,8 @@
    "output_tokens": 621
   },
   "latency_s": 4.78,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -494,7 +532,8 @@
    "output_tokens": 1121
   },
   "latency_s": 52.74,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -507,7 +546,8 @@
    "output_tokens": 175
   },
   "latency_s": 9.84,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -520,7 +560,8 @@
    "output_tokens": 1525
   },
   "latency_s": 7.2,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -533,7 +574,8 @@
    "output_tokens": 2232
   },
   "latency_s": 9.03,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -546,7 +588,8 @@
    "output_tokens": 99
   },
   "latency_s": 2.11,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -559,7 +602,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.95,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -572,7 +616,8 @@
    "output_tokens": 849
   },
   "latency_s": 33.5,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -585,7 +630,8 @@
    "output_tokens": 94
   },
   "latency_s": 8.28,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -598,7 +644,8 @@
    "output_tokens": 1445
   },
   "latency_s": 14.84,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -611,7 +658,8 @@
    "output_tokens": 1912
   },
   "latency_s": 7.39,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -624,7 +672,8 @@
    "output_tokens": 87
   },
   "latency_s": 1.95,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -637,7 +686,8 @@
    "output_tokens": 414
   },
   "latency_s": 3.14,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -650,7 +700,8 @@
    "output_tokens": 1052
   },
   "latency_s": 35.95,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -663,7 +714,8 @@
    "output_tokens": 109
   },
   "latency_s": 9.02,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -676,7 +728,8 @@
    "output_tokens": 1349
   },
   "latency_s": 6.69,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -689,7 +742,8 @@
    "output_tokens": 1901
   },
   "latency_s": 7.08,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -702,7 +756,8 @@
    "output_tokens": 102
   },
   "latency_s": 2.03,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -715,7 +770,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.86,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -728,7 +784,8 @@
    "output_tokens": 1102
   },
   "latency_s": 40.34,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -741,7 +798,8 @@
    "output_tokens": 126
   },
   "latency_s": 11.69,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -754,7 +812,8 @@
    "output_tokens": 1373
   },
   "latency_s": 6.72,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -767,7 +826,8 @@
    "output_tokens": 1867
   },
   "latency_s": 7.06,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -780,7 +840,8 @@
    "output_tokens": 103
   },
   "latency_s": 1.86,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -793,7 +854,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.59,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -806,7 +868,8 @@
    "output_tokens": 1004
   },
   "latency_s": 102.89,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -819,7 +882,8 @@
    "output_tokens": 179
   },
   "latency_s": 12.72,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -832,7 +896,8 @@
    "output_tokens": 1340
   },
   "latency_s": 7.12,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -845,7 +910,8 @@
    "output_tokens": 1819
   },
   "latency_s": 7.25,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -858,7 +924,8 @@
    "output_tokens": 103
   },
   "latency_s": 2.16,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -871,7 +938,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.69,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -884,7 +952,8 @@
    "output_tokens": 1475
   },
   "latency_s": 59.33,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -897,7 +966,8 @@
    "output_tokens": 80
   },
   "latency_s": 7.98,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -910,7 +980,8 @@
    "output_tokens": 1289
   },
   "latency_s": 6.44,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -923,7 +994,8 @@
    "output_tokens": 1733
   },
   "latency_s": 7.14,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -936,7 +1008,8 @@
    "output_tokens": 87
   },
   "latency_s": 1.91,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -949,7 +1022,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.95,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -962,7 +1036,8 @@
    "output_tokens": 1298
   },
   "latency_s": 113.17,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -975,7 +1050,8 @@
    "output_tokens": 122
   },
   "latency_s": 9.69,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -988,7 +1064,8 @@
    "output_tokens": 1139
   },
   "latency_s": 5.84,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1001,7 +1078,8 @@
    "output_tokens": 1592
   },
   "latency_s": 5.98,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1014,7 +1092,8 @@
    "output_tokens": 97
   },
   "latency_s": 1.83,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1027,7 +1106,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.97,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1040,7 +1120,8 @@
    "output_tokens": 734
   },
   "latency_s": 161.84,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1053,7 +1134,8 @@
    "output_tokens": 84
   },
   "latency_s": 7.89,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1066,7 +1148,8 @@
    "output_tokens": 1299
   },
   "latency_s": 6.55,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1079,7 +1162,8 @@
    "output_tokens": 2501
   },
   "latency_s": 11.14,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1092,7 +1176,8 @@
    "output_tokens": 2550
   },
   "latency_s": 10.81,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1105,7 +1190,8 @@
    "output_tokens": 1499
   },
   "latency_s": 57.31,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1118,7 +1204,8 @@
    "output_tokens": 114
   },
   "latency_s": 9.25,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1131,7 +1218,8 @@
    "output_tokens": 1278
   },
   "latency_s": 33.61,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1144,7 +1232,8 @@
    "output_tokens": 1691
   },
   "latency_s": 6.39,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1157,7 +1246,8 @@
    "output_tokens": 87
   },
   "latency_s": 1.73,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1170,7 +1260,8 @@
    "output_tokens": 342
   },
   "latency_s": 3.0,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1183,7 +1274,8 @@
    "output_tokens": 719
   },
   "latency_s": 26.34,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1196,7 +1288,8 @@
    "output_tokens": 172
   },
   "latency_s": 13.22,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1209,7 +1302,8 @@
    "output_tokens": 1309
   },
   "latency_s": 15.02,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1222,7 +1316,8 @@
    "output_tokens": 1832
   },
   "latency_s": 7.61,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1235,7 +1330,8 @@
    "output_tokens": 89
   },
   "latency_s": 1.81,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1248,7 +1344,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.56,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1261,7 +1358,8 @@
    "output_tokens": 1333
   },
   "latency_s": 42.28,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1274,7 +1372,8 @@
    "output_tokens": 130
   },
   "latency_s": 8.72,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1287,7 +1386,8 @@
    "output_tokens": 1270
   },
   "latency_s": 6.36,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1300,7 +1400,8 @@
    "output_tokens": 1868
   },
   "latency_s": 7.8,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1313,7 +1414,8 @@
    "output_tokens": 87
   },
   "latency_s": 2.17,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1326,7 +1428,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.66,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1339,7 +1442,8 @@
    "output_tokens": 1217
   },
   "latency_s": 46.8,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1352,7 +1456,8 @@
    "output_tokens": 291
   },
   "latency_s": 15.08,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1365,7 +1470,8 @@
    "output_tokens": 1506
   },
   "latency_s": 6.95,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1378,7 +1484,8 @@
    "output_tokens": 1977
   },
   "latency_s": 7.67,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1391,7 +1498,8 @@
    "output_tokens": 100
   },
   "latency_s": 1.78,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1404,7 +1512,8 @@
    "output_tokens": 82
   },
   "latency_s": 1.33,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.story",
@@ -1417,7 +1526,8 @@
    "output_tokens": 1195
   },
   "latency_s": 55.06,
-  "tool": "emit_core_story"
+  "tool": "emit_core_story",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.surface",
@@ -1430,7 +1540,8 @@
    "output_tokens": 125
   },
   "latency_s": 12.86,
-  "tool": "emit_surface"
+  "tool": "emit_surface",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.structure",
@@ -1443,7 +1554,8 @@
    "output_tokens": 1433
   },
   "latency_s": 14.72,
-  "tool": "emit_structure"
+  "tool": "emit_structure",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.review",
@@ -1456,7 +1568,8 @@
    "output_tokens": 1942
   },
   "latency_s": 7.03,
-  "tool": "emit_review"
+  "tool": "emit_review",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.safety",
@@ -1469,7 +1582,8 @@
    "output_tokens": 101
   },
   "latency_s": 2.33,
-  "tool": "emit_safety_check"
+  "tool": "emit_safety_check",
+  "telemetry_schema": "legacy-message-level"
  },
  {
   "stage": "puzzle.truth_audit",
@@ -1482,6 +1596,7 @@
    "output_tokens": 82
   },
   "latency_s": 1.52,
-  "tool": "emit_truth_audit"
+  "tool": "emit_truth_audit",
+  "telemetry_schema": "legacy-message-level"
  }
 ]

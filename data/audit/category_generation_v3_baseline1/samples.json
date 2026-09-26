@@ -2,7 +2,6 @@
  {
   "category": "logic",
   "category_attempt": 1,
-  "attempt": 1,
   "ok": false,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -18,12 +17,27 @@
     "latency_s": 248.22,
     "tool": "emit_core_story"
    }
-  ]
+  ],
+  "keywords": [
+   "鱼",
+   "未接来电"
+  ],
+  "keyword_draw_index": 1,
+  "draws": [
+   {
+    "keywords": [
+     "鱼",
+     "未接来电"
+    ],
+    "keyword_draw_index": 1,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "logic",
   "category_attempt": 2,
-  "attempt": 2,
   "ok": false,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -39,12 +53,27 @@
     "latency_s": 247.73,
     "tool": "emit_core_story"
    }
-  ]
+  ],
+  "keywords": [
+   "伴郎",
+   "恐惧"
+  ],
+  "keyword_draw_index": 2,
+  "draws": [
+   {
+    "keywords": [
+     "伴郎",
+     "恐惧"
+    ],
+    "keyword_draw_index": 2,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "logic",
   "category_attempt": 3,
-  "attempt": 3,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -74,12 +103,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 3,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "合影",
+     "自律"
+    ],
+    "keyword_draw_index": 3,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "logic",
   "category_attempt": 4,
-  "attempt": 4,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -112,12 +151,22 @@
    "f6/f7/f8 的 public_text 为空，而观众一旦问到这些点（比如问到\"他家里有正常的床吗\"）主持人无从转述，固定槽位形同虚设。"
   ],
   "keyword_draw_index": 4,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "狂风暴雨",
+     "床"
+    ],
+    "keyword_draw_index": 4,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "logic",
   "category_attempt": 5,
-  "attempt": 5,
   "ok": true,
   "requested_category": "logic",
   "requested_difficulty": "",
@@ -147,12 +196,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 5,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "火山",
+     "重口味"
+    ],
+    "keyword_draw_index": 5,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
   "category_attempt": 1,
-  "attempt": 6,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -182,12 +241,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 6,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "衣柜",
+     "仪式"
+    ],
+    "keyword_draw_index": 6,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
   "category_attempt": 2,
-  "attempt": 7,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -221,12 +290,22 @@
    "该句还把\"邻居听琴的历史\"误当成\"女孩活着\"的历史：录音可以放很多年，真弹的只能是活着那几年——原字面读法给了一条无法成立的时间线。"
   ],
   "keyword_draw_index": 7,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "旋律",
+     "禁足"
+    ],
+    "keyword_draw_index": 7,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "suspense",
   "category_attempt": 3,
-  "attempt": 3,
   "ok": false,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -312,12 +391,27 @@
     "latency_s": 4.78,
     "tool": "emit_truth_audit"
    }
-  ]
+  ],
+  "keywords": [
+   "隧道",
+   "名画"
+  ],
+  "keyword_draw_index": 8,
+  "draws": [
+   {
+    "keywords": [
+     "隧道",
+     "名画"
+    ],
+    "keyword_draw_index": 8,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "suspense",
   "category_attempt": 4,
-  "attempt": 9,
   "ok": true,
   "requested_category": "suspense",
   "requested_difficulty": "",
@@ -351,12 +445,22 @@
    "core_answer 未点出她把搜寻队误当作威胁来源这一关键中介，观众靠现有表述容易以为她只是『害怕』。"
   ],
   "keyword_draw_index": 9,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "冻死",
+     "布偶"
+    ],
+    "keyword_draw_index": 9,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "horror",
   "category_attempt": 1,
-  "attempt": 1,
   "ok": false,
   "requested_category": "horror",
   "requested_difficulty": "",
@@ -442,12 +546,27 @@
     "latency_s": 3.14,
     "tool": "emit_truth_audit"
    }
-  ]
+  ],
+  "keywords": [
+   "时钟",
+   "鼓掌"
+  ],
+  "keyword_draw_index": 10,
+  "draws": [
+   {
+    "keywords": [
+     "时钟",
+     "鼓掌"
+    ],
+    "keyword_draw_index": 10,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "horror",
   "category_attempt": 2,
-  "attempt": 11,
   "ok": true,
   "requested_category": "horror",
   "requested_difficulty": "",
@@ -477,12 +596,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 11,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "人工心脏",
+     "指引"
+    ],
+    "keyword_draw_index": 11,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "horror",
   "category_attempt": 3,
-  "attempt": 12,
   "ok": true,
   "requested_category": "horror",
   "requested_difficulty": "",
@@ -513,12 +642,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 12,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "赌博",
+     "柠檬"
+    ],
+    "keyword_draw_index": 12,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "horror",
   "category_attempt": 4,
-  "attempt": 13,
   "ok": true,
   "requested_category": "horror",
   "requested_difficulty": "",
@@ -550,12 +689,22 @@
    "fair_clues 里 '醉酒' 不是谜面逐字原文(谜面写的是'一个醉汉'), quote 验证会失败。"
   ],
   "keyword_draw_index": 13,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "小吃摊",
+     "心脏"
+    ],
+    "keyword_draw_index": 13,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "emotion",
   "category_attempt": 1,
-  "attempt": 14,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -585,12 +734,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 14,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "尝试",
+     "惊奇"
+    ],
+    "keyword_draw_index": 14,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "emotion",
   "category_attempt": 2,
-  "attempt": 15,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -620,12 +779,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 15,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "吵闹",
+     "排风扇"
+    ],
+    "keyword_draw_index": 15,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "emotion",
   "category_attempt": 3,
-  "attempt": 3,
   "ok": false,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -698,12 +867,27 @@
     "latency_s": 10.81,
     "tool": "emit_review"
    }
-  ]
+  ],
+  "keywords": [
+   "家里空",
+   "玩笑"
+  ],
+  "keyword_draw_index": 16,
+  "draws": [
+   {
+    "keywords": [
+     "家里空",
+     "玩笑"
+    ],
+    "keyword_draw_index": 16,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "emotion",
   "category_attempt": 4,
-  "attempt": 4,
   "ok": false,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -789,12 +973,27 @@
     "latency_s": 3.0,
     "tool": "emit_truth_audit"
    }
-  ]
+  ],
+  "keywords": [
+   "数学课本",
+   "结局"
+  ],
+  "keyword_draw_index": 17,
+  "draws": [
+   {
+    "keywords": [
+     "数学课本",
+     "结局"
+    ],
+    "keyword_draw_index": 17,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": true
  },
  {
   "category": "emotion",
   "category_attempt": 5,
-  "attempt": 18,
   "ok": true,
   "requested_category": "emotion",
   "requested_difficulty": "",
@@ -825,12 +1024,22 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 18,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "AO3",
+     "下毒"
+    ],
+    "keyword_draw_index": 18,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
   "category_attempt": 1,
-  "attempt": 19,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -864,12 +1073,22 @@
    "谜面\"直到有一天\"在语义上暗示那天才发生改变，但谜底中男人的生活状态其实从未改变、改变的是路人的认知，措辞略有歧义。"
   ],
   "keyword_draw_index": 19,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "牌",
+     "邋遢"
+    ],
+    "keyword_draw_index": 19,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
   "category_attempt": 2,
-  "attempt": 20,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -902,12 +1121,22 @@
    "谜面为第一人称叙事，按体例应改为第三人称客观叙述"
   ],
   "keyword_draw_index": 20,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "八音盒",
+     "护工"
+    ],
+    "keyword_draw_index": 20,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  },
  {
   "category": "brainstorm",
   "category_attempt": 3,
-  "attempt": 21,
   "ok": true,
   "requested_category": "brainstorm",
   "requested_difficulty": "",
@@ -937,6 +1166,17 @@
   "reject": "",
   "review_issues": [],
   "keyword_draw_index": 21,
-  "keyword_session_seed": 20260928
+  "keyword_session_seed": 20260928,
+  "draws": [
+   {
+    "keywords": [
+     "推理",
+     "110"
+    ],
+    "keyword_draw_index": 21,
+    "draw_seq": 1
+   }
+  ],
+  "audit_fields_reconstructed_from_seed": false
  }
 ]
