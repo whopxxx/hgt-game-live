@@ -26,9 +26,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from story.haiguitang_protocol import (  # noqa: E402
-    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION as V1,
+    CATEGORIES, DIFFICULTIES, HAIGUITANG_PROTOCOL_VERSION,
     MAX_CATEGORIES, MIN_CATEGORIES,
+    PROTOCOL_V1 as V1, PROTOCOL_V2 as V2,
     PROTOCOL_V1_MAX_COMPLETION_FACTS, PROTOCOL_V1_MIN_COMPLETION_FACTS,
+    V1_CATEGORIES, V2_CATEGORIES,
     GenerationBrief,
 )
 from story.llm import (  # noqa: E402
@@ -69,8 +71,11 @@ def test_all_stages_load():
               .replace("_", "-").split("-")[0]) or bool(stage_version(stage)),
               stage_version(stage))
     check("Pack 总版本", HAIGUITANG_GENERATION_PROMPT_VERSION
-          == "haiguitang-generation-v1" == PROMPT_PACK_VERSION,
+          == "haiguitang-generation-v2" == PROMPT_PACK_VERSION,
           HAIGUITANG_GENERATION_PROMPT_VERSION)
+    check("contract / audit stage 指向 v2 文件",
+          STAGES["contract"] == ("contract-v2.md", "contract-v2")
+          and STAGES["audit"] == ("audit-v2.md", "audit-v2"), STAGES)
     # 静态性: 六份文件都不含 {placeholder}(§6)
     for stage in STAGES:
         check(f"{stage} 无模板变量(全静态)", "{" not in load_prompt(stage))
@@ -164,15 +169,20 @@ def test_v1_tool_schema_matches_protocol():
     check("Contract difficulty enum == DIFFICULTIES",
           sch["difficulty"]["enum"] == list(DIFFICULTIES),
           sch["difficulty"]["enum"])
-    check("Contract primary enum == CATEGORIES",
-          sch["primary_category"]["enum"] == list(CATEGORIES),
+    # ---- 5 大类协议 v2: 当前 Contract schema enum 必须精确等于五类 ----
+    check("Contract primary enum == v2 五类(精确相等, 不是包含)",
+          sch["primary_category"]["enum"] == list(V2_CATEGORIES),
           sch["primary_category"]["enum"])
     cats = sch["categories"]
-    check("Contract categories 1~3 且 enum == CATEGORIES",
+    check("Contract categories 1~3 且 enum == v2 五类(精确相等)",
           cats["minItems"] == MIN_CATEGORIES == 1
           and cats["maxItems"] == MAX_CATEGORIES == 3
-          and cats["items"]["enum"] == list(CATEGORIES),
+          and cats["items"]["enum"] == list(V2_CATEGORIES),
           (cats["minItems"], cats["maxItems"]))
+    for legacy_cat in ("crime", "family", "twist", "sci_fi", "warm"):
+        check(f"Contract schema 不含旧类 {legacy_cat}",
+              legacy_cat not in sch["primary_category"]["enum"]
+              and legacy_cat not in cats["items"]["enum"], legacy_cat)
     check("Contract required 带分类三件",
           all(k in _TOOL_STRUCTURE["input_schema"]["required"]
               for k in ("difficulty", "primary_category", "categories")),
@@ -192,11 +202,24 @@ def test_v1_tool_schema_matches_protocol():
     check("Audit facts[].public_text 必填",
           "public_text" in vs["facts"]["items"]["required"],
           vs["facts"]["items"]["required"])
-    check("Audit difficulty/primary/categories enum 对齐协议",
+    check("Audit difficulty/primary/categories enum 对齐协议(默认 v2)",
           vs["difficulty"]["enum"] == list(DIFFICULTIES)
-          and vs["primary_category"]["enum"] == list(CATEGORIES)
-          and vs["categories"]["items"]["enum"] == list(CATEGORIES),
+          and vs["primary_category"]["enum"] == list(V2_CATEGORIES)
+          and vs["categories"]["items"]["enum"] == list(V2_CATEGORIES),
           "enum 漂移")
+    # ---- v1 历史题的可达路径: 审稿 schema 必须仍按 11 类解释 ----
+    from story.llm import _protocol_categories
+    v1_probe = {"protocol_version": V1, "source_type": ""}
+    v1_audit = _v1_check_tool(cats_enum=_protocol_categories(v1_probe))
+    v1props = v1_audit["input_schema"]["properties"]
+    check("v1 题的 Audit primary enum == 历史 11 类(精确, 不被 alias 覆盖)",
+          v1props["primary_category"]["enum"] == list(V1_CATEGORIES),
+          v1props["primary_category"]["enum"])
+    check("v1 题的 Audit categories enum == 历史 11 类",
+          v1props["categories"]["items"]["enum"] == list(V1_CATEGORIES),
+          "v1 枚举被偷换")
+    check("v1 枚举里没有 emotion(v2 独有)",
+          "emotion" not in v1props["primary_category"]["enum"], "11 类被污染")
     # legacy/curated 不受影响
     legacy = check_tool(None)
     lcomp = legacy["input_schema"]["properties"]["completion_fact_ids"]
@@ -393,8 +416,8 @@ def test_full_pipeline_v1_clean_and_pool():
     print("\n[P4] FakeClient 全链: v1 spec clean 且过池门(§64/§95)")
     spec, reason, cli, w = _run_pipeline()
     check("成题", bool(spec and spec.puzzle), reason)
-    check("protocol_version == haiguitang-v1",
-          spec.protocol_version == V1, spec.protocol_version)
+    check("protocol_version == haiguitang-v2",
+          spec.protocol_version == V2, spec.protocol_version)
     check("prompt_version == 生成 Pack 版本",
           spec.prompt_version == HAIGUITANG_GENERATION_PROMPT_VERSION,
           spec.prompt_version)
@@ -449,6 +472,52 @@ def test_completion_2_3_4_all_clean_and_pool():
         check(f"{n}-fact 过池门", ok, why)
 
 
+def test_v2_generation_writes_v2_and_v2_categories():
+    """(5 大类协议 v2)新生成正式题写 protocol_version=haiguitang-v2,
+    observed 分类是五类, prompt_version 是新 Pack 总版本。"""
+    print("\n[P5b] 新生成 spec: protocol=v2 / 五类分类 / Pack 总版本 bump")
+    # Contract payload 用一个五类合法分类; 审稿 pass 原样带回同一分类
+    spec, reason, cli, _w = _run_pipeline(
+        _v1_contract_payload(2, primary_category="suspense",
+                             categories=["suspense", "brainstorm"]),
+        review_result=LLMResult(tool_input=_review_payload(
+            "pass", primary_category="suspense",
+            categories=["suspense", "brainstorm"])))
+    check("成题", bool(spec and spec.puzzle), reason)
+    check("protocol_version == haiguitang-v2(代码注入)",
+          spec.protocol_version == V2, spec.protocol_version)
+    check("prompt_version == haiguitang-generation-v2",
+          spec.prompt_version == "haiguitang-generation-v2"
+          == HAIGUITANG_GENERATION_PROMPT_VERSION, spec.prompt_version)
+    check("observed 分类 == Contract 回传的五类",
+          (spec.primary_category, spec.categories)
+          == ("suspense", ["suspense", "brainstorm"]),
+          (spec.primary_category, spec.categories))
+    check("observed 分类全部属于 v2 五类",
+          spec.primary_category in V2_CATEGORIES
+          and all(c in V2_CATEGORIES for c in spec.categories),
+          (spec.primary_category, spec.categories))
+    vr = validate_spec(spec)
+    check("validate_spec clean", vr.ok and not vr.fixable, vr.errors)
+    ok, why = PuzzlePool._validate_pool_spec(spec)
+    check("过池门", ok, why)
+    # ---- 盲分类(§26.E): requested 不进 Contract/Audit 的输入 ----
+    brief = GenerationBrief(requested_category="emotion")
+    spec2, reason2, cli2, _w2 = _run_pipeline(
+        _v1_contract_payload(2), brief=brief)
+    check("带 brief 成题", bool(spec2 and spec2.puzzle), reason2)
+    intent = "本次希望主方向偏向"
+    check("Contract user message 看不到 requested(盲分类保持)",
+          intent not in cli2.calls[2]["user"], cli2.calls[2]["user"][:80])
+    check("Audit user message 看不到 requested(盲分类保持)",
+          intent not in cli2.calls[3]["user"], "requested 泄漏进 audit")
+    check("盲分类不因 enum 切换而丢失: spec.requested=emotion / "
+          "observed=logic(来自 Contract)",
+          spec2.requested_category == "emotion"
+          and spec2.primary_category == "logic",
+          (spec2.requested_category, spec2.primary_category))
+
+
 def test_completion_1_and_5_rejected():
     print("\n[P6] 1/5 completion 被硬门拒, Reviewer 不能静默绕过(§66)")
     spec, reason, _cli, _w = _run_pipeline(_v1_contract_payload(1))
@@ -485,19 +554,19 @@ def test_missing_public_text_never_autofilled():
 
 
 def test_requested_category_mismatch_end_to_end():
-    print("\n[P8] requested=sci_fi, observed=suspense: 合法且 provenance 保持"
-          "(§35/§68/§70)")
-    brief = GenerationBrief(requested_category="sci_fi")
+    print("\n[P8] requested=brainstorm, observed=suspense: 合法且 provenance "
+          "保持(§35/§68/§70; 新 brief 只收 v2 五类)")
+    brief = GenerationBrief(requested_category="brainstorm")
     spec, reason, cli, w = _run_pipeline(
         _v1_contract_payload(2, primary_category="suspense",
-                             categories=["suspense", "sci_fi"]),
+                             categories=["suspense", "brainstorm"]),
         brief=brief,
         review_result=LLMResult(tool_input=_review_payload(
             "pass", primary_category="suspense",
-            categories=["suspense", "sci_fi"])))
+            categories=["suspense", "brainstorm"])))
     check("成题", bool(spec and spec.puzzle), reason)
     check("Truth user message 带创作意图",
-          "sci_fi" in cli.calls[0]["user"], cli.calls[0]["user"][:80])
+          "brainstorm" in cli.calls[0]["user"], cli.calls[0]["user"][:80])
     intent = "本次希望主方向偏向"
     check("Surface 看不到 requested(创作意图句不出现)",
           intent not in cli.calls[1]["user"], cli.calls[1]["user"][:60])
@@ -505,8 +574,8 @@ def test_requested_category_mismatch_end_to_end():
           intent not in cli.calls[2]["user"], cli.calls[2]["user"][:80])
     check("Audit 看不到 requested(盲分类)",
           intent not in cli.calls[3]["user"], "requested 泄漏进 audit")
-    check("spec.requested_category == sci_fi(provenance 保持)",
-          spec.requested_category == "sci_fi", spec.requested_category)
+    check("spec.requested_category == brainstorm(provenance 保持)",
+          spec.requested_category == "brainstorm", spec.requested_category)
     check("spec.primary_category == suspense(观察结果)",
           spec.primary_category == "suspense", spec.primary_category)
     check("requested != primary 合法且 clean",
@@ -554,7 +623,7 @@ def _review_payload(decision="pass", **kw):
 
 def test_review_fix_preserves_v1_fields():
     print("\n[P10] Audit fix rebuild 不丢 v1 字段(§40/§71)")
-    brief = GenerationBrief(requested_category="sci_fi")
+    brief = GenerationBrief(requested_category="brainstorm")
     # 谜面只追加一句(fair_clue 的 quote 仍在改后谜面里), 走 fix 分支
     fixed_puzzle = PUZZLE + "守塔人对此绝口不提。"
     fixed = _review_payload(
@@ -565,10 +634,10 @@ def test_review_fix_preserves_v1_fields():
         review_result=LLMResult(tool_input=fixed))
     check("fix 成题", bool(spec and spec.puzzle),
           (reason, _reject_of(_w)))
-    check("protocol_version 仍是 v1", spec.protocol_version == V1,
-          spec.protocol_version)
-    check("requested_category 仍是 sci_fi",
-          spec.requested_category == "sci_fi", spec.requested_category)
+    check("protocol_version 仍是 v2(代码字段, fix 不改)",
+          spec.protocol_version == V2, spec.protocol_version)
+    check("requested_category 仍是 brainstorm",
+          spec.requested_category == "brainstorm", spec.requested_category)
     check("prompt_version 仍是 Pack 版本",
           spec.prompt_version == HAIGUITANG_GENERATION_PROMPT_VERSION,
           spec.prompt_version)
@@ -604,8 +673,8 @@ def test_review_rewrite_lifecycle():
     spec, reason, _cli, _w = _run_pipeline(
         _v1_contract_payload(2),
         review_result=LLMResult(tool_input=_review_payload("pass")))
-    check("pass 成题且 protocol=v1",
-          bool(spec and spec.puzzle) and spec.protocol_version == V1,
+    check("pass 成题且 protocol=v2",
+          bool(spec and spec.puzzle) and spec.protocol_version == V2,
           (reason, getattr(spec, "protocol_version", None)))
     # rewrite: 坏候选不能伪装成成功 spec
     spec2, reason2, _cli2, _w2 = _run_pipeline(
@@ -647,7 +716,7 @@ def test_classic_and_curated_stay_legacy():
     # classic 链(emit_riddle)走 RIDDLE_SYSTEM, 产 legacy spec
     from story.llm import RIDDLE_SYSTEM  # noqa: F401  (常量仍在 = legacy 源)
     spec, reason, cli, w = _run_pipeline(_v1_contract_payload(2))
-    check("(前置)keyword2 产 v1", spec.protocol_version == V1,
+    check("(前置)keyword2 产 v2", spec.protocol_version == V2,
           spec.protocol_version)
     check("keyword2 链上没有 emit_riddle",
           all((c["tool"] or {}).get("name") != "emit_riddle"
@@ -831,9 +900,9 @@ def test_invalid_brief_fails_closed_before_any_llm_call():
 
     # 合法 brief 不受影响(require_valid 返回 self)
     check("合法 brief 通过 require_valid",
-          GenerationBrief(requested_category="sci_fi",
+          GenerationBrief(requested_category="emotion",
                           difficulty="hard").require_valid()
-          .requested_category == "sci_fi", "合法 brief 被误拒")
+          .requested_category == "emotion", "合法 brief 被误拒")
 
 
 # ======================================================================
@@ -844,6 +913,7 @@ def main():
     test_v1_tool_schema_matches_protocol()
     test_full_pipeline_v1_clean_and_pool()
     test_completion_2_3_4_all_clean_and_pool()
+    test_v2_generation_writes_v2_and_v2_categories()
     test_completion_1_and_5_rejected()
     test_missing_public_text_never_autofilled()
     test_requested_category_mismatch_end_to_end()

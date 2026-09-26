@@ -51,7 +51,11 @@ from pathlib import Path
 #: 版本", 写进成功 spec 的 `prompt_version` 与 metrics 的
 #: `prompt_pack_version`。它与 stage 文件版本(如 `truth-v1`)是两个
 #: 概念: 总版本变**或**任何一个 stage 文件变, 总版本都应 bump。
-HAIGUITANG_GENERATION_PROMPT_VERSION = "haiguitang-generation-v1"
+#:
+#: v2(5 大类协议): Contract / Audit 的分类语义从 11 类收敛成 5 大类
+#: (haiguitang-v2), 属于 generation prompt 的**行为变化** —— 总版本
+#: 必须 bump。Judging Pack 没有语义变化, **不**牵动。
+HAIGUITANG_GENERATION_PROMPT_VERSION = "haiguitang-generation-v2"
 
 #: 别名 —— 语义同上, 读起来更顺手的场合用。
 PROMPT_PACK_VERSION = HAIGUITANG_GENERATION_PROMPT_VERSION
@@ -83,8 +87,11 @@ JUDGING_PROMPT_ROOT = _PROJECT_ROOT / "haiguitang" / "prompts" / "judging"
 STAGES: dict = {
     "truth": ("truth-v1.md", "truth-v1"),
     "surface": ("surface-v1.md", "surface-v1"),
-    "contract": ("contract-v1.md", "contract-v1"),
-    "audit": ("audit-v1.md", "audit-v1"),
+    # ---- 5 大类协议 v2: Contract / Audit 的分类文字换 v2 文件 ----
+    # 历史 contract-v1.md / audit-v1.md **保留在盘上**(它们是 v1 时代
+    # 的合同文本, 不能覆盖其含义), 但当前生成链已指向 v2。
+    "contract": ("contract-v2.md", "contract-v2"),
+    "audit": ("audit-v2.md", "audit-v2"),
     "audit_truthfulness": ("audit-truthfulness-v1.md",
                            "audit-truthfulness-v1"),
     "audit_safety": ("audit-safety-v1.md", "audit-safety-v1"),

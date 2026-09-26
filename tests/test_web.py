@@ -1181,6 +1181,85 @@ window.addEventListener("load", async () => {
     }
 
 
+    // ================= puzzle_meta(5 大类协议 v2) =================
+    // 顶部正式元数据: "中等 · 悬疑 · 脑洞"。前端只渲染服务端下发的
+    // label(中文映射在后端); 空 metadata -> 整个元素干净隐藏。
+    {
+      const pm = document.getElementById("puzzle-meta");
+      check(!!pm, "M-0: #puzzle-meta 元素存在于 puzzle header");
+
+      // ① 完整渲染: 难度 + 两类, 顺序稳定, 分隔符 " · "
+      send({phase: "qa", puzzle_index: 60, story_index: 60,
+            puzzle: "元数据渲染测试。为什么？",
+            puzzle_meta: {difficulty: "medium", difficulty_label: "中等",
+                          primary_category: "suspense",
+                          primary_category_label: "悬疑",
+                          categories: ["suspense", "brainstorm"],
+                          category_labels: ["悬疑", "脑洞"]}});
+      check(pm.textContent === "中等 · 悬疑 · 脑洞",
+            "M-1: 应渲染 '中等 · 悬疑 · 脑洞', 实际 '" + pm.textContent + "'");
+      check(!pm.classList.contains("hidden"), "M-1: 有 metadata 时不隐藏");
+
+      // ② 顺序稳定: categories 顺序不变, 不被重排/去重错乱
+      send({puzzle_meta: {difficulty_label: "困难",
+                          category_labels: ["脑洞", "悬疑"]}});
+      check(pm.textContent === "困难 · 脑洞 · 悬疑",
+            "M-2: 顺序按服务端数组, 实际 '" + pm.textContent + "'");
+
+      // ③ 只有分类: 无前导/尾随分隔符
+      send({puzzle_meta: {primary_category: "horror",
+                          primary_category_label: "恐怖",
+                          categories: ["horror"], category_labels: ["恐怖"]}});
+      check(pm.textContent === "恐怖",
+            "M-3: 只有分类时应显示 '恐怖', 实际 '" + pm.textContent + "'");
+
+      // ④ 只有难度: 同样无分隔符
+      send({puzzle_meta: {difficulty: "easy", difficulty_label: "简单"}});
+      check(pm.textContent === "简单",
+            "M-4: 只有难度时应显示 '简单', 实际 '" + pm.textContent + "'");
+
+      // ⑤ 空 metadata -> 清空并隐藏(不显示"未知 · 未分类")
+      send({puzzle_meta: {}});
+      check(pm.textContent === "" && pm.classList.contains("hidden"),
+            "M-5: 空 metadata 应清空并隐藏, 实际 '" + pm.textContent + "'");
+      send({puzzle_meta: null});
+      check(pm.textContent === "" && pm.classList.contains("hidden"),
+            "M-5b: metadata 字段缺失时也应隐藏");
+
+      // ⑥ 防 stale: 第 60 题有 metadata -> SETTING(新题还没拿到) ->
+      //    metadata 立即清空 -> 第 61 题新 metadata 替换。
+      //    关键: SETTING 帧 puzzle_index 可能**没有**递增(服务端在
+      //    submit_riddle 才推进题号), 所以前端必须按"当前快照的
+      //    puzzle_meta"渲染, 不能等题号变化才清。
+      send({phase: "qa", puzzle_index: 60, story_index: 60,
+            puzzle: "旧题仍显示中。为什么？",
+            puzzle_meta: {difficulty_label: "中等",
+                          category_labels: ["悬疑"]}});
+      check(pm.textContent === "中等 · 悬疑", "M-6: 旧题 metadata 在显示");
+      send({phase: "setting", puzzle_index: 60, story_index: 60,
+            puzzle: "", puzzle_meta: {}});
+      check(pm.textContent === "" && pm.classList.contains("hidden"),
+            "M-6: SETTING(题号未变)必须立即清掉旧 metadata, 实际 '"
+            + pm.textContent + "'");
+      send({phase: "qa", puzzle_index: 61, story_index: 61,
+            puzzle: "新题的谜面。为什么？",
+            puzzle_meta: {difficulty_label: "困难",
+                          category_labels: ["脑洞", "情感"]}});
+      check(pm.textContent === "困难 · 脑洞 · 情感",
+            "M-6: 新题 metadata 正确替换, 实际 '" + pm.textContent + "'");
+
+      // ⑦ 安全纪律: label 全部走 textContent, 标签/属性不得被解析。
+      //    即使 enum 现在是代码控制, 也保持前端输入安全纪律。
+      send({puzzle_meta: {difficulty_label: "<b>注入</b>",
+                          category_labels: ["<img src=x onerror=window.__metaXss=1>"]}});
+      check(pm.querySelector("b") === null && pm.querySelector("img") === null,
+            "M-7: label 里的标签不得被解析成元素");
+      check(window.__metaXss === undefined, "M-7: 注入的 onerror 不得执行");
+      check(pm.textContent.includes("<b>注入</b>"),
+            "M-7: 标签应原样作为文本显示");
+    }
+
+
     //
     // 后台补题是运维概念, 不该泄漏给观众 —— 他们只该感受到
     // "看答案 60 秒 -> 下一题直接出现"。

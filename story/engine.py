@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 
 from .config import Config
 from . import parser as P
+from .haiguitang_protocol import public_puzzle_meta
 from .puzzle import PuzzleSignature, PuzzleSpec, runtime_spec_key
 from .state import (CMD_PREFIX, HINT_TOKENS, LEGACY_SKIP_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
@@ -127,6 +128,10 @@ class RoundEngine:
         # 观众群体**碰到过**哪些 fact(方案 §32)。判断提示方向时用。
         # 刻意叫 touched 不叫 discovered —— 问过 ≠ 确认为真。
         self._touched_fact_ids: set = set()
+        # 5 大类协议 v2: 当前题的**展示元数据**(难度/主题中文 label)。
+        # 由 `public_puzzle_meta` 在接受题时算好; SETTING 清空。
+        # 只进 Snapshot 的 puzzle_meta, 绝不回写 spec。
+        self._puzzle_meta: dict = {}
         self._candidate_count = 0        # 被标为"完整解释尝试"的提问数
         # 当前这题的完整 spec(方案 §49 的收拢方向; 现阶段与上面几个
         # 平铺字段并存, 供 archive 用)
@@ -894,6 +899,13 @@ class RoundEngine:
             self._solve_atoms = [_atom_dict(a) for a in (solve_atoms or [])]
             self._fair_clues = [_clue_dict(c) for c in (fair_clues or [])]
             self._spec = spec
+            # ---- 5 大类协议 v2: 当前题的展示元数据 ----
+            # 有结构化 spec 才有; legacy/兜底题 -> 空 dict(前端安静隐藏,
+            # 绝不显示"未知 · 未分类")。`public_puzzle_meta` 是确定性
+            # 纯函数(零 LLM / 零 I/O), v1 历史题在这里做**只读**展示
+            # 映射, 原始 spec 不被修改。
+            self._puzzle_meta = (public_puzzle_meta(spec)
+                                 if spec is not None else {})
             # ---- v5 通关合同 + 房间共同推理状态 ----
             #
             # **每道新题必须清零 established。** 不清零的话上一题的
@@ -2086,6 +2098,11 @@ class RoundEngine:
         self._solve_atoms = []
         self._fair_clues = []
         self._spec = None
+        # 5 大类协议 v2: 上一题的展示元数据必须清空 —— 否则会出现
+        # "AI 正在出第 13 题, 顶部还写着第 12 题的'中等 · 恐怖'"。
+        # 清空是**无条件的**(不依赖 puzzle_index 递增: SETTING 期间
+        # 下一题还没真正拿到, 新题号不一定已经变)。
+        self._puzzle_meta = {}
         # 运行时身份也一起清空(Batch B closeout): 新题还没被接受, 此刻
         # 任何带**上一题** key 的回调都必须被挡下 —— 那正是要防范的窗口。
         self._current_spec_key = ""
@@ -2742,6 +2759,11 @@ class RoundEngine:
                 puzzle_title=self._title,
                 puzzle_index=self._puzzle_index,
                 puzzle_elapsed_ms=elapsed,
+                # 5 大类协议 v2: 当前题的展示元数据。QA / REVEALING /
+                # REVEALED 都保留本题的(揭晓阶段顶部谜面还在显示);
+                # SETTING 期间已在 `_enter_setting_locked` 清空 ->
+                # 前端干净隐藏。
+                puzzle_meta=dict(self._puzzle_meta or {}),
                 revealed_answer=self._revealed,
                 revealed_core_answer=core_out,
                 revealed_full_answer=full_out,
