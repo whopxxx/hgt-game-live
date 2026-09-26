@@ -830,27 +830,33 @@ def test_prewarm_injection_reaches_playtest_gate():
 
     ## 为什么单列一条
 
-    `_finish_one` 里还有一处让路检查(试玩之前)。它默认**走不到** ——
+    `_finish_one` 里还有一处取消检查(试玩之前)。它默认**走不到** ——
     `playtest_enabled` 默认 False, 所以上面那两条预热用例根本不会经过
     它。于是"注入漏传到 `_finish_one`"这个变异**不会变红**(实测 M3)。
 
-    这正是本项目反复出现的形状: 一个机制有**多处**让路点, 测试只覆盖
+    这正是本项目反复出现的形状: 一个机制有**多处**检查点, 测试只覆盖
     了其中一处, 剩下的漏改也照样绿。所以这里显式打开试玩, 把那条路径
     逼出来。
 
     ## 断言的是什么
 
     预热 + 试玩都开着时, 试玩**必须真的跑**(`run` 被调用一次)。若
-    `_finish_one` 用的是后台判据 `self._should_continue`, 它在 IDLE 下
-    返回 False -> 试玩前让路 -> 整道题被丢弃 -> `run` 零调用。
+    `_finish_one` 用的是写死的后台判据 `_background_should_continue`,
+    它在 IDLE 下返回 False -> 试玩前中止 -> 整道题被丢弃 -> `run` 零调用。
+
+    另外还钉住**预热谓词必须按次传进 `run`**: 预热那份是 stop + deadline
+    的闭包, 与稳态实例谓词**不是同一个东西**。漏传会让预热试玩越过预算。
     """
     print("\n[G4-R1-P0d] 注入必须传到试玩前(否则该处漏改也看不出来)")
     with tmpdir() as d:
-        calls = {"run": 0}
+        calls = {"run": 0, "preds": []}
 
         class _PT:
-            def run(self, spec):
+            def run(self, spec, should_continue=None):
                 calls["run"] += 1
+                # ⚠️ 记录本次拿到的 override —— 这是"注入传到底"的
+                # 唯一可观测证据(见下面的断言)。
+                calls["preds"].append(should_continue)
                 from story.playtest import PASS, PlaytestResult
                 return PlaytestResult(status=PASS)
 
@@ -859,8 +865,18 @@ def test_prewarm_injection_reaches_playtest_gate():
         dr._prefetcher._playtester = _PT()
         check("试玩确实开着", dr._prefetcher._playtest_enabled() is True)
         dr._prewarm()
-        check("**试玩被真的调用了(说明没在 IDLE 上误让路)**",
+        check("**试玩被真的调用了(说明没在 IDLE 上误中止)**",
               calls["run"] == 1, calls["run"])
+        # 承重断言: 漏把 override 传进 `run` 时, 唯一会红的就是这一条。
+        check("**预热试玩拿到了按次的 override(不是 None)**",
+              len(calls["preds"]) == 1 and calls["preds"][0] is not None,
+              calls["preds"])
+        # 辅助: 它必须是**预热那份**(带 deadline), 不是稳态实例谓词 ——
+        # 传错对象同样会让预算失效。用 `is not` 比身份更稳。
+        check("**且它不是稳态那份实例谓词(预热 = stop + deadline)**",
+              calls["preds"] and calls["preds"][0]
+              is not dr._prefetcher._background_should_continue,
+              calls["preds"])
         after = dr._prefetcher._playable(
             dr._prefetcher._generation_inputs())
         check("**预热后 playable >= 1**", after >= 1, after)

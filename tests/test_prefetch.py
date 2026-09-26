@@ -36,6 +36,7 @@ from story.puzzle import (  # noqa: E402
     PuzzleSpec, SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.playtest import PASS, INTERRUPTED  # noqa: E402
 from story.quality import (  # noqa: E402
     FAMILY_SHAPES, QUALITY_POLICY_VERSION)
 from story.state import Phase  # noqa: E402
@@ -1119,7 +1120,8 @@ def _inline_threads():
 
 
 def _put_engine_in_qa(dr):
-    """让引擎进入 QA 阶段(补池的低压力门要求 phase == QA)。"""
+    """让引擎离开 IDLE —— 引擎有在播的题之后, Director 的 tick 才会
+    正常驱动补池(scheduler 那一拍不再被"没有在播的题"挡掉)。"""
     dr.engine.start()
     acts = dr.engine.submit_riddle(
         "端到端测试用谜面，为什么？", "端到端测试用谜底。",
@@ -2040,9 +2042,9 @@ class _GatedWriter:
     """可**在生成中途切换相位**的假 writer —— 复现实播那 51 秒。
 
     与 `_FakeWriter` 的区别: 它消费 `should_continue`, 在"每次昂贵
-    调用之前"检查一次(与真 `gen_spec` 的契约一致); 一旦让路就返回
+    调用之前"检查一次(与真 `gen_spec` 的契约一致); 一旦主动中止就返回
     一个 `metrics["interrupted"]=True`、puzzle 为空的 spec ——
-    **这正是真 gen_spec 让路时的返回形状**(error 留空, 因为它不是
+    **这正是真 gen_spec 主动中止时的返回形状**(error 留空, 因为它不是
     失败)。补池据此把它归到 `interrupted` 而不是 `gen_fail`。
 
     这不是"替身偷懒": 真 gen_spec 的检查点在
@@ -2070,7 +2072,7 @@ class _GatedWriter:
 
 
 def _interrupted_spec():
-    """真 `gen_spec` 让路时的返回形状: puzzle 空、**error 也空**。"""
+    """真 `gen_spec` 主动中止时的返回形状: puzzle 空、**error 也空**。"""
     s = good_spec()
     s.puzzle = ""
     s.error = ""
@@ -2082,8 +2084,8 @@ def test_g1_prefetch_passes_own_budget_not_live_budget():
     """**G1**: 后台补池必须用自己的预算, 不能吃 live 的 4 稿 / 90s。
 
     live 出一道题观众在干等, 多试一稿值得; 后台补池只是"有空补一道",
-    多试一稿的收益是池子里多一道题, 代价却是与直播抢网关 + 跨过
-    deadline 继续跑。
+    多试一稿的收益是池子里多一道题, 代价却是多占一份后台自己的调用
+    预算 + 跨过 deadline 继续跑。
     """
     print("\n[G1-A] 后台补池用独立预算")
     with tmpdir() as d:
@@ -2153,33 +2155,33 @@ def test_g1_stop_midflight_is_interrupted_not_fail():
     前身用"直播切 SETTING"制造谓词变 False; 现在唯一能让谓词变 False 的
     是 `request_stop()` / `shutdown()` —— 也就是**本次运行结束**。
     时间线: 请求已发出(无法取消) -> 停止信号到达 -> 返回时第一个检查点
-    就让路, 返回 interrupted spec。补池必须记 interrupted, **不记** gen_fail,
-    且不再启动第二稿。
+    就主动中止, 返回 interrupted spec。补池必须记 interrupted, **不记**
+    gen_fail, 且不再启动第二稿。
     """
     print("\n[G1-C] 中途停止: 不再出第二稿、不计失败")
     with tmpdir() as d:
         w = _GatedWriter()
         real = w.gen_spec
+        fired = {"n": 0}
 
         def gen_spec(**kw):
             # gen_spec 每次被调用时用**当前**的后台谓词 —— 等价于真
             # gen_spec 内部那条"每步之前重查一次"的契约。
             kw["should_continue"] = pf._background_should_continue
+            # ⚠️ 停止信号在** worker 体内**发出, 而不是在 `submit()` 里。
+            # 那正是真实时间线:"任务已经提交、HTTP 已经发出", 此刻收尾
+            # 信号到达 -> 下一次 stage 之前的检查点看到 False -> 收手。
+            # 在 `submit()` 里注入会与 `_submit_lock` 同线程重入(死锁),
+            # 因为"复查 stop + submit"现在是不可分割的一段。
+            if fired["n"] == 0:
+                fired["n"] += 1
+                pf.request_stop()
             return real(**kw)
 
         w.gen_spec = gen_spec
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
                   executor=_SyncExecutor(), pool_prefetch_max_attempts=2)
         fill(pf.pool, 1)
-        # 在 submit 之后、worker 真正跑之前置停止信号 —— 正是"下播那一刻
-        # 已发出的 HTTP 请求照旧返回, 但后续 stage 停手"的时间线。
-        real_submit = pf._executor.submit
-
-        def submit(fn, *a, **kw):
-            pf.request_stop()
-            return real_submit(fn, *a, **kw)
-
-        pf._executor.submit = submit
         pf.on_tick()                     # 提交 -> worker 立刻跑完
         check("发出了 1 次生成(已发出的请求无法取消)",
               len(w.calls) == 1, len(w.calls))
@@ -2386,7 +2388,7 @@ def test_g4c_playtest_runs_through_phase_switch():
         calls = {"run": 0}
 
         class _Playtester:
-            def run(self, spec):
+            def run(self, spec, should_continue=None):
                 # ⚠️ 只计数, 绝不抛 —— `_playtest()` 会把异常吞成
                 # (None, why), 于是断言里的 AssertionError 会静默。
                 calls["run"] += 1
@@ -2462,14 +2464,14 @@ def test_g4c_playtest_predicate_is_lifecycle_only():
 # 见 `mkcfg` 的说明), 并传一个实现了两条新方法的 `_KeywordWriter`。
 
 class _KeywordWriter:
-    """实现了 G2 两条新方法的假 writer。记录调用, 可编程地让路/失败。
+    """实现了 G2 两条新方法的假 writer。记录调用, 可编程地主动中止/失败。
 
     为什么不扩 `_FakeWriter`: 那个替身被 30+ 个既有用例共用, 给它加两条
     方法会让"这个替身到底实现了哪条链"变得含糊。新类只服务 G2 用例,
     意图更清楚。
 
     `stage_a_interrupt` / `stage_b_interrupt` 让用例在**中途某个阶段**
-    模拟"直播变忙" —— 那正是 §九 要求覆盖的四类窗口。
+    模拟一次主动中止(收到停止信号) —— 那正是 §九 要求覆盖的四类窗口。
 
     ## ⚠️ Stage A 的谜面**就是** `good_spec()` 那道题的谜面
 
@@ -2755,8 +2757,8 @@ def test_g2_stage_a_none_is_gen_fail():
 
 
 def test_g2_stage_a_interrupt_is_not_failure():
-    """Stage A 让路 -> interrupted, **不计失败不退避**。"""
-    print("\n[G2-5] Stage A 让路 -> interrupted(不是失败)")
+    """Stage A 主动中止 -> interrupted, **不计失败不退避**。"""
+    print("\n[G2-5] Stage A 主动中止 -> interrupted(不是失败)")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_a_interrupt=True))
         fill(pf.pool, 1)
@@ -2772,8 +2774,8 @@ def test_g2_stage_a_interrupt_is_not_failure():
 
 
 def test_g2_stage_b_interrupt_is_not_failure():
-    """Stage B 让路 -> interrupted, 不入池, 不计失败。"""
-    print("\n[G2-6] Stage B 让路 -> interrupted(不是失败)")
+    """Stage B 主动中止 -> interrupted, 不入池, 不计失败。"""
+    print("\n[G2-6] Stage B 主动中止 -> interrupted(不是失败)")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_b_interrupt=True))
         fill(pf.pool, 1)
@@ -2790,7 +2792,7 @@ def test_g2_stage_b_interrupt_is_not_failure():
 
 
 def test_g2_should_continue_blocks_before_stage_a():
-    """检查点 ①: Stage A **之前**就让路 -> 连 A 都不发。
+    """检查点 ①: Stage A **之前**就主动中止 -> 连 A 都不发。
 
     Phase C: 注入的谓词现在是 stop-only 的(`_background_should_continue`)。
     这里用**唯一**能真实触发它的手段 —— `request_stop()` —— 而不是像前身
@@ -2809,7 +2811,7 @@ def test_g2_should_continue_blocks_before_stage_a():
 
 
 def test_g2_should_continue_blocks_after_stage_a_before_stage_b():
-    """检查点 ②: Stage A 之后变忙 -> **Stage B 不调用**。
+    """检查点 ②: Stage A 之后收到停止信号 -> **Stage B 不调用**。
 
     这是新增 stage 之后最容易漏的一处: A 是一次几十秒的调用, 期间停止
     信号完全可能已经到达。
@@ -2822,7 +2824,7 @@ def test_g2_should_continue_blocks_after_stage_a_before_stage_b():
     with tmpdir() as d:
         w = _KeywordWriter()
         pf, _ = _mkpf_keyword(d, writer=w)
-        # 谓词: 第一次(A 之前)放行, 之后一律让路。
+        # 谓词: 第一次(A 之前)放行, 之后一律主动中止。
         state = {"n": 0}
 
         def gate():
@@ -3300,7 +3302,7 @@ def test_g4_provenance_records_vocab_and_seed():
 
 
 # ======================================================================
-# stable-refill: 直播 lease + 高水位 + 离线候选让路
+# stable-refill: 高水位 + 离线候选不越过直播窗口
 # ======================================================================
 def test_stable_refill_daemon_imports_and_defaults():
     print("\n[stable-refill] 守护脚本可 import，CLI 默认可解析")
@@ -3360,7 +3362,7 @@ def test_stable_refill_corrupt_heartbeat_is_idle():
 
 
 def test_stable_refill_candidate_never_adds_after_live_appears():
-    """直播在候选完成后才出现，也必须在 pool.add 前最后让路。"""
+    """直播在候选完成后才出现，也必须在 pool.add 前最后一次复查时中止。"""
     print("\n[stable-refill] live 出现后候选绝不入池")
     from prefill_pool import _PrefillSeeder, _one_keyword
 
@@ -3553,7 +3555,7 @@ def test_pc_d_candidate_survives_all_phases():
 def test_pc_e_background_continues_alongside_live_generation():
     """**E**: 后台正在生成 + 直播同时现场生成 -> 后台**继续**。
 
-    两条流水线共用上游网关但各有各的预算/客户端/单飞: 后台不因
+    两条流水线共用上游网关但各有各的预算/客户端/单飞: 后台**不因**
     "live 在忙"而让路(live 忙是 live 的事)。这里用"live 那条路占着
     writer"来模拟并发, 断言后台的谓词仍为 True。
     """
@@ -3583,7 +3585,7 @@ def test_pc_f_playtest_survives_phase_switch():
         calls = {"n": 0}
 
         class _PT:
-            def run(self, spec):
+            def run(self, spec, should_continue=None):
                 calls["n"] += 1
                 return PlaytestResult(status=PASS)
 
@@ -3633,15 +3635,13 @@ def test_pc_h_shutdown_midflight_is_interrupted_not_failed():
         w = _GatedWriter()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
                   executor=_SyncExecutor(), pool_prefetch_max_attempts=2)
-        w.gen_spec = _with_live_predicate(w.gen_spec, pf)
+        # ⚠️ 停止信号在 **worker 体内**(gen_spec 里)发出, 不在 `submit()`。
+        # 在 `submit()` 里注入会与 `_submit_lock` 同线程重入(死锁) ——
+        # "复查 stop + submit"现在是同一把锁下不可分割的一段。真实的
+        # shutdown 来自 Director 线程, 时序上正是"提交了、HTTP 在途,
+        # 此刻收尾" -> 后续 stage 的检查点看到 False 而收手。
+        w.gen_spec = _with_live_predicate(w.gen_spec, pf, stop=pf.shutdown)
         fill(pf.pool, 1)
-        real_submit = pf._executor.submit
-
-        def submit(fn, *a, **kw):
-            pf.shutdown()                   # 提交后立刻收手
-            return real_submit(fn, *a, **kw)
-
-        pf._executor.submit = submit
         _pc_tick(pf, 2)
         check("**记 interrupted**", pf.interrupted_count == 1,
               pf.interrupted_count)
@@ -3867,25 +3867,59 @@ def test_pc_s2_pending_result_still_accounted_after_stop():
 
     如果停止闸门把收账一起挡掉, `interrupted_count` 恰好在最该被看见的
     时刻(下播收尾)恒为 0 —— 运维会把一次正常停止读成"什么都没发生"。
+
+    真实时序是: 候选在**提交时**还没收到停止, 于是 worker 一路跑到
+    生成中途才看见停止 -> 返回"让路"形状 -> 结果落进 `_pending_result`,
+    但**这一拍来不及应用**(应用由下一拍的步骤 ② 做)。等下一拍到来时,
+    `gate` 已经为 False —— 收账**不能**被这道闸门一起挡掉, 否则
+    `interrupted_count` 恰好在最该被看见的时刻(下播收尾)恒为 0。
+
+    ⚠️ **停止信号不能放在 `submit()` 里, 也不能靠"第二拍再起一条"来造**。
+    `_submit_lock` 让 ⑩b 复查与 `submit` 成为不可分割的一段: 停止一旦
+    在提交之后到达, 那一拍就**零新提交**(见 `test_pc_u2`), 于是
+    "在途的 interrupted"根本不会新产生。所以这里必须让**第一拍**那条
+    候选自己跑成 interrupted —— 它是"停止之前就已提交"的合法在途,
+    结果留在槽位里等下一拍收账。
     """
     print("\n[PC-S2] 停止后仍收在途的账")
     with tmpdir() as d:
         w = _GatedWriter()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
                   executor=_SyncExecutor())
-        w.gen_spec = _with_live_predicate(w.gen_spec, pf)
+        # 让 writer 在生成中途就发现停止 -> 返回"让路"形状, 于是这一条
+        # 候选的终局结果是 interrupted, 但**提交发生在停止之前**。
+        state = {"stop_midgen": True}
+        real_gen = w.gen_spec
+
+        def gen(**kw):
+            if state["stop_midgen"]:
+                pf.request_stop()
+            return real_gen(**kw)
+
+        w.gen_spec = _with_live_predicate(gen, pf)
         fill(pf.pool, 1)
-        real_submit = pf._executor.submit
 
-        def submit(fn, *a, **kw):
-            pf.request_stop()
-            return real_submit(fn, *a, **kw)
+        # 第一拍: 提交(此时还没停) -> `_SyncExecutor` 就地跑完 worker,
+        # worker 在生成中途收到停止 -> 结果落进 `_pending_result`, 但
+        # **由下一拍步骤 ② 才应用**。
+        _pc_tick(pf, 1)
+        check("第一拍确实起了一个任务", len(w.calls) == 1, len(w.calls))
+        check("**第一拍的结果是 interrupted 且尚未收账**",
+              pf._pending_result is not None
+              and pf._pending_result[0] == "interrupted"
+              and pf.interrupted_count == 0,
+              (pf._pending_result, pf.interrupted_count))
 
-        pf._executor.submit = submit
-        _pc_tick(pf, 2)
-        check("**停止后那次在途被记成 interrupted**",
+        # 第二拍: gate 已 False(不再起新活), 但步骤 ② 必须照收旧账。
+        _pc_tick(pf, 1)
+
+        check("**停止后那次在途被收账**",
               pf.interrupted_count == 1, pf.interrupted_count)
-        check("**停止后没有第二次提交**", len(w.calls) == 1, len(w.calls))
+        check("**且不计失败/不退避(它是收尾不是故障)**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0,
+              (pf._fail_streak, pf._retry_at))
+        check("**停止后不再起新活(⑩b 复查拦下)**",
+              len(w.calls) == 1, len(w.calls))
 
 
 def test_pc_t_director_stops_background_at_phase_stopped():
@@ -3905,6 +3939,502 @@ def test_pc_t_director_stops_background_at_phase_stopped():
         check("**且 executor 尚未被回收(request_stop 只置信号)**",
               dr._prefetcher._executor is not None)
         dr.close()
+
+
+# ======================================================================
+# PC-U/V/W: 复审三个 lifecycle/concurrency blocker 的回归
+#
+# 这三组不是"加功能", 而是把三个**已修的缝**钉住。它们共同的形状是:
+# 旧实现在某个**边界**上没有线性化/检查点/传参, 于是能构造出
+# "已经停止却还在提交 / 还在写入 / 还在烧 LLM 轮次"。每条都做过
+# 变异测试(把修法删掉必须变红), 否则断言不承重。
+# ======================================================================
+
+def _PT(pf=None, status=None, stop_on_run=False, rounds=None):
+    """试玩替身: 可编程地"跑一次就停"或"被 deadline 拦下"。
+
+    记录的是**谓词对象本身**(`preds`)而不是它这次的结果 —— 后者在
+    "谓词恒真"时会恒过, 抓不到"漏传 override"这种变异。
+    """
+    from story.playtest import PASS, PlaytestResult
+
+    class _Double:
+        def __init__(self):
+            self.calls = []
+            self.preds = []
+
+        def run(self, spec, should_continue=None):
+            self.calls.append(spec)
+            self.preds.append(should_continue)
+            if stop_on_run and pf is not None:
+                pf.request_stop()
+            return PlaytestResult(status=status or PASS)
+
+    return _Double()
+
+
+class _DeadlinePT:
+    """试玩替身: 每轮昂贵调用**之前**问一次谓词, 模拟"烧 LLM 轮次"。
+
+    真 `Playtester._run_inner` 的契约就是**每轮重查谓词**; 这里如实地
+    逐轮问, 于是"谓词在第 i 轮变 False"这件事能被观察到。
+
+    关键指标是 `rounds_after_deadline`: 谓词从第 `expire_after` 轮起
+    开始返回 False, 若真被拦下, 这个值恒为 0; 若 prefetch 没把 override
+    传进来(走实例恒真谓词), 它会一路问到 `max_rounds`,
+    `rounds_after_deadline > 0` -> 红。
+    """
+
+    def __init__(self, pf, allow_rounds=1, max_rounds=5):
+        self.pf = pf
+        self.allow_rounds = allow_rounds
+        self.max_rounds = max_rounds
+        self.rounds_after_deadline = 0
+        self.calls = []
+        self.preds = []
+
+    def run(self, spec, should_continue=None):
+        from story.playtest import INTERRUPTED, PASS, PlaytestResult
+        self.calls.append(spec)
+        self.preds.append(should_continue)
+        if should_continue is None:
+            should_continue = self.pf._background_should_continue
+        for i in range(self.max_rounds):
+            if i >= self.allow_rounds:
+                # 此后"deadline 已过"：谓词必须开始返回 False。
+                if should_continue():
+                    # 谓词仍说可以继续 -> 说明 override 没生效。
+                    self.rounds_after_deadline += 1
+                    continue
+                return PlaytestResult(status=INTERRUPTED)
+        return PlaytestResult(status=PASS)
+
+
+class _NullWriter:
+    """`Playtester` 需要的**最小** writer —— W3 只测 run 的谓词语义。"""
+
+    def ask(self, *a, **kw):            # pragma: no cover - 不该被调用
+        raise AssertionError("W3 不该真的发 LLM 调用")
+
+
+
+def test_pc_u_submit_lock_is_separate_from_state_lock():
+    """**U (Blocker 1)**: 线性化锁必须**独立于** `_lock`。
+
+    为什么不能塞回 `_lock`: `submit` 必须在 `_lock` **之外**(见
+    `_on_tick_locked_ish` 的论证 —— 同步替身会在 `submit` 里就地跑完
+    worker, worker 结尾要拿 `_lock`, 非重入锁上直接死锁)。若把提交段
+    塞回 `_lock`, 要么死锁, 要么得放弃"submit 在锁外"这条前提。
+
+    这条用**源码级**断言(与 `test_no_guard_machinery_remains` 的 grep
+    纪律一致): 它钉的是"存在两把锁、且提交段与 request_stop 共用第二把"
+    这个**结构事实**, 而结构事实无法用行为断言稳定地表达。
+    """
+    print("\n[PC-U] 提交线性化锁与状态锁分离")
+    import inspect
+    from story.prefetch import PoolPrefetcher
+    with tmpdir() as d:
+        pf = mkpf(d)
+        check("**两把锁是两个不同的对象**",
+              pf._submit_lock is not pf._lock,
+              (type(pf._submit_lock).__name__, type(pf._lock).__name__))
+        # 必须是可重入的: 同步替身让 worker 在 `submit()` 内联跑完,
+        # worker 可能同线程再调 request_stop / shutdown。
+        check("**提交锁可重入(同步替身会同线程重入)**",
+              isinstance(pf._submit_lock, type(__import__("threading")
+                                               .RLock())),
+              type(pf._submit_lock).__name__)
+
+        src_stop = inspect.getsource(PoolPrefetcher.request_stop)
+        check("**request_stop 在 `_submit_lock` 下置位**",
+              "_submit_lock" in src_stop, src_stop.splitlines()[:3])
+        src_act = inspect.getsource(PoolPrefetcher.activate_background)
+        check("**activate_background 也在 `_submit_lock` 下**",
+              "_submit_lock" in src_act, src_act.splitlines()[:3])
+        src_tick = inspect.getsource(PoolPrefetcher._on_tick_locked_ish)
+        # ⑩b: 提交段里必须**复查**停止信号, 否则出锁到 submit 之间
+        # 到达的 stop 会让"停止之后仍然提交一条新候选"。
+        check("**提交段复查 `_shutdown_event`(⑩b)**",
+              "_shutdown_event.is_set()" in src_tick, None)
+        # 撤销 `_PENDING` 的那一行 —— 忘掉它就是单飞被永久占死。
+        check("**复查命中时撤销 `_PENDING`(单飞不被占死)**",
+              src_tick.count("_future = None") >= 1, None)
+
+
+def test_pc_u2_stop_in_the_window_between_pending_and_submit():
+    """**U2 (Blocker 1)**: stop 落在"⑩ 占位之后、真提交之前" -> 撤销占位且零提交。
+
+    这是 ⑩b 复查真正要拦的那一刻。**不能用"先手工置 `_PENDING` 再 tick"
+    来构造** —— 那样会先撞上步骤 ⑨ 的单飞守卫(`_future is not None`
+    直接 return), ⑩b 根本到不了。真实的缝是:
+
+        同一拍 tick: ⑨ 通过 -> ⑩ `_future = _PENDING` -> 出 `_lock`
+        ↓  **并发线程**在这条缝里跑完 `request_stop()`
+        ↓  进 `_submit_lock` -> ⑩b 复查到 stop -> 撤销 + 不提交
+
+    所以这里**精确地把 stop 注入到 `_submit_lock` 被获取的那一刻** ——
+    也就是"⑩ 已占位、⑩b 复查尚未读到"的那个点。这种注入方式同时也
+    证明了线性化边界存在: stop 只要抢在提交段之前拿到锁, 提交段就
+    一定能看见它。
+
+    四个断言:
+      * `_future is None`  —— 撤销 ⑩ 占位(忘掉就是单飞永久占死);
+      * `total == 0`       —— 零提交(这就是 blocker 本身);
+      * 账目零变动          —— 这活**没开始**, 不能记失败/退避/interrupted。
+    """
+    print("\n[PC-U2] stop 抢在提交段之前 -> 撤销占位且零提交")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w, executor=ex)
+        fill(pf.pool, 1)
+
+        # 把 `request_stop()` 注入到"提交段拿到 `_submit_lock` 的那一刻":
+        # 复现"⑩ 已占 `_PENDING`、⑩b 复查还没读到"的真实时序。
+        class _StopOnSubmitLockEnter:
+            def __init__(self, real, pfx):
+                self._real, self._pfx, self._fired = real, pfx, False
+
+            def __enter__(self):
+                if not self._fired:
+                    self._fired = True
+                    self._pfx.request_stop()
+                return self._real.__enter__()
+
+            def __exit__(self, *a):
+                return self._real.__exit__(*a)
+
+        pf._submit_lock = _StopOnSubmitLockEnter(pf._submit_lock, pf)
+
+        pf._on_tick_locked_ish(gate=True)
+
+        check("停止信号确实已置位", pf._shutdown_event.is_set() is True)
+        check("**占位被撤销(单飞不被永久占死)**",
+              pf._future is None, pf._future)
+        check("**零提交**", ex.total == 0, ex.total)
+        check("**不记失败/不退避/不记 interrupted(这活没开始)**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0
+              and pf.interrupted_count == 0,
+              (pf._fail_streak, pf._retry_at, pf.interrupted_count))
+        # 下一拍也不该起活(信号仍在)。
+        pf._on_tick_locked_ish(gate=True)
+        check("**后续拍仍零提交**", ex.total == 0, ex.total)
+
+
+def test_pc_u3_activate_after_stop_does_not_revive():
+    """**U3 (Blocker 1)**: `request_stop()` 之后 `activate_background()` 不得复活。
+
+    `activate_background()` 原来是**裸的** check-then-set:
+    "读 `_shutdown_event` -> 若未置位则 set `_background_active`" 两步
+    之间能被并发 `request_stop()` 插进来, 于是"停止之后又被复活激活"。
+    它现在与 `request_stop()` 共用 `_submit_lock`, 于是两者两两线性化。
+
+    这里单线程复现等价时序: 先 stop, 再 activate。
+    """
+    print("\n[PC-U3] 停止之后 activate 不得复活后台")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=ex, background_active=False)
+        fill(pf.pool, 1)
+
+        pf.request_stop()
+        pf.activate_background()
+        check("**停止后 activate 不会置位 `_background_active`**",
+              pf._background_active.is_set() is False,
+              pf._background_active.is_set())
+        # 后续多拍零提交: 复活若发生, 这里会红。
+        _pc_tick(pf, 10)
+        check("**停止 + 假 activate 之后 10 拍仍零提交**",
+              ex.total == 0, ex.total)
+        check("**后台谓词恒 False**",
+              pf._background_should_continue() is False)
+
+
+def test_pc_v_no_pool_add_when_stop_arrives_during_playtest():
+    """**V (Blocker 2)**: 试玩"成功"了但 stop 已到 -> 不得 `pool.add()`。
+
+    最坏形状: 生成链 + 整个试玩都跑完(试玩返回 PASS), 才在提交前收到
+    停止。旧实现的最后一次谓词检查在**试玩开始前**, 之后到 `pool.add`
+    之间(最坏 2N 次 LLM 调用)零检查点 —— 于是停止后仍会写入一道库存。
+
+    这里用**同步** executor: worker 在 `submit()` 内联跑完, 试玩替身在
+    `run()` 里先 `request_stop()` 再返回 PASS。于是走到 `pool.add` 紧前
+    那道检查点时, 谓词必为 False。
+
+    断言刻意包含"账目形状": 记 interrupted(候选确实走完了生成链),
+    **不**记失败/退避, **不**记 added; 且 detail 必须读起来像正常收尾,
+    不能出现旧架构的"直播变忙"。
+    """
+    print("\n[PC-V] 试玩通过但已停止 -> pool.add 不调用")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor(), playtest_enabled=True)
+        w.gen_spec = _with_live_predicate(w.gen_spec, pf)
+        fill(pf.pool, 1)
+
+        pt = _PT(pf, status=PASS, stop_on_run=True)
+        pf.set_playtester(pt)
+
+        adds = {"n": 0}
+        real_add = pf.pool.add
+
+        def counting_add(spec, **kw):
+            adds["n"] += 1
+            return real_add(spec, **kw)
+
+        pf.pool.add = counting_add
+
+        _pc_tick(pf, 2)
+
+        check("**试玩确实跑到了(证明缝在试玩之后)**",
+              len(pt.calls) == 1, len(pt.calls))
+        check("**pool.add 零调用**", adds["n"] == 0, adds["n"])
+        check("**记一次 interrupted**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("**不计 added**", pf.added_count == 0, pf.added_count)
+        check("**不计失败、不退避**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0,
+              (pf._fail_streak, pf._retry_at))
+        check("**被丢弃的 PASS 不污染试玩通过率**",
+              pf.playtest_pass_count == 0, pf.playtest_pass_count)
+
+
+def test_pc_v2_pre_add_checkpoint_also_covers_playtest_off():
+    """**V2 (Blocker 2)**: 试玩**关着**时, gen 返回 -> `pool.add` 之间同样有检查点。
+
+    这是 Blocker 2 最容易漏的一半。修法若只写在
+    `if self._playtest_enabled():` 里, 那么**默认配置**(试玩关闭)下
+    从生成链返回到 `pool.add` 仍是零检查点 —— 一个都没修。
+    那正是 `prefill_pool.py` 里"候选完成后、pool.add 之前"补过的同一个洞。
+
+    这里让 writer 在**返回前**置停止(即 gen 成功返回, 但停止已到),
+    断言零 `pool.add`。
+    """
+    print("\n[PC-V2] 试玩关闭时提交前检查点仍然生效")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor())      # 试玩默认关闭
+        check("试玩确实关着", pf._playtest_enabled() is False)
+
+        state = {"stop": False}
+        real_gen = w.gen_spec
+
+        def gen(**kw):
+            # 先出稿, 返回前才停 —— 停止信号落在 gen 内部最后一段,
+            # 于是 ① (试玩前) 整段被跳过, 只剩 ③ 能拦。
+            spec = real_gen(**kw)
+            if state["stop"]:
+                pf.request_stop()
+            return spec
+
+        w.gen_spec = _with_live_predicate(gen, pf)
+        state["stop"] = True
+        fill(pf.pool, 1)
+
+        adds = {"n": 0}
+        real_add = pf.pool.add
+
+        def counting_add(spec, **kw):
+            adds["n"] += 1
+            return real_add(spec, **kw)
+
+        pf.pool.add = counting_add
+        _pc_tick(pf, 2)
+
+        check("**pool.add 零调用(试玩关着也拦得住)**",
+              adds["n"] == 0, adds["n"])
+        check("**记一次 interrupted**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+
+
+def test_pc_v3_both_checkpoints_exist_and_ordered():
+    """**V3 (Blocker 2)**: 两个检查点都在, 且提交前那个在 `pool.add` **之前**。
+
+    白盒的**结构**断言: `_finish_one` 里必须有**两处**
+    `if not should_continue():` —— 少一处就是少一层检查(① 省下 N 次
+    LLM 调用, ③ 省下一次写入, 语义不同、不可合并)。并且第二处必须
+    出现在 `self.pool.add` **之前** —— 否则它拦不住任何东西。
+
+    还要求两处用的是**注入的** `should_continue` 而不是写死的实例谓词
+    —— 否则预热路径那份带 deadline 的谓词在 ③ 处失效(Blocker 3 会
+    被这条一并破掉)。
+    """
+    print("\n[PC-V3] 两个提交检查点都在且有序")
+    import inspect
+    from story.prefetch import PoolPrefetcher
+    src = inspect.getsource(PoolPrefetcher._finish_one)
+    n = src.count("if not should_continue():")
+    check("**`_finish_one` 里恰有两个 should_continue 检查点**",
+          n == 2, n)
+    idx_last = src.rfind("if not should_continue():")
+    idx_add = src.find("self.pool.add")
+    check("**第二处在 `self.pool.add` 之前**",
+          0 <= idx_last < idx_add, (idx_last, idx_add))
+    check("**用的是注入的谓词, 不是写死的实例谓词**",
+          "_background_should_continue()" not in src,
+          src.count("_background_should_continue"))
+
+
+def _mk_prewarm_pf(tmp, executor=None, **cfgkw):
+    """建一个**预热态**的 prefetcher: 未 activate。
+
+    预热路径在生产里是 `Director._prewarm()` 直接调
+    `_generate_one_inner(inputs, should_continue=sc)` —— 绕过 `_future`
+    单飞。这里如实复现那一跳。
+    """
+    return mkpf(tmp, executor=executor or _SyncExecutor(),
+                background_active=False, **cfgkw)
+
+
+def test_pc_w_prewarm_playtest_gets_deadline_predicate():
+    """**W (Blocker 3, 核心)**: 预热 deadline 必须**贯穿到试玩内部**。
+
+    旧实现: `Playtester.__init__` 一次性捕获实例谓词, `run(spec)` 不收
+    谓词。于是 `_finish_one` 的 `should_continue`(预热时 = stop +
+    deadline)只用在试玩**开始前**那道 guard, 之后被丢弃 —— 预热试玩
+    越过 deadline 后继续烧 LLM 轮次。
+
+    修法: `Playtester.run(spec, should_continue=...)` 支持**本次调用**
+    的 override, `_finish_one` 把那份带 deadline 的谓词传进去。
+
+    ⚠️ 真 deadline 走 `time.monotonic()`(不可注入), 所以这里用一个
+    **从第 N 轮起翻假**的谓词来等价地表达"预算在第 N 轮之前耗尽":
+      * 若设成"一开始就 False", 会先被 ① 那道 guard 拦下, 只测到旧行为;
+      * 必须让 ① 放行、由试玩**内部**的逐轮检查拦下, 才证明 override
+        真的贯穿进去了。
+    """
+    print("\n[PC-W] 预热 deadline 贯穿到试玩内部")
+    with tmpdir() as d:
+        pf = _mk_prewarm_pf(d, playtest_enabled=True)
+        w = pf.writer
+        fill(pf.pool, 1)
+
+        # 预热谓词: 前 `ALLOW + 1` 次调用放行, 之后一律 False。
+        #
+        # 为什么是 `ALLOW + 1`: `_finish_one` 里有两处会问谓词 ——
+        #   ① 试玩开始前那道 guard  (问 1 次)
+        #   ② 试玩**内部**的逐轮检查 (让 `ALLOW` 轮放行)
+        # 要证明"override 贯穿到试玩**内部**", 就必须让 ① 放行、由试玩
+        # 内部的检查点拦下 —— 否则只测到 ① 的旧行为(它在修 Blocker 3
+        # 之前就存在, 不承重)。
+        # 预算: 只让 **① 那道 guard** 放行(它就问掉第 1 次); 从
+        # 试玩**内部**的第 1 轮起必须为 False。于是"① 放行 + 内部拦下"
+        # 这个形状被精确构造出来 —— 拦点一定在试玩内部, 不承重的
+        # 旧 guard 拦不住它。
+        calls = {"n": 0}
+
+        def sc() -> bool:
+            calls["n"] += 1
+            return calls["n"] <= 1
+
+        # `allow_rounds=0`: 内部**第 1 轮**就要检查谓词。
+        pt = _DeadlinePT(pf, allow_rounds=0)
+        pf.set_playtester(pt)
+
+        spec = w.gen_spec(should_continue=sc)
+        kind, detail, extra = pf._finish_one(spec, {}, sc)
+
+        check("**预热试玩被内部检查点拦下(override 真的传进去了)**",
+              pt.rounds_after_deadline == 0, pt.rounds_after_deadline)
+        check("**试玩确实收到了 override 谓词**",
+              pt.preds and pt.preds[0] is not None, pt.preds)
+        check("**拦在试玩内部, 不是试玩开始前那道 guard**",
+              len(pt.calls) == 1, len(pt.calls))
+        # 结果**不是** `interrupted` 而是 `playtest_interrupted` —— 这
+        # 正是正确的语义: 被中止的是**这次试玩**(deadline 到了), 与
+        # "整个运行停止 -> interrupted"是两类账。`_apply_result` 会按
+        # `extra["playtest"]` 记一次 `playtest_interrupted_count`, 并按
+        # `extra["interrupted"]` 免退避。
+        check("**结果是 playtest_interrupted(试玩被 deadline 中止)**",
+              kind == "playtest_interrupted", (kind, detail))
+        check("**免退避(extra 标记 interrupted)**",
+              extra.get("interrupted") is True, extra)
+        check("**没入池**", pf.added_count == 0, pf.added_count)
+
+
+def test_pc_w2_steady_state_playtest_uses_instance_predicate():
+    """**W2 (Blocker 3)**: 稳态试玩不传 override -> 用实例谓词(逐位不变)。
+
+    反证: 实例谓词**恒真**且已 `request_stop()` 时, 稳态试玩**不**中断
+    —— 证明稳态路径**不读** `_shutdown_event`(实例谓词不包含 stop)。
+    这是"override 是 replace 而非 AND"的另一半证据: 稳态没有被悄悄
+    塞进 stop 语义。
+    """
+    print("\n[PC-W2] 稳态试玩走实例谓词")
+    with tmpdir() as d:
+        pf = mkpf(d, playtest_enabled=True)
+        pt = _PT(pf, status=PASS)
+        pf.set_playtester(pt)
+        pf.request_stop()               # 实例谓词恒真, 不受它影响
+        got, _ = pf._playtest(good_spec())
+        check("**不传 override 时仍然跑完试玩**", pt.calls and len(pt.calls) == 1,
+              len(pt.calls))
+        check("**override 参数确实为 None(走实例谓词)**",
+              pt.preds == [None], pt.preds)
+
+
+def test_pc_w3_override_replaces_not_ands():
+    """**W3 (Blocker 3)**: override 是 **replace**, 不是 AND。
+
+    依据: `prewarm_should_continue._go()` 先查 `should_abort` 再查
+    `deadline` —— 预热谓词**已经包含 stop**。再 AND 一次实例谓词是
+    同一件事做两遍, 而且会让"实例谓词恒假"这种测试配置下无法表达
+    "本次调用放行"。
+
+    这条是**唯一**把 replace 语义写进契约的测试: 若有人误改成
+    `lambda: inst() and ov()`, 这里立刻红。
+    """
+    print("\n[PC-W3] override replace 而非 AND")
+    from story.playtest import Playtester
+    # 实例谓词恒假、override 恒真 -> 必须**正常跑完**。
+    # `Playtester(player_client, host_writer, should_continue=..., ...)`。
+    pt = Playtester(_NullWriter(), _NullWriter(),
+                    should_continue=lambda: False,
+                    max_turns=2, clock=lambda: 0.0)
+    r = pt.run(good_spec(), should_continue=lambda: True)
+    check("**实例谓词恒假但 override 恒真 -> 未被中断**",
+          r.status != "interrupted", r.status)
+
+
+def test_pc_w4_finish_one_threads_predicate_into_playtest():
+    """**W4 (Blocker 3)**: `_finish_one` 必须把谓词**传进** `_playtest`。
+
+    防漏传的变异测试: 删掉 `_playtest(spec, should_continue)` 里的
+    第二个实参 -> 这里红。记录的是"传进来的谓词对象本身不是 None",
+    而不是它这次的结果 —— 后者会因谓词恒真而恒过, 抓不到漏传。
+    """
+    print("\n[PC-W4] _finish_one 把谓词传进试玩")
+    with tmpdir() as d:
+        pf = mkpf(d, playtest_enabled=True)
+        pt = _PT(pf, status=PASS)
+        pf.set_playtester(pt)
+        pf._finish_one(good_spec(), {}, lambda: True)
+        check("**试玩收到非 None 的 override**",
+              pt.preds and pt.preds[0] is not None, pt.preds)
+        check("**且传的正是同一个对象**",
+              pt.preds[0] is not None and pt.preds[0]() is True, pt.preds)
+
+
+def test_pc_w5_playtester_run_signature_accepts_optional_predicate():
+    """**W5 (Blocker 3)**: `Playtester.run` 的签名固化。
+
+    把"~25 个单参调用点不红(向后兼容)"从口头约定变成可执行断言:
+    `should_continue` 必须是**可选**的(默认 None), 否则老调用点全红。
+    """
+    print("\n[PC-W5] Playtester.run 签名接受可选谓词")
+    import inspect
+    from story.playtest import PASS, Playtester
+    sig = inspect.signature(Playtester.run)
+    params = list(sig.parameters)
+    check("**参数表为 self, spec, should_continue**",
+          params == ["self", "spec", "should_continue"], params)
+    check("**should_continue 默认 None**",
+          sig.parameters["should_continue"].default is None,
+          sig.parameters["should_continue"].default)
 
 
 def _mk_director_for_pc(tmp, executor):
@@ -3951,14 +4481,28 @@ class _PCDirector:
                 pass
 
 
-def _with_live_predicate(gen_spec, pf):
+def _with_live_predicate(gen_spec, pf, stop=None):
     """把 `gen_spec` 包成"每次调用都用**当前**的后台谓词"。
 
     真 `gen_spec` 的契约是"每个昂贵 stage 之前重查一次谓词"。替身只查
     一次, 所以这里必须**在调用时刻**取谓词, 否则 `request_stop()` 在
     提交之后到达就测不出来。
+
+    `stop`: 可选的"收尾动作"(通常是 `pf.request_stop` 或 `pf.shutdown`)。
+    给它就在**第一次**调用时、查谓词**之前**先执行 —— 用来复现"任务已经
+    提交、HTTP 在途, 此刻收尾信号到达"的真实时序。
+
+    ⚠️ 收尾信号必须从**这里**(worker 体内)发出, 不能从 `submit()` 里
+    发出:`_submit_lock` 让"复查 stop + submit"成为不可分割的一段,
+    从 `submit()` 里调 `request_stop()`/`shutdown()` 会**同线程重入
+    非重入锁 -> 自死锁**。
     """
+    fired = {"n": 0}
+
     def wrapped(**kw):
+        if stop is not None and fired["n"] == 0:
+            fired["n"] += 1
+            stop()
         kw["should_continue"] = pf._background_should_continue
         return gen_spec(**kw)
     return wrapped
@@ -4049,7 +4593,7 @@ def main():
         test_g1_stopped_prefetcher_never_submits_again,
         test_g1_backoff_schedule_increases_then_caps,
         test_refill_active_keeps_technical_backoff_short_until_target,
-        # ---- G4-C: 试玩前让路 ----
+        # ---- G4-C: 试玩不因相位切换中止 ----
         test_g4c_playtest_runs_through_phase_switch,
         test_g4c_playtest_predicate_is_lifecycle_only,
         test_g1_success_resets_backoff_streak,
@@ -4102,6 +4646,18 @@ def main():
         test_pc_s_stop_before_executor_shutdown_blocks_submit,
         test_pc_s2_pending_result_still_accounted_after_stop,
         test_pc_t_director_stops_background_at_phase_stopped,
+        # ---- PC-U/V/W: 复审三个 lifecycle/concurrency blocker ----
+        test_pc_u_submit_lock_is_separate_from_state_lock,
+        test_pc_u2_stop_in_the_window_between_pending_and_submit,
+        test_pc_u3_activate_after_stop_does_not_revive,
+        test_pc_v_no_pool_add_when_stop_arrives_during_playtest,
+        test_pc_v2_pre_add_checkpoint_also_covers_playtest_off,
+        test_pc_v3_both_checkpoints_exist_and_ordered,
+        test_pc_w_prewarm_playtest_gets_deadline_predicate,
+        test_pc_w2_steady_state_playtest_uses_instance_predicate,
+        test_pc_w3_override_replaces_not_ands,
+        test_pc_w4_finish_one_threads_predicate_into_playtest,
+        test_pc_w5_playtester_run_signature_accepts_optional_predicate,
     ]
     for t in tests:
         t()

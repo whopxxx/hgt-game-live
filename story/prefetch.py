@@ -295,6 +295,45 @@ class PoolPrefetcher:
         # 刻意**不**复用 Director 的 _narrating: 那个锁是出题用的, 补池
         # 持它会把 live 出题挤成"推迟到下一拍" —— 优先级完全倒过来。
         self._lock = threading.Lock()
+        #: 生命周期/submit **线性化锁**。⚠️ 与 `_lock` 是**两把**锁, 别合并。
+        #:
+        #: 为什么必须分开: `submit` 必须在 `_lock` 之外(见
+        #: `_on_tick_locked_ish` 的论证 —— submit 可能阻塞, 且同步替身会
+        #: 在 submit 里就地跑完 worker, worker 结尾要拿 `_lock`, 非重入
+        #: 锁上直接死锁)。于是"把 stop 信号与最终 submit 排成先后"这件事
+        #: 没有锁可依 —— 必须由**另一把**锁提供。
+        #:
+        #: 它守护的不变量只有一条: **一旦 `_shutdown_event` 可见地置位,
+        #: 就绝不会再有新的 `submit`**。`request_stop()` / `activate_background()`
+        #: 与 tick 的提交段都在它下面, 于是三者两两线性化。
+        #:
+        #: ## 锁序(死锁防护, 不是风格)
+        #:
+        #:   唯一合法方向: `_submit_lock` → `_lock`(外层 `_submit_lock`,
+        #:   内层可再取 `_lock`)。`_lock` 内**绝不**回头取 `_submit_lock`。
+        #:
+        #: 之所以不是"两把锁永不嵌套": 提交段里"撤销 `_PENDING` / 回填
+        #: future"这两个子块必须原子(否则第二拍 tick 会看到半截状态而
+        #: 破坏单飞), 所以它们必须在 `_submit_lock` 内再进 `_lock`。
+        #: 方向单一 + `_lock` 内从不取 `_submit_lock`, 就不会成环。
+        #:
+        #: 持有者只有三个: `request_stop()` / `activate_background()` /
+        #: `_on_tick_locked_ish` 的提交段。
+        #:
+        #: ## 为什么是 `RLock` 而不是 `Lock`
+        #:
+        #: 它必须是**可重入**的。原因很具体: 提交段持着它调
+        #: `executor.submit()`; 而同步执行的替身(测试用)会在这把锁内部
+        #: 就地跑完整个 worker, worker 又可能调 `request_stop()` /
+        #: `shutdown()` —— 那是**同一线程**重入。普通 `Lock` 会自死锁。
+        #:
+        #: 这不是只为测试让步: "生成链发现致命错误 -> 主动收手"是未来
+        #: 完全可能出现的生产形状(worker 自己调 stop)。把它做成不可重入
+        #: 等于埋一颗雷。`RLock` 只放行**同一线程**重入, 跨线程的互斥
+        #: 与 `Lock` 完全一致 —— 于是"stop 与 submit 的线性化"这条不变量
+        #: 一字不变: 另一个线程的 `request_stop()` 仍然必须等提交段走完
+        #: (或抢在它前面, 让提交段复查到并放弃)。
+        self._submit_lock = threading.RLock()
         self._future: Optional[Future] = None
         self._refill_active = False        # latch(滞回)
         self._retry_at = 0.0               # 退避到期时刻(monotonic)
@@ -405,10 +444,14 @@ class PoolPrefetcher:
 
         幂等: 重复调用无副作用。
         """
-        if self._shutdown_event.is_set():
-            # 已经决定停止 -> 不再激活(否则 stop 之后 activate 会把它复活)。
-            return
-        self._background_active.set()
+        # 与 `request_stop()` 共用 `_submit_lock`: 否则这里是裸的
+        # check-then-set, 并发 stop 会让"停止之后又被复活激活" ——
+        # 正是上面那句注释要防的事, 但没锁时防不住。
+        with self._submit_lock:
+            if self._shutdown_event.is_set():
+                # 已经决定停止 -> 不再激活(否则 stop 之后 activate 会把它复活)。
+                return
+            self._background_active.set()
 
     def request_stop(self) -> None:
         """发出停止信号。**只置位, 不做资源回收。**
@@ -420,8 +463,13 @@ class PoolPrefetcher:
 
         ⚠️ 这是生成链的唯一主动中止理由 —— `_background_should_continue()`
         直接读它。幂等。
+
+        ⚠️ 在 `_submit_lock` 下置位, 与 tick 的提交段互斥 —— 那是
+        "stop 之后不得再有 submit" 的线性化边界(见 `_submit_lock`
+        的声明与 `_on_tick_locked_ish` 的 ⑩b)。
         """
-        self._shutdown_event.set()
+        with self._submit_lock:
+            self._shutdown_event.set()
 
     def set_playtester(self, playtester: Any) -> None:
         """注入 AI 试玩器(Q10)。装配权在 Director —— 见 `__init__` 的说明。
@@ -498,15 +546,23 @@ class PoolPrefetcher:
             log.exception("补池 tick 决策异常(忽略)")
 
     def _on_tick_locked_ish(self, gate: bool = True) -> None:
-        """决策。**锁只包住状态读写, 不包住 submit。**
+        """决策。**`_lock` 只包住状态读写, 不包住 submit。**
 
-        为什么 submit 必须在锁外:
+        为什么 submit 必须在 `_lock` 之外:
           - 真实 executor 的 `submit()` 在队列满时可以阻塞, 持锁阻塞会
             把 tick 线程卡住 —— 那正是"补池不能影响直播"要避免的;
           - 同步执行的替身(测试里那种)会在 `submit()` 里**就地**跑完
-            worker, 而 worker 结尾要拿同一把锁写 `_pending_result` ——
-            非重入锁上直接死锁。
+            worker, 而 worker 结尾要拿同一把 `_lock` 写 `_pending_result`
+            —— 非重入锁上直接死锁。
         所以这里先把该读的读完、该占的标记占掉, 出了锁再真正提交。
+
+        ## 但"出锁再提交"本身带一条缝, 由 `_submit_lock` 补上
+
+        `_PENDING` 占位(`_lock` 内)到真提交(`_lock` 外)之间, 并发进来的
+        `request_stop()` 会让"停止之后仍然提交一条新候选"。所以提交段整段
+        挪进 `_submit_lock`, 并在其中**复查**一次 `_shutdown_event` ——
+        详见该段自己的注释(⑩b)。`_lock` 与 `_submit_lock` 的锁序见
+        `_submit_lock` 的声明。
         """
         now = self._clock()
         to_submit = None
@@ -621,24 +677,52 @@ class PoolPrefetcher:
             to_submit = inputs
             self._future = _PENDING
 
-        # ---- 锁外真正提交 ----
-        try:
-            fut = self._executor.submit(self._generate_one, to_submit)
-        except Exception:                       # noqa: BLE001
-            log.exception("补池提交失败")
+        # ---- 锁外真正提交(由 `_submit_lock` 线性化) ----
+        #
+        # ⚠️ 这里为什么不能只靠上面的 `gate`: `gate` 是在**进 `_lock`
+        # 之前**算好的(on_tick 里), 而 `_PENDING` 占位到真提交之间已经
+        # 出了 `_lock`。`request_stop()` 恰恰能插进这条缝:
+        #
+        #     ⑩ `self._future = _PENDING`   ← 持 `_lock`
+        #     ↓  出锁
+        #     ↓  request_stop() 在这里跑完 → `_shutdown_event` 置位
+        #     ↓  executor.submit(...)       ← 停都停了还提交, 这就是漏
+        #
+        # 修法: 拿 `_submit_lock`(与 `request_stop()` 同一把), 在它下面
+        # **复查**一次, 然后把复查与 submit 排成不可分割的一段。这样
+        # "可见的 stop" 与 "新的 submit" 之间就有了明确的先后 —— 要么
+        # stop 先拿到锁(submit 段复查到 → 不提交), 要么 submit 段先拿到
+        # 锁(stop 会等它做完, 那条任务属于"停止之前就已提交", 合法)。
+        with self._submit_lock:
+            # ---- ⑩b 线性化复查: 最后一个决策点 ----
+            if self._shutdown_event.is_set():
+                with self._lock:            # 锁序: _submit_lock → _lock
+                    # ⚠️ 必须撤销 ⑩ 占的标记。忘了它 -> `_future` 永远是
+                    # `_PENDING` -> 单飞被永久占死, 补池再也不启动。
+                    self._future = None
+                # 不提交。**不记失败、不退避**: 这活根本没开始, 不是故障,
+                # 也不是 `interrupted`(那是"已开始后被协作式收手")。
+                # 语义与 `_apply_result` 的 interrupted 分支一致。
+                return
+            try:
+                fut = self._executor.submit(self._generate_one, to_submit)
+            except Exception:                   # noqa: BLE001
+                log.exception("补池提交失败")
+                with self._lock:
+                    self._future = None
+                    # G4-R2 §五: 提交失败也算一次连续失败, 所以同样按"池空与否"
+                    # 选序列 —— 否则空池时的这条兜底会退回 240/300 秒, 而它
+                    # 恰恰是"池子空 + 提交路径出问题"这个最该快速重试的组合。
+                    self._fail_streak += 1
+                    self._retry_at = now + self._backoff_for_streak_now(
+                        self._fail_streak)
+                return
             with self._lock:
-                self._future = None
-                # G4-R2 §五: 提交失败也算一次连续失败, 所以同样按"池空与否"
-                # 选序列 —— 否则空池时的这条兜底会退回 240/300 秒, 而它
-                # 恰恰是"池子空 + 提交路径出问题"这个最该快速重试的组合。
-                self._fail_streak += 1
-                self._retry_at = now + self._backoff_for_streak_now(
-                    self._fail_streak)
-            return
-        with self._lock:
-            # 只有还是自己占的那个标记才认(理论上期间不会被改, 但留个护栏)
-            if self._future is _PENDING:
-                self._future = fut
+                # 只有还是自己占的那个标记才认(理论上期间不会被改, 但留个护栏)。
+                # ⚠️ 它**不是** stop 防护 —— stop 由上面的 ⑩b 复查负责,
+                # 别以为有了这个守卫就不用复查。
+                if self._future is _PENDING:
+                    self._future = fut
 
     def _apply_result(self, kind: str, detail: str, extra: dict,
                       now: float) -> None:
@@ -646,8 +730,8 @@ class PoolPrefetcher:
 
         两条**正交**的账, 不要互相吞:
           - **试玩结果**: `playtest_*_count` **无条件**按 status 自增。
-            所以 INTERRUPTED 虽然不退避(让路), 仍然计一次 interrupted ——
-            否则区分不了"试玩系统经常坏"和"直播太忙总被打断"。
+            所以 INTERRUPTED 虽然不退避, 仍然计一次 interrupted ——
+            否则区分不了"试玩系统经常坏"和"本次运行正常结束时被中止"。
           - **入池结果**: `added` / `add_fail` 记最终有没有落进池子。
             试玩 PASS 之后 `pool.add()` 失败, 前面那次 `playtest_pass_count`
             **照样保留** —— 否则以后会误以为 Player 没通过。
@@ -1076,9 +1160,9 @@ class PoolPrefetcher:
                               story_timeout=None) -> tuple:
         """G2: `2-key -> Stage A -> Stage B`, 之后与 classic 路径**完全共用**。
 
-        ## 让路检查点(§九)
+        ## 主动中止检查点(§九)
 
-        这条链比 classic 多一次**独立**的 LLM 阶段(Stage A), 所以让路检查
+        这条链比 classic 多一次**独立**的 LLM 阶段(Stage A), 所以中止检查
         必须覆盖它。四个位置:
 
             ① Stage A 之前          (骨架内)
@@ -1088,7 +1172,7 @@ class PoolPrefetcher:
 
         ⚠️ **G4-2 §四: ①② 现在住在 `keyword_seed.keyword_spec` 里**,
         因为 live 现场生成走的是**同一条链**(见 `director._riddle` 的
-        fallback)。两份实现会在"哪里写 metrics / 哪里判让路"上漂, 而
+        fallback)。两份实现会在"哪里写 metrics / 哪里判中止"上漂, 而
         漂了以后 live 与 prefetch 出的题就不是同一种东西了。
 
         ③④ 落在 `structure_original_idea` 里是刻意的: 那里的检查点与
@@ -1097,17 +1181,16 @@ class PoolPrefetcher:
 
         ## 为什么 ①② 必须存在
 
-        Stage A 是**新增的昂贵调用**。若不在它前后让路, 就会出现 G1 修掉
-        的那个形状: 后台在 REVEALED 启动, 下一题已经开始现场生成, 而后台
-        还在往下走 —— 两边同时占网关。任务书 §九 原话: "不能因为新增
-        Stage A/B 把已经修好的'后台与 live 抢网关'问题带回来。"
+        Stage A 是**新增的昂贵调用**。若不在它前后检查, 就会出现 G1 修掉
+        的那个形状: 收尾/停止信号已经到达, 而后台还在往下走 —— 白白多占
+        一份网关配额、拖长一次收尾。任务书 §九 原话: "不能因为新增
+        Stage A/B 把已经修好的'一次运行结束后仍在烧昂贵调用'问题带回来。"
 
         任何一处 false -> `interrupted`(不计 gen_fail、不退避)。
 
         ⚠️ **谓词由参数注入**(默认 `self._background_should_continue`)。预热
         传的是它**自己**的谓词(stop + deadline) —— 见 `_generate_one_inner`。
-        注入必须传进 `keyword_spec`(①②)与 `_finish_one`(试玩前), 这两处
-        是预热路径上仅有的两个判停的地方。
+        注入必须传进 `keyword_spec`(①②)与 `_finish_one`(试玩前 / 提交前)。
         """
         if should_continue is None:
             should_continue = self._background_should_continue
@@ -1124,7 +1207,7 @@ class PoolPrefetcher:
             story_timeout=story_timeout)
         if spec is None:
             if reason == "interrupted":
-                return ("interrupted", "直播变忙, keyword2 让路",
+                return ("interrupted", "本次运行已结束, keyword2 主动中止",
                         {"interrupted": True})
             # ---- G4-R2 §六: 把"为什么没成"带进分类账 ----
             # `keyword_spec` 只回一个粗粒度的 `gen_fail` —— 那正是实播
@@ -1173,9 +1256,13 @@ class PoolPrefetcher:
         # 不能再发下一次**。这正是要消灭的实播事故: 下一题已经开始现场
         # 生成, 而旧 prefetch 还在审稿 / 再出一稿, 两边同时占网关 51 秒。
         #
+        # ⚠️ Phase C 之后 `should_continue` 为 False 的**唯一**含义是
+        # "本次运行已结束"(stop / shutdown), 不再有"直播忙 -> 让路"这层
+        # 意思。后台与直播是两条独立流水线, 各走各的 transport。
+        #
         # 预算也换成后台自己的(少尝试, 不是降低题质): live 是 4 稿/90s,
         # 后台是 2 稿/25s。后台多试一稿的收益只是池子里多一道题, 代价
-        # 却是跨过 deadline 与直播抢网关。
+        # 却是多占一份网关配额、拖长一次收尾。
         spec = self.writer.gen_spec(
             avoid=avoid, blueprint=bp, recent=recent,
             max_attempts=self._prefetch_attempts,
@@ -1184,17 +1271,18 @@ class PoolPrefetcher:
             # bp is None 时**真的**跳过 blueprint 硬校验, 而不是退回
             # 默认 blueprint(那是已经修过的 bug)。与 live 路径同一写法。
             enforce_blueprint=bp is not None)
-        # ---- G1: 让路 —— 单独一类结果, **不能**记成 gen_fail ----
+        # ---- G1: 主动中止 —— 单独一类结果, **不能**记成 gen_fail ----
         # 判据看 metrics 里的显式标记(gen_spec 设的), 而不是猜 error
         # 文本; 也顺手兜住"writer 是替身、没有 metrics"的情况。
         if bool((getattr(spec, "metrics", None) or {}).get("interrupted")):
-            return ("interrupted", "直播变忙, 本轮补池让路", {"interrupted": True})
-        # 让路时 gen_spec **故意**把 error 留空(它不是失败), 所以这里
+            return ("interrupted", "本次运行已结束, 本轮补池主动中止",
+                    {"interrupted": True})
+        # 中止时 gen_spec **故意**把 error 留空(它不是失败), 所以这里
         # 必须在判断 error 之前先判 puzzle 空 —— 否则会走进下面
-        # "空谜面"那条, 把一次让路记成 gen_fail。
+        # "空谜面"那条, 把一次主动中止记成 gen_fail。
         if spec is None or not getattr(spec, "puzzle", ""):
             if bool(getattr(spec, "interrupted", False)):
-                return ("interrupted", "直播变忙, 本轮补池让路",
+                return ("interrupted", "本次运行已结束, 本轮补池主动中止",
                         {"interrupted": True})
             return ("gen_fail",
                     (spec.error if spec is not None else "spec=None")
@@ -1213,38 +1301,41 @@ class PoolPrefetcher:
         """
         # ---- Q10: AI 试玩(默认关闭, 开着才跑) ----
         #
-        # ---- G4-C: 试玩也必须在**开始之前**让路 ----
+        # ---- G4-C: 试玩也必须在**开始之前**检查取消 ----
         #
-        # G1 让 `gen_spec` 在每一次尚未发出的昂贵调用前检查谓词, 但
-        # `_playtest` **不在 `gen_spec` 里面** —— 它在它返回之后。于是
+        # 生成链的检查点在 `gen_spec` / `keyword_spec` 内部(每一次尚未发出的
+        # 昂贵调用之前), 但 `_playtest` **不在它们里面** —— 它在之后。于是
         # 存在这条缝:
         #
-        #     gen_spec 成功返回(一次完整的多稿生成 + 审稿 + audit)
-        #     ↓  这一段之间直播已经进入 SETTING
+        #     稿子生成成功返回(完整的生成 + 审稿 + audit)
+        #     ↓  这一段之间停止信号到达
         #     ↓  prefetch 仍然启动一次 AI 试玩
         #
-        # 试玩本身是**若干次 LLM 调用**(模拟提问者反复问), 会和下一题
-        # 的现场生成抢同一个网关。
+        # 试玩本身是**若干次 LLM 调用**(模拟提问者反复问), 跑起来很贵。
         #
-        # G1 冻结的原则是"后台每一个尚未开始的昂贵 LLM 阶段都必须让 live
-        # 优先", 试玩没有理由例外 —— 只是因为它在 gen_spec 之外, 被漏掉了。
+        # Phase C 的原则是"每一个尚未开始的昂贵阶段都必须先问一次要不要
+        # 继续", 试玩没有理由例外 —— 只是因为它在生成链之外, 容易漏掉。
         #
         # ⚠️ G2: keyword2 链同样经过这里。Stage A / Stage B 各自有检查点,
         # 但**试玩这一处**仍然要判 —— 它是独立的一次(或多次)调用。
         #
-        # 两层检查并不冲突: 这里管"要不要**开始**", 而 playtester 自己
-        # 内部若也有协作取消, 管的是"试玩**过程中**还继续吗"。
-        #
         # ⚠️ 用注入的谓词, **不是**写死的后台判据 —— 预热走到这里时后台
-        # 尚未 activate, 生命周期状态与稳态不同, 必须用它自己那份谓词。
+        # 尚未 activate, 生命周期状态与稳态不同; 而且预热那份谓词带
+        # deadline(见 `prewarm_should_continue`), 写死会让预算失效。
+        #
+        # `_finish_one` 里一共**三**层检查, 各管各的, 不要合并:
+        #   ① 这里(试玩之前)   —— 要不要**开始**这次试玩?
+        #   ② playtester 内部   —— 试玩**过程中**还继续吗?(每轮重查)
+        #   ③ `pool.add` 之前   —— 要不要**写进池子**?(见本函数末尾)
+        # ① 能省下 N 次 LLM 调用, ③ 省下一次写入; 少任何一个都有缝。
         if should_continue is None:
             should_continue = self._background_should_continue
         if self._playtest_enabled():
             if not should_continue():
-                log.info("补池: 直播变忙, 试玩前让路(已生成的稿子丢弃)")
-                return ("interrupted", "直播变忙, 试玩前让路",
+                log.info("补池: 已请求停止, 试玩未开始(已生成的稿子丢弃)")
+                return ("interrupted", "本次运行已结束, 试玩未开始",
                         {"interrupted": True})
-            pt, why = self._playtest(spec)
+            pt, why = self._playtest(spec, should_continue)
             if pt is not None:
                 # 试玩结论落进 metrics —— Q8 的序列化链天然保存它。
                 try:
@@ -1261,6 +1352,31 @@ class PoolPrefetcher:
                             {"playtest": pt.status,
                              "interrupted": pt.status == OUTCOME_INTERRUPTED})
                 extra = {"playtest": pt.status}
+
+        # ---- ③ 提交前最后一道检查点(与上面的 ① 是**两个**不同的检查点) ----
+        #
+        # ① 管"要不要**开始**这次试玩"; 这里管"要不要**把它写进池子**"。
+        # 两者之间可能隔着整个试玩(最坏 2N 次 LLM 调用), 停止信号随时
+        # 可能到达 —— 特别是下播收尾那几秒。已经发出的调用收不回来, 但
+        # **最后这次写入**必须被拦下: 停了就该停, 不该再往池子里灌库存。
+        #
+        # ⚠️ 必须放在**两条路径的汇合处**, 不能只写在
+        # `if self._playtest_enabled():` 里 —— 试玩关着(**默认**!)时那
+        # 整段被跳过, 从生成链返回到这里同样是零检查点。那正是
+        # `prefill_pool.py` 里"候选完成后 pool.add 之前"补过的同一个洞。
+        #
+        # ⚠️ 用注入的 `should_continue`, **不是**写死的后台判据 —— 预热
+        # 走到这里时那份谓词带 deadline(stop + 总预算)。写死会让预热
+        # 在预算耗尽后照样写入。
+        if not should_continue():
+            log.info("补池: 已请求停止, 提交前放弃本稿(pool.add 未调用)")
+            # `interrupted` 的语义是"已经开始的链被协作式收手"(与"从未
+            # 开始"不同, 见 `_on_tick_locked_ish` 的 ⑩b)。这里候选确实
+            # 走完了生成链, 所以记一次 interrupted_count 是对的 —— 而
+            # `extra` 里**不带** `playtest` 键, 那次被丢弃的 PASS 不该
+            # 进试玩账(否则试玩通过率会被它污染)。
+            return ("interrupted", "本次运行已结束, 提交前放弃本稿",
+                    {"interrupted": True})
 
         if not self.pool.add(spec, source="prefetch"):
             # 契约: add 失败 == 这次生成**丢弃**。
@@ -1281,14 +1397,19 @@ class PoolPrefetcher:
             return False
         return bool(getattr(self.cfg, "playtest_enabled", False))
 
-    def _playtest(self, spec: Any) -> tuple:
+    def _playtest(self, spec: Any, should_continue=None) -> tuple:
         """跑一次试玩。返回 `(PlaytestResult | None, why)`。
+
+        `should_continue` 是**本次试玩的**谓词 override(见 `_finish_one`):
+        稳态传 None(用 playtester 构造时注入的 stop-only 实例谓词);
+        预热必须传它自己那份 `sc`(stop + **deadline**) —— 否则预热试玩
+        会越过预算继续打 LLM 轮次, 预算形同虚设。
 
         **绝不让试玩异常冒泡** —— 它跑在 worker 线程里, 抛出去会变成
         `exc`, 那会把"试玩坏"记成"代码 bug", 混淆两类账。
         """
         try:
-            r = self._playtester.run(spec)
+            r = self._playtester.run(spec, should_continue)
             return r, ""
         except Exception as e:                  # noqa: BLE001
             log.exception("试玩异常: %s", e)
@@ -1306,7 +1427,7 @@ class PoolPrefetcher:
             Director 的 finally     -> shutdown()       <- 资源回收, 可以晚
 
         主循环结束后到 `finally` 之间还有几秒收尾(`Phase.STOPPED` 上要
-        先 sleep)。删掉相位门之后那几秒里后台理论上还能起新候选, 所以
+        先 sleep)。这几秒里后台理论上还能起新候选, 所以
         "停止"必须在**离开主循环那一刻**就生效, 而 executor 的回收不必
         抢在那之前。`shutdown()` 自己也置位(幂等), 所以单独调用它仍然是
         完整语义 —— 只是**不要只依赖它在 finally 里被调**。
@@ -1339,7 +1460,7 @@ class PoolPrefetcher:
 
         一个总的 `fail_count` 在这里是有害的: 生成失败/入池失败/代码异常/
         试玩没过是四类完全不同的故障, 合并之后"试玩失败率 40%"这句话
-        既不知道是题不收敛、是网关抖了, 还是直播太忙。
+        既不知道是题不收敛、是网关抖了, 还是本次运行正常结束时被中止。
         """
         with self._lock:
             f = self._future
@@ -1376,7 +1497,7 @@ class PoolPrefetcher:
                 "generation_fail": self.generation_fail_count,
                 "add_fail": self.add_fail_count,
                 "exception": self.exception_count,
-                # G1: 与 generation_fail **分开** —— 让路是优先级, 不是故障。
+                # G1: 与 generation_fail **分开** —— 主动中止是生命周期, 不是故障。
                 "interrupted": self.interrupted_count,
                 "skip": self.skip_count,
                 # G4-R2 §六: 决策树上的五个出口, 直接可读。实播复盘
