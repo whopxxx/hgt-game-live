@@ -71,9 +71,16 @@ def test_all_stages_load():
         check(f"{stage} 有版本号", stage_version(stage).startswith(stage
               .replace("_", "-").split("-")[0]) or bool(stage_version(stage)),
               stage_version(stage))
-    check("Pack 总版本", HAIGUITANG_GENERATION_PROMPT_VERSION
-          == "haiguitang-generation-v2" == PROMPT_PACK_VERSION,
+    check("Pack 总版本(Generation v3, Issue #58)",
+          HAIGUITANG_GENERATION_PROMPT_VERSION
+          == "haiguitang-generation-v3" == PROMPT_PACK_VERSION,
           HAIGUITANG_GENERATION_PROMPT_VERSION)
+    check("truth stage 指向 truth-v2(生产 lane 移除后的版本化)",
+          STAGES["truth"] == ("truth-v2.md", "truth-v2"), STAGES["truth"])
+    # 历史 truth-v1.md 保留在盘上(不覆盖旧语义)
+    _tv1 = PROMPT_ROOT / "truth-v1.md"
+    check("truth-v1.md 冻结保留", _tv1.exists()
+          and bool(_tv1.read_text(encoding="utf-8").strip()), str(_tv1))
     check("contract / audit stage 指向 v2 文件",
           STAGES["contract"] == ("contract-v2.md", "contract-v2")
           and STAGES["audit"] == ("audit-v2.md", "audit-v2"), STAGES)
@@ -130,19 +137,19 @@ def test_loader_negatives():
                 check("缺文件被拒", False, "没抛")
             except PromptPackError as e:
                 check("缺文件被拒", "missing" in str(e), str(e)[:60])
-            (Path(td) / "truth-v1.md").write_text("", encoding="utf-8")
+            (Path(td) / "truth-v2.md").write_text("", encoding="utf-8")
             try:
                 load_prompt("truth")
                 check("空文件被拒", False, "没抛")
             except PromptPackError as e:
                 check("空文件被拒", "empty" in str(e), str(e)[:60])
-            (Path(td) / "truth-v1.md").write_text("   \n\t \n", encoding="utf-8")
+            (Path(td) / "truth-v2.md").write_text("   \n\t \n", encoding="utf-8")
             try:
                 load_prompt("truth")
                 check("只有空白被拒", False, "没抛")
             except PromptPackError as e:
                 check("只有空白被拒", "empty" in str(e), str(e)[:60])
-            (Path(td) / "truth-v1.md").write_text(
+            (Path(td) / "truth-v2.md").write_text(
                 "写一个故事 {lane} 结束。", encoding="utf-8")
             try:
                 load_prompt("truth")
@@ -510,8 +517,8 @@ def test_v2_generation_writes_v2_and_v2_categories():
     check("成题", bool(spec and spec.puzzle), reason)
     check("protocol_version == haiguitang-v2(代码注入)",
           spec.protocol_version == V2, spec.protocol_version)
-    check("prompt_version == haiguitang-generation-v2",
-          spec.prompt_version == "haiguitang-generation-v2"
+    check("prompt_version == haiguitang-generation-v3",
+          spec.prompt_version == "haiguitang-generation-v3"
           == HAIGUITANG_GENERATION_PROMPT_VERSION, spec.prompt_version)
     check("observed 分类 == Contract 回传的五类",
           (spec.primary_category, spec.categories)
@@ -955,6 +962,88 @@ def test_v1_reviewer_duplicate_completion_not_washed():
 
 
 # ======================================================================
+# P20(Generation v3 / Issue #58 §18-B): 五类创作 Brief 完整性
+# ======================================================================
+def test_category_briefs_complete():
+    """创作 Brief 单一来源: key 精确等于 V2_CATEGORIES, 每类四段齐。"""
+    print("[P20] 五类创作 Brief 完整性(Issue #58 §18-B)")
+    from story.category_briefs import CATEGORY_CREATIVE_BRIEFS, creative_brief
+    check("key 集合精确等于 V2_CATEGORIES(无缺类/无第六类)",
+          set(CATEGORY_CREATIVE_BRIEFS) == set(V2_CATEGORIES),
+          sorted(CATEGORY_CREATIVE_BRIEFS))
+    # 每类的结构锚: 四段标题 + 内容非空。检查结构与关键锚, 不复制
+    # 完整 prompt 文本做第二事实源。
+    for cat in V2_CATEGORIES:
+        card = creative_brief(cat)
+        check(f"[{cat}] 卡非空", bool(card.strip()))
+        for anchor in ("【核心体验】", "【常见汤味】", "【可用风格】",
+                       "【避免跑偏】"):
+            check(f"[{cat}] 含{anchor}", anchor in card, card[:40])
+        check(f"[{cat}] 未知类查询返回空", creative_brief("banana") == "")
+        check(f"[{cat}] 空/空白类查询返回空", creative_brief("  ") == "")
+    # 红黑清只作为创作语言存在, 不成为任何 schema/protocol 字段。
+    from story import haiguitang_protocol as HGP
+    for proto_field in ("soup_color", "lane", "tone_axis", "red_black_mode"):
+        check(f"协议层无 {proto_field} 字段",
+              not hasattr(HGP, proto_field))
+
+
+# ======================================================================
+# P21(Generation v3 / Issue #58 §18-C): Truth 只在 requested 非空时
+#      注入对应类型创作卡; 空 requested 自由生成不随机选类
+# ======================================================================
+def test_truth_user_brief_injection():
+    """Truth user message 新形状: 目标类型卡 + 关键词 + 可选难度。"""
+    print("[P21] Truth user 创作卡注入(Issue #58 §18-C)")
+    from story.llm import _story_user
+    from story.category_briefs import creative_brief
+    from story.haiguitang_protocol import GenerationBrief, DIFFICULTY_LABELS
+
+    # requested=emotion -> emotion 卡在, 其它类卡不在
+    u = _story_user(["车站", "雨伞"],
+                    GenerationBrief(requested_category="emotion"))
+    check("emotion -> 目标类型行在",
+          "【目标类型】" in u and "emotion" in u and "情感" in u, u[:60])
+    check("emotion -> 注入的是 emotion 卡",
+          creative_brief("emotion") in u)
+    check("emotion -> 不混入 horror/logic 卡",
+          creative_brief("horror") not in u
+          and creative_brief("logic") not in u)
+    check("关键词行在", "【随机关键词】车站，雨伞" in u, u[:80])
+    check("无难度时不输出难度行", "【目标难度】" not in u)
+
+    # requested=logic -> logic 卡, 不混入 horror/emotion 卡
+    u2 = _story_user(["钥匙", "停电"],
+                     GenerationBrief(requested_category="logic"))
+    check("logic -> 注入 logic 卡", creative_brief("logic") in u2)
+    check("logic -> 不混入 horror/emotion 卡",
+          creative_brief("horror") not in u2
+          and creative_brief("emotion") not in u2)
+
+    # requested="" -> 自由生成: 不随机选类, 不出现任何创作卡/red/black
+    u3 = _story_user(["灯塔", "礁石"], GenerationBrief())
+    check("空 requested -> 无目标类型行", "【目标类型】" not in u3)
+    check("空 requested -> 无任何创作卡",
+          all(creative_brief(c) not in u3 for c in V2_CATEGORIES))
+    check("空 requested -> 不随机分配五类标签",
+          not any(f"（{lbl}）" in u3 for lbl in
+                  ("逻辑", "悬疑", "恐怖", "情感", "脑洞")))
+    check("空 requested -> 无 red/black lane 文案",
+          "红汤" not in u3 and "黑汤" not in u3
+          and "类型：红汤" not in u3 and "类型：黑汤" not in u3)
+    check("空 requested -> 通用创作要求在",
+          "请围绕这几个关键词构思一个完整的中文海龟汤隐藏故事" in u3)
+
+    # difficulty 非空 -> 仍正确出现
+    u4 = _story_user(["灯塔", "礁石"],
+                     GenerationBrief(requested_category="horror",
+                                     difficulty="hard"))
+    check("difficulty 非空 -> 难度行正确",
+          f"【目标难度】{DIFFICULTY_LABELS['hard']}" in u4, u4[-40:])
+    check("horror 卡在(与难度共存)", creative_brief("horror") in u4)
+
+
+# ======================================================================
 # P19: 非法 GenerationBrief 在 0 次 LLM 调用前被拒(#51 review Blocker 2)
 # ======================================================================
 def test_invalid_brief_fails_closed_before_any_llm_call():
@@ -1000,7 +1089,7 @@ def test_invalid_brief_fails_closed_before_any_llm_call():
         sim_path="x", no_llm=True))
     raised3 = None
     try:
-        w3.gen_keyword_story(["灯塔", "退潮"], "red",
+        w3.gen_keyword_story(["灯塔", "退潮"],
                              brief=GenerationBrief(requested_category="banana"))
     except ValueError:
         raised3 = True
@@ -1035,6 +1124,8 @@ def main():
     test_v1_reviewer_bundle_illegal_fact_not_washed()
     test_v1_reviewer_duplicate_completion_not_washed()
     test_invalid_brief_fails_closed_before_any_llm_call()
+    test_category_briefs_complete()
+    test_truth_user_brief_injection()
     test_classic_and_curated_stay_legacy()
     test_single_source_of_prompts()
     print()

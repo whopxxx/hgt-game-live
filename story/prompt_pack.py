@@ -55,7 +55,12 @@ from pathlib import Path
 #: v2(5 大类协议): Contract / Audit 的分类语义从 11 类收敛成 5 大类
 #: (haiguitang-v2), 属于 generation prompt 的**行为变化** —— 总版本
 #: 必须 bump。Judging Pack 没有语义变化, **不**牵动。
-HAIGUITANG_GENERATION_PROMPT_VERSION = "haiguitang-generation-v2"
+#:
+#: v3(Generation v3, Issue #58): 生产链移除随机 red/black lane, Truth
+#: 的 user message 换成"五类创作 Brief + 关键词 + 可选难度"(动态
+#: contract 变了, 即便静态 system 只微调一句也必须 bump)。Judging
+#: Pack 仍然不动。
+HAIGUITANG_GENERATION_PROMPT_VERSION = "haiguitang-generation-v3"
 
 #: 别名 —— 语义同上, 读起来更顺手的场合用。
 PROMPT_PACK_VERSION = HAIGUITANG_GENERATION_PROMPT_VERSION
@@ -85,7 +90,13 @@ JUDGING_PROMPT_ROOT = _PROJECT_ROOT / "haiguitang" / "prompts" / "judging"
 #: 拼路径。新增 stage = 在这里登记 + 新建对应 .md, 二者缺一即 fail
 #: closed(测试 §60 会抓)。
 STAGES: dict = {
-    "truth": ("truth-v1.md", "truth-v1"),
+    # ---- Generation v3(Issue #58): Truth 指向 truth-v2 ----
+    # 生产链移除随机 red/black lane 后 Truth 的实际生成行为变化(五类
+    # 创作 Brief 经 user message 注入), 属于 generation prompt 的行为
+    # 变化 —— 总版本随之 bump 到 haiguitang-generation-v3。
+    # 历史 truth-v1.md **保留在盘上**(lane 时代的合同文本, 不覆盖),
+    # 与 v1 的 11 类时代文件同一退役纪律。
+    "truth": ("truth-v2.md", "truth-v2"),
     "surface": ("surface-v1.md", "surface-v1"),
     # ---- 5 大类协议 v2: Contract / Audit 的分类文字换 v2 文件 ----
     # 历史 contract-v1.md / audit-v1.md **保留在盘上**(它们是 v1 时代

@@ -2412,9 +2412,9 @@ class _R5Writer:
         self.keyword_calls = []
 
     # ---- keyword2 三段 ----
-    def gen_keyword_story(self, keywords, lane, *, should_continue=None,
+    def gen_keyword_story(self, keywords, *, should_continue=None,
                           **kw):
-        self.keyword_calls.append((list(keywords), lane))
+        self.keyword_calls.append((list(keywords),))
         self.tools.append("emit_core_story")
         if should_continue is not None and not should_continue():
             return {"interrupted": True}
@@ -2569,8 +2569,10 @@ def test_r5_prefill_default_goes_through_keyword_spec():
         check("**metrics.surface_prompt_version == Pack stage 版本**",
               m.get("surface_prompt_version") == stage_version("surface"),
               m.get("surface_prompt_version"))
-        check("**metrics 有 lane**", m.get("lane") in ("red", "black"),
-              m.get("lane"))
+        # ---- Generation v3(Issue #58): lane 不再是新生成事实 ----
+        # 新题 lane 恒为空串(deprecated 历史兼容占位), 不是真实决策。
+        check("**新题 lane 是空串(deprecated)**", m.get("lane") == "",
+              repr(m.get("lane")))
         check("**metrics 有 keywords**", bool(m.get("keywords")),
               m.get("keywords"))
         check("**metrics 有 keyword_draw_index**",
@@ -2585,10 +2587,10 @@ def test_r5_prefill_reuses_one_bag_across_attempts():
 
     ## 这是本 issue 里最容易修假的点
 
-    每次 `_one()` 重建 bag 会让每个 draw 都从 index=1 开始。而
-    `draw_lane(session_seed, draw_index)` 是**无状态派生**的 ——
-    index 恒为 1 => **lane 恒为同一个**。症状是整批预热题非红即黑,
-    而红黑混出正是这次要播的性质。
+    每次 `_one()` 重建 bag 会让每个 draw 都从 index=1 开始 —— 同一场
+    预热的每道题拿到**同一组词**。Generation v3(Issue #58)删掉了生产
+    lane 之后, 这条钉的仍然是"唯一 draw 点 + bag 复用": index 序列必须
+    反映真实抽词次数。
 
     两种实现都会过质量门, 所以只能靠断言挡。
 
@@ -2609,11 +2611,6 @@ def test_r5_prefill_reuses_one_bag_across_attempts():
             seen.append(bag.served)
         check("**bag.served 单调递增到 3**", seen == [1, 2, 3], seen)
         check("**没有从 index=1 重来**", seen != [1, 1, 1], seen)
-        # ---- lane 必须跟着 draw_index 变 ----
-        from story.keyword_seed import draw_lane
-        lanes = [draw_lane(seeder.session_seed, i + 1) for i in range(3)]
-        check("(对照) 三个 draw_index 派生出 >=2 种 lane",
-              len(set(lanes)) >= 2, lanes)
         check("池里有 3 道(彼此不重复)", pool.stock_count() == 3,
               pool.stock_count())
 
@@ -2881,8 +2878,8 @@ def test_r5_prefill_failure_reports_reject_reason():
         pool = PuzzlePool.open(cfg)
 
         class _Dead(_R5Writer):
-            def gen_keyword_story(self, keywords, lane, **kw):
-                self.keyword_calls.append((list(keywords), lane))
+            def gen_keyword_story(self, keywords, **kw):
+                self.keyword_calls.append((list(keywords),))
                 return None
 
         w = _Dead()
