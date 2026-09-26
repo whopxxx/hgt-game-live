@@ -2579,7 +2579,7 @@ class RoundEngine:
             fid = str(x).strip()
             if not fid or fid in out:
                 continue
-            if known and fid not in known:
+            if fid not in known:
                 # 模型编了一个不存在的 id。丢掉, 不猜。
                 log.debug("established 含不存在的 fact id, 已丢弃: %r", fid)
                 continue

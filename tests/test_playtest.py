@@ -111,11 +111,16 @@ def mk_spec(**kw) -> PuzzleSpec:
         # 的 —— 留空会被正确地隔离(那正是隔离生效的证据, 但在本套件
         # 里它只是噪音)。
         quality_policy_version=QUALITY_POLICY_VERSION,
+        protocol_version="haiguitang-v1", difficulty="medium",
+        primary_category="suspense", categories=["suspense"],
         metrics={"ok": True},
         blueprint_specified=True,
     )
     for k, v in kw.items():
         setattr(s, k, v)
+    for fact in s.facts:
+        if fact.kind == "core" and not fact.public_text:
+            fact.public_text = fact.text[:12]
     return s
 
 

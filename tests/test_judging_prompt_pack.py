@@ -759,10 +759,10 @@ def test_engine_defense_in_depth():
     check("unavailable + established -> 不收",
           eng._established_fact_ids == set(), eng._established_fact_ids)
     # 直接调写入口, 显式 response_kind=rephrase
-    got = eng._record_human_established_locked(
+    got = eng._record_established_locked(
         ["f1"], verdict="是", status="ok", response_kind="rephrase")
     check("写入口拒绝 rephrase", got == [])
-    got = eng._record_human_established_locked(
+    got = eng._record_established_locked(
         ["f1"], verdict="是", status="ok", response_kind="verdict")
     check("写入口接受 verdict=是", got == ["f1"], got)
     # 即便 f1 已进共识, 合同没有 f2 依然不揭晓

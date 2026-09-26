@@ -628,7 +628,7 @@ def test_reference_bootstrap_reports_mode():
 def test_cookie_fail_open_and_secrecy():
     print("\n[#42-7] Cookie: env-only / fail-open / 不泄漏")
     # ---- ① env-only: 没配 -> None; 配了 -> 原样进 cfg(但 repr 不见) ----
-    cfg = Config(live_id="1")
+    cfg = Config(live_id="1", douyin_live_cookie=None)
     check("未配置 -> None(直播照常可起)", cfg.douyin_live_cookie is None)
     cfg2 = Config(live_id="1", douyin_live_cookie="secret-cookie-value")
     r = repr(cfg2)
@@ -639,7 +639,7 @@ def test_cookie_fail_open_and_secrecy():
     # (把 warn 抽成方法以便离线直测; start() 不在本测里起线程。)
     import queue as _q
     from story.ingest import LiveSource
-    cfg3 = Config(live_id="1")
+    cfg3 = Config(live_id="1", douyin_live_cookie=None)
     src = LiveSource(cfg3, _q.Queue())
     check("无 Cookie 时需要警告", src._needs_cookie_warning() is True)
     check("无 Cookie 也能装配 source(不抛)",

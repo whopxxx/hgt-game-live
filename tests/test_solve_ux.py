@@ -402,9 +402,9 @@ def test_case_m_human_only():
     check("技术失败不建立事实", eng._established_fact_ids == before,
           eng._established_fact_ids)
     # 边界必须显式可查(Step 14 Detective 绝不能调它)
-    check("存在具名写入口", hasattr(eng, "_record_human_established_locked"))
-    doc = eng._record_human_established_locked.__doc__ or ""
-    check("docstring 冻结了 Detective 边界", "Detective" in doc, doc[:80])
+    check("存在具名共享写入口", hasattr(eng, "_record_established_locked"))
+    doc = eng._record_established_locked.__doc__ or ""
+    check("docstring 冻结了系统动作边界", "submit_detective" in doc, doc[:80])
     check("submit_detective 尚不存在(Step 14)",
           not hasattr(eng, "submit_detective"))
 
@@ -799,6 +799,13 @@ def test_closeout_b2_pool_rejects_v5_without_contract():
         solution_shape="identity_reversal", domain="family",
         emotion_mode="warm", relation="family", time_shape="instant",
         reveal_mode="identity_flip")
+    full.protocol_version = "haiguitang-v1"
+    full.difficulty = "medium"
+    full.primary_category = "family"
+    full.categories = ["family"]
+    for fact in full.facts:
+        if fact.kind == "core":
+            fact.public_text = fact.text[:12]
     ok4, why4 = PuzzlePool._validate_pool_spec(full)
     check("完整 v5 题 -> 入池", ok4, why4)
     del pool
@@ -1436,6 +1443,13 @@ def test_v6_pool_quarantines_quality_v5():
             solution_shape="identity_reversal", domain="family",
             emotion_mode="warm", relation="family", time_shape="instant",
             reveal_mode="identity_flip")
+        sp.protocol_version = "haiguitang-v1"
+        sp.difficulty = "medium"
+        sp.primary_category = "family"
+        sp.categories = ["family"]
+        for fact in sp.facts:
+            if fact.kind == "core":
+                fact.public_text = fact.text[:12]
         return sp
 
     # 入池门: 政策版本不匹配 -> quarantine(不迁移、不猜)。

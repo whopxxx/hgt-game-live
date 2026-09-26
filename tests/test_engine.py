@@ -660,14 +660,14 @@ def test_timeline_countdown_fields():
           (s.next_event_kind, s.next_event_label))
     check("剩余约 100s", 95 <= s.next_event_ms / 1000 <= 100,
           s.next_event_ms)
-    # 走到第 3 格后, 倒计时应指向"揭晓"
+    # 时间格已到第三格但只成功上屏一条 Hint，下一事件仍是 Hint2。
     clk.advance(N * 3 + 1)
     for a in eng.tick():
         if a.kind == ActionKind.HINT:
             eng.submit_hint("h")
     s2 = eng.snapshot()
-    check("最后一格指向揭晓",
-          s2.next_event_kind == "reveal" and "揭晓" in s2.next_event_label,
+    check("未上屏的 Hint 编号仍由成功数决定",
+          s2.next_event_kind == "hint" and "第 2 条" in s2.next_event_label,
           (s2.next_event_kind, s2.next_event_label))
 
 
@@ -3893,6 +3893,7 @@ def test_ai_player_ask_consumes_without_human_completion():
 
 def test_ai_player_shared_fact_gate_and_victory():
     print("\n[AI-67] AI ask 共享事实、verifier、贡献与真人统计隔离")
+    from story import parser as P
 
     def ask(eng, result):
         p = _ai_start(eng)
@@ -3936,9 +3937,20 @@ def test_ai_player_shared_fact_gate_and_victory():
     check("AI verified fact 进入共享事实与 touched",
           eng._established_fact_ids == {"f1", "f2"}
           and "f2" in eng._touched_fact_ids)
-    check("AI 补齐后 Fact Rail 与胜利同步",
-          snap.fact_progress["established"] == 2
-          and eng.phase == Phase.REVEALING and snap.solved_by == "AI玩家")
+    check("AI 补齐后立即胜利",
+          eng.phase == Phase.REVEALING and snap.solved_by == "AI玩家")
+    progress, _, _ = boot_v5()
+    ask(progress, QAResult(qid=0, verdict=P.YES, status="ok",
+                           established_fact_ids=["f1"],
+                           completion_verified_fact_ids=["f1"]))
+    check("AI 非终局事实立即推进 QA Fact Rail",
+          progress.snapshot().fact_progress["established"] == 1)
+    ordinary, _, _ = boot_v5(completion=("f2",))
+    ask(ordinary, QAResult(qid=0, verdict=P.NO, status="ok",
+                            established_fact_ids=["f1"]))
+    check("AI 不是可建立普通 fact，但不推进 completion",
+          ordinary._established_fact_ids == {"f1"}
+          and ordinary.snapshot().fact_progress["established"] == 0)
     check("AI 不进真人统计与榜单",
           before == (snap.stat_questions, snap.stat_answered,
                      dict(eng._verdict_counts), snap.stat_viewers_seen)
@@ -3956,6 +3968,55 @@ def test_ai_player_shared_fact_gate_and_victory():
         old["token"], old["expect_round"], old["expect_spec_key"],
         "ask", "旧问题", result=result)
     check("stale token 不能写事实", not stale._established_fact_ids)
+    guarded, _, _ = boot_v5()
+    reservation = _ai_start(guarded)
+    host = _ai_move(guarded, reservation, "ask", "她是谁？")
+    for round_index, spec_key in ((host["expect_round"] + 1,
+                                   host["expect_spec_key"]),
+                                  (host["expect_round"], "wrong-spec")):
+        guarded.submit_ai_player_result(
+            host["token"], round_index, spec_key, "ask", host["text"],
+            result=QAResult(qid=0, verdict=P.YES, status="ok",
+                            established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"]))
+    check("stale round/spec 不能写事实", not guarded._established_fact_ids)
+    no_spec, _ = boot(mkcfg())
+    no_spec._completion_fact_ids = {"f1"}
+    ask(no_spec, QAResult(qid=0, verdict=P.YES, status="ok",
+                          established_fact_ids=["f1"],
+                          completion_verified_fact_ids=["f1"]))
+    check("没有已知 fact 表时不能凭 id 建立事实",
+          not no_spec._established_fact_ids and no_spec.phase == Phase.QA)
+
+    # Engine -> Director -> Writer -> Engine：确认生产装配搬运完整 verifier 上下文。
+    import threading
+    from director import Director
+    assembled, _, _ = boot_v5()
+    reservation = _ai_start(assembled)
+    host = _ai_move(assembled, reservation, "ask", "她是谁？")
+    done = threading.Event()
+    seen = {}
+
+    class Writer:
+        def answer(self, *args, **kwargs):
+            seen.update(kwargs)
+            return [QAResult(qid=0, verdict=P.YES, status="ok",
+                             established_fact_ids=["f1"],
+                             completion_verified_fact_ids=["f1"])], None
+
+    director = Director.__new__(Director)
+    director.engine = assembled
+    director.writer = Writer()
+    director._dispatch = lambda actions: done.set()
+    director.push = lambda: None
+    director._ai_player(host)
+    check("Director AI ask 完成", done.wait(3))
+    check("Director 原样传合同、core、已建立快照",
+          seen.get("completion_fact_ids") == ["f1", "f2"]
+          and seen.get("core_answer") == assembled._core_answer
+          and seen.get("room_established_fact_ids") == [])
+    check("生产链把 verified AI fact 写入 Fact Rail",
+          assembled.snapshot().fact_progress["established"] == 1)
 
 
 def test_ai_player_solve_wrong_and_right_are_independent():
