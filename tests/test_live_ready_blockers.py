@@ -191,6 +191,30 @@ def test_audit_fixture():
         assert data2["used_ledger_sha256"] == __import__("hashlib").sha256(b"").hexdigest()
 
 
+def test_public_stock_specs():
+    from test_pool import _write_raw_pool, good_spec, mkcfg
+    with tempfile.TemporaryDirectory() as d:
+        current = good_spec()
+        old = good_spec(id="old-policy")
+        old.quality_policy_version = "quality-v2"
+        _write_raw_pool(d, [current, old])
+        cfg = mkcfg(d)
+        pool = PuzzlePool.open(cfg)
+        snapshot = pool.stock_specs()
+        assert len(snapshot) == pool.stock_count() == 1
+        assert snapshot[0].puzzle == current.puzzle
+        snapshot[0].puzzle = "MUTATED"
+        snapshot[0].facts[0].text = "MUTATED NESTED"
+        assert pool.stock_specs()[0].puzzle == current.puzzle
+        assert pool.stock_specs()[0].facts[0].text == current.facts[0].text
+        assert pool.stock_count() == 1
+        delivered = pool.pop_next(recent_signatures=[])
+        assert delivered is not None
+        assert pool.stock_specs() == [] and pool.stock_count() == 0
+        Path(cfg.pool_used_path).write_text("{broken\n", encoding="utf-8")
+        assert PuzzlePool.open(cfg).stock_specs() == []
+
+
 def test_runtime_manifest_if_present():
     pool_path = ROOT / "data/pool.jsonl"
     if not pool_path.exists():  # CI checkout keeps the runtime pool gitignored.
@@ -214,6 +238,7 @@ def test_runtime_manifest_if_present():
 if __name__ == "__main__":
     for test in (test_fact_progress, test_theme_demand_end_to_end,
                  test_production_executor_and_writer, test_audit_fixture,
+                 test_public_stock_specs,
                  test_runtime_manifest_if_present):
         test()
         print("PASS", test.__name__)

@@ -1,6 +1,6 @@
 # Live-ready Theme v1 — 库存验收报告
 
-- 生成时间：2026-09-26T12:05:23.189903+00:00
+- 生成时间：2026-09-26T12:21:44.949683+00:00
 - 正式池：`data/pool.jsonl`；SHA256 `711359702aa627ce23298b74db5daa31dee45d8edf2a58859324ae2e563ea1df`
 - used ledger：`data/pool_used.jsonl`；SHA256 `c080ca6798edc35c1600934ea82d4869b3d23e17b8dda8c4cecda68ae8c2cb61`（不存在时为 null）
 - ledger trustworthy：`true`

@@ -38,10 +38,8 @@ def build(pool_path: Path, used_path: Path) -> dict:
             sources[str(row.get("pool_key", ""))] = str(row.get("added_by", ""))
 
     entries = []
-    for spec in pool._items:
+    for spec in pool.stock_specs():
         key = spec_key(spec)
-        if key in pool._used or not pool._validate_pool_spec(spec)[0]:
-            continue
         protocol = str(spec.protocol_version or "")
         categories = list(spec.categories or []) if protocol == "haiguitang-v2" else []
         entries.append({

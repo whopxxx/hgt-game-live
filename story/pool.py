@@ -91,6 +91,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from typing import Any, Optional
 
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
@@ -737,6 +738,28 @@ class PuzzlePool:
                 if ok:
                     n += 1
             return n
+
+    def stock_specs(self) -> list[PuzzleSpec]:
+        """当前未 used、通过 stock_count 同一静态准入门的独立快照。
+
+        used 账本不可信时 fail closed；返回深拷贝，调用方不能改池内题。
+        不运行 dynamic gate，也不写 pool/used 文件。
+        """
+        with self._lock:
+            if not self._used_trustworthy:
+                return []
+            out = []
+            for spec in self._items:
+                if spec_key(spec) in self._used:
+                    continue
+                try:
+                    ok, _ = self._validate_pool_spec(spec)
+                except Exception:                   # noqa: BLE001
+                    log.exception("库存快照校验异常, 该题跳过")
+                    continue
+                if ok:
+                    out.append(deepcopy(spec))
+            return out
 
     def stock_signatures(self,
                          limit: Optional[int] = None) -> list:
