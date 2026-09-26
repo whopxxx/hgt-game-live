@@ -1465,19 +1465,37 @@ window.addEventListener('load', async () => {
           lastRect.bottom <= qaRect.bottom + 1, 'W9 latest QA not fully visible');
     check(document.documentElement.scrollWidth <= innerWidth + 1 &&
           stage.scrollWidth <= 1080 + 1, 'W10 horizontal overflow');
-    send({phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',
+    const revealPayload = {phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',
       revealed_core_answer:'广播揭示了车票的真实用途。',
       revealed_full_answer:'车票并非普通乘车凭证。',
       reveal_stage:'contribution', solved:true, solved_by:'观众甲',
       next_puzzle_ms:10000, reveal_contributors:[
         {qid:1,user_name:'观众甲',text:'广播和车票有关吗？',verdict:'是',is_final:false},
-        {qid:2,user_name:'观众乙',text:'他知道票的真实用途了吗？',verdict:'是',is_final:true}],
-      reveal_interaction:{rating_open:false,theme_vote_open:true,
+        {qid:2,user_name:'观众乙',text:'他知道票的真实用途了吗？',verdict:'是',is_final:true}]};
+    const interaction = {rating_open:true,theme_vote_open:true,
         theme_options:[{code:'a',label:'逻辑',category:'logic',votes:2},
           {code:'b',label:'悬疑',category:'suspense',votes:1},
           {code:'c',label:'恐怖',category:'horror',votes:3},
           {code:'d',label:'情感',category:'emotion',votes:0},
-          {code:'e',label:'脑洞',category:'brainstorm',votes:1}]}});
+          {code:'e',label:'脑洞',category:'brainstorm',votes:1}]};
+    send({...revealPayload, reveal_interaction:interaction});
+    await wait(80);
+    const ratingOpen = rect('rating-box'), themeOpen = rect('theme-box');
+    const separate = ratingOpen.right <= themeOpen.left + 1 ||
+      themeOpen.right <= ratingOpen.left + 1 ||
+      ratingOpen.bottom <= themeOpen.top + 1 ||
+      themeOpen.bottom <= ratingOpen.top + 1;
+    check(separate, 'W11a rating and theme groups overlap');
+    for (const pill of document.querySelectorAll('.rating-pill, .theme-pill')) {
+      const p = pill.getBoundingClientRect(), panel = document.getElementById('reveal').getBoundingClientRect();
+      check(p.left >= panel.left - 1 && p.right <= panel.right + 1,
+        'W11b vote pill outside reveal panel: ' + pill.textContent);
+    }
+    check(rect('reveal-interaction').bottom <= rect('reveal-contrib').top + 1 &&
+          rect('reveal-contrib').bottom <= rect('reveal-next').top + 1 &&
+          rect('reveal-next').bottom <= rect('reveal').bottom + 1,
+      'W11c vote, contribution, or countdown overlap or clip');
+    send({...revealPayload, reveal_interaction:{...interaction, rating_open:false}});
     await wait(80);
     const contribution = rect('reveal-contrib');
     const theme = rect('theme-box');
