@@ -91,6 +91,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from typing import Any, Optional
 
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
@@ -738,6 +739,28 @@ class PuzzlePool:
                     n += 1
             return n
 
+    def stock_specs(self) -> list[PuzzleSpec]:
+        """当前未 used、通过 stock_count 同一静态准入门的独立快照。
+
+        used 账本不可信时 fail closed；返回深拷贝，调用方不能改池内题。
+        不运行 dynamic gate，也不写 pool/used 文件。
+        """
+        with self._lock:
+            if not self._used_trustworthy:
+                return []
+            out = []
+            for spec in self._items:
+                if spec_key(spec) in self._used:
+                    continue
+                try:
+                    ok, _ = self._validate_pool_spec(spec)
+                except Exception:                   # noqa: BLE001
+                    log.exception("库存快照校验异常, 该题跳过")
+                    continue
+                if ok:
+                    out.append(deepcopy(spec))
+            return out
+
     def stock_signatures(self,
                          limit: Optional[int] = None) -> list:
         """**只读**快照: 当前库存题(能进 `pop_next` 候选集的那些)的
@@ -1211,103 +1234,301 @@ class PuzzlePool:
             return True
 
     # ------------------------------------------------------------------
-    def pop_next(self, recent_signatures: Optional[list] = None,
-                 avoid: Optional[list] = None) -> Optional[PuzzleSpec]:
-        """挑一道**此刻**可用的题。挑不到返回 None(调用方回落现场生成)。
+    def add_with_final_admission(self, spec: PuzzleSpec, source: str,
+                                 recent: Optional[list] = None
+                                 ) -> tuple:
+        """**原子**的最终 admission: 相似 recheck + 入池一气呵成。
 
-        每道候选都要过三关:
-          ① `validate_spec`  —— 重新确认它本身仍是合格的;
-          ② `cross_puzzle_gate` —— 与**当前** recent 窗口的分布是否冲突;
-          ③ `too_similar` —— 谜面是否与最近出过的太像。
+        ## Issue #60 §16: 并发后的 TOCTOU
 
-        ⚠️ 第 ② 关**必须调用 `cross_puzzle_gate` 本身**, 不能只比
-        `(mechanism_family, solution_shape)`。那个 tuple 只是结构去重,
-        而 `check_signature` 实际还管着 death / past_trauma /
-        trauma_ritual / grief / profession_ritual / domain / relation,
-        一共 9 个维度。
+        并发(2/5 worker)下, 5 个 worker 都可能拿着**同一份旧 stock
+        recent** 开始生成, 最后同时产出很相似的题。只靠生成开始前的
+        recent 挡不住 —— check 和 add 必须在同一把锁内完成, 让两个
+        同时完成的相似 candidate **不可能**都穿过去:
 
-        被拒的候选**不**从池里删掉 —— 池子是**集合不是队列**: 它是被
-        "当前窗口"挡住的, 等最近 10 题滚过去之后它就能用了。
+            with pool._lock:            # 原子段
+                ① 重读当前库存**谜面文本**(不是 worker 启动时那份)
+                ② 复用现有 deterministic identity primitive
+                   (`too_similar`, 文本 near-duplicate = identity)
+                ③ add 的静态准入门 + 去重 + 落盘
+            check 失败 -> 记明确 reject, 不写 used ledger, 不入池。
 
-        **不抛异常**: 任何意外都退化成返回 None。
+        ⚠️ `recent`(可选)是**已出过的谜面文本**(avoid 语义, 与
+        `pop_next(avoid=...)` 同一含义), 不是 `PuzzleSignature` 列表
+        —— `too_similar` 吃的是文本。
+
+        返回 `(ok: bool, why: str)`:
+            (True, "")   已入池
+            (False, why) 最终 admission 被挡(相似/静态门)。
+
+        ## 仍执行 stop/shutdown final gate
+
+        调用方(§14/§17 worker)必须**在调用本方法之前**先查自己的
+        `should_continue` —— 这里的原子段只管"库存视角"的一致性,
+        不管生命周期。两层检查各管各的, 不要合并。
+        """
+        ok, why = False, ""
+        with self._lock:
+            # ---- ① 重读当前库存的**谜面文本**(锁内现算) ----
+            #
+            # 并发期间其它 worker 可能已经 add 进来了 —— 那正是 §16 要防
+            # 的形状: 5 个 worker 都拿同一份旧 stock recent 开始生成, 最后
+            # 同时交付近似题。池的静态门(`add` 内)只查结构不查文本, 所以
+            # "两道近似题同时入池"原本没有任何一道门能挡。
+            #
+            # ⚠️ 刻意**不用** `cross_puzzle_gate` 把整池当 recent:
+            # "同 mechanism_family 共存"在既有产品语义里是**合法的**
+            # (G4-B: "同类型不是拒题理由", pop_next 两遍选择会兜底交付),
+            # 全池签名当 recent 会把同 family 库存永久挡死。最终 admission
+            # 防的是 **identity**(文本 near-duplicate / 完全同文), 不是
+            # **diversity**(同 family) —— 后者是配额偏好, 不是事故。
+            try:
+                stock_texts = [s.puzzle for s in self._items
+                               if spec_key(s) not in self._used]
+            except Exception:                   # noqa: BLE001
+                log.exception("final admission 读库存文本异常, 按空窗口处理")
+                stock_texts = []
+            # `recent` 按契约是**谜面文本**(avoid 语义); 防御性过滤掉
+            # 误传的 PuzzleSignature(不可迭代成文本就忽略该项)。
+            caller_texts = [t for t in (recent or [])
+                            if isinstance(t, str)]
+            merged_texts = (caller_texts + list(self._avoid_extra)
+                            + stock_texts)
+            # ---- ② 复用现有 deterministic primitive: too_similar ----
+            if too_similar(spec.puzzle, merged_texts):
+                ok, why = False, "final admission: 与现有库存/近期出题太像"
+                log.info("final admission 拒绝(相似): %s -> %s",
+                         (spec.puzzle or "")[:30], why)
+                return ok, why
+            # ---- ③ add(静态门 + 落盘) —— 同锁内, 原子 ----
+            if not self.add(spec, source=source):
+                ok, why = False, "final admission: pool.add 被拒(静态门/重复/used)"
+                log.info("final admission: %s", why)
+                return ok, why
+            # 入池成功 -> 这道题的 signature 立即对后续并发 worker 可见。
+            return True, ""
+    #
+    # 统一存储不变: 仍是一只 pool.jsonl + 一份 used ledger, **不**拆五个
+    # 文件。这里新增的是"按五类看库存 / 按类取题"的稳定 public API。
+    # eligibility 定义(§0 冻结):
+    #
+    #     theme in spec.categories     (多标签允许重叠)
+    #
+    # 只对 current Protocol v2 题生效; 历史/unknown 协议题的 categories
+    # 要么为空、要么是 v1 的 11 类枚举 —— 不做"猜分类", 绝不允许它们
+    # 冒充五类库存凑 live-ready 指标。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _category_eligible(spec: PuzzleSpec, category: str) -> bool:
+        """这道题是不是 `category` 的合法候选。
+
+        `category` 为空 = 不限类(返回 True, 走原路径)。
+        `protocol_version` 必须是 haiguitang-v2 才认 `spec.categories`
+        —— v1 题/无协议题的 categories 不在五类枚举里, 硬性挡掉。
+        """
+        cat = str(category or "").strip()
+        if not cat:
+            return True
+        if str(getattr(spec, "protocol_version", "") or "") != "haiguitang-v2":
+            return False
+        cats = getattr(spec, "categories", None) or []
+        return cat in {str(c) for c in cats}
+
+    def distinct_stock_count(self) -> int:
+        """distinct current-policy 未播库存(§9 的硬指标口径)。
+
+        与 `stock_count()` 同一扇 `_validate_pool_spec` 门(quality policy
+        兼容 / used 排除), 但**按题计数** —— 多标签题只算 1 道。
+        """
+        with self._lock:
+            n = 0
+            for s in self._items:
+                if spec_key(s) in self._used:
+                    continue
+                try:
+                    ok, _ = self._validate_pool_spec(s)
+                except Exception:                   # noqa: BLE001
+                    log.exception("distinct 库存校验异常, 该题不计入")
+                    continue
+                if ok:
+                    n += 1
+            return n
+
+    def stock_by_category(self) -> dict:
+        """五类 eligible 库存。多标签题同时计入多个类(§8 多标签计数)。
+
+        返回 `{category: count}`; 键恒为五类全集(0 也是有效读数)。
+        """
+        from .haiguitang_protocol import V2_CATEGORIES
+        out = {c: 0 for c in V2_CATEGORIES}
+        with self._lock:
+            for s in self._items:
+                if spec_key(s) in self._used:
+                    continue
+                try:
+                    ok, _ = self._validate_pool_spec(s)
+                except Exception:                   # noqa: BLE001
+                    log.exception("分类库存校验异常, 该题跳过")
+                    continue
+                if not ok:
+                    continue
+                if str(getattr(s, "protocol_version", "") or "") \
+                        != "haiguitang-v2":
+                    continue
+                for c in (getattr(s, "categories", None) or []):
+                    c = str(c)
+                    if c in out:
+                        out[c] += 1
+        return out
+
+    def playable_by_category(self, category: str,
+                             recent_signatures: Optional[list] = None,
+                             avoid: Optional[list] = None,
+                             limit: Optional[int] = None) -> int:
+        """`pop_next(category)` 此刻实际能交付几道(动态门同一份)。
+
+        补池/refill 判断"该类此刻有没有得播"用它, 与 `playable_count`
+        的分工相同: stock 管长期库存, playable 管当前窗口。
         """
         try:
-            return self._pop_next_locked(recent_signatures, avoid)
+            return self._playable_count_locked(
+                recent_signatures, avoid, limit, category=category)
+        except Exception:                       # noqa: BLE001
+            log.exception("playable_by_category 异常, 按 0 处理")
+            return 0
+
+    def _playable_count_locked(self, recent: Optional[list],
+                               avoid: Optional[list],
+                               limit: Optional[int],
+                               category: str = "") -> int:
+        with self._lock:
+            if not self._used_trustworthy:
+                return 0
+            quotas = Quotas.from_config(self.cfg)
+            used_texts = list(avoid or []) + self._avoid_extra
+            n = 0
+            passes = self._passes()
+            for soft_ok in passes:
+                for s in self._items:
+                    if limit is not None and n >= limit:
+                        break
+                    if spec_key(s) in self._used:
+                        continue
+                    # ---- Issue #60: category eligibility 在最外层 ----
+                    # 不含该类的题连静态门都不进(与 pop_next 同一判定)。
+                    if not self._category_eligible(s, category):
+                        continue
+                    ok, _ = self._validate_pool_spec(s)
+                    if not ok:
+                        continue
+                    if self._candidate_block_reason_locked(
+                            s, recent, avoid, quotas, used_texts, soft_ok):
+                        continue
+                    n += 1
+                if n:
+                    break
+            return n
+
+    def pop_next(self, recent_signatures: Optional[list] = None,
+                 avoid: Optional[list] = None,
+                 category: Optional[str] = None) -> Optional[PuzzleSpec]:
+        """挑一道**此刻**可用的题。挑不到返回 None(调用方回落现场生成)。
+
+        ## Issue #60: `category`(可选)
+
+        指定主题时:
+          1. 只看 `category in spec.categories` 的候选(§8 eligibility);
+          2. **优先 primary_category == category**;
+          3. primary 命中无合格可播时, secondary eligible 是合法 fallback;
+          4. 静态 validate / used fail-closed / cross_puzzle_gate /
+             too_similar / 两遍 diversity —— 全部保持;
+          5. **绝不**因为该类没题而偷偷返回一个不含此 category 的题
+             (§8: silent fallback 是对投票的假装满足)。
+
+        `category=None`/`""` 时逐位保持原有语义。
+        """
+        try:
+            return self._pop_next_locked(recent_signatures, avoid,
+                                         category=str(category or ""))
         except Exception:                       # noqa: BLE001
             log.exception("pop_next 异常, 本题回落现场生成")
             return None
 
     def _pop_next_locked(self, recent: Optional[list],
-                         avoid: Optional[list]) -> Optional[PuzzleSpec]:
+                         avoid: Optional[list],
+                         category: str = "") -> Optional[PuzzleSpec]:
         with self._lock:
-            # ---- fail closed ----
-            # 账本不可信时**一道都不交付**。理由: "某道题不在 _used 里"
-            # 和"那一行没读出来"从结果上无法区分, 而前者意味着把已经
-            # 播过的题再播一次 —— 那正是我们定死的"宁可不播"要避免的。
-            # 池子本身还完好, 但账本坏了就不能信池子里的任何判断。
             if not self._used_trustworthy:
                 log.error("used 账本不可信, 本次不交付任何题(回落现场生成)")
                 return None
             cands = [s for s in self._items
                      if spec_key(s) not in self._used]
-            if not cands:
-                log.info("题池没有可用题(池内 %d 道), 回落现场生成",
-                         len(self._items))
+            if category:
+                # ---- 类内取题: primary 优先, secondary 兜底(§8) ----
+                primary_c = [s for s in cands
+                             if self._category_eligible(s, category)
+                             and str(getattr(s, "primary_category", "")
+                                     or "") == category]
+                secondary_c = [s for s in cands
+                               if self._category_eligible(s, category)
+                               and str(getattr(s, "primary_category", "")
+                                       or "") != category]
+                if primary_c:
+                    log.info("主题取题(%s): primary 候选 %d / secondary %d",
+                             category, len(primary_c), len(secondary_c))
+                    groups = [primary_c, secondary_c]
+                else:
+                    log.info("主题取题(%s): primary 无候选, "
+                             "secondary eligible %d 道合法兜底",
+                             category, len(secondary_c))
+                    groups = [secondary_c]
+                cands_by_group = groups
+            else:
+                cands_by_group = [cands]
+            if not any(cands_by_group):
+                log.info("题池没有可用题(池内 %d 道%s), 回落现场生成",
+                         len(self._items),
+                         f", 主题 {category}" if category else "")
                 return None
-            # 打散, 免得每次总是同一道被先试(池内顺序会随 add 固定)
-            self._rng.shuffle(cands)
             quotas = Quotas.from_config(self.cfg)
-            # "该避开的谜面": 调用方给的 avoid(当前窗口) + 池子自己记的
-            # (跨进程/跨场次存活, 见 `remember_avoid`)。**算一次** ——
-            # 它的内容在循环里不变, 而 `too_similar` 是 O(池大小 × 历史)。
             used_texts = list(avoid or []) + self._avoid_extra
             blocked: list[str] = []
-            # G4-B: 两遍 —— 与 `_playable_count_locked` 同一份阶梯。
-            # 遍序必须与它**完全一致**(P0-3)。
             passes = self._passes()
-            for soft_ok in passes:
-                for spec in cands:
-                    # ① 本体仍合格? **走和 add() 同一扇门** —— 磁盘里的
-                    #    signature 可能在入池后被改坏, 只验 API 入口不够。
-                    #    quality policy 不兼容的题也在这里被挡下, 而且
-                    #    **在 `_persist_used` 之前** continue —— 所以隔离题
-                    #    不会进 used ledger(quarantine != 已播出; 它将来
-                    #    离线重审后仍可能重新合法)。
-                    ok, why = self._validate_pool_spec(spec)
-                    if not ok:
-                        blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
-                        continue
-                    # ②③ 动态门 —— **与 `playable_count()` 共用一份实现**。
-                    #     分成两套的话, 补池会按其中一个数判断"还够播"而
-                    #     另一个数把它挡住, 两边永远对不上。
-                    bad = self._candidate_block_reason_locked(
-                        spec, recent, avoid, quotas, used_texts, soft_ok)
-                    if bad:
-                        blocked.append(f"{spec.puzzle[:20]}…: {bad[:60]}")
-                        continue
-                    # ---- 先落盘再交付(见模块 docstring 的不变式) ----
-                    if not self._persist_used(spec, aired=False):
-                        # 记不下来就**不交付** —— 宁可不播, 也不冒"重启后
-                        # 同一道题再播一次"的风险。
-                        log.warning("used 记不下来, 放弃这道题(回落现场生成)")
-                        blocked.append(f"{spec.puzzle[:20]}…: used 写失败")
-                        continue
-                    self._used.add(spec_key(spec))
-                    if soft_ok:
-                        # G4-B: 这一道是 Pass 1 挑不出、靠忽略 diversity
-                        # 才拿到的。计一次 —— 见 `diversity_reject_count`。
-                        self.diversity_reject_count += 1
-                        log.info("题池出题(Pass 2: 忽略纯 diversity): %s…",
-                                 spec.puzzle[:30])
-                    else:
-                        log.info("题池出题: %s…", spec.puzzle[:30])
-                    return spec
-                # 这一遍一道都没交付 -> 自然进入下一遍(Pass 2 放宽 diversity)。
-                # 注意: Pass 2 只是再看一遍同一批候选, 只不过 soft 维度不再
-                # 阻塞; **绝不**因此绕过 ①(静态准入)与 used 写入。
-
-            log.info("题池 %d 道候选全部被挡(回落现场生成): %s",
-                     len(cands), " | ".join(blocked[:3]))
+            for group in cands_by_group:
+                # 打散, 免得每次总是同一道被先试(池内顺序会随 add 固定)
+                self._rng.shuffle(group)
+                for soft_ok in passes:
+                    for spec in group:
+                        ok, why = self._validate_pool_spec(spec)
+                        if not ok:
+                            blocked.append(f"{spec.puzzle[:20]}…: {why[:60]}")
+                            continue
+                        bad = self._candidate_block_reason_locked(
+                            spec, recent, avoid, quotas, used_texts, soft_ok)
+                        if bad:
+                            blocked.append(f"{spec.puzzle[:20]}…: {bad[:60]}")
+                            continue
+                        if not self._persist_used(spec, aired=False):
+                            log.warning("used 记不下来, 放弃这道题(回落现场生成)")
+                            blocked.append(f"{spec.puzzle[:20]}…: used 写失败")
+                            continue
+                        self._used.add(spec_key(spec))
+                        if soft_ok:
+                            self.diversity_reject_count += 1
+                            log.info("题池出题(Pass 2: 忽略纯 diversity"
+                                     "%s): %s…",
+                                     f", 主题 {category}" if category else "",
+                                     spec.puzzle[:30])
+                        else:
+                            log.info("题池出题%s: %s…",
+                                     (f"(主题 {category})" if category
+                                      else ""),
+                                     spec.puzzle[:30])
+                        return spec
+            log.info("题池 %d 道候选全部被挡(回落现场生成%s): %s",
+                     sum(len(g) for g in cands_by_group),
+                     f", 主题 {category}" if category else "",
+                     " | ".join(blocked[:3]))
             return None
 
     # ------------------------------------------------------------------

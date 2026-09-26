@@ -57,6 +57,10 @@ class ActionKind(str, Enum):
     REVEAL = "reveal"         # 调 LLM 生成揭晓(谜底措辞)
     AI_PLAYER = "ai_player"   # AI 玩家生成公开动作 / Host 或 Judge 裁决
     BROADCAST = "broadcast"   # 只更新状态/提示文案, 不调 LLM
+    #: Issue #60: REVEALED 60s freeze 后由 Director 落盘的 closeout
+    #: (评分聚合 + 主题票聚合 + selected_category)。Engine 不做 I/O。
+    ROUND_CLOSEOUT = "round_closeout"
+    THEME_DEMAND = "theme_demand"
     LOG = "log"
 
 
@@ -443,6 +447,11 @@ class Snapshot:
     #   / 一次 burst 只有一个事件(每批 pulse 一个 seq)。
     # 前端只保留**一个**待播点赞槽位, 新 seq 覆盖旧的 —— 永不无限积压。
     like_progress_notice: Optional[dict[str, Any]] = None
+    # ---- Issue #60 §5: REVEALED 互动权威状态 ----
+    # rating_open / theme_vote_open / 聚合票数 / freeze 后的
+    # selected_category。窗口开放与否由 Engine 判, 前端不自行推断。
+    reveal_interaction: dict[str, Any] = field(default_factory=dict)
+    fact_progress: dict[str, Any] = field(default_factory=dict)
     # ---- 统计 ----
     stat_questions: int = 0                 # 本题累计提问数
     stat_answered: int = 0                  # 本题累计已答数
@@ -498,6 +507,9 @@ class Snapshot:
             "phase_hint": self.phase_hint,
             "ai_player": self.ai_player,
             "like_progress_notice": self.like_progress_notice,
+            # Issue #60: 评分/主题投票的权威窗口状态(前端只渲染它)。
+            "reveal_interaction": self.reveal_interaction,
+            "fact_progress": self.fact_progress,
             "stats": {
                 "questions": self.stat_questions,
                 "answered": self.stat_answered,

@@ -33,6 +33,10 @@
       <section id="bottom">
         <div id="announcer" aria-live="polite"><div id="announcer-text"></div></div>
         <div id="qa-title">问答</div>
+        <div id="fact-progress" class="hidden" aria-live="polite">
+          <div id="fact-progress-title"></div>
+          <div id="fact-progress-list"></div>
+        </div>
         <div id="qa">
           <div id="qa-body"></div>
         </div>
@@ -62,6 +66,24 @@
         <div id="reveal-core"></div>
         <div id="reveal-who" class="hidden"></div>
         <div id="reveal-body" class="hidden"></div>
+        <!--
+          Issue #60 §5: REVEALED 互动层(评分 #1~#5 / 下一题主题 #a~#e)。
+          ⚠️ 前端**只渲染**服务端 reveal_interaction 快照:
+            rating_open / theme_vote_open 由 Engine 判,
+            前端绝不从 next_puzzle_ms 自行推断窗口。
+          0~30s: 评分+主题并排; 30~60s: 评分弱化, 主题成主 CTA。
+          45~60s contribution 内容仍可读(本面板不挤占正文空间)。
+        -->
+        <div id="reveal-interaction" class="hidden">
+          <div id="rating-box" class="">
+            <div id="rating-title">给本题评分：发送 #1~#5</div>
+            <div id="rating-dist"></div>
+          </div>
+          <div id="theme-box">
+            <div id="theme-title">下一题主题：发送 #a~#e（可改票）</div>
+            <div id="theme-options"></div>
+          </div>
+        </div>
         <!--
           揭晓贡献链: "这题大家是怎么一起推出来的"。
           刻意放在正文**之后** —— 核心答案始终是视觉第一层, 贡献链是

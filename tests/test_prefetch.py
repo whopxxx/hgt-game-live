@@ -154,6 +154,103 @@ def variant(i: int) -> PuzzleSpec:
     )
 
 
+#: Issue #60 §16: `_FakeWriter` 默认产物的**独立模板** —— 与 `variant()`
+#: 的守夜人模板文本距离足够远(`too_similar` < 0.22), 保证"fill 种子池
+#: 之后 writer 再生成"仍能过最终 atomic admission, 既有状态机用例不用
+#: 因为新闸门改断言。5 个模板是**完整故事各不相同**的(不只是换场景词),
+#: 连续生成彼此也不撞相似门。
+_GEN_STORIES = (
+    {
+        "puzzle": "咖啡馆角落的钢琴从来没人弹，琴却每天早上都是热的。为什么？",
+        "answer": "流浪乐手夜里偷偷来弹琴取暖，清晨店员生炉子时烘热了琴身。",
+        "title": "热钢琴",
+        "f1": "夜里有人来弹过琴", "f2": "炉子紧挨着钢琴",
+        "f3": "店员早上会生炉子", "f4": "不是店员自己弹的",
+        "a1": "流浪乐手夜里进店取暖弹琴", "fa1": "琴每天早上是热的",
+        "a2": "热度来自紧挨着的炉子", "fa2": "从来没人弹却发热",
+        "clue1": "琴却每天早上都是热的", "clue2": "从来没人弹",
+        "beat1": "先注意到没人弹琴却是热的", "beat2": "再想到炉子就在旁边",
+    },
+    {
+        "puzzle": "鱼摊老板每天收摊都往冰块上浇一壶热水。为什么？",
+        "answer": "热水让冰面融出一层水膜，鱼在夜里的冰面上不会被冻住粘皮。",
+        "title": "热水浇冰",
+        "f1": "水膜能防止鱼皮和冰冻在一起", "f2": "冻住的鱼卖相会坏",
+        "f3": "摊子夜里无人看管", "f4": "不是为了化冰省地方",
+        "a1": "浇热水是造保护水膜", "fa1": "每天收摊浇热水",
+        "a2": "水膜保住鱼的卖相", "fa2": "他卖的是鲜鱼",
+        "clue1": "浇一壶热水", "clue2": "每天收摊",
+        "beat1": "先注意到热水浇冰很反常", "beat2": "再想到鱼会被冻住",
+    },
+    {
+        "puzzle": "图书馆的还书箱晚上八点准时上锁，管理员却在七点半把最后一批书搬走。为什么？",
+        "answer": "晚上八点后馆区断电，搬走的书要赶在断电前完成消磁登记。",
+        "title": "七点半搬书",
+        "f1": "八点整全馆断电", "f2": "消磁登记需要电",
+        "f3": "没登记的书会触发警报", "f4": "不是要提前下班",
+        "a1": "赶在断电前完成登记", "fa1": "七点半搬走最后一批书",
+        "a2": "断电后无法消磁", "fa2": "警报会误触发",
+        "clue1": "晚上八点准时上锁", "clue2": "在七点半把最后一批书搬走",
+        "beat1": "先注意到搬书比上锁早", "beat2": "再想到断电与消磁",
+    },
+    {
+        "puzzle": "地铁站的闸机半夜全部打开，站务员却站在旁边阻止任何人通过。为什么？",
+        "answer": "当晚系统升级，开着的闸机没有供电也没有计数，放人进去会有人困在无灯隧道口。",
+        "title": "开着的闸机",
+        "f1": "系统升级期间闸机不计数", "f2": "隧道口当晚无照明",
+        "f3": "升级持续到凌晨", "f4": "不是为了逃票",
+        "a1": "开闸是升级需要", "fa1": "半夜闸机全部打开",
+        "a2": "拦人是为了安全", "fa2": "进去会有危险",
+        "clue1": "闸机半夜全部打开", "clue2": "站在旁边阻止任何人通过",
+        "beat1": "先注意到开闸与拦人矛盾", "beat2": "再想到升级断电",
+    },
+    {
+        "puzzle": "花店老板每次给温室浇水前都要先敲三下门。温室里明明只有花。为什么？",
+        "answer": "温室里养着一只负责抓虫的寄居雀，敲门是喂食信号，它听到才会躲开花架不挨浇。",
+        "title": "敲三下门",
+        "f1": "温室里有一只寄居雀", "f2": "雀听到敲门会飞进窝",
+        "f3": "水对雀的羽毛有害", "f4": "不是防人偷花",
+        "a1": "敲门是给雀的信号", "fa1": "每次浇水前敲三下",
+        "a2": "雀避开就不会挨浇", "fa2": "雀负责抓虫不能淋湿",
+        "clue1": "温室里明明只有花", "clue2": "浇水前都要先敲三下门",
+        "beat1": "先注意到对空屋敲门", "beat2": "再想到有动物在屋里",
+    },
+)
+
+
+def generated_variant(i: int) -> PuzzleSpec:
+    """writer 默认产物: 第 i 道, 整个故事按 i 轮换(内容自洽的合格题)。"""
+    st = _GEN_STORIES[(i - 1) % len(_GEN_STORIES)]
+    return good_spec(
+        puzzle=st["puzzle"],
+        answer=st["answer"],
+        title=st["title"],
+        facts=[
+            PuzzleFact(id="f1", text=st["f1"], kind="core"),
+            PuzzleFact(id="f2", text=st["f2"], kind="core"),
+            PuzzleFact(id="f3", text=st["f3"],
+                       kind="support", hintable=False),
+            PuzzleFact(id="f4", text=st["f4"], kind="exclusion",
+                       hintable=False),
+        ],
+        solve_atoms=[
+            SolveAtom(id="a1", role="cause",
+                      text=st["a1"], fact_ids=["f2"]),
+            SolveAtom(id="a2", role="mechanism",
+                      text=st["a2"], fact_ids=["f1", "f3"]),
+        ],
+        fair_clues=[
+            FairClue(quote=st["clue1"], supports_atoms=["a1"]),
+            FairClue(quote=st["clue2"], supports_atoms=["a2"]),
+        ],
+        # quality-v8: 当前政策要求 2~4 个发现阶段。
+        discovery_beats=[
+            DiscoveryBeat(id="b1", text=st["beat1"], fact_ids=["f1"]),
+            DiscoveryBeat(id="b2", text=st["beat2"], fact_ids=["f2"]),
+        ],
+    )
+
+
 def mkcfg(tmp, **kw):
     kw.setdefault("pool_enabled", True)
     kw.setdefault("pool_path", os.path.join(tmp, "pool.jsonl"))
@@ -468,7 +565,16 @@ class _ManualExecutor:
 
 
 class _FakeWriter:
-    """假生成器。specs 为空时返回一道新的 variant。"""
+    """假生成器。specs 为空时返回一道新的 variant。
+
+    ⚠️ Issue #60 §16 之后, worker 产出的候选要过 pool 的最终 atomic
+    admission(`too_similar` 对**盘上现有库存**)。`variant(i)` 是同一
+    模板换数字, 相似度远超阈值 —— 灌进 `fill(pool, 5)` 的种子池之后,
+    writer 再产 variant(1) 必然被正确拒绝(那正是 final admission 要防
+    的"并发批次全产近似题")。所以默认产物改用**与种子池模板明显不同**
+    的 `_GEN_VARIANTS` 轮换, 让"生成成功 -> 入池"这条主链的既有用例
+    继续测状态机, 而不是测夹具撞夹具。显式传 specs 的用例不受影响。
+    """
     def __init__(self, specs=None, fail=False):
         self.calls = []
         self._specs = list(specs or [])
@@ -488,7 +594,7 @@ class _FakeWriter:
         if self._specs:
             return self._specs.pop(0)
         self._n += 1
-        return variant(self._n)
+        return generated_variant(self._n)
 
 
 class _Clock:
@@ -659,10 +765,13 @@ def test_latch_held_under_pressure():
         check("缺货 -> latch active", pf._refill_active is True)
         check("**提交 1 个后台任务**", ex.total == 1, ex.total)
         pf.on_tick()
-        check("**单飞仍成立, 不会并发堆任务**", ex.total == 1, ex.total)
+        # ---- Issue #60 §14: bounded concurrency=2 —— 第二拍补满第二个
+        # 空闲 slot(硬上限), 第 3 个任务必须等一个 slot 空出来。
+        check("**第二拍补满并发=2, 不会超过上限堆任务**", ex.total == 2,
+              ex.total)
         ex.run_next()
         pf.on_tick()
-        check("上一道完成后继续向 target 补", ex.total == 2, ex.total)
+        check("完成一个 slot 后继续向 target 补", ex.total == 3, ex.total)
 
 
 def test_two_ticks_produce_one_task():
@@ -680,7 +789,8 @@ def test_two_ticks_produce_one_task():
         pf.on_tick()
         pf.on_tick()
         pf.on_tick()
-        check("**三拍只提交一次**", ex.total == 1, ex.total)
+        # ---- Issue #60 §14: 并发=2 —— 三拍最多提交 2 个(每 slot 一个)。
+        check("**三拍最多提交并发上限个**", ex.total == 2, ex.total)
 
 
 def test_next_task_only_after_done():
@@ -693,10 +803,13 @@ def test_next_task_only_after_done():
         pf.on_tick()
         check("第一次提交", ex.total == 1, ex.total)
         pf.on_tick()
-        check("没完成 -> 不起新的", ex.total == 1, ex.total)
+        # ---- Issue #60 §14: 第二拍补满并发=2; 之后没完成就不起新的。
+        check("第二拍补满并发上限", ex.total == 2, ex.total)
+        pf.on_tick()
+        check("都未完成 -> 不起新的", ex.total == 2, ex.total)
         ex.run_next()
         pf.on_tick()
-        check("完成 -> 可以起下一个", ex.total == 2,
+        check("完成 -> 可以起下一个", ex.total == 3,
               ex.total)
 
 
@@ -726,7 +839,14 @@ def test_max_workers_one_is_not_the_guard():
         fill(pool, 1)
         for _ in range(5):
             pf.on_tick()
-        check("**5 拍仍只起 1 个生成**", w.calls == 1, w.calls)
+        # ---- Issue #60 §14: 并发=2 —— 5 拍最多提交 2 个(护栏是
+        # _futures 不是线程池大小)。真 executor(1) 上第二个任务排队,
+        # 所以"**开始执行**的"只有 1 个(第一个还压着 release)。
+        check("**5 拍最多提交 2 个(并发上限)**", w.calls == 1, w.calls)
+        check("**且提交了 2 个(第二个在 executor 队列里)**",
+              len(pf._futures) == 2
+              and sum(1 for f in pf._futures if f is not None) == 2,
+              pf._futures)
         release.set()
         pf._executor.shutdown(wait=True)
 
@@ -1015,16 +1135,20 @@ def test_pop_next_still_uses_current_gate():
     ⚠️ **G4-B**: 窗口里的**纯 diversity** 项不再挡交付, 所以这里改用
     identity 那一关(`too_similar`)来证明"播出时仍然重判"—— 那一条
     G4 没有放宽, 也是本测试真正关心的性质。
+
+    ⚠️ Issue #60 §16 之后, prefetch 链有**最终 atomic admission**
+    (对盘上库存 too_similar), 近似题根本进不了池 —— 那是 §16 自己的
+    用例(见下)。所以本用例**不再经过 prefetcher**, 直接用普通
+    `pool.add`(无相似门)摆出"池里躺着近似题"的局面, 纯测 pop_next
+    交付时的重判。
     """
     print("\n[B15] pop_next 仍走当前 gate(补池不改这一点)")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
-        pf = mkpf(d, pool=pool)
-        fill(pool, 1)
-        pf.on_tick()
-        check("补池后有 2 道", pool.stock_count() == 2, pool.stock_count())
-        pz = pool._items[0].puzzle
-        got = pool.pop_next(avoid=[pz])
+        pool.add(variant(100))
+        pool.add(variant(101))          # 与 100 同模板, near-duplicate
+        pz0 = variant(100).puzzle
+        got = pool.pop_next(avoid=[pz0])
         check("**too_similar 仍然在交付时重判 -> None**", got is None, got)
 
 
@@ -2068,7 +2192,10 @@ class _GatedWriter:
                            "has_predicate": should_continue is not None})
         if should_continue is not None and not should_continue():
             return _interrupted_spec()
-        return self._spec if self._spec is not None else variant(len(self.calls))
+        # Issue #60 §16: 默认产物用与 variant 模板**不相似**的独立模板
+        # (否则过不了 pool 的最终 atomic admission)。显式 spec 不受影响。
+        return (self._spec if self._spec is not None
+                else generated_variant(len(self.calls)))
 
 
 def _interrupted_spec():
@@ -3326,7 +3453,9 @@ def test_stable_refill_default_waterlines():
           not hasattr(cfg, "pool_reveal_target_size")
           and not hasattr(cfg, "pool_reveal_playable_target"),
           [n for n in dir(cfg) if "reveal" in n and "pool" in n])
-    check("硬上限 = 16", cfg.pool_max_size == 16, cfg.pool_max_size)
+    # Issue #60 §10: 硬上限从 16 提到 60 —— 容纳 50+ distinct 库存,
+    # 并给 observed miss / in-flight overshoot 留余量。
+    check("硬上限 = 60(Issue #60)", cfg.pool_max_size == 60, cfg.pool_max_size)
     check("refill 技术短退避默认 5/10/15",
           tuple(cfg.pool_prefetch_refill_backoff_schedule_s)
           == (5.0, 10.0, 15.0),
@@ -3662,13 +3791,15 @@ def test_pc_i_at_most_one_future_across_many_ticks():
         fill(pf.pool, 1)
         for _ in range(10):
             pf.on_tick()
-        check("**10 拍只提交了 1 条(在途未完成)**", ex.total == 1, ex.total)
-        check("**且它仍在途**", len(ex.pending) == 1, len(ex.pending))
-        # 完成它 -> 允许下一条
+        # ---- Issue #60 §14: 并发=2 —— 10 拍最多 2 条在途(每 slot 一条)。
+        check("**10 拍最多提交并发上限条(在途未完成)**", ex.total == 2,
+              ex.total)
+        check("**且它们仍在途**", len(ex.pending) == 2, len(ex.pending))
+        # 完成一个 -> 允许补一条
         ex.run_next()
         pf.on_tick()                        # 回收 + 应用
         pf.on_tick()                        # 再提交
-        check("**完成后才允许下一条**", ex.total == 2, ex.total)
+        check("**完成一个 slot 后才允许下一条**", ex.total == 3, ex.total)
 
 
 def test_pc_j_latch_closes_at_target():
@@ -3905,11 +4036,13 @@ def test_pc_s2_pending_result_still_accounted_after_stop():
         # **由下一拍步骤 ② 才应用**。
         _pc_tick(pf, 1)
         check("第一拍确实起了一个任务", len(w.calls) == 1, len(w.calls))
+        # ---- Issue #60 §14: 单槽换成了结果队列 `_pending_results`,
+        # 断言随接口改: 队列里有这条 interrupted 且尚未收账。
         check("**第一拍的结果是 interrupted 且尚未收账**",
-              pf._pending_result is not None
-              and pf._pending_result[0] == "interrupted"
+              len(pf._pending_results) == 1
+              and pf._pending_results[0][0] == "interrupted"
               and pf.interrupted_count == 0,
-              (pf._pending_result, pf.interrupted_count))
+              (pf._pending_results, pf.interrupted_count))
 
         # 第二拍: gate 已 False(不再起新活), 但步骤 ② 必须照收旧账。
         _pc_tick(pf, 1)
@@ -4058,8 +4191,9 @@ def test_pc_u_submit_lock_is_separate_from_state_lock():
         check("**提交段复查 `_shutdown_event`(⑩b)**",
               "_shutdown_event.is_set()" in src_tick, None)
         # 撤销 `_PENDING` 的那一行 —— 忘掉它就是单飞被永久占死。
+        # (Issue #60 §14: 单 `_future` 变成了 `_futures` 列表。)
         check("**复查命中时撤销 `_PENDING`(单飞不被占死)**",
-              src_tick.count("_future = None") >= 1, None)
+              src_tick.count("_futures[i] = None") >= 1, None)
 
 
 def test_pc_u2_stop_in_the_window_between_pending_and_submit():
@@ -4438,6 +4572,189 @@ def test_pc_w5_playtester_run_signature_accepts_optional_predicate():
           sig.parameters["should_continue"].default)
 
 
+# ======================================================================
+# Issue #60: bounded concurrency / reservation / demand / final admission
+# ======================================================================
+def test_i60_concurrency_cap_never_exceeded():
+    """§21: 最大 active worker 永不 >2(并发上限硬约束)。"""
+    print("\n[I60-1] 并发上限 = 2")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        for _ in range(10):
+            pf.on_tick()
+        check("**10 拍最多 2 条在途**",
+              sum(1 for f in pf._futures if f is not None) <= 2,
+              pf._futures)
+        check("**提交数也不超过 2**", ex.total <= 2, ex.total)
+
+
+def test_i60_two_workers_results_both_consumed():
+    """§21: 2 个 worker 同时完成 -> 两个结果都被消费, 不覆盖。"""
+    print("\n[I60-2] 双 worker 结果不互相覆盖")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        pf = mkpf(d, pool=pool, writer=_FakeWriter(), executor=ex)
+        fill(pool, 1)
+        pf.on_tick()
+        pf.on_tick()                # 补满 2 个 slot
+        check("2 个 slot 都在途", ex.total == 2, ex.total)
+        ex.run_next()
+        ex.run_next()               # 两个 worker 都"同时"完成
+        pf.on_tick()                # 一拍全部收账
+        check("**两个结果都被收账(added=2)**", pf.added_count == 2,
+              pf.added_count)
+        check("**结果队列清空(没有残留/覆盖)**", pf._pending_results == [],
+              pf._pending_results)
+
+
+def test_i60_per_worker_independent_writers():
+    """§14: 每个 worker 独立 client + PuzzleWriter(factory 注入)。"""
+    print("\n[I60-3] 每 worker 独立 writer")
+    with tmpdir() as d:
+        made = []
+
+        def factory(slot):
+            w = _FakeWriter()
+            made.append((slot, w))
+            return w
+
+        ex = _SyncExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        pf = mkpf(d, pool=pool, executor=ex)
+        pf._writer_factory = factory
+        pf._writers = [factory(i) for i in range(pf._concurrency)]
+        fill(pool, 1)
+        pf.on_tick()
+        check("**工厂为每个 slot 各建一个 writer**", len(pf._writers) == 2,
+              len(pf._writers))
+        check("**writer 实例互不相同**",
+              pf._writers[0] is not pf._writers[1], None)
+
+
+def test_i60_category_reservation_prevents_overshoot():
+    """§14: category in-flight reservation —— 两个 slot 不同时补同一缺口。
+
+    夹具: 池里已有 v2 题(分类信息可用), logic 类 eligible=0。
+    demand 缺口 = 1; 第一个 slot 占了 reservation 之后, 第二个 slot
+    看到的 effective_stock = 0+1 >= 需求 -> 不会再为 logic 起一个。
+    """
+    print("\n[I60-4] reservation 防同缺口重复超发")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        # 一道 v2 题(非 logic), 让分类读数"可用"但 logic 仍为 0。
+        spec = generated_variant(1)
+        spec.protocol_version = "haiguitang-v2"
+        spec.primary_category = "horror"
+        spec.categories = ["horror"]
+        pool.add(spec)
+        pf = mkpf(d, pool=pool, writer=_FakeWriter(), executor=ex,
+                  pool_category_target=1, pool_category_low_water=1)
+        pf.request_category("logic")
+        pf.on_tick()
+        check("第一拍为 logic 起一个", ex.total == 1, ex.total)
+        check("logic 的 in-flight reservation = 1",
+              pf._in_flight_by_category.get("logic") == 1,
+              pf._in_flight_by_category)
+        pf.on_tick()
+        # 第二拍可能走全局 free path(全局 latch 是开的), 但**绝不能**
+        # 再为 logic 起一个 —— effective_stock = 0 + 1(在飞) >= target 1。
+        second = ex.pending[1][1][0] if ex.total == 2 else {}
+        check("**不再为同一缺口超发(第二个请求不是 logic)**",
+              second.get("requested_category") != "logic",
+              second.get("requested_category"))
+
+
+def test_i60_demand_priority_over_maintenance():
+    """§11: demand 缺口 > 普通 maintenance deficit。"""
+    print("\n[I60-5] demand 优先于 maintenance")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        for cat, fam_story in (("logic", 1), ("horror", 2)):
+            s = generated_variant(fam_story)
+            s.protocol_version = "haiguitang-v2"
+            s.primary_category = cat
+            s.categories = [cat]
+            pool.add(s)
+        pf = mkpf(d, pool=pool, writer=_FakeWriter(), executor=ex,
+                  pool_category_target=2, pool_category_low_water=1)
+        pf.request_category("horror")
+        pf.on_tick()
+        got = ex.pending[0][1][0]
+        check("**demand 的 horror 先被补**",
+              got.get("requested_category") == "horror",
+              got.get("requested_category"))
+
+
+def test_i60_demand_survives_technical_fail():
+    """§11: demand 任务不因一次技术失败消失 —— 在恢复前保持 pending。"""
+    print("\n[I60-6] demand 不因技术失败消失")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pool = PuzzlePool.open(mkcfg(d))
+        s = generated_variant(1)
+        s.protocol_version = "haiguitang-v2"
+        s.primary_category = "horror"
+        s.categories = ["horror"]
+        pool.add(s)
+        pf = mkpf(d, pool=pool, writer=_FakeWriter(), executor=ex,
+                  pool_category_target=2, pool_category_low_water=1)
+        pf.request_category("logic")
+        pf.on_tick()
+        ex.run_next()
+        # 一次技术失败(不退出 demand)
+        pf._apply_result("gen_fail", "网关抖",
+                         {"reject": "structure_technical_fail"}, 0.0)
+        check("**demand 仍然 pending**", "logic" in pf._demand_categories,
+              pf._demand_categories)
+        pf.on_tick()
+        check("**恢复后继续为 logic 补**", ex.total == 2, ex.total)
+
+
+def test_i60_final_admission_blocks_near_duplicate():
+    """§16/§21: 并发 final admission 不把相似候选一起灌进池。"""
+    print("\n[I60-7] final admission 拒近似题")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(variant(100))
+        near = variant(101)         # 同模板, near-duplicate
+        ok, why = pool.add_with_final_admission(near, source="prefetch")
+        check("**近似候选被拒**", ok is False, why)
+        check("拒绝原因提到相似", "太像" in why, why)
+        check("**不写 used ledger**", pool.used_count() == 0,
+              pool.used_count())
+        check("**池里仍只有 1 道**", pool.stock_count() == 1,
+              pool.stock_count())
+
+
+def test_i60_final_admission_allows_distinct():
+    """§16: 与库存不同的合格题正常入池(不误杀)。"""
+    print("\n[I60-8] final admission 不误杀不同题")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(variant(100))
+        fresh = generated_variant(3)
+        ok, why = pool.add_with_final_admission(fresh, source="prefetch")
+        check("**不同题入池成功**", ok is True, why)
+        check("池里 2 道", pool.stock_count() == 2, pool.stock_count())
+
+
+def test_i60_stop_before_final_add_gate():
+    """§21: stop 后 final add gate —— 提交前最后一道检查仍在。"""
+    print("\n[I60-9] stop 后不写池")
+    import inspect
+    src = inspect.getsource(PoolPrefetcher._finish_one)
+    idx_stop = src.rfind("if not should_continue():")
+    idx_adm = src.find("add_with_final_admission")
+    check("**stop 检查在 final admission 之前**",
+          0 <= idx_stop < idx_adm, (idx_stop, idx_adm))
+
+
 def _mk_director_for_pc(tmp, executor):
     """建一个真实 Director, 替换掉 prefetcher 的 executor/writer。
 
@@ -4659,6 +4976,16 @@ def main():
         test_pc_w3_override_replaces_not_ands,
         test_pc_w4_finish_one_threads_predicate_into_playtest,
         test_pc_w5_playtester_run_signature_accepts_optional_predicate,
+        # ---- Issue #60: bounded concurrency / reservation / demand / admission
+        test_i60_concurrency_cap_never_exceeded,
+        test_i60_two_workers_results_both_consumed,
+        test_i60_per_worker_independent_writers,
+        test_i60_category_reservation_prevents_overshoot,
+        test_i60_demand_priority_over_maintenance,
+        test_i60_demand_survives_technical_fail,
+        test_i60_final_admission_blocks_near_duplicate,
+        test_i60_final_admission_allows_distinct,
+        test_i60_stop_before_final_add_gate,
     ]
     for t in tests:
         t()

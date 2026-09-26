@@ -87,6 +87,9 @@ jobs:
       - name: 离线套件 engine
         run: uv run tests/test_engine.py
 
+      - name: PR #61 live-ready blocker regressions
+        run: uv run tests/test_live_ready_blockers.py
+
       - name: 离线套件 ingest
         run: uv run tests/test_ingest.py
 
@@ -138,6 +141,12 @@ jobs:
 
       - name: 离线套件 prefetch
         run: uv run tests/test_prefetch.py
+
+      # Issue #60: REVEALED 互动 —— 评分 #1~#5 前 30s / 主题投票 #a~#e
+      # 全 60s / freeze 恰好一次 / tie 确定性 / requested_category 不丢 /
+      # Snapshot.reveal_interaction 窗口权威 / closeout payload 完整。
+      - name: 离线套件 interaction
+        run: uv run tests/test_interaction.py
 
       - name: 离线套件 playtest
         run: uv run tests/test_playtest.py

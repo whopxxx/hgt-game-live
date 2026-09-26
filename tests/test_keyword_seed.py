@@ -962,6 +962,62 @@ def test_g4d_real_vocab_has_no_shock_seeds():
           d["corpus_version"])
 
 
+def test_i60_concurrent_draw_atomic():
+    """Issue #60 §15: 多线程 draw —— index 单调唯一、1..N 完整、无异常。"""
+    print("\n[K60-1] KeywordBag 并发 draw 原子化")
+    import threading
+    bag = KeywordBag([f"词{i}" for i in range(50)], session_seed=42)
+    n_threads, per = 8, 50
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(per):
+                results.append(bag.draw()["index"])
+        except Exception as e:              # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("无异常/无状态损坏", not errors, errors[:3])
+    check("draw 总数正确", len(results) == n_threads * per, len(results))
+    check("**index 无重复**", len(set(results)) == len(results),
+          len(results) - len(set(results)))
+    check("**1..N 完整单调**",
+          sorted(results) == list(range(1, n_threads * per + 1)), None)
+
+
+def test_i60_concurrent_draw_sequential_equivalence():
+    """§15: 同 seed 下, 并发串行化后的 draw 序列 == 单线程序列
+    (锁只做串行化, 不改行为)。"""
+    print("\n[K60-2] 并发 draw 与单线程同序")
+    import threading
+    words = [f"w{i}" for i in range(30)]
+    solo = KeywordBag(words, session_seed=7)
+    seq = [solo.draw()["keywords"] for _ in range(100)]
+    # 并发: 4 线程但用屏障逐次同步 -> 每 draw 的相对顺序确定
+    bag = KeywordBag(words, session_seed=7)
+    bar = threading.Barrier(4)
+    got = []
+
+    def w():
+        for _ in range(25):
+            bar.wait()
+            got.append(bag.draw()["keywords"])
+
+    ts = [threading.Thread(target=w) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("barrier 串行化后同序列列一致", got == seq,
+          None if got == seq else (got[:3], seq[:3]))
+
+
 def main():
     tests = [
         test_bank_shape,
@@ -1001,6 +1057,9 @@ def main():
         test_g4d_reason_matches_validator,
         test_g4d_product_reports_reasons_not_words,
         test_g4d_real_vocab_has_no_shock_seeds,
+        # ---- Issue #60 §15: KeywordBag 并发安全 ----
+        test_i60_concurrent_draw_atomic,
+        test_i60_concurrent_draw_sequential_equivalence,
     ]
     for t in tests:
         t()

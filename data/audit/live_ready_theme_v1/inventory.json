@@ -1,0 +1,834 @@
+{
+  "generated_at": "2026-09-26T12:21:44.949683+00:00",
+  "issue": 60,
+  "milestone": "Live-ready Theme v1",
+  "pool_path": "data/pool.jsonl",
+  "used_ledger_path": "data/pool_used.jsonl",
+  "pool_file_sha256": "711359702aa627ce23298b74db5daa31dee45d8edf2a58859324ae2e563ea1df",
+  "used_ledger_sha256": "c080ca6798edc35c1600934ea82d4869b3d23e17b8dda8c4cecda68ae8c2cb61",
+  "used_ledger_exists": true,
+  "ledger_trustworthy": true,
+  "criteria": {
+    "distinct_current_policy_unplayed_min": 50,
+    "per_category_eligible_min": 10
+  },
+  "observed": {
+    "distinct_stock_count": 53,
+    "distinct_v2_unplayed": 45,
+    "stock_by_category": {
+      "logic": 18,
+      "suspense": 25,
+      "horror": 10,
+      "emotion": 30,
+      "brainstorm": 16
+    },
+    "primary_counts": {
+      "emotion": 20,
+      "suspense": 8,
+      "horror": 7,
+      "brainstorm": 9,
+      "logic": 1
+    },
+    "secondary_eligible_counts": {
+      "logic": 17,
+      "suspense": 17,
+      "horror": 3,
+      "emotion": 10,
+      "brainstorm": 7
+    },
+    "protocol_versions": {
+      "legacy": 8,
+      "haiguitang-v2": 45
+    },
+    "prompt_versions": {
+      "keyword2-v7": 8,
+      "haiguitang-generation-v3": 45
+    },
+    "quality_policy_versions": {
+      "quality-v13": 53
+    }
+  },
+  "criteria_met": true,
+  "inventory": [
+    {
+      "pool_key": "79ac96a05d1a54ff",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "emotional_motive",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "f6a938a8355d03e6",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "b8935fdd49380dae",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "cdae249e621673f6",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "3480cb2971ece921",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "object_misuse",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "3aa4d166778a2671",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "information_gap",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "5c94528d3a3b07f7",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "information_gap",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "4154a22f0de18c35",
+      "protocol_version": "",
+      "prompt_version": "keyword2-v7",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "",
+      "categories": [],
+      "difficulty": "",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": false,
+      "added_source": "prefetch"
+    },
+    {
+      "pool_key": "83b5aaeed2f12cd2",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "4ba56244de7048c1",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "fc308f3b32cda32b",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "goal_reversal",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "3af18afc62dd25b6",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic"
+      ],
+      "difficulty": "hard",
+      "mechanism_family": "information_gap",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "7446de77273719ab",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "9528e39205c8930b",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "e0412e19d37a2f1a",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "social_rule",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "cbdb5042de2677b9",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "70a13862b1d92a88",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "66fc303890ed34e2",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "object_misuse",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "3c3eef8812bbe8f3",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "94bc04e81bb94a26",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "fee06b4ec62b8373",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "object_misuse",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "a8951a1a06630e40",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "object_misuse",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "214c3993f3c02be5",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "28a37d73a892cd6b",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense",
+        "brainstorm"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "1621c30c5e197ede",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "8c05406bf3886f7f",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic",
+        "horror"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "causal_reversal",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "7b4eaba432c23204",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense",
+        "brainstorm"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "1843dceca8d4d98a",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "rule_constraint",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "e6239bf1fc35d846",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "horror",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "time_reinterpretation",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "0625ef9252e39682",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "horror",
+      "categories": [
+        "horror",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "d0f199273944daa3",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "emotion"
+      ],
+      "difficulty": "easy",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "1b1ad1ce4f82d1b1",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "emotional_motive",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "2e941dabc5c94115",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense",
+        "horror"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "61b38ce723a72bff",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "information_gap",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "74057a286a608d09",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "object_misuse",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "da609aed16c8e4e8",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "38fac47e33cafb93",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "difficulty": "easy",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "0baca20d328e1a20",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "6a4ca2c19b6c94bd",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "logic"
+      ],
+      "difficulty": "easy",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "f7b4e57487c8de61",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "86d8d7ce48e27da6",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "7aeac7af9916187d",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "information_gap",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "cd671f7afc0b453c",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "e02b811ee7e56ff9",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "rule_constraint",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "569b74dfe471a891",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "emotion"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "beaaae15b7b6b202",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "logic",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "acc6a03422e06266",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "logic",
+      "categories": [
+        "logic",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "observer_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "313e560c08a8138f",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "suspense",
+      "categories": [
+        "suspense",
+        "logic"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "hidden_function",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "48a931be2c73e900",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "difficulty": "easy",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "53e36cb522b45ad4",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "brainstorm",
+      "categories": [
+        "brainstorm",
+        "emotion"
+      ],
+      "difficulty": "easy",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "658cfc67084c8102",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "time_reinterpretation",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "7d9afb065344ce2a",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "suspense"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "space_reinterpretation",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    },
+    {
+      "pool_key": "c2d7e7496039b75c",
+      "protocol_version": "haiguitang-v2",
+      "prompt_version": "haiguitang-generation-v3",
+      "quality_policy_version": "quality-v13",
+      "primary_category": "emotion",
+      "categories": [
+        "emotion",
+        "brainstorm"
+      ],
+      "difficulty": "medium",
+      "mechanism_family": "identity_misread",
+      "eligible_v2": true,
+      "added_source": "prefill"
+    }
+  ]
+}

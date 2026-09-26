@@ -132,11 +132,15 @@ prefetch client 有自己的 timeout / max_retries(见 `director.py`)。
    此时补进来的新题会被同一条件挡住 —— 没有上限就是无限烧配额而
    playable 一动不动。到 `pool_max_size` 就停, 只 warning。
 
-4. **单飞靠 `self._future`, 不靠 `max_workers=1`**。后者只保证"同时执行
-   一个", 挡不住 tick 往队列里排 30 个任务。
+4. **在途护栏是 `_futures`(每 slot 一个), 不靠 `max_workers`**。后者只
+   保证"同时执行 N 个", 挡不住 tick 往队列里排 30 个任务。
+   (#55 之前是单 `_future` 单飞; Issue #60 §14 起 bounded concurrency
+   = `pool_prefetch_concurrency`, live 默认 2。)
 
-5. **一次只生成一道**。任何时刻最多一个 background future。提高补货
-   吞吐靠"不停手"(不被直播打断), **不是**靠并发。
+5. **任何时刻最多 N 条 generation pipeline(N=并发上限)**。live 默认
+   2 条; 开播前 bulk prefill 用 5(独立进程, 见 prefill_pool.py)。
+   每个 slot 独立 Future + 独立 writer; 结果进队列不互相覆盖;
+   category in-flight reservation 防 overshoot(§14)。
 
 ## 为什么用轮询 future.done() 而不是 add_done_callback
 
@@ -144,7 +148,7 @@ prefetch client 有自己的 timeout / max_retries(见 `director.py`)。
 抢锁, 而 on_tick 正持锁, 就是死锁; 不抢锁则是静默数据竞争。
 
 轮询让 **latch/退避/计数器只有一个写者(tick 线程)**, 这正是让滞回可
-审计、可单测的性质。worker 唯一的写口是 `_pending_result` 那个槽位。
+审计、可单测的性质。worker 唯一的写口是 `_pending_results` 结果队列(Issue #60 §14)。
 
 零新依赖。
 """
@@ -180,17 +184,54 @@ log = logging.getLogger("story.prefetch")
 #: 都会正确地把它当成"在途"。
 _PENDING = object()
 
+#: `_pick_deficit_category_locked` 的哨兵: 这一拍**没有**该补的 category
+#: (所有类都在 target 之上) —— 走全局 free path 补充。
+_NO_SLOT_NEEDED = object()
+
 
 class PoolPrefetcher:
-    """题池后台补池。**绝不抛、绝不阻塞 tick。**"""
+    """题池后台补池。**绝不抛、绝不阻塞 tick。**
+
+    ## Issue #60 §14: bounded concurrency
+
+    Q9/#55 时代是 single-flight(一个 `_future` / 一个 `_pending_result`
+    槽)。本 Issue 把后台生成流水线改成 **bounded concurrency =
+    `pool_prefetch_concurrency`(live 默认 2)**:
+
+        * tick 只补空闲 slot, 同时最多 N 条 generation pipeline;
+        * 每个 slot 有独立的 Future 与独立的 writer(worker 可能有
+          **独立 client + PuzzleWriter** —— `_last_reject` / reviewer
+          side-channel 是实例状态, 多 worker 绝不能共用一个 writer);
+        * 结果不再塞单槽 `_pending_result`, 而是进**结果队列** ——
+          2 个 worker 同时完成不互相覆盖(tick 一拍全部收账);
+        * 对每个 requested category 维护 **in-flight reservation**,
+          调度用 `effective_stock = actual + in_flight` 防同缺口
+          无限 overshoot;
+        * stop/shutdown 不变量(#55)逐条保留: `_submit_lock` 与
+          state lock 分离 / visible stop 后不再 submit / final
+          `should_continue` 紧贴最终 pool 写入 / shutdown 不死锁 /
+          已开始 worker 协作中止记 interrupted。
+    """
 
     def __init__(self, cfg: Any, pool: Any, writer: Any,
                  probe_inputs: Callable, pick_blueprint: Callable,
                  rng: Optional[random.Random] = None,
-                 executor: Any = None, clock: Callable = time.monotonic):
+                 executor: Any = None, clock: Callable = time.monotonic,
+                 writer_factory: Optional[Callable] = None):
         self.cfg = cfg
         self.pool = pool
-        self.writer = writer
+        # ---- Issue #60 §14: 每 worker 独立 writer ----
+        #
+        # `writer_factory` 给了 -> 为每个 slot 各建一个(`PuzzleWriter`
+        # 的 `_last_reject` / `_last_review_*` 是实例状态, 共享会让
+        # 并发审稿的 provenance 互相污染 —— 与 Director 里 live/prefetch
+        # 分实例是同一条理由, 现在并发 worker 之间也要分)。
+        # 只传 `writer`(旧调用方/测试) -> 所有 slot 共用它: 测试替身
+        # 无状态, 共享无害; 生产路径必须走 factory。
+        self._writer_factory = writer_factory
+        self._base_writer = writer
+        self._concurrency = max(
+            1, int(getattr(cfg, "pool_prefetch_concurrency", 2) or 1))
         self._probe_inputs = probe_inputs
         self._pick_blueprint = pick_blueprint
         self._clock = clock
@@ -287,9 +328,10 @@ class PoolPrefetcher:
         self._init_keyword_bag(cfg)
 
         # 自己起 executor(不借 Director 的): 它是本模块的内部实现细节,
-        # 而且 max_workers=1 只是第二道防线, 单飞由 _future 保证。
+        # 执行线程数与实际可占用 slot 数一致。
+        self._owns_executor = executor is None
         self._executor = executor or ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="prefetch")
+            max_workers=self._concurrency, thread_name_prefix="prefetch")
 
         # ---- 状态(全部由下面这把锁保护) ----
         # 刻意**不**复用 Director 的 _narrating: 那个锁是出题用的, 补池
@@ -334,14 +376,33 @@ class PoolPrefetcher:
         #: 一字不变: 另一个线程的 `request_stop()` 仍然必须等提交段走完
         #: (或抢在它前面, 让提交段复查到并放弃)。
         self._submit_lock = threading.RLock()
-        self._future: Optional[Future] = None
+        # ---- Issue #60 §14: bounded concurrency 状态 ----
+        # 每个 slot 一个 Future(None = 空闲)。`_PENDING` 占位语义保留:
+        # 已决定提交、还没拿到 Future。旧 single-flight 的
+        # `self._future` 语义由 `_futures` 列表取代;
+        # `test` 里直接摸 `pf._future` 的少数路径由下面的兼容 property 承接
+        # (等价于"任一 slot 在途")。
+        self._futures: list = [None] * self._concurrency
         self._refill_active = False        # latch(滞回)
         self._retry_at = 0.0               # 退避到期时刻(monotonic)
         #: 连续失败次数。`interrupted`(主动中止)**不计** —— 见
         #: `_apply_result`。它在 `_fail_streak` 上的效果必须是
         #: "什么都没发生"。
         self._fail_streak = 0
-        self._pending_result = None        # worker 的终局结果, 由 tick 取走
+        # ---- §14: 结果**队列**(替代旧单槽 `_pending_result`) ----
+        # 2 个 worker 同一拍完成时, 两个终局都必须被收账 —— 单槽会
+        # 互相覆盖。`_pending_results` 是 list[tuple], tick 一次全取走。
+        self._pending_results: list = []
+        # ---- §11: category in-flight reservation ----
+        # key = category("" = 无主题); value = 该类当前在飞的 pipeline 数。
+        # 调度用 effective_stock = actual + in_flight, 防止 2 个 slot
+        # 同时看到同一个缺口无限 overshoot。
+        self._in_flight_by_category: dict = {}
+        # ---- §11: demand refill(主题投票的高优先级 demand 信号) ----
+        # key = category; value = demand 置位时间。demand 的业务任务
+        # 不因一次技术失败/observed miss 消失 —— 直到该类库存回到
+        # target 或生命周期 stop 前保持 pending。重复置位去重。
+        self._demand_categories: dict = {}
         self._last_fail = ""
         #: 硬上限 warning 的节流时刻(monotonic)。tick 4Hz, 不节流会把
         #: "到顶了但还是没得播"刷成日志洪水。
@@ -414,8 +475,95 @@ class PoolPrefetcher:
             "safety_technical_fail": 0,
             "success": 0,
         }
+        # ---- Issue #60 §14: 每 slot 独立 writer(状态齐了再建) ----
+        self._writers = [self._make_writer(i)
+                         for i in range(self._concurrency)]
+        if (self._owns_executor and self._concurrency > 1
+                and len({id(w) for w in self._writers if w is not None})
+                    != len([w for w in self._writers if w is not None])):
+            raise ValueError("concurrent prefetch writers must be independent")
+
+    def _make_writer(self, slot: int) -> Any:
+        """slot i 的 writer。并发时 factory 必须提供独立实例。"""
+        if self._writer_factory is not None:
+            w = self._writer_factory(slot)
+            if w is None and self._concurrency > 1 and self._base_writer is not None:
+                raise ValueError("prefetch writer_factory returned None")
+            return w
+        if (self._concurrency > 1 and self._owns_executor
+                and self._base_writer is not None):
+            raise ValueError("concurrent prefetch requires writer_factory")
+        return self._base_writer
+
+    @property
+    def writer(self) -> Any:
+        """兼容入口: 稳态路径用的是 slot 0 的 writer。
+
+        ⚠️ 写它(测试/老代码 `pf.writer = X`)会同时替换 slot 0 ——
+        这是历史语义的保留, 生产代码一律走 `_writers[slot]`。
+        """
+        return self._writers[0] if self._writers else self._base_writer
+
+    @writer.setter
+    def writer(self, value) -> None:
+        if self._writers:
+            self._writers[0] = value
+        self._base_writer = value
 
     # ------------------------------------------------------------------
+    # ---- Issue #60 §11: demand refill 接口 ----
+    # ------------------------------------------------------------------
+    def request_category(self, category: str) -> bool:
+        """主题投票的 demand 信号(Engine/Director 在 REVEALED 中
+        第一次见到某类有效票时发)。
+
+        幂等: 重复 demand 同一类不会重复 enqueue 业务任务 —— 已在
+        pending 就刷新时间戳并返回 False。demand 的优先级高于普通
+        maintenance deficit(见 `_on_tick_locked_ish`)。
+        """
+        cat = str(category or "").strip()
+        if not cat:
+            return False
+        now = self._clock()
+        with self._lock:
+            first = cat not in self._demand_categories
+            self._demand_categories[cat] = now
+        if first:
+            log.info("demand refill 置位: category=%s(主题投票需求)", cat)
+        return first
+
+    def _clear_demand_if_healthy_locked(self, stock_by_cat: dict) -> None:
+        """某类库存 >= target 时清除它的 demand(lifecycle stop 也清)。"""
+        target = max(0, int(getattr(self.cfg, "pool_category_target", 10)))
+        for cat in list(self._demand_categories):
+            if stock_by_cat.get(cat, 0) >= target:
+                del self._demand_categories[cat]
+                log.info("demand refill 清除: category=%s 库存已到 target", cat)
+
+    def _effective_stock_locked(self, stock_by_cat: dict,
+                                category: str) -> int:
+        """§14: actual eligible stock + 该类 in-flight reservation。"""
+        actual = stock_by_cat.get(category, 0)
+        in_flight = self._in_flight_by_category.get(category, 0)
+        return actual + in_flight
+
+    # ------------------------------------------------------------------
+    @property
+    def _future(self):
+        """兼容: 旧单飞语义 = "任一 slot 在途"。
+
+        生产代码不再读它; 保留给既有测试(`pf._future is not None` /
+        占位撤销断言)与排查。赋值只在并发=1 时与旧语义等价。
+        """
+        return next((f for f in self._futures if f is not None), None)
+
+    @_future.setter
+    def _future(self, value) -> None:
+        # 并发=1 时旧测试/旧代码可以按原样置 None(撤销占位)。
+        if self._concurrency == 1:
+            self._futures[0] = value
+        # 并发>1 时忽略外部赋值 —— slot 状态只能由 tick/worker 管理。
+
     def _enabled(self) -> bool:
         """补池能不能跑。
 
@@ -552,7 +700,7 @@ class PoolPrefetcher:
           - 真实 executor 的 `submit()` 在队列满时可以阻塞, 持锁阻塞会
             把 tick 线程卡住 —— 那正是"补池不能影响直播"要避免的;
           - 同步执行的替身(测试里那种)会在 `submit()` 里**就地**跑完
-            worker, 而 worker 结尾要拿同一把 `_lock` 写 `_pending_result`
+            worker, 而 worker 结尾要拿同一把 `_lock` 写结果队列
             —— 非重入锁上直接死锁。
         所以这里先把该读的读完、该占的标记占掉, 出了锁再真正提交。
 
@@ -567,18 +715,18 @@ class PoolPrefetcher:
         now = self._clock()
         to_submit = None
         with self._lock:
-            # ---- ① 回收已完成的 future ----
+            # ---- ① 回收已完成的 future(每个 slot 各自回收) ----
             # 只把句柄置 None; 状态转移在 ② 做, 让 latch 保持单写者。
             # `_PENDING` 是刚占的位、还没有 Future, 跳过。
-            fut = self._future
-            if fut is not None and fut is not _PENDING and fut.done():
-                self._future = None
+            for i, fut in enumerate(self._futures):
+                if fut is not None and fut is not _PENDING and fut.done():
+                    self._futures[i] = None
 
-            # ---- ② 应用 worker 的终局结果 ----
+            # ---- ② 应用 worker 的终局结果(队列, 一次全收) ----
             # **无条件**: 即使在途那条是因为停止才收手(interrupted), 也要
             # 把这次结果记进账。停止闸门只拦"起新活", 不拦"收旧账"。
-            res, self._pending_result = self._pending_result, None
-            if res is not None:
+            results, self._pending_results = self._pending_results, []
+            for res in results:
                 kind, detail, extra = res
                 self._apply_result(kind, detail, extra, now)
 
@@ -608,14 +756,15 @@ class PoolPrefetcher:
             # 两拍的窗口差异会让补池照着一个过期判断跑。
             inputs = self._generation_inputs()
 
-            # ---- ⑥ 库存 / 可播数 ----
-            # 库存目标**只有一套**: min / target / playable_min / max。
-            # 不再有"REVEALED 专用目标" —— 那条产品线已经取消(它的默认
-            # 值本来就和 QA 一致), 而且它依赖读直播相位, 与本轮的原则冲突。
+            # ---- ⑥ 库存 / 可播数 + category-aware 库存(§10) ----
             stock = self._stock()
             if stock is None:
                 return
             playable = self._playable(inputs)
+            stock_by_cat = self._stock_by_category()
+
+            # demand 信号的生命周期: 该类库存到 target 就清(§11)。
+            self._clear_demand_if_healthy_locked(stock_by_cat)
 
             # ---- ⑦ 硬上限(先于 latch 判) ----
             # 到顶就彻底停, 即使 playable 仍是 0。理由见 config 里
@@ -640,17 +789,23 @@ class PoolPrefetcher:
                 return
 
             # ---- ⑧ latch(滞回) ----
-            # 启动条件: 长期库存见底 **或** 下一题此刻没得播。
-            # 停止条件: 库存到高水位 **且** 下一题有得播。
-            #
-            # 为什么停止要 `and` 而不是 `or`: 只满足一个就停, 会在
-            # "库存够但全被当前窗口挡住"时提前收工 —— 那正是实播里
-            # "6 道候选全被挡、回落现场生成"的场景。反过来, 只按
-            # playable 判启动会让窗口拥挤时狂补(盘上其实堆满了),
-            # 所以启动也保留 stock < min 这条腿。
+            # 启动条件: 长期库存见底 **或** 下一题此刻没得播
+            # **或** 某类 eligible 库存低于 low_water(§10)。
+            # 停止条件: 库存到高水位 **且** 下一题有得播 **且** 每类
+            # 都达到 category target。
             need = (stock < self._min_size
                     or (playable < self._playable_min
                         and stock < self._max_size))
+            if not need:
+                # ---- §10: category-aware 缺货也是 need ----
+                low_water = max(
+                    0, int(getattr(self.cfg, "pool_category_low_water", 8)))
+                for cat, cnt in stock_by_cat.items():
+                    if cnt < low_water and \
+                            self._effective_stock_locked(stock_by_cat, cat) \
+                            < low_water:
+                        need = True
+                        break
             if not self._refill_active and need:
                 self._refill_active = True
                 log.info("补池周期启动: 库存 %d < 低水位 %d, 或 可播 %d < %d",
@@ -666,16 +821,30 @@ class PoolPrefetcher:
                 self.skip_count += 1
                 return
 
-            # ---- ⑨ 单飞 ----
-            if self._future is not None:
+            # ---- ⑨ 空闲 slot ----
+            # 单飞(并发=1)时这条退化为旧语义: 任一在途就不再起新活。
+            free_slots = [i for i, f in enumerate(self._futures)
+                          if f is None]
+            if not free_slots:
                 return
 
-            # ---- ⑩ 占住"在途"标记 ----
-            # 快照在 ⑤ 已经取好了 —— 与"这道题是不是真的缺"是同一份
-            # recent/avoid。这里只占标记: 否则出锁到真提交之间若有第二拍
-            # 进来, 会重复起任务。
-            to_submit = inputs
-            self._future = _PENDING
+            # ---- ⑩ 决定这一拍要补的 category(deficit 选择) ----
+            # 优先级(§11): 有投票 demand 且库存不足的 category
+            #             > 普通 category maintenance deficit
+            #             > 全局(无主题, "" —— 走原 free path)。
+            # ⚠️ effective_stock 扣掉 in-flight: 2 个 slot 不能同时
+            #    看到同一个缺口无限 overshoot —— 第一个 slot 占了
+            #    reservation 之后, 第二个 slot 看到的缺口就小一格。
+            cat_plan = self._pick_deficit_category_locked(stock_by_cat)
+            if cat_plan is _NO_SLOT_NEEDED:
+                # 分类信息全部健康(或池子无 v2 题) -> 全局 free path。
+                # 全局 latch 既然还开着(全局 stock/playable 缺), 就该补。
+                cat_plan = ""
+            to_submit = dict(inputs or {})
+            to_submit["requested_category"] = cat_plan
+            # 占住一个空闲 slot(标记), 其余留给后面的拍。
+            slot = free_slots[0]
+            self._futures[slot] = _PENDING
 
         # ---- 锁外真正提交(由 `_submit_lock` 线性化) ----
         #
@@ -683,7 +852,7 @@ class PoolPrefetcher:
         # 之前**算好的(on_tick 里), 而 `_PENDING` 占位到真提交之间已经
         # 出了 `_lock`。`request_stop()` 恰恰能插进这条缝:
         #
-        #     ⑩ `self._future = _PENDING`   ← 持 `_lock`
+        #     ⑩ `self._futures[slot] = _PENDING` ← 持 `_lock`
         #     ↓  出锁
         #     ↓  request_stop() 在这里跑完 → `_shutdown_event` 置位
         #     ↓  executor.submit(...)       ← 停都停了还提交, 这就是漏
@@ -697,19 +866,24 @@ class PoolPrefetcher:
             # ---- ⑩b 线性化复查: 最后一个决策点 ----
             if self._shutdown_event.is_set():
                 with self._lock:            # 锁序: _submit_lock → _lock
-                    # ⚠️ 必须撤销 ⑩ 占的标记。忘了它 -> `_future` 永远是
-                    # `_PENDING` -> 单飞被永久占死, 补池再也不启动。
-                    self._future = None
+                    # ⚠️ 必须撤销 ⑩ 占的标记。忘了它 -> 该 slot 永远是
+                    # `_PENDING` -> 并发被永久占死, 补池再也不启动。
+                    for i, f in enumerate(self._futures):
+                        if f is _PENDING:
+                            self._futures[i] = None
                 # 不提交。**不记失败、不退避**: 这活根本没开始, 不是故障,
                 # 也不是 `interrupted`(那是"已开始后被协作式收手")。
                 # 语义与 `_apply_result` 的 interrupted 分支一致。
                 return
             try:
-                fut = self._executor.submit(self._generate_one, to_submit)
+                fut = self._executor.submit(self._generate_one,
+                                            to_submit, slot)
             except Exception:                   # noqa: BLE001
                 log.exception("补池提交失败")
                 with self._lock:
-                    self._future = None
+                    for i, f in enumerate(self._futures):
+                        if f is _PENDING:
+                            self._futures[i] = None
                     # G4-R2 §五: 提交失败也算一次连续失败, 所以同样按"池空与否"
                     # 选序列 —— 否则空池时的这条兜底会退回 240/300 秒, 而它
                     # 恰恰是"池子空 + 提交路径出问题"这个最该快速重试的组合。
@@ -721,8 +895,17 @@ class PoolPrefetcher:
                 # 只有还是自己占的那个标记才认(理论上期间不会被改, 但留个护栏)。
                 # ⚠️ 它**不是** stop 防护 —— stop 由上面的 ⑩b 复查负责,
                 # 别以为有了这个守卫就不用复查。
-                if self._future is _PENDING:
-                    self._future = fut
+                for i, f in enumerate(self._futures):
+                    if f is _PENDING:
+                        self._futures[i] = fut
+                        # 该 slot 起飞 -> 记它的 category in-flight
+                        # reservation(§14)。
+                        cat = str((to_submit or {}).get(
+                            "requested_category", "") or "")
+                        if cat:
+                            self._in_flight_by_category[cat] = \
+                                self._in_flight_by_category.get(cat, 0) + 1
+                        break
 
     def _apply_result(self, kind: str, detail: str, extra: dict,
                       now: float) -> None:
@@ -907,6 +1090,61 @@ class PoolPrefetcher:
             log.exception("读账本可信度异常, 本次不补池")
             return False
 
+    def _stock_by_category(self) -> dict:
+        """五类 eligible 库存(§10)。
+
+        **分类信息可用**的判定: 池子里存在至少一道 haiguitang-v2 题。
+        全部是历史/legacy 题(或空池)时返回空表 —— 此时 category-aware
+        调度整条退位, latch 与 deficit 都只看全局 stock/playable。
+        理由: legacy 题不冒充五类库存(§8/§9), 同样**不制造**五类缺口
+        —— 否则任何装满 legacy 题的池子都会被误判成"五类全部缺货",
+        逐类补到 60 道 hard max。
+        """
+        try:
+            fn = getattr(self.pool, "stock_by_category", None)
+            if fn is None:
+                return {}
+            d = fn()
+            if not isinstance(d, dict) or not any(d.values()):
+                return {}
+            return d
+        except Exception:                       # noqa: BLE001
+            log.exception("读分类库存异常, 按空表处理")
+            return {}
+
+    def _pick_deficit_category_locked(self, stock_by_cat: dict):
+        """这一拍该补哪个 category(§10/§11 的调度决策)。须持锁。
+
+        返回 category 字符串("" = 全局 free path)或 `_NO_SLOT_NEEDED`
+        (所有已知类都在 target 之上, 且没有 demand)。
+
+        优先级:
+            1. **demand 且库存不足**(主题投票的高优先级信号)
+            2. **maintenance deficit**(eligible < target)
+            3. 全局 free path("")
+        effective_stock = actual + in-flight reservation —— 已在飞的
+        缺口不再重复补(§14 防 overshoot)。
+
+        tie-break: demand 按置位时间(最早优先), deficit 按五类枚举顺序
+        (`V2_CATEGORIES`) —— 全部显式确定, 不依赖 dict 迭代顺序。
+        """
+        from .haiguitang_protocol import V2_CATEGORIES
+        target = max(0, int(getattr(self.cfg, "pool_category_target", 10)))
+        # ---- 1. demand 且库存不足(按 demand 置位时间升序) ----
+        for cat, _ts in sorted(self._demand_categories.items(),
+                               key=lambda kv: (kv[1], kv[0])):
+            if self._effective_stock_locked(stock_by_cat, cat) < target:
+                return cat
+        # ---- 2. maintenance deficit(按五类枚举序) ----
+        for cat in V2_CATEGORIES:
+            cnt = stock_by_cat.get(cat)
+            if cnt is None:
+                continue        # 池子没给该类的分类读数(老池/空池) -> 跳过
+            if self._effective_stock_locked(stock_by_cat, cat) < target:
+                return cat
+        # ---- 3. 全部健康 -> free path(全局补水) ----
+        return _NO_SLOT_NEEDED
+
     def _stock(self) -> Optional[int]:
         try:
             # limit=max_size(不是 target): 硬上限那条判断需要看得到
@@ -1020,25 +1258,42 @@ class PoolPrefetcher:
             return {}
 
     # ------------------------------------------------------------------
-    def _generate_one(self, inputs: dict) -> None:
+    def _generate_one(self, inputs: dict, slot: int = 0) -> None:
         """executor 线程。**唯一职责: 生成一道, (可选)试玩, add 进池。**
 
-        唯一的写口是结尾那个 `_pending_result` —— 绝不碰 latch/退避/
-        计数器(那些是 tick 线程的单写者变量)。
+        唯一的写口是结尾那个**结果队列**(`_pending_results`) —— 绝不碰
+        latch/退避/计数器(那些是 tick 线程的单写者变量)。
+        队列(而不是旧的单槽)保证 2 个 worker 同拍完成时两条终局都留下
+        (§14: 2 个 worker 同时完成不能互相覆盖)。
+
+        `slot`: 本 worker 占的 slot 号 —— 它决定用哪只独立 writer。
         """
         kind, detail, extra = "exc", "", {}
         try:
-            kind, detail, extra = self._generate_one_inner(inputs)
+            kind, detail, extra = self._generate_one_inner(
+                inputs, slot=slot)
         except Exception as e:                  # noqa: BLE001
             log.exception("补池生成异常: %s", e)
             kind, detail, extra = "exc", str(e), {}
         finally:
+            cat = str((inputs or {}).get("requested_category", "") or "")
             with self._lock:
-                self._pending_result = (kind, detail, extra)
+                self._pending_results.append((kind, detail, extra))
+                # ---- §14: 释放该 category 的 in-flight reservation ----
+                # observed miss 一样释放 —— reservation 只代表"在飞",
+                # 不代表"命中"。释放后 tick 重新算 deficit, requested
+                # 仍未达标就继续请求该类。
+                if cat:
+                    left = self._in_flight_by_category.get(cat, 0) - 1
+                    if left > 0:
+                        self._in_flight_by_category[cat] = left
+                    else:
+                        self._in_flight_by_category.pop(cat, None)
 
     def _generate_one_inner(self, inputs: dict,
                             should_continue=None,
-                            story_timeout=None) -> tuple:
+                            story_timeout=None,
+                            slot: int = 0) -> tuple:
         """返回 `(kind, detail, extra)`。
 
         `extra` 目前只带一个 key: `playtest`(试玩 status)或 `interrupted`。
@@ -1076,10 +1331,17 @@ class PoolPrefetcher:
         """
         if should_continue is None:
             should_continue = self._background_should_continue
+        # ---- Issue #60 §12: 每个 worker 启动前拿到明确 GenerationBrief ----
+        # `inputs["requested_category"]` 由 tick 的 deficit 选择决定(§10)。
+        # 仍走生产唯一入口 `keyword_spec()` —— 不复制 Prompt/Truth/Surface
+        # /Contract 逻辑。
+        requested = str((inputs or {}).get("requested_category", "") or "")
         if self._keyword_enabled():
             return self._generate_keyword_one(
-                inputs, should_continue, story_timeout=story_timeout)
-        return self._generate_classic_one(inputs, should_continue)
+                inputs, should_continue, story_timeout=story_timeout,
+                slot=slot, requested_category=requested)
+        return self._generate_classic_one(inputs, should_continue,
+                                          slot=slot)
 
     # ------------------------------------------------------------------
     def _init_keyword_bag(self, cfg: Any) -> None:
@@ -1157,7 +1419,9 @@ class PoolPrefetcher:
 
     def _generate_keyword_one(self, inputs: dict,
                               should_continue=None,
-                              story_timeout=None) -> tuple:
+                              story_timeout=None,
+                              slot: int = 0,
+                              requested_category: str = "") -> tuple:
         """G2: `2-key -> Stage A -> Stage B`, 之后与 classic 路径**完全共用**。
 
         ## 主动中止检查点(§九)
@@ -1197,14 +1461,22 @@ class PoolPrefetcher:
         if story_timeout is None:
             story_timeout = self._story_timeout
         from .keyword_seed import keyword_spec
+        from .haiguitang_protocol import GenerationBrief
         recent = inputs.get("recent_signatures") or []
         avoid = inputs.get("avoid")
+        # ---- Issue #60 §12: worker 启动前拿到明确 GenerationBrief ----
+        # requested_category 为空 = 自由生成(GenerationBrief() 等价)。
+        brief = GenerationBrief(
+            requested_category=requested_category).require_valid()
+        writer = self._writers[slot] if slot < len(self._writers) \
+            else self.writer
         spec, reason = keyword_spec(
-            self.writer, self._bag, self._keyword_session_seed,
+            writer, self._bag, self._keyword_session_seed,
             avoid=avoid, recent=recent,
             should_continue=should_continue,
             corpus_version=self._bag_meta.get("corpus_version", ""),
-            story_timeout=story_timeout)
+            story_timeout=story_timeout,
+            brief=brief)
         if spec is None:
             if reason == "interrupted":
                 return ("interrupted", "本次运行已结束, keyword2 主动中止",
@@ -1213,11 +1485,21 @@ class PoolPrefetcher:
             # `keyword_spec` 只回一个粗粒度的 `gen_fail` —— 那正是实播
             # 复盘时"只有 keyword2 未成题"的来源。细因写在**失败那一次
             # 的 spec.metrics 里**, 所以从 writer 的侧信道取。
-            return ("gen_fail", "keyword2 未成题", self._reject_extra())
+            return ("gen_fail", "keyword2 未成题", self._reject_extra(writer))
+        # ---- §12: requested vs observed 补货闭环 ----
+        # A. requested ∈ observed categories -> 合法入池, deficit 被补上。
+        # B. requested ∉ observed -> 题本身合格仍入统一池(贡献别的类),
+        #    但 requested deficit 仍在 —— `extra["category_hit"]=False`
+        #    让调度侧知道这一发没有补到 requested(不篡改 observed)。
+        obs = list(getattr(spec, "categories", None) or [])
+        hit = (not requested_category) or (requested_category in obs)
         # ---- 之后与 classic 路径完全一致(试玩 / add) ----
-        return self._finish_one(spec, {}, should_continue)
+        return self._finish_one(spec, {"category_hit": hit,
+                                       "requested_category":
+                                           requested_category},
+                                should_continue)
 
-    def _reject_extra(self) -> dict:
+    def _reject_extra(self, writer=None) -> dict:
         """G4-R2 §六: 取上一次 keyword2 失败的**原因标签**。
 
         Stage B 把标签写进自己返回的那个 spec 的 `metrics["reject"]`,
@@ -1228,11 +1510,13 @@ class PoolPrefetcher:
 
         读不到就返回空 dict —— 没有标签好过编一个错的标签。
         """
-        tag = str(getattr(self.writer, "_last_reject", "") or "")
+        w = writer if writer is not None else self.writer
+        tag = str(getattr(w, "_last_reject", "") or "")
         return {"reject": tag} if tag else {}
 
     def _generate_classic_one(self, inputs: dict,
-                              should_continue=None) -> tuple:
+                              should_continue=None,
+                              slot: int = 0) -> tuple:
         """旧路径: `pick_blueprint -> gen_spec`。
 
         保留它是为了 §八 的 kill-switch —— `pool_keyword_seed_enabled=False`
@@ -1249,6 +1533,8 @@ class PoolPrefetcher:
         avoid = inputs.get("avoid")
         extra: dict = {}
         bp = self._pick_blueprint(recent, rng=self._rng)
+        writer = self._writers[slot] if slot < len(self._writers) \
+            else self.writer
         # ---- G1: 低优先级生成 ----
         # `should_continue` 在**每一次尚未发出的昂贵调用之前**被检查
         # (出稿 / 审稿 / truth audit / 下一稿, 见 `gen_spec`)。已经发出去
@@ -1263,7 +1549,7 @@ class PoolPrefetcher:
         # 预算也换成后台自己的(少尝试, 不是降低题质): live 是 4 稿/90s,
         # 后台是 2 稿/25s。后台多试一稿的收益只是池子里多一道题, 代价
         # 却是多占一份网关配额、拖长一次收尾。
-        spec = self.writer.gen_spec(
+        spec = writer.gen_spec(
             avoid=avoid, blueprint=bp, recent=recent,
             max_attempts=self._prefetch_attempts,
             budget_s=self._prefetch_budget,
@@ -1378,7 +1664,27 @@ class PoolPrefetcher:
             return ("interrupted", "本次运行已结束, 提交前放弃本稿",
                     {"interrupted": True})
 
-        if not self.pool.add(spec, source="prefetch"):
+        # ---- Issue #60 §16: 最终 atomic admission(stop gate 之后) ----
+        #
+        # 并发下多个 worker 都可能拿着同一份旧 stock recent 开始生成,
+        # 最后同时产出相似的题。`add_with_final_admission` 在**同一把
+        # pool 锁内**重读当前库存 signatures + 复用现有 deterministic
+        # diversity primitives + add, check 与写入之间没有 TOCTOU:
+        # 两个同时完成的相似 candidate 不可能都穿过去。
+        #
+        # 被挡的候选记明确 reject(addmission_reject), 不写 used ledger。
+        try:
+            ok, why = self.pool.add_with_final_admission(
+                spec, source="prefetch")
+        except AttributeError:
+            # 测试替身 pool 没有 final-admission API -> 退回普通 add
+            # (替身本来就不模拟并发, 行为等价)。
+            ok, why = (bool(self.pool.add(spec, source="prefetch")),
+                       "pool.add 返回 False")
+        except Exception:                       # noqa: BLE001
+            log.exception("final admission 异常")
+            ok, why = False, "final admission 异常"
+        if not ok:
             # 契约: add 失败 == 这次生成**丢弃**。
             #
             # **不**留内存副本、**不**直接 submit_riddle 上屏。否则池子里
@@ -1388,7 +1694,7 @@ class PoolPrefetcher:
             #
             # `extra` 里那次 `playtest=PASS` **照样带回 tick 线程计数** ——
             # 试玩统计与入池统计正交, add 失败不能把 PASS 吞掉。
-            return ("add_fail", "pool.add 返回 False", extra)
+            return ("add_fail", why or "pool.add 返回 False", extra)
         return ("ok", "", extra)
 
     # ------------------------------------------------------------------
@@ -1468,6 +1774,12 @@ class PoolPrefetcher:
                 "refill_active": self._refill_active,
                 # `_PENDING` 也算在途(已决定提交、还没拿到 Future)。
                 "in_flight": f is not None,
+                # ---- Issue #60 §14: bounded concurrency 指纹 ----
+                "concurrency": self._concurrency,
+                "in_flight_count": sum(
+                    1 for x in self._futures if x is not None),
+                "in_flight_by_category": dict(self._in_flight_by_category),
+                "demand_categories": sorted(self._demand_categories),
                 "backoff_until": self._retry_at,
                 # 滞回的两个输入。只看 stock 的话, "stock=5 playable=0"
                 # (候选全被当前窗口挡住)这种现场指纹在计数里完全看不见。

@@ -199,9 +199,19 @@ def test_prefetch_uses_independent_fail_fast_client():
         check("**只有 prefetcher 的 Story override = 45s**",
               dr._prefetcher._story_timeout == 45.0,
               dr._prefetcher._story_timeout)
-        check("prefetch writer 确实接独立 client",
-              dr._prefetcher.writer.client is dr._prefetch_client,
-              dr._prefetcher.writer.client)
+        # ---- Issue #60 §14: 并发 worker 各自持有**独立** client+writer
+        # (writer_factory 建 N 份; `_prefetch_client` 是 slot 0 的那份,
+        # 保留用于 transport 口径断言)。任何一个 worker 的 client 都
+        # **不能**是正式直播 client。
+        check("prefetch writer 确实接独立 client(全部 slot)",
+              all(w.client is not dr.client for w in dr._prefetcher._writers
+                  if w is not None and hasattr(w, "client")),
+              [id(getattr(w, "client", None))
+               for w in dr._prefetcher._writers])
+        check("prefetch 并发 = 2",
+              dr._prefetcher._concurrency == 2
+              and len(dr._prefetcher._writers) == 2,
+              dr._prefetcher._concurrency)
         check("模型路由仍与正式 client 相同",
               dr._prefetch_client.cfg.resolved_models()
               == dr.client.cfg.resolved_models(),
