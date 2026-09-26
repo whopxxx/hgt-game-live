@@ -10,7 +10,7 @@
 ## 两个 Pack, 两个独立总版本(Issue #53 §3)
 
     generation -> haiguitang/prompts/generation/   haiguitang-generation-v1
-    judging    -> haiguitang/prompts/judging/      haiguitang-judging-v1
+    judging    -> haiguitang/prompts/judging/      haiguitang-judging-v2
 
 "怎么出题"与"怎么理解观众的一句话"是两个独立演进的东西: 出题侧换
 prompt 不该迫使判题侧 bump 版本, 反之亦然。所以总版本**必须**分开,
@@ -70,7 +70,7 @@ PROMPT_PACK_VERSION = HAIGUITANG_GENERATION_PROMPT_VERSION
 #: ⚠️ 与 generation 总版本**互相独立**: 任何一个判题 stage 文件变了
 #: 它才 bump; generation 侧的任何变化**不得**牵动它(反之亦然),
 #: 否则 #50 的 provenance 语义就漂移了。
-HAIGUITANG_JUDGING_PROMPT_VERSION = "haiguitang-judging-v1"
+HAIGUITANG_JUDGING_PROMPT_VERSION = "haiguitang-judging-v2"
 
 #: 项目根锚点: `story/prompt_pack.py` -> 上两级 = repo root。
 #: **绝不**用 cwd —— 服务可能从任意目录启动。
@@ -117,8 +117,13 @@ STAGES: dict = {
 #: 名**全局不重名** —— allowlist 查找是两级线性表, 重名会让
 #: `load_prompt("answer")` 的归属变得含糊, 直接禁止。
 JUDGING_STAGES: dict = {
-    "answer": ("answer-v1.md", "answer-v1"),
-    "candidate_recheck": ("candidate-recheck-v1.md", "candidate-recheck-v1"),
+    # ---- Issue #65: QA v7 三态(是/不是/不重要) —— judging v2 ----
+    # 正常业务 verdict enum 收敛为三态, 「无关」删除(不引入「不确定」);
+    # comment 合同变化(不重要默认空); answer-v1.md 原样冻结保留。
+    # 历史 answer-v1.md / candidate-recheck-v1.md **留在盘上**(v1 时代
+    # 的合同文本, 不覆盖、不迁移旧 archive)。
+    "answer": ("answer-v2.md", "answer-v2"),
+    "candidate_recheck": ("candidate-recheck-v2.md", "candidate-recheck-v2"),
     "completion_verify": ("completion-verify-v1.md", "completion-verify-v1"),
 }
 

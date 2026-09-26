@@ -416,9 +416,9 @@ def _verdict_tool_no(established=None, touched=None, cand=False):
 
 
 def _verdict_tool_irrelevant(cand=True):
-    """candidate=True 却判「无关」—— 自相矛盾结果(A2 的原料)。"""
+    """candidate=True 却判「不重要」—— 自相矛盾结果(A2 的原料, Issue #65)。"""
     return LLMResult(tool_input={"answers": [{
-        "id": 1, "response_kind": "verdict", "verdict": "无关",
+        "id": 1, "response_kind": "verdict", "verdict": "不重要",
         "comment": "发个 是/不是 的猜测",
         "solution_candidate": cand,
         "touched_fact_ids": [], "established_fact_ids": [],
@@ -491,7 +491,7 @@ def test_ai_player_ask_is_exactly_one_host_call():
     check("没有 Final Judge/候选重判",
           fc.calls[0]["tool"]["name"] == "emit_verdict",
           [c["tool"]["name"] for c in fc.calls])
-    check("正常返回公开裁决", out and out[0].verdict == "无关", out)
+    check("正常返回公开裁决", out and out[0].verdict == "不重要", out)
 
 
 def test_ux_h_legacy_still_judges():
@@ -2178,7 +2178,7 @@ def test_solution_candidate_definition():
           and "不能直接判 solved" in sc["description"], sc)
     v = props["verdict"]
     check("枚举里没有揭晓", "揭晓" not in v["enum"], v["enum"])
-    check("枚举就是三种", v["enum"] == ["是", "不是", "无关"], v["enum"])
+    check("枚举就是三态(Issue #65)", v["enum"] == ["是", "不是", "不重要"], v["enum"])
     check("candidate 是必填", "solution_candidate"
           in _TOOL_ANSWER["input_schema"]["properties"]["answers"]["items"]["required"],
           _TOOL_ANSWER["input_schema"]["properties"]["answers"]["items"]["required"])

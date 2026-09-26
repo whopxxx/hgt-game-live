@@ -148,6 +148,11 @@ jobs:
       - name: 离线套件 interaction
         run: uv run tests/test_interaction.py
 
+      # Issue #65: 同题同问一致性 cache —— 成功结果复用(不重复调 LLM) /
+      # 未判定不缓存 / 换题失效 / cache 有界 / 规范化只做 trim+空白折叠。
+      - name: 离线套件 qa_consistency
+        run: uv run tests/test_qa_consistency.py
+
       - name: 离线套件 playtest
         run: uv run tests/test_playtest.py
 

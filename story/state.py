@@ -143,7 +143,7 @@ class QAResult:
     solution_candidate: Optional[bool] = None
     # ---- Issue #53 §5/§7: 语义类别与裁决分离 ----
     # response_kind = "verdict" -> 这条结果是一次可裁决命题的裁判,
-    # verdict ∈ {是, 不是, 无关} 有意义。
+    # verdict ∈ {是, 不是, 不重要}(Issue #65 三态)有意义。
     # response_kind = "rephrase" -> 模型理解了这句话, 但它没有给出可
     # 裁决的命题(开放索取/要求解释/闲聊); verdict 为空, 不建立任何
     # fact。旧数据/旧调用方缺字段 -> 默认 "verdict"(archive 向后兼容)。

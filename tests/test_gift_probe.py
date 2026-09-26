@@ -1826,7 +1826,21 @@ def test_diagnostic_off_preserves_production_behaviour():
     written = "".join(df._fp.written)
 
     def _non_gift_lines(text):
-        return [l for l in text.splitlines()
+        # ⚠️ 比对时剥离 `ts`: 两侧行是分两次生成的, 恰好跨秒边界时
+        # `ts` 会差 1 秒(CI 实测过一次红: 15:59:15 vs 15:59:16)。
+        # 断言的意图是"业务字段逐字一致", 不是"生成时刻相同" ——
+        # 剥掉时间戳后比对, 消除这个与被测行为无关的抖动。
+        import json as _json
+
+        def _strip_ts(line):
+            try:
+                d = _json.loads(line)
+                d.pop("ts", None)
+                return _json.dumps(d, ensure_ascii=False, sort_keys=True)
+            except Exception:               # noqa: BLE001
+                return line
+
+        return [_strip_ts(l) for l in text.splitlines()
                 if l.strip() and '"kind": "gift"' not in l]
 
     check("诊断侧落库调用与基线 除 Gift 行外逐字一致",

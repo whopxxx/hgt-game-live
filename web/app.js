@@ -487,11 +487,13 @@
   const MAX_ROWS = 60;          // DOM 里最多留多少行(防卡)
   let lastQaPuzzle = undefined; // 用于检测"换题"
   let lastRenderedSig = null;   // 上次渲染内容的指纹, 没变就不动 DOM
-  // 连续「无关」只显示最近 KEEP_IRRELEVANT 条, 其余折叠成一行小字。
-  // 观众问偏了是常事, 但一屏全是"无关"太难看, 也会把有用的问答顶走。
+  // 连续「不重要」只显示最近 KEEP_UNIMPORTANT 条, 其余折叠成一行小字。
+  // 观众问到未定义的细节是常事, 但一屏全是"不重要"太难看, 也会把有用的
+  // 问答顶走。Issue #65: 「无关」已从业务 verdict 删除, 折叠信号随之
+  // 迁到三态里的「不重要」。
   // Issue #53 §31: rephrase(请改问法)**不参与**这里的折叠 —— 它不是
-  // 「无关」, 混进去会把"不知道怎么问"和"问偏了"两种信号搅在一起。
-  const KEEP_IRRELEVANT = 2;
+  // 「不重要」, 混进去会把"不知道怎么问"和"问到细节"两种信号搅在一起。
+  const KEEP_UNIMPORTANT = 2;
 
   function rowKey(r) {
     // 问答有唯一 qid; 提示/重述用 kind+文本(会被替换, 所以同一时刻只有一条)
@@ -516,28 +518,26 @@
     lastRenderedSig = sig;
 
     el.qaBody.innerHTML = "";
-    let pendingIrrelevant = 0;             // 待折叠的连续无关计数
+    let pendingUnimportant = 0;            // 待折叠的连续「不重要」计数
     for (let i = 0; i < log.length; i++) {
       const r = log[i];
-      const isIrrelevant = r.kind === "qa" && r.verdict === "无关";
-      if (isIrrelevant) {
-        pendingIrrelevant++;
-        // 先攒着; 等到这一串无关结束(或到达窗口末尾)再决定显示几条
+      const isUnimportant = r.kind === "qa" && r.verdict === "不重要";
+      if (isUnimportant) {
+        pendingUnimportant++;
+        // 先攒着; 等到这一串结束(或到达窗口末尾)再决定显示几条
         const next = log[i + 1];
-        const nextIsIrrelevant = next && next.kind === "qa" && next.verdict === "无关";
-        if (nextIsIrrelevant) continue;
-        // 这串无关结束了: 折叠前面多余的, 只保留最后 KEEP_IRRELEVANT 条。
-        // 注意起点必须是**这一串的开头**(i - pendingIrrelevant + 1),
-        // 早先错写成 i - KEEP_IRRELEVANT + 1 —— 当这串只有 1 条时,
-        // 起点会退到上一条(非无关的), 把它**重复画一遍**。
-        const start = i - pendingIrrelevant + 1;
-        const keepFrom = Math.max(start, i - KEEP_IRRELEVANT + 1);
+        const nextIsUnimportant = next && next.kind === "qa" && next.verdict === "不重要";
+        if (nextIsUnimportant) continue;
+        // 这串结束了: 折叠前面多余的, 只保留最后 KEEP_UNIMPORTANT 条。
+        // 注意起点必须是**这一串的开头**(i - pendingUnimportant + 1)。
+        const start = i - pendingUnimportant + 1;
+        const keepFrom = Math.max(start, i - KEEP_UNIMPORTANT + 1);
         const drop = keepFrom - start;
         if (drop > 0) el.qaBody.appendChild(buildFoldRow(drop));
         for (let j = keepFrom; j <= i; j++) {
           el.qaBody.appendChild(buildRow(log[j]));
         }
-        pendingIrrelevant = 0;
+        pendingUnimportant = 0;
         continue;
       }
       el.qaBody.appendChild(buildRow(r));
@@ -588,7 +588,7 @@
     row.className = "qa-row kind-fold";
     const q = document.createElement("div");
     q.className = "q";
-    q.textContent = "…（前 " + n + " 条与汤底无关，已折叠）";
+    q.textContent = "…（前 " + n + " 条不重要细节，已折叠）";
     row.appendChild(q);
     return row;
   }
