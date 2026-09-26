@@ -1080,6 +1080,37 @@ class LLMResult:
     #: `model` 的语义**没变**: 它始终是"返回体里那个模型"。
     stage: Optional[str] = None
     requested_model: Optional[str] = None
+    #: ---- transport 层总账(review 5325160597 Blocker 3)----
+    #:
+    #: 一次业务层 `messages()` 可能内部发 2~N 次 HTTP 请求(empty tool_input
+    #: 的 transport 退避重试 / 5xx 重试)。`usage` 只是**最后一次**请求的
+    #: 用量, 直接拿它做总账会漏掉重试里已消耗的 token。
+    #:
+    #: `transport_attempts` = 实际发出的 HTTP/model 请求次数(>=1)。
+    #: `transport_usage` = 全部 attempt 的 usage **逐项累加**(不是最后
+    #: 一次的) —— probe/审计方以它为准, `usage` 保持原语义不动。
+    #: 只在真实 transport 层路径上写; 旧调用方构造的 LLMResult 保持
+    #: None(缺省), 不受影响。
+    transport_attempts: Optional[int] = None
+    transport_usage: Optional[dict] = None
+
+
+def _merge_usage(usages: list) -> Optional[dict]:
+    """把多次 HTTP attempt 的 usage **逐项累加**成一份总账。
+
+    数字键求和, 其它键取最后一次非空值; 空列表返回 None(与
+    `usage` 缺省一致)。只做纯累加, 无副作用。
+    """
+    if not usages:
+        return None
+    tot: dict = {}
+    for u in usages:
+        for k, v in dict(u or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                tot[k] = tot.get(k, 0) + v
+            elif v is not None:
+                tot[k] = v
+    return tot or None
 
 
 class AnthropicMessagesClient:
@@ -1173,16 +1204,24 @@ class AnthropicMessagesClient:
                 route.alias or requested_model, requested_model,
                 max_tokens or self.cfg.max_tokens,
                 len(system), len(user), _clip(user, 500))
+        # ---- transport 总账(review 5325160597 Blocker 3)----
+        # 每次 HTTP attempt 的 usage 累加到这里; 最终结果带
+        # `transport_attempts` / `transport_usage` 回给调用方。
+        _attempts_made = 0
+        _all_usage: list[dict] = []
         for attempt in range(mr + 1):
             try:
                 req = urllib.request.Request(request_url, data=data,
                                             headers=headers, method="POST")
+                _attempts_made += 1
                 with urllib.request.urlopen(req, timeout=to) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
                 r = self._parse(raw, want_tool=tool is not None,
                                 budget=body.get("max_tokens") or 0,
                                 stage=stage, requested_model=requested_model,
                                 requested_provider=route.provider)
+                if r.usage:
+                    _all_usage.append(r.usage)
                 u = r.usage or {}
                 _detail("← LLM %s provider=%s stage=%s requested_model=%s "
                         "actual_model=%s %.1fs in=%s out=%s err=%s\n      结果=%s",
@@ -1223,7 +1262,11 @@ class AnthropicMessagesClient:
                         continue
                     # 重试配额内的最后一次也空 -> 把错误交回调用方
                     # (应用层的技术重试边界保持原样)。
+                    r.transport_attempts = _attempts_made
+                    r.transport_usage = _merge_usage(_all_usage)
                     return r
+                r.transport_attempts = _attempts_made
+                r.transport_usage = _merge_usage(_all_usage)
                 return r
             except urllib.error.HTTPError as e:
                 code = e.code
@@ -1236,7 +1279,9 @@ class AnthropicMessagesClient:
                     log.warning("LLM HTTP %s provider=%s (不重试): %s",
                                 code, route.provider, snippet[:120])
                     return LLMResult(error=f"HTTP {code}: {snippet}",
-                                     stage=stage, requested_model=requested_model)
+                                     stage=stage, requested_model=requested_model,
+                                     transport_attempts=_attempts_made,
+                                     transport_usage=_merge_usage(_all_usage))
                 last_err = f"HTTP {code}: {snippet}"
                 if attempt < mr:
                     log.warning(
@@ -1270,7 +1315,9 @@ class AnthropicMessagesClient:
                 time.sleep(min(backoff, 8.0))
 
         return LLMResult(error=f"重试耗尽: {last_err}",
-                         stage=stage, requested_model=requested_model)
+                         stage=stage, requested_model=requested_model,
+                         transport_attempts=_attempts_made,
+                         transport_usage=_merge_usage(_all_usage))
 
     # ------------------------------------------------------------------
     def probe_temperature(self) -> tuple[bool, str]:

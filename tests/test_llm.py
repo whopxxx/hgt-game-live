@@ -6215,8 +6215,248 @@ def test_g4_fix_reasons_never_guesses():
           ValidationResult().fix_reasons())
 
 
+# ======================================================================
+# review 5325160597 Blocker 3: transport 层 empty-tool 重试 + 总账口径
+# (变异敏感矩阵 —— 打桩 urlopen 观察**真实**发出的 HTTP 次数)
+# ======================================================================
+def _tool_resp(name: str, payload: dict, out_tokens: int = 50):
+    import json as _json
+    return ('{"content":[{"type":"tool_use","name":"' + name + '","input":'
+            + _json.dumps(payload, ensure_ascii=False) + "}],"
+            '"stop_reason":"tool_use",'
+            '"usage":{"input_tokens":10,"output_tokens":' + str(out_tokens)
+            + "}}").encode("utf-8")
+
+
+def _empty_tool_resp(name: str, out_tokens: int = 50):
+    # 截断/抖动的关键形状: stop_reason + 空 dict input
+    return ('{"content":[{"type":"tool_use","name":"' + name + '","input":{}}],'
+            '"stop_reason":"tool_use",'
+            '"usage":{"input_tokens":10,"output_tokens":' + str(out_tokens)
+            + "}}").encode("utf-8")
+
+
+_TOOL_S = {"name": "emit_core_story", "description": "d",
+           "input_schema": {"type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"]}}
+
+
+def _raw_resp(raw: bytes):
+    """urlopen 返回的**上下文管理器**替身(生产代码用 with 语句)。"""
+    class _R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return raw
+    return _R()
+
+
+def test_transport_empty_tool_retry_matrix():
+    """empty tool_input 的 transport 重试矩阵(review 5325160597)。
+
+    打桩 urlopen 数**真实 HTTP 次数**, 每个分支都是变异敏感的:
+
+        正常 tool_input        -> 恰好 1 次, 不重试
+        empty tool_input       -> 1 + max_retries 次
+        max_retries=0          -> 恰好 1 次
+        max_tokens 触顶的空    -> 恰好 1 次(预算问题, 重发必再截断)
+        transport_attempts/usage 总账正确(含已消耗的重试)
+    """
+    print("\n[TX-1] transport empty-tool 重试矩阵")
+    import urllib.request
+    import time as _t
+    from story.llm import AnthropicMessagesClient
+    from story.config import LLMConfig
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None            # 跳过退避
+    try:
+        cfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                        timeout=5.0, max_retries=2)
+        c = AnthropicMessagesClient(cfg)
+
+        # ---- ① 正常 tool_input -> 不重试 ----
+        state = {"n": 0}
+
+        def ok_resp(req, timeout=None):
+            state["n"] += 1
+            return _raw_resp(_tool_resp("emit_core_story",
+                                        {"answer": "汤底"}))
+        urllib.request.urlopen = ok_resp
+        r = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                       stage="puzzle.story")
+        check("正常 tool_input -> 恰好 1 次 HTTP", state["n"] == 1, state["n"])
+        check("正常路径 transport_attempts == 1",
+              r.transport_attempts == 1, r.transport_attempts)
+        check("正常路径 transport_usage == usage(单次)",
+              r.transport_usage == r.usage, (r.transport_usage, r.usage))
+
+        # ---- ② empty tool_input -> 1 + max_retries 次原样重发 ----
+        state["n"] = 0
+        bodies = []
+
+        def empty_resp(req, timeout=None):
+            state["n"] += 1
+            bodies.append(req.data)
+            return _raw_resp(_empty_tool_resp("emit_core_story"))
+        urllib.request.urlopen = empty_resp
+        r2 = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("empty tool_input -> 1 + max_retries(2) 次 HTTP",
+              state["n"] == 3, state["n"])
+        check("重发的是**同一个请求体**(不是多稿)",
+              len(set(bodies)) == 1, f"{len(set(bodies))} 种 body")
+        check("耗尽后 error 交回调用方",
+              r2.error and "空 input" in r2.error, r2.error)
+        check("transport_attempts == 3(含已消耗的重试)",
+              r2.transport_attempts == 3, r2.transport_attempts)
+        check("transport_usage 累加 3 次(usage 只剩最后一次)",
+              (r2.transport_usage or {}).get("output_tokens") == 150
+              and (r2.usage or {}).get("output_tokens") == 50,
+              (r2.transport_usage, r2.usage))
+
+        # ---- ③ max_retries=0 -> 不重发 ----
+        cfg0 = LLMConfig(api_key="x", base_url="http://x", model="m",
+                         timeout=5.0, max_retries=0)
+        c0 = AnthropicMessagesClient(cfg0)
+        state["n"] = 0
+        urllib.request.urlopen = empty_resp
+        r3 = c0.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                         stage="puzzle.story")
+        check("max_retries=0 -> 恰好 1 次 HTTP", state["n"] == 1, state["n"])
+        check("mr=0 transport_attempts == 1",
+              r3.transport_attempts == 1, r3.transport_attempts)
+
+        # ---- ④ max_tokens 触顶的空 tool_input -> **不**当抖动重试 ----
+        state["n"] = 0
+
+        def ceiling_resp(req, timeout=None):
+            state["n"] += 1
+            # max_tokens=100 的预算, 实出 100 -> 触顶截断
+            return _raw_resp(_empty_tool_resp("emit_core_story",
+                                              out_tokens=100))
+        urllib.request.urlopen = ceiling_resp
+        r4 = c.messages("s", "u", max_tokens=100, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("触顶空 input -> 恰好 1 次(不当网关抖动重试)",
+              state["n"] == 1, state["n"])
+        check("触顶错误点名 max_tokens(与应用层区分)",
+              r4.error and "max_tokens" in r4.error, r4.error)
+
+        # ---- ⑤ 网络错误重试的 transport_attempts 也正确 ----
+        state["n"] = 0
+
+        def neterr(req, timeout=None):
+            state["n"] += 1
+            raise TimeoutError("timed out")
+        urllib.request.urlopen = neterr
+        r5 = c.messages("s", "u", max_tokens=3000, tool=_TOOL_S,
+                        stage="puzzle.story")
+        check("网络错误 1 + max_retries 次", state["n"] == 3, state["n"])
+        check("耗尽 transport_attempts == 3",
+              r5.transport_attempts == 3, r5.transport_attempts)
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+
+
+def test_transport_retry_never_touches_semantics():
+    """语义拒绝(Reviewer 重写/validate)发生在 messages() 之外,
+    transport 重试结构上碰不到它; latency-critical 调用显式
+    max_retries=0 时不会被 transport 重试偷偷加次。"""
+    print("\n[TX-2] transport 重试不碰语义路径")
+    import urllib.request
+    import time as _t
+    from story.llm import AnthropicMessagesClient
+    from story.config import LLMConfig
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None
+    try:
+        # ① Reviewer 语义拒稿: 返回的是**合法 tool_input**(decision=reject),
+        #    messages() 层看起来"成功" —— 绝无重试, 恰好 1 次 HTTP。
+        state = {"n": 0}
+
+        def reject_resp(req, timeout=None):
+            state["n"] += 1
+            return _raw_resp(_tool_resp(
+                "emit_review",
+                {"decision": "rewrite", "issues": ["谜底泄底"],
+                 "puzzle": "改后谜面", "answer": "改后汤底"}))
+        urllib.request.urlopen = reject_resp
+        cfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                        timeout=5.0, max_retries=3)
+        c = AnthropicMessagesClient(cfg)
+        review_tool = {"name": "emit_review", "description": "d",
+                       "input_schema": {"type": "object", "properties": {}}}
+        c.messages("s", "u", max_tokens=4000, tool=review_tool,
+                   stage="puzzle.review")
+        check("Reviewer 语义拒稿(合法 tool_input) -> 恰好 1 次 HTTP",
+              state["n"] == 1, state["n"])
+
+        # ② 文本调用(不带 tool)从不触发 empty-tool 重试
+        state["n"] = 0
+        urllib.request.urlopen = reject_resp
+        c.messages("s", "u", max_tokens=100, stage="probe")
+        check("无 tool 调用 -> 恰好 1 次", state["n"] == 1, state["n"])
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+
+
+def test_story_max_tokens_budget():
+    """story_max_tokens 生产预算(review 5324929975 -> 5325160597):
+    默认 3000 真实传到 puzzle.story; 自定义 Config 覆盖生效。"""
+    print("\n[TX-3] story_max_tokens 预算接线")
+    import urllib.request
+    import json as _json
+    import time as _t
+    from story.llm import AnthropicMessagesClient, PuzzleWriter
+    from story.config import LLMConfig, Config
+
+    orig_urlopen = urllib.request.urlopen
+    orig_sleep = _t.sleep
+    _t.sleep = lambda s: None
+    seen = {"max_tokens": []}
+    try:
+        def capture(req, timeout=None):
+            body = _json.loads(req.data)
+            seen["max_tokens"].append(body.get("max_tokens"))
+            return _raw_resp(_tool_resp("emit_core_story",
+                                        {"answer": "汤底"}))
+        urllib.request.urlopen = capture
+
+        # ① 默认 3000
+        llmcfg = LLMConfig(api_key="x", base_url="http://x", model="m",
+                           timeout=5.0, max_retries=0)
+        client = AnthropicMessagesClient(llmcfg)
+        rt = Config(sim_path="x", no_llm=True)
+        w = PuzzleWriter(client=client, runtime_cfg=rt)
+        w.gen_keyword_story(["a", "b"])
+        check("默认 story_max_tokens=3000 传到 puzzle.story",
+              seen["max_tokens"][-1] == 3000, seen["max_tokens"])
+
+        # ② 自定义覆盖
+        rt2 = Config(sim_path="x", no_llm=True, story_max_tokens=4096)
+        w2 = PuzzleWriter(client=client, runtime_cfg=rt2)
+        w2.gen_keyword_story(["a", "b"])
+        check("自定义 story_max_tokens 覆盖生效",
+              seen["max_tokens"][-1] == 4096, seen["max_tokens"])
+    finally:
+        urllib.request.urlopen = orig_urlopen
+        _t.sleep = orig_sleep
+    from story.config import Config as _C
+    check("Config 默认值就是 3000", _C(sim_path="x",
+                                       no_llm=True).story_max_tokens == 3000)
+
+
 def main():
-    for t in (test_riddle_tool,
+    for t in (test_transport_empty_tool_retry_matrix,
+              test_transport_retry_never_touches_semantics,
+              test_story_max_tokens_budget,
+              test_riddle_tool,
               # ---- UX-2: v5 通关合同 ----
               test_ux_g_v5_skips_final_judge,
               test_ai_player_ask_is_exactly_one_host_call,

@@ -43,7 +43,7 @@ from story.haiguitang_protocol import (  # noqa: E402
     CATEGORY_LABELS, V2_CATEGORIES,
 )
 
-#: 固定类目顺序 —— 报告与 samples.jsonl 的分组顺序必须稳定。
+#: 固定类目顺序 —— 报告与 samples.json 的分组顺序必须稳定。
 CATEGORY_ORDER: tuple = tuple(V2_CATEGORIES)
 
 
@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generation v3 五类创作真实 LLM 基线(只组织与报告, "
                     "不复制生成逻辑)")
     ap.add_argument("--out", default="data/audit/category_generation_v3",
-                    help="输出目录(run.json / samples.jsonl / report.md)")
+                    help="输出目录(run.json / samples.json / calls.json / report.md)")
     ap.add_argument("--accepted-per-category", type=int, default=3,
                     help="每类目标 accepted 数(默认 3)")
     ap.add_argument("--max-attempts-per-category", type=int, default=6,
@@ -87,11 +87,20 @@ def run_probe(args) -> dict:
         t = time.monotonic()
         r = _orig(*a, **kw)
         with _lock:
+            # ---- transport 层总账(review 5325160597 Blocker 3)----
+            # 一次 messages() 内部可能重发多次 HTTP。总账以
+            # transport_attempts / transport_usage(全部 attempt 累加)
+            # 为准; 旧 client(测试替身)没这两个字段时回退 usage/1 次,
+            # 不编造。
+            attempts = int(getattr(r, "transport_attempts", None) or 1)
+            tus = getattr(r, "transport_usage", None)
+            usage = dict(tus) if tus else dict(r.usage or {})
             calls.append({
                 "stage": str(kw.get("stage") or "(未标注)"),
                 "model": r.model or "",
                 "error": r.error or "",
-                "usage": dict(r.usage or {}),
+                "usage": usage,
+                "transport_attempts": attempts,
                 "latency_s": round(time.monotonic() - t, 2),
                 "tool": ((kw.get("tool") or {}).get("name") or ""),
             })
@@ -114,6 +123,28 @@ def run_probe(args) -> dict:
                       or DEFAULT_CORPUS_PATH)
     bag, bag_meta = load_bag(corpus_path, int(ss))
 
+    # ---- draw 观测(review 5325160597 Blocker 2)----
+    # 只**代理观测**生产 bag.draw(): 记录每次真实抽词的 keywords/index,
+    # 抽词逻辑零复制零改动 —— `keyword_spec` 仍是唯一 draw 入口。
+    # 让失败 attempt 也能直接带 keywords/keyword_draw_index, 不要求
+    # reviewer 拿 seed 重放 RNG。
+    import threading as _threading
+    _draw_lock = _threading.Lock()
+    _draws: list = []
+    _orig_draw = bag.draw
+
+    def _observed_draw():
+        d = _orig_draw()                      # 原样调用生产 draw
+        with _draw_lock:
+            _draws.append({
+                "keywords": list(d.get("keywords") or []),
+                "keyword_draw_index": int(d.get("index") or 0),
+                "draw_seq": len(_draws) + 1,
+            })
+        return d
+
+    bag.draw = _observed_draw                 # type: ignore[assignment]
+
     brief_difficulty = str(args.difficulty or "").strip()
     # difficulty 交给 GenerationBrief 校验(空=不指定; 非法早炸)
     if brief_difficulty:
@@ -135,7 +166,8 @@ def run_probe(args) -> dict:
                and attempts < int(args.max_attempts_per_category)):
             attempts += 1
             # 每次 attempt 从生产 KeywordBag 抽**新的** 2 个关键词
-            # (keyword_spec 内部是唯一 draw 点, 这里只递 bag)。
+            # (keyword_spec 内部是唯一 draw 点, 这里只递观测代理)。
+            draws_before = len(_draws)
             calls_before = len(calls)
             brief = GenerationBrief(requested_category=cat,
                                     difficulty=brief_difficulty)
@@ -148,17 +180,20 @@ def run_probe(args) -> dict:
                 fails["other"] += 1
                 samples.append(_fail_record(
                     cat, attempts, brief, f"exc:{e}",
-                    writer=writer, calls=calls[calls_before:]))
+                    writer=writer, calls=calls[calls_before:],
+                    draws=_draws[draws_before:]))
                 continue
             if spec is None:
                 fails.setdefault(why or "gen_fail", 0)
                 fails[why or "gen_fail"] += 1
                 samples.append(_fail_record(
                     cat, attempts, brief, why or "gen_fail",
-                    writer=writer, calls=calls[calls_before:]))
+                    writer=writer, calls=calls[calls_before:],
+                    draws=_draws[draws_before:]))
                 continue
             accepted += 1
-            samples.append(_ok_record(cat, attempts, brief, spec))
+            samples.append(_ok_record(cat, attempts, brief, spec,
+                                      draws=_draws[draws_before:]))
         per_cat_attempts[cat] = attempts
         per_cat_accepted[cat] = accepted
         per_cat_fail[cat] = fails
@@ -207,66 +242,81 @@ def _prompt_version() -> str:
     return HAIGUITANG_GENERATION_PROMPT_VERSION
 
 
-def _ok_record(cat: str, attempt_no: int, brief, spec) -> dict:
+def _ok_record(cat: str, attempt_no: int, brief, spec,
+               draws=None) -> dict:
     m = dict(getattr(spec, "metrics", None) or {})
-    return {
-        "category": cat,
-        # category_attempt = 本类内第几次 attempt; attempt = 全局 draw 序号
-        # (keyword_draw_index)。两者分开 —— 审计时要同时能对上
-        # "第几试"与"抽的第几组词"。
-        "category_attempt": attempt_no,
-        "attempt": m.get("keyword_draw_index"),
-        "ok": True,
-        "requested_category": brief.requested_category,
-        "requested_difficulty": brief.difficulty,
-        "primary_category": getattr(spec, "primary_category", ""),
-        "categories": list(getattr(spec, "categories", None) or []),
-        "difficulty": getattr(spec, "difficulty", ""),
-        "keywords": list(m.get("keywords") or []),
-        "puzzle": getattr(spec, "puzzle", ""),
-        "answer": getattr(spec, "answer", ""),
-        "core_answer": getattr(spec, "core_answer", ""),
-        "protocol_version": getattr(spec, "protocol_version", ""),
-        "prompt_version": getattr(spec, "prompt_version", ""),
-        "model": getattr(spec, "model", ""),
-        "usage": dict(getattr(spec, "usage", None) or {}),
-        "review_decision": m.get("review_decision", ""),
-        "reject": m.get("reject", ""),
-        "review_issues": list(m.get("review_issues") or []),
-        "keyword_draw_index": m.get("keyword_draw_index"),
-        "keyword_session_seed": m.get("keyword_session_seed"),
-    }
+    return _common_record(
+        cat, attempt_no, brief, ok=True, draws=draws,
+        extras={
+            "primary_category": getattr(spec, "primary_category", ""),
+            "categories": list(getattr(spec, "categories", None) or []),
+            "difficulty": getattr(spec, "difficulty", ""),
+            "puzzle": getattr(spec, "puzzle", ""),
+            "answer": getattr(spec, "answer", ""),
+            "core_answer": getattr(spec, "core_answer", ""),
+            "protocol_version": getattr(spec, "protocol_version", ""),
+            "prompt_version": getattr(spec, "prompt_version", ""),
+            "model": getattr(spec, "model", ""),
+            "usage": dict(getattr(spec, "usage", None) or {}),
+            "review_decision": m.get("review_decision", ""),
+            "reject": m.get("reject", ""),
+            "review_issues": list(m.get("review_issues") or []),
+        })
 
 
 def _fail_record(cat: str, attempt_no: int, brief, why: str,
-                 writer=None, calls=None) -> dict:
-    """失败 attempt 的**完整审计记录**(review 5324929975 Blocker 1/2)。
+                 writer=None, calls=None, draws=None) -> dict:
+    """失败 attempt 的**完整审计记录**(review 5325160597 Blocker 2)。
 
     侧信道语义与 G4-R2 §六 同一套: `_last_reject` 是 writer 上"最后一次
     Stage B 失败的原因标签"(structure_technical_fail / review_rewrite /
     truth_reject / validation_reject), 失败时才写, 成功时不清 —— 所以
     读不到时记空串, **绝不编造**。`calls` 是本次 attempt 期间的调用审计
     切片(stage/model/usage/error), 让"这次 attempt 死在哪个 stage"可查。
+    `draws` 是 draw 观测代理记下的本次真实 keywords/index —— 失败题
+    **直接可见**, 不要求 reviewer 拿 seed 重放 RNG。
     """
     reject = str(getattr(writer, "_last_reject", "") or "")
     review_tech = bool(getattr(writer, "_last_review_technical", False))
+    return _common_record(
+        cat, attempt_no, brief, ok=False, draws=draws,
+        extras={
+            "reason": why,
+            "reject": reject,
+            "review_technical": review_tech,
+            "calls": list(calls or []),
+        })
+
+
+def _common_record(cat: str, attempt_no: int, brief, *, ok: bool,
+                   draws, extras: dict) -> dict:
+    """success/fail **统一**的审计字段(review 5325160597 Blocker 2)。
+
+    两种记录的每一个字段都同语义:
+
+        category_attempt  本类内第几次 attempt
+        keyword_draw_index 本次 attempt 实际抽词的 bag 序号
+        keywords          本次 attempt 实际抽到的 2 个词(观测代理记录)
+        draws             完整 draw 观测列表(通常 1 条; >1 条说明
+                          本次 attempt 内发生了多次 draw)
+
+    没有语义漂移的裸 `attempt` 键 —— 那正是本轮要消掉的。
+    """
+    # 生产约定: keyword_spec 每 attempt 恰好一次 bag.draw()。观测到
+    # 0 条(异常早于 draw)时 keywords/index 记 None, 不编造。
+    d = (draws or [{}])[0] if draws else {}
     rec = {
         "category": cat,
         "category_attempt": attempt_no,
-        "attempt": attempt_no,
-        "ok": False,
+        "ok": ok,
         "requested_category": brief.requested_category,
         "requested_difficulty": brief.difficulty,
-        "reason": why,
-        "reject": reject,
-        "review_technical": review_tech,
-        "calls": list(calls or []),
+        "keywords": (list(d.get("keywords") or [])
+                     if d.get("keywords") else None),
+        "keyword_draw_index": d.get("keyword_draw_index"),
+        "draws": list(draws or []),
     }
-    # 失败 attempt 的关键词/draw_index: 从调用审计里找本 attempt 的
-    # Truth(story)调用拿不到(它是服务端状态), 侧面从 bag 拿不到 ——
-    # keyword_spec 是唯一 draw 点, 失败稿被丢弃。诚实处理: 这两个键在
-    # 失败记录里缺省, 由 session_seed + attempt 顺序可复现
-    # (同 seed 重放 bag.draw() 序列即得, 与 r4_smoke 的 replay 同一约定)。
+    rec.update(extras)
     return rec
 
 
@@ -324,12 +374,13 @@ def write_outputs(run: dict, out_dir: str) -> None:
         json.dumps(run, ensure_ascii=False, indent=2), encoding="utf-8")
     # 逐调用审计日志(review 5324929975): 每次 LLM 调用的
     # stage/model/usage/error/latency —— **含失败调用**。
-    with (d / "calls.jsonl").open("w", encoding="utf-8") as f:
-        for c in call_log:
-            f.write(json.dumps(c, ensure_ascii=False) + "\n")
-    with (d / "samples.jsonl").open("w", encoding="utf-8") as f:
-        for s in samples:
-            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    # .json(JSON 数组)而不是 .jsonl —— `data/**/*.jsonl` 在 .gitignore
+    # 里挡直播热路径的滚动日志, audit artifact 必须能进版本控制
+    # (review 5325160597 Blocker 1); 不为它放宽全局 ignore。
+    (d / "calls.json").write_text(
+        json.dumps(call_log, ensure_ascii=False, indent=1), encoding="utf-8")
+    (d / "samples.json").write_text(
+        json.dumps(samples, ensure_ascii=False, indent=1), encoding="utf-8")
     (d / "report.md").write_text(
         render_report(run, samples), encoding="utf-8")
 
@@ -384,7 +435,7 @@ def render_report(run: dict, samples: list) -> str:
             if s.get("category") != c or not s.get("ok"):
                 continue
             n += 1
-            P(f"### {c}-{s['attempt']:02d}")
+            P(f"### {c}-{s['category_attempt']:02d}")
             P("")
             P(f"请求类型：{s['requested_category']} / "
               f"{CATEGORY_LABELS.get(s['requested_category'], '')}")

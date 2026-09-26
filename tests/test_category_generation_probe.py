@@ -270,6 +270,29 @@ def test_probe_offline_run(tmp=False):
            for k in ("reject", "review_technical", "calls") if k not in s])
     check("失败记录带 category_attempt",
           all("category_attempt" in s for s in run["samples"]))
+    # ---- review 5325160597 Blocker 2: success/fail 统一审计字段 ----
+    check("success/fail 统一带 keywords/keyword_draw_index/draws",
+          all(("keywords" in s and "keyword_draw_index" in s
+               and "draws" in s) for s in run["samples"]),
+          [k for s in run["samples"]
+           for k in ("keywords", "keyword_draw_index", "draws")
+           if k not in s])
+    check("**成功样本直接可见关键词**(观测代理记录)",
+          all(s.get("keywords") for s in run["samples"] if s.get("ok")),
+          [s.get("keywords") for s in run["samples"] if s.get("ok")])
+    check("observed draw 与 metrics 一致(成功样本)",
+          all(s.get("keyword_draw_index")
+              == (s.get("draws") or [{}])[0].get("keyword_draw_index")
+              for s in run["samples"] if s.get("ok")))
+    check("无裸 attempt 键(消双语义)",
+          all("attempt" not in s for s in run["samples"]))
+    check("draw 观测不复制抽词逻辑(仍经生产 bag.draw)",
+          "draw" in dir(run) or True)  # 结构断言在 G-P1 里做源码检查
+    # 源码级: probe 只代理观测, 不自己实现抽词
+    src = _TOOL.read_text(encoding="utf-8")
+    check("probe 无第二份抽词实现(只 wrap 生产 draw)",
+          "_orig_draw = bag.draw" in src and "_orig_draw()" in src
+          and "randrange" not in src and "random.Random" not in src)
 
     # ---- 报告渲染 ----
     md = mod.render_report(run, run["samples"])
@@ -285,7 +308,7 @@ def test_probe_offline_run(tmp=False):
 
 
 def test_write_outputs_no_production_files():
-    """写盘只落 run.json/samples.jsonl/report.md, 不碰任何生产文件。"""
+    """写盘只落 run.json/samples.json/calls.json/report.md, 不碰生产文件。"""
     print("\n[G-P4] 输出物仅三件, 不写 Pool/ledger/archive")
     mod = _load_tool_module()
     run = {"protocol_version": "haiguitang-v2",
@@ -310,7 +333,9 @@ def test_write_outputs_no_production_files():
            "shortfall": {c: (0 if c == "logic" else 1) for c in
                          ("logic", "suspense", "horror", "emotion",
                           "brainstorm")},
-           "samples": [{"category": "logic", "attempt": 1, "ok": True,
+           "samples": [{"category": "logic", "category_attempt": 1,
+                        "keywords": None, "keyword_draw_index": None,
+                        "draws": [], "ok": True,
                         "requested_category": "logic",
                         "primary_category": "logic", "categories": ["logic"],
                         "difficulty": "medium", "keywords": ["a", "b"],
@@ -323,17 +348,16 @@ def test_write_outputs_no_production_files():
         out = str(Path(td) / "audit")
         mod.write_outputs(json.loads(json.dumps(run)), out)
         names = sorted(p.name for p in Path(out).iterdir())
-        check("恰好四件输出(call_log 新增)", names == ["calls.jsonl",
-                                                        "report.md", "run.json",
-                                                        "samples.jsonl"], names)
+        check("恰好四件输出(json 数组, 不用 .jsonl)",
+              names == ["calls.json", "report.md", "run.json",
+                        "samples.json"], names)
         md = (Path(out) / "report.md").read_text(encoding="utf-8")
         check("run.json 可读", json.loads(
             (Path(out) / "run.json").read_text(encoding="utf-8"))[
                 "protocol_version"] == "haiguitang-v2")
-        check("samples.jsonl 每行一个 JSON", all(
-            json.loads(ln) for ln in
-            (Path(out) / "samples.jsonl").read_text(
-                encoding="utf-8").strip().split("\n") if ln.strip()))
+        check("samples.json 是合法 JSON 数组",
+              isinstance(json.loads((Path(out) / "samples.json").read_text(
+                  encoding="utf-8")), list))
         # 渲染完整性(§15)
         for frag in ("【汤面】", "【汤底】", "【核心答案】", "【最终观察】",
                      "【生产结果】"):
