@@ -813,6 +813,7 @@
       cancel();
       active = kind;
       box.classList.remove("hidden");
+      el.qa.scrollTop = el.qa.scrollHeight;
       box.dataset.kind = kind;
       text.textContent = message;
       const width = box.clientWidth, length = text.scrollWidth;
@@ -1078,7 +1079,6 @@
     renderStats(s);
     renderDebug(s);
     layout();
-    el.announcer.style.top = el.qa.offsetTop + "px";
     announcer.update(s);
     puzzleScroller.update(
       JSON.stringify([s.puzzle_index, s.puzzle || "", s.phase || ""]),

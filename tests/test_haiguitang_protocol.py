@@ -543,19 +543,19 @@ def test_archive_version():
 
 
 # ======================================================================
-# P12: quality-v13 池不被隔离(Phase A 核心安全门)
+# P12: legacy 可解析，但 live pool 隔离缺少展示元数据的库存
 # ======================================================================
 def test_pool_eligibility_unchanged():
-    print("\n[P12] legacy v13 spec 的 live eligibility 不变")
+    print("\n[P12] legacy v13 spec 保留解析但不再 live-eligible")
     ok, why = PuzzlePool._validate_pool_spec(_legacy_spec(1))
-    check("legacy 1-completion v13 spec 仍可入池", ok, why)
+    check("legacy 1-completion v13 spec 被隔离", not ok, why)
     ok2, why2 = PuzzlePool._validate_pool_spec(_legacy_spec(2))
-    check("legacy 2-completion v13 spec 仍可入池", ok2, why2)
+    check("legacy 2-completion v13 spec 被隔离", not ok2, why2)
     s = PuzzleSpec.from_dict(json.loads(
         (FIXTURES / "protocol_v1" / "valid_legacy_current.json")
         .read_text(encoding="utf-8"))["spec"])
     ok3, why3 = PuzzlePool._validate_pool_spec(s)
-    check("fixture 的 legacy spec 仍可入池", ok3, why3)
+    check("fixture 的 legacy spec 被隔离", not ok3, why3)
     bad = _patch_spec(_legacy_spec(2), protocol_version="banana")
     ok4, why4 = PuzzlePool._validate_pool_spec(bad)
     check("unknown protocol_version 在池门 fail closed", not ok4, why4)

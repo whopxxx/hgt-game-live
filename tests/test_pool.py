@@ -83,8 +83,10 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
         answer=answer or "退潮时礁石露出水面, 亮灯是为标出礁石位置; "
                          "涨潮后继续亮反而误导船只。",
         facts=[
-            PuzzleFact(id="f1", text="退潮时危险礁石会露出或接近水面", kind="core"),
-            PuzzleFact(id="f2", text="灯的真正作用是标示危险礁石的位置", kind="core"),
+            PuzzleFact(id="f1", text="退潮时危险礁石会露出或接近水面",
+                       public_text="退潮时礁石露出", kind="core"),
+            PuzzleFact(id="f2", text="灯的真正作用是标示危险礁石的位置",
+                       public_text="灯用来标示礁石", kind="core"),
             PuzzleFact(id="f3", text="涨潮后礁石被淹没, 亮灯反而会误导船只",
                        kind="support", hintable=False),
             PuzzleFact(id="f4", text="他的行为不是为了纪念死者", kind="exclusion",
@@ -130,6 +132,8 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             reveal_mode="meaning_flip"),
         prompt_version="riddle-v3",
         quality_policy_version=QUALITY_POLICY_VERSION,
+        protocol_version="haiguitang-v1", difficulty="medium",
+        primary_category="suspense", categories=["suspense"],
         metrics={"generation_attempts": 2, "review_calls": 1,
                  "rewrite_count": 0, "review_decision": "pass",
                  "review_latency_ms_total": 3310,
@@ -3348,6 +3352,45 @@ def test_i60_legacy_never_counts_as_v2_stock():
         check("legacy 不被按类 pop 出来", got is None, got)
 
 
+def test_i67_live_metadata_gate():
+    print("\n[I67-B] 直播池只交付完整展示元数据")
+    from story.haiguitang_protocol import public_puzzle_meta
+    with tmpdir() as d:
+        cfg = mkcfg(d)
+        legacy = good_spec(protocol_version="", difficulty="",
+                           primary_category="", categories=[])
+        _write_raw_pool(d, [legacy])
+        pool_path = Path(cfg.pool_path)
+        before = pool_path.read_bytes()
+        pool = PuzzlePool.open(cfg)
+        check("legacy raw row 保留但不可播",
+              pool.size() == 1 and pool.stock_count() == 0
+              and pool.distinct_stock_count() == 0
+              and pool.playable_count([]) == 0
+              and pool.pop_next([]) is None)
+        check("legacy add 被拒且磁盘原样", not pool.add(legacy)
+              and pool_path.read_bytes() == before
+              and not Path(cfg.pool_used_path).exists())
+
+    good_v1 = good_spec(primary_category="crime", categories=["crime"])
+    check("v1 用现有展示映射通过", public_puzzle_meta(good_v1)
+          .get("primary_category") == "suspense"
+          and PuzzlePool._validate_pool_spec(good_v1)[0])
+    good_v2 = _v2_spec(["logic", "brainstorm"])
+    check("v2 完整元数据可播", PuzzlePool._validate_pool_spec(good_v2)[0])
+    for name, updates in (
+            ("unknown protocol", {"protocol_version": "unknown"}),
+            ("difficulty 空", {"difficulty": ""}),
+            ("difficulty 非法", {"difficulty": "expert"}),
+            ("primary 空", {"primary_category": ""}),
+            ("primary 不在 categories", {"primary_category": "horror"}),
+            ("categories 空", {"categories": []})):
+        spec = _v2_spec(["logic"])
+        for field, value in updates.items():
+            setattr(spec, field, value)
+        check(name + " 被隔离", not PuzzlePool._validate_pool_spec(spec)[0])
+
+
 def main():
     tests = [
         # 验收点 1
@@ -3464,6 +3507,7 @@ def main():
         test_i60_pop_never_returns_unrelated_category,
         test_i60_used_disappears_from_all_categories,
         test_i60_legacy_never_counts_as_v2_stock,
+        test_i67_live_metadata_gate,
     ]
     for t in tests:
         # ---- 每个用例单独兜异常 ----

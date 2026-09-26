@@ -660,14 +660,14 @@ def test_timeline_countdown_fields():
           (s.next_event_kind, s.next_event_label))
     check("剩余约 100s", 95 <= s.next_event_ms / 1000 <= 100,
           s.next_event_ms)
-    # 走到第 3 格后, 倒计时应指向"揭晓"
+    # 时间格已到第三格但只成功上屏一条 Hint，下一事件仍是 Hint2。
     clk.advance(N * 3 + 1)
     for a in eng.tick():
         if a.kind == ActionKind.HINT:
             eng.submit_hint("h")
     s2 = eng.snapshot()
-    check("最后一格指向揭晓",
-          s2.next_event_kind == "reveal" and "揭晓" in s2.next_event_label,
+    check("未上屏的 Hint 编号仍由成功数决定",
+          s2.next_event_kind == "hint" and "第 2 条" in s2.next_event_label,
           (s2.next_event_kind, s2.next_event_label))
 
 
@@ -3271,8 +3271,8 @@ def test_ux_m_human_only_established():
     check("技术失败不建立任何事实",
           eng._established_fact_ids == before, eng._established_fact_ids)
     # 直接调用具名方法必须存在(边界显式可查)
-    check("存在具名写入口 _record_human_established_locked",
-          hasattr(eng, "_record_human_established_locked"))
+    check("存在共享共识写入口 _record_established_locked",
+          hasattr(eng, "_record_established_locked"))
 
 
 def test_ux_new_puzzle_clears_established():
@@ -3580,6 +3580,12 @@ def test_h1_b_time_after_question_does_not_repeat():
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("20 问 -> Hint 1", len(got) == 1, got)
     eng.submit_hint("提示一")
+    early = eng.snapshot()
+    check("提前 Hint1 后倒计时指向 Hint2",
+          early.hint_count == 1 and early.next_event_kind == "hint"
+          and "第 2 条" in early.next_event_label
+          and early.timeline_slot >= early.hint_count,
+          (early.next_event_label, early.timeline_slot))
     # 空转到 5 分钟时间格
     clk.advance(301)
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
@@ -3605,12 +3611,21 @@ def test_h1_c_cooldown_prevents_back_to_back():
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("**40 问但冷却未过 -> 不发 Hint 2**", not got,
           [a.payload for a in got])
+    waiting = eng.snapshot()
+    check("Hint2 冷却倒计时非负且指向第二条",
+          waiting.next_event_ms >= 0
+          and "第 2 条" in waiting.next_event_label)
     # 冷却过了
     clk.advance(50)
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("**45s 后 -> Hint 2**", len(got) == 1, got)
     check("level=2", got and got[0].payload["level"] == 2,
           got[0].payload if got else None)
+    eng.submit_hint("提示二")
+    two = eng.snapshot()
+    check("提前 Hint2 后倒计时指向 Hint3",
+          two.hint_count == 2 and "第 3 条" in two.next_event_label
+          and two.timeline_slot >= 2)
 
 
 def test_h1_d_only_successful_human_verdicts_count():
@@ -3680,6 +3695,10 @@ def test_h1_e_question_count_never_reveals():
     check("**仍在 QA(没被问答数刷到揭晓)**",
           eng.phase == Phase.QA, (eng.phase, clk.t))
     check("提示给满 3 条就停", eng._hints_given == 3, eng._hints_given)
+    full = eng.snapshot()
+    check("三条提示后下一事件是揭晓",
+          full.next_event_kind == "reveal"
+          and full.timeline_slot >= full.hint_count)
     # 时间轴走完才揭晓
     clk.advance(N * 4)
     eng.tick()
@@ -3870,6 +3889,134 @@ def test_ai_player_ask_consumes_without_human_completion():
     check("仍在 QA", eng.phase == Phase.QA, eng.phase)
     check("只广播，不伪装成人类 ANSWER",
           all(a.kind == ActionKind.BROADCAST for a in acts), kinds(acts))
+
+
+def test_ai_player_shared_fact_gate_and_victory():
+    print("\n[AI-67] AI ask 共享事实、verifier、贡献与真人统计隔离")
+    from story import parser as P
+
+    def ask(eng, result):
+        p = _ai_start(eng)
+        host = _ai_move(eng, p, "ask", "她是谁？")
+        check("AI payload 带权威合同与房间状态",
+              host["completion_fact_ids"] == sorted(eng._completion_fact_ids)
+              and host["core_answer"] == eng._core_answer
+              and host["established_fact_ids"] == sorted(eng._established_fact_ids))
+        return eng.submit_ai_player_result(
+            host["token"], host["expect_round"], host["expect_spec_key"],
+            "ask", host["text"], result=result), host
+
+    for label, result in (
+            ("不重要", QAResult(qid=0, verdict=P.UNIMPORTANT,
+                                  established_fact_ids=["f1"], status="ok")),
+            ("未判定", QAResult(qid=0, verdict=P.UNAVAILABLE,
+                                  established_fact_ids=["f1"], status="unavailable")),
+            ("rephrase", QAResult(qid=0, verdict="", response_kind="rephrase",
+                                     established_fact_ids=["f1"], status="ok")),
+            ("未复核", QAResult(qid=0, verdict=P.YES, status="ok",
+                                    established_fact_ids=["f1"])),
+            ("不是", QAResult(qid=0, verdict=P.NO, status="ok",
+                                  established_fact_ids=["f1"],
+                                  completion_verified_fact_ids=["f1"]))):
+        eng, _, _ = boot_v5(completion=("f1", "f2"))
+        ask(eng, result)
+        check(label + "不得建立 completion", not eng._established_fact_ids)
+
+    eng, clk, _ = boot_v5(completion=("f1", "f2"))
+    _answer_and_submit(eng, clk, "u1", "真人", "她是女儿吗？",
+                       verdict=P.YES, status="ok", established_fact_ids=["f1"])
+    before = (eng.snapshot().stat_questions, eng.snapshot().stat_answered,
+              dict(eng._verdict_counts), eng.snapshot().stat_viewers_seen)
+    result = QAResult(qid=0, verdict=P.YES, status="ok",
+                      touched_fact_ids=["f2"], established_fact_ids=["f2"],
+                      completion_verified_fact_ids=["f2"],
+                      solution_candidate=True,
+                      judging_prompt_version="judge-v2")
+    acts, host = ask(eng, result)
+    snap = eng.snapshot()
+    check("AI verified fact 进入共享事实与 touched",
+          eng._established_fact_ids == {"f1", "f2"}
+          and "f2" in eng._touched_fact_ids)
+    check("AI 补齐后立即胜利",
+          eng.phase == Phase.REVEALING and snap.solved_by == "AI玩家")
+    progress, _, _ = boot_v5()
+    ask(progress, QAResult(qid=0, verdict=P.YES, status="ok",
+                           established_fact_ids=["f1"],
+                           completion_verified_fact_ids=["f1"]))
+    check("AI 非终局事实立即推进 QA Fact Rail",
+          progress.snapshot().fact_progress["established"] == 1)
+    ordinary, _, _ = boot_v5(completion=("f2",))
+    ask(ordinary, QAResult(qid=0, verdict=P.NO, status="ok",
+                            established_fact_ids=["f1"]))
+    check("AI 不是可建立普通 fact，但不推进 completion",
+          ordinary._established_fact_ids == {"f1"}
+          and ordinary.snapshot().fact_progress["established"] == 0)
+    check("AI 不进真人统计与榜单",
+          before == (snap.stat_questions, snap.stat_answered,
+                     dict(eng._verdict_counts), snap.stat_viewers_seen)
+          and not snap.leaderboard)
+    reveal = next(a for a in acts if a.kind == ActionKind.REVEAL)
+    contrib = reveal.payload["reveal_contributors"]
+    check("贡献链按提交顺序含真人和 AI", len(contrib) == 2
+          and [row["user_name"] for row in contrib] == ["真人", "AI玩家"]
+          and contrib[-1]["is_final"])
+    check("AI 记录含完整 provenance",
+          snap.qa_archive[-1]["judging_prompt_version"] == "judge-v2")
+    stale, _, _ = boot_v5()
+    _, old = ask(stale, QAResult(qid=0, verdict=P.YES, status="ok"))
+    stale.submit_ai_player_result(
+        old["token"], old["expect_round"], old["expect_spec_key"],
+        "ask", "旧问题", result=result)
+    check("stale token 不能写事实", not stale._established_fact_ids)
+    guarded, _, _ = boot_v5()
+    reservation = _ai_start(guarded)
+    host = _ai_move(guarded, reservation, "ask", "她是谁？")
+    for round_index, spec_key in ((host["expect_round"] + 1,
+                                   host["expect_spec_key"]),
+                                  (host["expect_round"], "wrong-spec")):
+        guarded.submit_ai_player_result(
+            host["token"], round_index, spec_key, "ask", host["text"],
+            result=QAResult(qid=0, verdict=P.YES, status="ok",
+                            established_fact_ids=["f1"],
+                            completion_verified_fact_ids=["f1"]))
+    check("stale round/spec 不能写事实", not guarded._established_fact_ids)
+    no_spec, _ = boot(mkcfg())
+    no_spec._completion_fact_ids = {"f1"}
+    ask(no_spec, QAResult(qid=0, verdict=P.YES, status="ok",
+                          established_fact_ids=["f1"],
+                          completion_verified_fact_ids=["f1"]))
+    check("没有已知 fact 表时不能凭 id 建立事实",
+          not no_spec._established_fact_ids and no_spec.phase == Phase.QA)
+
+    # Engine -> Director -> Writer -> Engine：确认生产装配搬运完整 verifier 上下文。
+    import threading
+    from director import Director
+    assembled, _, _ = boot_v5()
+    reservation = _ai_start(assembled)
+    host = _ai_move(assembled, reservation, "ask", "她是谁？")
+    done = threading.Event()
+    seen = {}
+
+    class Writer:
+        def answer(self, *args, **kwargs):
+            seen.update(kwargs)
+            return [QAResult(qid=0, verdict=P.YES, status="ok",
+                             established_fact_ids=["f1"],
+                             completion_verified_fact_ids=["f1"])], None
+
+    director = Director.__new__(Director)
+    director.engine = assembled
+    director.writer = Writer()
+    director._dispatch = lambda actions: done.set()
+    director.push = lambda: None
+    director._ai_player(host)
+    check("Director AI ask 完成", done.wait(3))
+    check("Director 原样传合同、core、已建立快照",
+          seen.get("completion_fact_ids") == ["f1", "f2"]
+          and seen.get("core_answer") == assembled._core_answer
+          and seen.get("room_established_fact_ids") == [])
+    check("生产链把 verified AI fact 写入 Fact Rail",
+          assembled.snapshot().fact_progress["established"] == 1)
 
 
 def test_ai_player_solve_wrong_and_right_are_independent():
@@ -4340,6 +4487,7 @@ def main():
              test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
+             test_ai_player_shared_fact_gate_and_victory,
              test_ai_player_solve_wrong_and_right_are_independent,
              test_ai_player_priority_cooldown_failure_giveup_and_stale,
              test_ai_player_public_snapshot_only_contains_public_transcript,

@@ -1334,19 +1334,43 @@ window.addEventListener('load', async () => {
   const box = document.getElementById('announcer');
   const eventText = () => document.getElementById('announcer-text').textContent;
   const visible = () => !box.classList.contains('hidden');
-  let state = {phase:'qa',puzzle_index:1,puzzle:'测试汤面',qa_log:[],qa_total:0,
+  let state = {phase:'qa',puzzle_index:1,puzzle:'测试汤面',qa_log:[
+    {qid:1,kind:'hint',user_name:'提示',text:'历史提示',verdict:''},
+    {qid:2,kind:'qa',user_name:'甲',text:'问题一',verdict:'是'},
+    {qid:3,kind:'qa',user_name:'乙',text:'问题二',verdict:'不是'}],qa_total:2,
     hint_count:0,hint_text:'',leaderboard:[]};
   const send = extra => { Object.assign(state,extra); socket.onmessage({data:JSON.stringify(state)}); };
   const qaHeight = () => document.getElementById('qa').getBoundingClientRect().height;
+  const laneClear = () => {
+    const event = box.getBoundingClientRect();
+    const fact = document.getElementById('fact-progress').getBoundingClientRect();
+    const qa = document.getElementById('qa').getBoundingClientRect();
+    const footer = document.getElementById('footer-status').getBoundingClientRect();
+    const first = document.querySelector('#qa-body .qa-row');
+    const row = first && first.getBoundingClientRect();
+    return fact.bottom <= event.top + 1 && event.bottom <= qa.top + 1 &&
+      (!row || event.bottom <= row.top + 1) && qa.bottom <= footer.top + 1;
+  };
   try {
     send({});
     check(!visible(), 'E1 event lane is empty and hidden at rest');
-    check(getComputedStyle(box).position==='absolute', 'E2 event lane is outside flex flow');
+    check(box.getBoundingClientRect().height===0, 'E2 hidden lane has zero height');
     const baseline = qaHeight();
+    const footerTop = document.getElementById('footer-status').getBoundingClientRect().top;
+    const factTop = document.getElementById('fact-progress').getBoundingClientRect().top;
     send({hint_count:1,hint_text:'第一条提示'});
     check(visible() && box.dataset.kind==='hint' && eventText().includes('第一条提示'),
       'E3 hint appears in event lane');
-    check(Math.abs(qaHeight()-baseline)<1, 'E4 hint does not shrink QA');
+    const unit = document.getElementById('stage').getBoundingClientRect().width/1080;
+    check(Math.abs(box.getBoundingClientRect().height/unit-52)<1 &&
+      (baseline-qaHeight())/unit>=52 && laneClear(),
+      'E4 hint owns 52px and does not cover QA: ' + JSON.stringify({
+        box:box.getBoundingClientRect().toJSON(), qa:document.getElementById('qa').getBoundingClientRect().toJSON(),
+        row:document.querySelector('#qa-body .qa-row')?.getBoundingClientRect().toJSON(),
+        baseline, laneClear:laneClear()}));
+    check(Math.abs(document.getElementById('footer-status').getBoundingClientRect().top-footerTop)<1 &&
+      Math.abs(document.getElementById('fact-progress').getBoundingClientRect().top-factTop)<1,
+      'E4b footer and fact rail stay fixed');
     const hintAnimation = document.getElementById('announcer-text').getAnimations()[0];
     check(hintAnimation && hintAnimation.effect.getTiming().duration>=4000 &&
       hintAnimation.effect.getTiming().duration<=8000, 'E5 hint has bounded playback');
@@ -1356,14 +1380,17 @@ window.addEventListener('load', async () => {
     await tick(7200);
     check(box.dataset.kind==='like' && eventText().includes('点赞推进'),
       'E7 like follows hint');
-    check(Math.abs(qaHeight()-baseline)<1, 'E8 like does not shrink QA');
+    check(laneClear(), 'E8 like does not cover QA');
     send({});
     check(box.dataset.kind==='like', 'E9 repeated snapshot does not replay like');
     await tick(5200);
     check(!visible(), 'E10 like disappears without fixed gap');
+    check(box.getBoundingClientRect().height===0 && Math.abs(qaHeight()-baseline)<1,
+      'E10b hidden lane returns its full height to QA');
     await tick(91000);
     check(box.dataset.kind==='preset' && eventText().includes('轮播公告'),
       'E11 preset plays in shared event lane');
+    check(laneClear(), 'E11b preset does not cover QA');
     send({hint_count:2,hint_text:'更重要的提示'});
     check(box.dataset.kind==='hint', 'E12 hint preempts preset');
     send({phase:'setting',hint_count:0,hint_text:''});
@@ -1379,6 +1406,7 @@ window.addEventListener('load', async () => {
     await tick(90000);
     check(box.dataset.kind==='leaderboard' && eventText().includes('累计猜汤榜'),
       'E16 leaderboard is transient and low frequency');
+    check(laneClear(), 'E16b leaderboard does not cover QA');
     await tick(8000);
     check(!visible(), 'E17 leaderboard leaves no permanent baseline');
   } catch(e) { errors.push(e.stack); }
@@ -1466,13 +1494,16 @@ window.addEventListener('load', async () => {
     check(factRows.length === 4 && factRows.every(row => row.getBoundingClientRect().height <= 34) &&
           getComputedStyle(factRows[3]).textOverflow === 'ellipsis',
       'W5f each fact must stay on one ellipsized line');
-    check(Math.abs(qa.height-before.height) <= 1 &&
-          eventStyle.position === 'absolute',
-          'W6 transient event changed bottom flex geometry');
+    check(eventStyle.position === 'relative' && event.height >= 51 &&
+          before.height - qa.height >= 51 && fact.bottom <= event.top + 1 &&
+          event.bottom <= qa.top + 1,
+          'W6 transient event must own space between fact rail and QA');
     check(event.top >= bottom.top - 1, 'W7 event covers puzzle');
     check(footer && event.bottom <= footer.top + 1, 'W8 event covers footer');
     check(lastRect && lastRect.top >= qaRect.top - 1 &&
-          lastRect.bottom <= qaRect.bottom + 1, 'W9 latest QA not fully visible');
+          lastRect.bottom <= qaRect.bottom + 1, 'W9 latest QA not fully visible: ' +
+          JSON.stringify({row:lastRect?.toJSON(), qa:qaRect.toJSON(),
+            scroll:document.getElementById('qa').scrollTop}));
     check(document.documentElement.scrollWidth <= innerWidth + 1 &&
           stage.scrollWidth <= 1080 + 1, 'W10 horizontal overflow');
     const revealPayload = {phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',

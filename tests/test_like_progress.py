@@ -14,8 +14,7 @@ Issue #43: 统一点赞推进机制 —— 专用回归套件。
   §16/§17 快照: 显式点赞公告事件 + 同源时间轴
   §28 REVEALED 60 秒不被点赞缩短
 
-产品语义一句话: 每新增 100 赞 = 1 个 pulse = 当前题 AI 机会 +1 **且**
-当前题有效时间 +30s(内部调参值, UI 永不显示秒数)。
+每新增 100 赞 = 1 pulse。SETTING 只给 AI 机会；QA 另给时间加成。
 """
 
 from __future__ import annotations
@@ -196,7 +195,8 @@ def test_round_opportunity_reset_on_new_round():
 def test_setting_pulses_credit_current_round():
     """§5/§22: SETTING 的 pulse 记入正在准备的题; SETTING 本身不发 AI。"""
     print("\n[LP-5] SETTING 阶段的 pulse 不浪费")
-    eng, clk = RoundEngine(mkcfg()), FakeClock()
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
     eng.start()
     assert eng.phase == Phase.SETTING
     like(eng, 0)                      # 基线 0
@@ -206,8 +206,11 @@ def test_setting_pulses_credit_current_round():
     check("SETTING 公告中性、round 指向正在准备的题",
           notice and notice["phase"] == "setting"
           and notice["round_index"] == 1
-          and "新题开始后生效" in notice["text"],
+          and "AI玩家将在新题开始后加入" in notice["text"]
+          and "游戏加速" not in notice["text"],
           notice)
+    check("SETTING 不提前消耗时间",
+          eng._round_progress_bonus_seconds == 0)
     check("SETTING 不谎称 AI 正在行动",
           notice and "正在" not in notice["text"], notice and notice["text"])
     acts = eng.tick()
@@ -216,6 +219,9 @@ def test_setting_pulses_credit_current_round():
     eng.submit_riddle("谜面。为什么？", "谜底", now=clk.t)
     check("进 QA 后 SETTING 期间的额度可用",
           eng._ai_player_ledger.available == 2, led_snapshot(eng))
+    check("新题 Hint1 倒计时完整",
+          299000 <= eng.snapshot().next_event_ms <= 300000,
+          eng.snapshot().next_event_ms)
 
 
 def test_revealing_revealed_pulses_not_credited():
@@ -366,6 +372,55 @@ def test_auto_reveal_real_time_floor():
     check("真实 180s: 揭晓放行",
           any(a.kind == ActionKind.REVEAL for a in acts)
           and eng.phase == Phase.REVEALING, (kinds(acts), eng.phase))
+
+
+def test_reveal_countdown_beats_hint_cooldown():
+    """点赞越过 20 分钟线后，180s 揭晓早于下一条 Hint 冷却。"""
+    print("\n[LP-11a] 揭晓倒计时早于 Hint 冷却")
+    eng, clk = boot(mkcfg(hint_seconds=300.0, max_hints=3,
+                          puzzle_min_qa_seconds=180.0,
+                          hint_min_gap_seconds=45.0,
+                          restate_seconds=999999))
+    like(eng, 100)                    # high-water 基线
+    clk.advance(160)
+    like(eng, 4100)                   # 40 桶 = 1200s bonus，越过揭晓线
+    acts = eng.tick()
+    check("真实时间底线先挡揭晓，派发 Hint1",
+          eng.phase == Phase.QA and ActionKind.HINT in kinds(acts), kinds(acts))
+    eng.submit_hint("提示一")
+    snap = eng.snapshot()
+    check("Hint2 冷却 45s，但 20s 后揭晓是下一事件",
+          snap.hint_count == 1 and snap.next_event_kind == "reveal"
+          and snap.next_event_label == "距揭晓"
+          and snap.next_event_ms == 20000,
+          (snap.hint_count, snap.next_event_kind, snap.next_event_ms))
+    clk.advance(20)
+    snap = eng.snapshot()
+    check("同 tick 揭晓优先于 Hint", snap.next_event_kind == "reveal"
+          and snap.next_event_ms == 0, (snap.next_event_kind, snap.next_event_ms))
+    acts = eng.tick()
+    check("Engine 同 tick 实际执行揭晓",
+          ActionKind.REVEAL in kinds(acts) and ActionKind.HINT not in kinds(acts)
+          and eng.phase == Phase.REVEALING, kinds(acts))
+
+
+def test_reveal_countdown_beats_hint_retry():
+    """Hint 生成失败后，重试时间晚于揭晓时显示揭晓。"""
+    print("\n[LP-11b] 揭晓倒计时早于 Hint 重试")
+    eng, clk = boot(mkcfg(hint_seconds=300.0, max_hints=3,
+                          puzzle_min_qa_seconds=180.0,
+                          hint_retry_seconds=60.0,
+                          restate_seconds=999999))
+    like(eng, 100)
+    clk.advance(160)
+    like(eng, 4100)
+    check("派发 Hint1", ActionKind.HINT in kinds(eng.tick()))
+    eng.submit_hint(error="gateway")
+    snap = eng.snapshot()
+    check("重试晚于揭晓时显示揭晓，不显示未成功的 Hint",
+          snap.hint_count == 0 and snap.next_event_kind == "reveal"
+          and snap.next_event_ms == 20000,
+          (snap.hint_count, snap.next_event_kind, snap.next_event_ms))
 
 
 def test_human_completion_ignores_min_qa_floor():
@@ -520,6 +575,8 @@ def main():
         test_single_tick_burst_no_spam,
         test_effective_elapsed_ui_fields,
         test_auto_reveal_real_time_floor,
+        test_reveal_countdown_beats_hint_cooldown,
+        test_reveal_countdown_beats_hint_retry,
         test_human_completion_ignores_min_qa_floor,
         test_legacy_skip_tokens_are_tombstones,
         test_tombstone_match_is_exact_not_substring,

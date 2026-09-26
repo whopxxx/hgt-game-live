@@ -693,7 +693,9 @@ class Director:
                             payload.get("text", ""), judge_solve=False,
                             solve_atoms=payload.get("solve_atoms"),
                             facts=payload.get("facts"),
-                            completion_fact_ids=[],
+                            completion_fact_ids=payload.get("completion_fact_ids"),
+                            core_answer=payload.get("core_answer", ""),
+                            room_established_fact_ids=payload.get("established_fact_ids"),
                             timeout=payload.get("timeout"),
                             max_retries=payload.get("max_retries"))
                     r = results[0] if results else None
@@ -702,6 +704,7 @@ class Director:
                         payload.get("text", ""),
                         verdict=(r.verdict if r else ""),
                         comment=(r.comment if r else ""),
+                        result=r,
                         failed=(r is None or r.status != "ok"),
                         error=(err if r is None else None))
                 elif stage == "solve":

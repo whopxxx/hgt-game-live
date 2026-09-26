@@ -757,7 +757,7 @@ def test_classic_and_curated_stay_legacy():
     ls = _legacy_spec(1)
     ls.prompt_version = "keyword2-v7"
     ok, why = PuzzlePool._validate_pool_spec(ls)
-    check("legacy v13 spec(protocol='')仍可入池", ok, why)
+    check("legacy v13 spec(protocol='')不再进入直播池", not ok, why)
     check("legacy 不会因为生成侧激活 v1 而被要求 v1", ls.protocol_version == "",
           ls.protocol_version)
 

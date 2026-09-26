@@ -201,9 +201,8 @@ class RoundEngine:
         self._core_answer = ""
         #: **房间已公开确认**的 fact 集合。每道新题清零。
         #:
-        #: ⚠️ **只有真人 QA 能写它** —— 见 `_record_human_established_locked`。
-        #: 提示 / nudge / 将来 Detective 的自动作答绝不能碰, 否则系统会
-        #: 自己把题解掉。
+        #: 真人 QA 与公开 AI ask 共用 `_record_established_locked`。
+        #: 提示 / nudge / 系统动作不能写入。
         self._established_fact_ids: set = set()
         self._qa_total = 0
         #: R2: 本题**真实提交顺序**的单调序号 —— 每接受一条真人 QA +1。
@@ -428,9 +427,8 @@ class RoundEngine:
             round 进度加成         +N * like_progress_seconds_per_bucket
 
         只有 SETTING / QA 消费 pulse:
-            SETTING  记入"正在准备的这一题", 进 QA 后生效; 本身不加速
-                     出题、不重复提交 RIDDLE、不派发任何 AI 动作。
-            QA       主战场: 一次性入账 + 一个聚合公告。
+            SETTING  只记 AI 玩家机会，不提前消耗新题的 QA 时间。
+            QA       AI 玩家机会与时间加成一次性入账。
         其它 phase(REVEALING / REVEALED / IDLE / STOPPED):
             只推进高水位与遥测 —— **不入账当前题、不带入下一题、
             不发公告**。REVEALED 的 60 秒是 #45 评分+主题投票的窗口,
@@ -457,9 +455,10 @@ class RoundEngine:
                 return []
             # ---- 一次性入账(当前题) ----
             self._ai_player_ledger.earn(pulses)
-            self._round_progress_bonus_seconds += (
-                pulses * max(0.0, float(
-                    self.cfg.like_progress_seconds_per_bucket)))
+            if self.phase == Phase.QA:
+                self._round_progress_bonus_seconds += (
+                    pulses * max(0.0, float(
+                        self.cfg.like_progress_seconds_per_bucket)))
             self._push_like_notice_locked(pulses)
             return [EngineAction(ActionKind.BROADCAST, {
                 "like_progress_pulses": pulses,
@@ -488,7 +487,7 @@ class RoundEngine:
         """
         self._like_notice_seq += 1
         if self.phase == Phase.SETTING:
-            text = "❤️ 点赞助攻已累积，新题开始后生效"
+            text = "❤️ 点赞助攻已累积，AI玩家将在新题开始后加入"
         elif pulses > 1:
             text = f"❤️ 点赞助攻 ×{pulses}！AI玩家获得更多行动机会，游戏加速"
         else:
@@ -1128,7 +1127,7 @@ class RoundEngine:
                     if receipt is not None:
                         receipt[r.qid] = False
                     continue
-                # ---- v5: 只有**真人问答**能建立事实 ----
+                # ---- v5: 公开问答可以建立事实 ----
                 #
                 # 抽成一个具名方法(而不是在这里内联几行), 是为了让
                 # 边界**显式可查**: 将来 Step 14 实现 Detective 时,
@@ -1172,14 +1171,14 @@ class RoundEngine:
                     r.established_fact_ids,
                     r.completion_verified_fact_ids,
                     verdict=r.verdict)
-                est = self._record_human_established_locked(
+                est = self._record_established_locked(
                     safe_est, verdict=r.verdict,
                     status=r.status,
                     response_kind=getattr(r, "response_kind", "verdict"))
                 # R2: 真实提交顺序。**必须在这个 lock 内自增** —— 出了这里
                 # 就可能被别的 worker 插队, 序号就不再等于提交顺序。
                 self._qa_commit_seq += 1
-                # 这次真正新增的(est 是 `_record_human_established_locked`
+                # 这次真正新增的(est 是 `_record_established_locked`
                 # 采纳的 id, 已经过滤过不存在/重复的; 再减去 before 才
                 # 是"推进了房间进度"的那部分)。
                 #
@@ -1349,6 +1348,9 @@ class RoundEngine:
                 "solve_atoms": list(self._solve_atoms),
                 "facts": ([f.to_dict() for f in self._spec.facts]
                           if self._spec else []),
+                "completion_fact_ids": sorted(self._completion_fact_ids),
+                "core_answer": self._core_answer,
+                "established_fact_ids": sorted(self._established_fact_ids),
                 "transcript": self._transcript_locked(),
                 "timeout": self.cfg.qa_answer_timeout,
                 "max_retries": self.cfg.qa_answer_retries,
@@ -1360,6 +1362,7 @@ class RoundEngine:
             move_kind: str, text: str, verdict: str = "", comment: str = "",
             solved: bool = False, failed: bool = False,
             error: Optional[str] = None, now: Optional[float] = None,
+            result: Optional[QAResult] = None,
             ) -> list[EngineAction]:
         """提交完整 AI ask/solve；只有成功上屏后才兑现一次次数。"""
         now = self._now(now)
@@ -1373,6 +1376,11 @@ class RoundEngine:
                 return self._ai_player_failed_locked(
                     token, round_index, spec_key, now,
                     error or "裁决技术失败")
+            if move_kind == "ask" and result is not None:
+                verdict, comment = result.verdict, result.comment
+                if result.status != "ok":
+                    return self._ai_player_failed_locked(
+                        token, round_index, spec_key, now, "裁决技术失败")
             if move_kind == "ask":
                 # Issue #65: 正常三态(是/不是/不重要)。
                 if verdict not in (P.YES, P.NO, P.UNIMPORTANT):
@@ -1385,13 +1393,40 @@ class RoundEngine:
                 return self._ai_player_failed_locked(
                     token, round_index, spec_key, now, "动作类型无效")
 
-            # AI 行使用同一个 QA 流，但不碰真人 questions/answered/viewers，
-            # 更不调用 `_record_human_established_locked`。
+            # AI ask 共享事实入口与真人一致；统计仍只属于真人。
+            before = set(self._established_fact_ids)
+            est = []
+            contrib = []
+            if move_kind == "ask" and result is not None:
+                safe = self._verified_established_locked(
+                    result.established_fact_ids,
+                    result.completion_verified_fact_ids, verdict=verdict)
+                est = self._record_established_locked(
+                    safe, verdict=verdict, status=result.status,
+                    response_kind=result.response_kind)
+                contrib = [fid for fid in est
+                           if fid not in before and fid in self._completion_fact_ids]
+                self._touched_fact_ids.update(result.touched_fact_ids or [])
+            self._qa_commit_seq += 1
             self._qid_seq += 1
             rec = QARec(
                 qid=self._qid_seq, user_name="AI玩家", text=text[:200],
                 verdict=shown_verdict, comment=comment[:60],
-                kind="ai_player", ts=now)
+                kind="ai_player", ts=now, commit_seq=self._qa_commit_seq,
+                status=result.status if result is not None else "ok",
+                response_kind=result.response_kind if result is not None else "verdict",
+                touched_fact_ids=list(result.touched_fact_ids or []) if result else None,
+                established_fact_ids=est,
+                completion_verified_fact_ids=(list(result.completion_verified_fact_ids or [])
+                                              if result else None),
+                completion_contribution_fact_ids=contrib or None,
+                solution_candidate=result.solution_candidate if result else None,
+                judging_prompt_version=result.judging_prompt_version if result else "",
+                answer_prompt_version=result.answer_prompt_version if result else "",
+                candidate_recheck_prompt_version=(
+                    result.candidate_recheck_prompt_version if result else ""),
+                completion_verify_prompt_version=(
+                    result.completion_verify_prompt_version if result else ""))
             self._append_qa_locked(rec)
             if not self._ai_player_ledger.commit(
                     token, round_index, spec_key):
@@ -1403,6 +1438,10 @@ class RoundEngine:
                 "answer": rec.to_json(), "phase_changed": False})]
             if move_kind == "solve" and solved:
                 log.info("AI玩家独立猜中第%d题", self._puzzle_index)
+                acts.extend(self._enter_revealing_locked(
+                    now, "ai_solved", "AI玩家"))
+            elif (move_kind == "ask" and self._completion_fact_ids
+                  and self._completion_fact_ids <= self._established_fact_ids):
                 acts.extend(self._enter_revealing_locked(
                     now, "ai_solved", "AI玩家"))
             return acts
@@ -1964,6 +2003,14 @@ class RoundEngine:
         return self._real_elapsed_locked(now) + max(
             0.0, self._round_progress_bonus_seconds)
 
+    def _auto_reveal_remaining_locked(self, now: float) -> float:
+        """自动揭晓还需多久：有效时间轴与真实 QA 底线须同时满足。"""
+        return max(0.0,
+                   (self.cfg.max_hints + 1) * self.cfg.hint_seconds
+                   - self._effective_elapsed_locked(now),
+                   self.cfg.puzzle_min_qa_seconds
+                   - self._real_elapsed_locked(now))
+
     def _tick_qa_locked(self, now: float) -> list[EngineAction]:
         acts: list[EngineAction] = []
 
@@ -2088,7 +2135,7 @@ class RoundEngine:
             # 一波点赞爆点"不能把题直接烧掉。真人真实通关(合同覆盖 /
             # legacy SOLVE)不经过这里, 不受此限。守在下面的分支里每拍
             # 重新判, 真实时间一到自然揭晓。
-            if real_elapsed < self.cfg.puzzle_min_qa_seconds:
+            if self._auto_reveal_remaining_locked(now) > 0:
                 _detail("effective 已过揭晓阈值但真实 QA 不足 %.0fs "
                         "(real=%.0fs), 揭晓被最低保护压住",
                         self.cfg.puzzle_min_qa_seconds, real_elapsed)
@@ -2272,18 +2319,18 @@ class RoundEngine:
 
         ## 谁算贡献
 
-        `completion_contribution_fact_ids` 非空 = 这条真人问答在**实际
-        提交的那一刻**首次为房间补进了一块通关拼图(见 R1)。
+        `completion_contribution_fact_ids` 非空 = 真人 QA 或 AI 玩家公开 ask
+        在**实际提交的那一刻**首次为房间补进了一块通关拼图(见 R1)。
 
         因此下面这些**一律不算**, 哪怕它们和谜底有关:
           - support / exclusion fact:   建立了也不推进通关;
           - `touched_fact_ids`:          只是问过这个方向;
           - 重复确认(别人早说过了):       贡献是空的;
-          - hint / nudge:                `kind != "qa"`;
+          - hint / nudge:                `kind` 不属于 `qa` / `ai_player`;
           - 「未判定」:                   `status != "ok"`;
           - 「不重要」:                   它没确认/否定任何东西(Issue #65)。
-        将来 Step 14 的 Detective 也**绝不能**算进来 —— 这一层是
-        "真人共同解谜"的表彰, 系统自己推出来的不算。
+        AI 的公开贡献不计入真人 leaderboard。将来 Step 14 的 Detective
+        也**绝不能**算进来：系统内部自己推出来的不算公开问答贡献。
 
         ## 排序: 按真实提交顺序, 不按 archive 顺序
 
@@ -2310,7 +2357,7 @@ class RoundEngine:
             return []
         rows: list[QARec] = []
         for rec in self._qa_archive:
-            if rec.kind != "qa":
+            if rec.kind not in ("qa", "ai_player"):
                 continue
             if rec.status != "ok":
                 continue
@@ -2450,10 +2497,10 @@ class RoundEngine:
                         sorted(set(dropped)), verdict)
         return out
 
-    def _record_human_established_locked(
+    def _record_established_locked(
             self, raw_ids, verdict: str = "", status: str = "",
             response_kind: str = "verdict") -> list:
-        """把一条**真人 QA** 公开确认的事实并进房间共识。返回真正采纳的 id。
+        """把真人 QA 或公开 AI ask 确认的事实并进房间共识。
 
         ## 为什么必须是一个具名方法(而不是内联三行)
 
@@ -2461,12 +2508,12 @@ class RoundEngine:
         显式冻结:
 
             submit_qa(human)          -> 可以调用
+            submit_ai_player_result(ask) -> 可以调用
             submit_detective(...)     -> **绝不能**调用  (Step 14)
             submit_hint / nudge       -> **绝不能**调用
             system 自动动作           -> **绝不能**调用
 
-        若将来 Detective 能写这个集合, 系统就会**自己把题解掉** —— 观众
-        什么也没说, 题就揭晓了。那是不可接受的。
+        Hint/Nudge/System 不能通过这扇门自行推进通关。
 
         ## Engine 侧的 defense-in-depth
 
@@ -2540,7 +2587,7 @@ class RoundEngine:
             fid = str(x).strip()
             if not fid or fid in out:
                 continue
-            if known and fid not in known:
+            if fid not in known:
                 # 模型编了一个不存在的 id。丢掉, 不猜。
                 log.debug("established 含不存在的 fact id, 已丢弃: %r", fid)
                 continue
@@ -2976,20 +3023,29 @@ class RoundEngine:
             # `_puzzle_started` 会是 0.0, 真值判断会把它当成"没有开始"。
             if self.phase == Phase.QA and self._puzzle_started is not None:
                 n = self.cfg.hint_seconds
-                real = self._real_elapsed_locked(now)
                 eff = self._effective_elapsed_locked(now)
-                slot = int(eff // n)
-                if slot < self.cfg.max_hints:
-                    # 距下一格提示: bonus 在两条点赞事件之间是常数,
-                    # 所以"effective 还差多少"就等于"真实还差多少"。
-                    remaining = max(0.0, (slot + 1) * n - eff)
-                    ev_kind = "hint"
-                    ev_label = f"距第 {slot + 1} 条提示"
-                else:
-                    remaining = max(0.0, (self.cfg.max_hints + 1) * n - eff)
-                    # §9: 自动揭晓 = effective 过阈值 **且** 真实过最低保护。
+                time_slot = int(eff // n)
+                slot = max(time_slot, self._hints_given)
+                reveal_remaining = self._auto_reveal_remaining_locked(now)
+                if self._hints_given < self.cfg.max_hints:
+                    next_level = self._hints_given + 1
+                    remaining = max(0.0, next_level * n - eff)
+                    per = int(getattr(self.cfg, "hint_questions_per_level", 20) or 0)
+                    if per > 0 and sum(self._verdict_counts.values()) >= next_level * per:
+                        remaining = 0.0
                     remaining = max(remaining,
-                                    max(0.0, self.cfg.puzzle_min_qa_seconds - real))
+                                    self._hint_cooldown_until - now,
+                                    self._hint_retry_at - now,
+                                    0.0)
+                    if reveal_remaining <= remaining:
+                        remaining = reveal_remaining
+                        ev_kind = "reveal"
+                        ev_label = "距揭晓"
+                    else:
+                        ev_kind = "hint"
+                        ev_label = f"距第 {next_level} 条自动提示"
+                else:
+                    remaining = reveal_remaining
                     ev_kind = "reveal"
                     ev_label = "距揭晓"
                 ev_ms = max(0, int(remaining * 1000))

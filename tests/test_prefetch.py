@@ -105,6 +105,8 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
             reveal_mode="meaning_flip"),
         prompt_version="riddle-v3",
         quality_policy_version=QUALITY_POLICY_VERSION,
+        protocol_version="haiguitang-v1", difficulty="medium",
+        primary_category="suspense", categories=["suspense"],
         metrics={"generation_attempts": 2, "review_calls": 1,
                  "rewrite_count": 0, "review_decision": "pass",
                  "review_latency_ms_total": 3310,
@@ -113,6 +115,9 @@ def good_spec(puzzle=None, answer=None, **kw) -> PuzzleSpec:
     )
     for k, v in kw.items():
         setattr(s, k, v)
+    for fact in s.facts:
+        if fact.kind == "core" and not fact.public_text:
+            fact.public_text = fact.text[:12]
     return s
 
 
@@ -4702,16 +4707,18 @@ def test_i60_demand_survives_technical_fail():
         s.primary_category = "horror"
         s.categories = ["horror"]
         pool.add(s)
+        clk = _Clock()
         pf = mkpf(d, pool=pool, writer=_FakeWriter(), executor=ex,
+                  clock=clk,
                   pool_category_target=2, pool_category_low_water=1)
         pf.request_category("logic")
         pf.on_tick()
         ex.run_next()
-        # 一次技术失败(不退出 demand)
-        pf._apply_result("gen_fail", "网关抖",
-                         {"reject": "structure_technical_fail"}, 0.0)
+        # 收回实际 worker 的技术失败，再等真实退避到期。
+        pf.on_tick()
         check("**demand 仍然 pending**", "logic" in pf._demand_categories,
               pf._demand_categories)
+        clk.advance(pf._retry_at - clk.t)
         pf.on_tick()
         check("**恢复后继续为 logic 补**", ex.total == 2, ex.total)
 
