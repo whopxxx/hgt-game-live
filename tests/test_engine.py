@@ -3271,8 +3271,8 @@ def test_ux_m_human_only_established():
     check("技术失败不建立任何事实",
           eng._established_fact_ids == before, eng._established_fact_ids)
     # 直接调用具名方法必须存在(边界显式可查)
-    check("存在具名写入口 _record_human_established_locked",
-          hasattr(eng, "_record_human_established_locked"))
+    check("存在共享共识写入口 _record_established_locked",
+          hasattr(eng, "_record_established_locked"))
 
 
 def test_ux_new_puzzle_clears_established():
@@ -3872,6 +3872,73 @@ def test_ai_player_ask_consumes_without_human_completion():
           all(a.kind == ActionKind.BROADCAST for a in acts), kinds(acts))
 
 
+def test_ai_player_shared_fact_gate_and_victory():
+    print("\n[AI-67] AI ask 共享事实、verifier、贡献与真人统计隔离")
+
+    def ask(eng, result):
+        p = _ai_start(eng)
+        host = _ai_move(eng, p, "ask", "她是谁？")
+        check("AI payload 带权威合同与房间状态",
+              host["completion_fact_ids"] == sorted(eng._completion_fact_ids)
+              and host["core_answer"] == eng._core_answer
+              and host["established_fact_ids"] == sorted(eng._established_fact_ids))
+        return eng.submit_ai_player_result(
+            host["token"], host["expect_round"], host["expect_spec_key"],
+            "ask", host["text"], result=result), host
+
+    for label, result in (
+            ("不重要", QAResult(qid=0, verdict=P.UNIMPORTANT,
+                                  established_fact_ids=["f1"], status="ok")),
+            ("未判定", QAResult(qid=0, verdict=P.UNAVAILABLE,
+                                  established_fact_ids=["f1"], status="unavailable")),
+            ("rephrase", QAResult(qid=0, verdict="", response_kind="rephrase",
+                                     established_fact_ids=["f1"], status="ok")),
+            ("未复核", QAResult(qid=0, verdict=P.YES, status="ok",
+                                    established_fact_ids=["f1"])),
+            ("不是", QAResult(qid=0, verdict=P.NO, status="ok",
+                                  established_fact_ids=["f1"],
+                                  completion_verified_fact_ids=["f1"]))):
+        eng, _, _ = boot_v5(completion=("f1", "f2"))
+        ask(eng, result)
+        check(label + "不得建立 completion", not eng._established_fact_ids)
+
+    eng, clk, _ = boot_v5(completion=("f1", "f2"))
+    _answer_and_submit(eng, clk, "u1", "真人", "她是女儿吗？",
+                       verdict=P.YES, status="ok", established_fact_ids=["f1"])
+    before = (eng.snapshot().stat_questions, eng.snapshot().stat_answered,
+              dict(eng._verdict_counts), eng.snapshot().stat_viewers_seen)
+    result = QAResult(qid=0, verdict=P.YES, status="ok",
+                      touched_fact_ids=["f2"], established_fact_ids=["f2"],
+                      completion_verified_fact_ids=["f2"],
+                      solution_candidate=True,
+                      judging_prompt_version="judge-v2")
+    acts, host = ask(eng, result)
+    snap = eng.snapshot()
+    check("AI verified fact 进入共享事实与 touched",
+          eng._established_fact_ids == {"f1", "f2"}
+          and "f2" in eng._touched_fact_ids)
+    check("AI 补齐后 Fact Rail 与胜利同步",
+          snap.fact_progress["established"] == 2
+          and eng.phase == Phase.REVEALING and snap.solved_by == "AI玩家")
+    check("AI 不进真人统计与榜单",
+          before == (snap.stat_questions, snap.stat_answered,
+                     dict(eng._verdict_counts), snap.stat_viewers_seen)
+          and not snap.leaderboard)
+    reveal = next(a for a in acts if a.kind == ActionKind.REVEAL)
+    contrib = reveal.payload["reveal_contributors"]
+    check("贡献链按提交顺序含真人和 AI", len(contrib) == 2
+          and [row["user_name"] for row in contrib] == ["真人", "AI玩家"]
+          and contrib[-1]["is_final"])
+    check("AI 记录含完整 provenance",
+          snap.qa_archive[-1]["judging_prompt_version"] == "judge-v2")
+    stale, _, _ = boot_v5()
+    _, old = ask(stale, QAResult(qid=0, verdict=P.YES, status="ok"))
+    stale.submit_ai_player_result(
+        old["token"], old["expect_round"], old["expect_spec_key"],
+        "ask", "旧问题", result=result)
+    check("stale token 不能写事实", not stale._established_fact_ids)
+
+
 def test_ai_player_solve_wrong_and_right_are_independent():
     print("\n[AI-3] solve 猜错/猜中都是真实独立动作")
     wrong, _ = boot(mkcfg())
@@ -4340,6 +4407,7 @@ def main():
              test_fixed_viewer_copy_uses_soup_terms,
              test_ai_player_like_high_water_and_gift_zero,
              test_ai_player_ask_consumes_without_human_completion,
+             test_ai_player_shared_fact_gate_and_victory,
              test_ai_player_solve_wrong_and_right_are_independent,
              test_ai_player_priority_cooldown_failure_giveup_and_stale,
              test_ai_player_public_snapshot_only_contains_public_transcript,

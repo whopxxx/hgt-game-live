@@ -201,9 +201,8 @@ class RoundEngine:
         self._core_answer = ""
         #: **房间已公开确认**的 fact 集合。每道新题清零。
         #:
-        #: ⚠️ **只有真人 QA 能写它** —— 见 `_record_human_established_locked`。
-        #: 提示 / nudge / 将来 Detective 的自动作答绝不能碰, 否则系统会
-        #: 自己把题解掉。
+        #: 真人 QA 与公开 AI ask 共用 `_record_established_locked`。
+        #: 提示 / nudge / 系统动作不能写入。
         self._established_fact_ids: set = set()
         self._qa_total = 0
         #: R2: 本题**真实提交顺序**的单调序号 —— 每接受一条真人 QA +1。
@@ -1128,7 +1127,7 @@ class RoundEngine:
                     if receipt is not None:
                         receipt[r.qid] = False
                     continue
-                # ---- v5: 只有**真人问答**能建立事实 ----
+                # ---- v5: 公开问答可以建立事实 ----
                 #
                 # 抽成一个具名方法(而不是在这里内联几行), 是为了让
                 # 边界**显式可查**: 将来 Step 14 实现 Detective 时,
@@ -1172,14 +1171,14 @@ class RoundEngine:
                     r.established_fact_ids,
                     r.completion_verified_fact_ids,
                     verdict=r.verdict)
-                est = self._record_human_established_locked(
+                est = self._record_established_locked(
                     safe_est, verdict=r.verdict,
                     status=r.status,
                     response_kind=getattr(r, "response_kind", "verdict"))
                 # R2: 真实提交顺序。**必须在这个 lock 内自增** —— 出了这里
                 # 就可能被别的 worker 插队, 序号就不再等于提交顺序。
                 self._qa_commit_seq += 1
-                # 这次真正新增的(est 是 `_record_human_established_locked`
+                # 这次真正新增的(est 是 `_record_established_locked`
                 # 采纳的 id, 已经过滤过不存在/重复的; 再减去 before 才
                 # 是"推进了房间进度"的那部分)。
                 #
@@ -1349,6 +1348,9 @@ class RoundEngine:
                 "solve_atoms": list(self._solve_atoms),
                 "facts": ([f.to_dict() for f in self._spec.facts]
                           if self._spec else []),
+                "completion_fact_ids": sorted(self._completion_fact_ids),
+                "core_answer": self._core_answer,
+                "established_fact_ids": sorted(self._established_fact_ids),
                 "transcript": self._transcript_locked(),
                 "timeout": self.cfg.qa_answer_timeout,
                 "max_retries": self.cfg.qa_answer_retries,
@@ -1360,6 +1362,7 @@ class RoundEngine:
             move_kind: str, text: str, verdict: str = "", comment: str = "",
             solved: bool = False, failed: bool = False,
             error: Optional[str] = None, now: Optional[float] = None,
+            result: Optional[QAResult] = None,
             ) -> list[EngineAction]:
         """提交完整 AI ask/solve；只有成功上屏后才兑现一次次数。"""
         now = self._now(now)
@@ -1373,6 +1376,11 @@ class RoundEngine:
                 return self._ai_player_failed_locked(
                     token, round_index, spec_key, now,
                     error or "裁决技术失败")
+            if move_kind == "ask" and result is not None:
+                verdict, comment = result.verdict, result.comment
+                if result.status != "ok":
+                    return self._ai_player_failed_locked(
+                        token, round_index, spec_key, now, "裁决技术失败")
             if move_kind == "ask":
                 # Issue #65: 正常三态(是/不是/不重要)。
                 if verdict not in (P.YES, P.NO, P.UNIMPORTANT):
@@ -1385,13 +1393,40 @@ class RoundEngine:
                 return self._ai_player_failed_locked(
                     token, round_index, spec_key, now, "动作类型无效")
 
-            # AI 行使用同一个 QA 流，但不碰真人 questions/answered/viewers，
-            # 更不调用 `_record_human_established_locked`。
+            # AI ask 共享事实入口与真人一致；统计仍只属于真人。
+            before = set(self._established_fact_ids)
+            est = []
+            contrib = []
+            if move_kind == "ask" and result is not None:
+                safe = self._verified_established_locked(
+                    result.established_fact_ids,
+                    result.completion_verified_fact_ids, verdict=verdict)
+                est = self._record_established_locked(
+                    safe, verdict=verdict, status=result.status,
+                    response_kind=result.response_kind)
+                contrib = [fid for fid in est
+                           if fid not in before and fid in self._completion_fact_ids]
+                self._touched_fact_ids.update(result.touched_fact_ids or [])
+            self._qa_commit_seq += 1
             self._qid_seq += 1
             rec = QARec(
                 qid=self._qid_seq, user_name="AI玩家", text=text[:200],
                 verdict=shown_verdict, comment=comment[:60],
-                kind="ai_player", ts=now)
+                kind="ai_player", ts=now, commit_seq=self._qa_commit_seq,
+                status=result.status if result is not None else "ok",
+                response_kind=result.response_kind if result is not None else "verdict",
+                touched_fact_ids=list(result.touched_fact_ids or []) if result else None,
+                established_fact_ids=est,
+                completion_verified_fact_ids=(list(result.completion_verified_fact_ids or [])
+                                              if result else None),
+                completion_contribution_fact_ids=contrib or None,
+                solution_candidate=result.solution_candidate if result else None,
+                judging_prompt_version=result.judging_prompt_version if result else "",
+                answer_prompt_version=result.answer_prompt_version if result else "",
+                candidate_recheck_prompt_version=(
+                    result.candidate_recheck_prompt_version if result else ""),
+                completion_verify_prompt_version=(
+                    result.completion_verify_prompt_version if result else ""))
             self._append_qa_locked(rec)
             if not self._ai_player_ledger.commit(
                     token, round_index, spec_key):
@@ -1403,6 +1438,10 @@ class RoundEngine:
                 "answer": rec.to_json(), "phase_changed": False})]
             if move_kind == "solve" and solved:
                 log.info("AI玩家独立猜中第%d题", self._puzzle_index)
+                acts.extend(self._enter_revealing_locked(
+                    now, "ai_solved", "AI玩家"))
+            elif (move_kind == "ask" and self._completion_fact_ids
+                  and self._completion_fact_ids <= self._established_fact_ids):
                 acts.extend(self._enter_revealing_locked(
                     now, "ai_solved", "AI玩家"))
             return acts
@@ -2310,7 +2349,7 @@ class RoundEngine:
             return []
         rows: list[QARec] = []
         for rec in self._qa_archive:
-            if rec.kind != "qa":
+            if rec.kind not in ("qa", "ai_player"):
                 continue
             if rec.status != "ok":
                 continue
@@ -2450,10 +2489,10 @@ class RoundEngine:
                         sorted(set(dropped)), verdict)
         return out
 
-    def _record_human_established_locked(
+    def _record_established_locked(
             self, raw_ids, verdict: str = "", status: str = "",
             response_kind: str = "verdict") -> list:
-        """把一条**真人 QA** 公开确认的事实并进房间共识。返回真正采纳的 id。
+        """把真人 QA 或公开 AI ask 确认的事实并进房间共识。
 
         ## 为什么必须是一个具名方法(而不是内联三行)
 
@@ -2461,12 +2500,12 @@ class RoundEngine:
         显式冻结:
 
             submit_qa(human)          -> 可以调用
+            submit_ai_player_result(ask) -> 可以调用
             submit_detective(...)     -> **绝不能**调用  (Step 14)
             submit_hint / nudge       -> **绝不能**调用
             system 自动动作           -> **绝不能**调用
 
-        若将来 Detective 能写这个集合, 系统就会**自己把题解掉** —— 观众
-        什么也没说, 题就揭晓了。那是不可接受的。
+        Hint/Nudge/System 不能通过这扇门自行推进通关。
 
         ## Engine 侧的 defense-in-depth
 
