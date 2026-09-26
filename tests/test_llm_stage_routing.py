@@ -1043,11 +1043,11 @@ def test_qa_stages_route_independently():
     check("**completion 复核确实被调用(不是空断言)**",
           len(cli_v.calls) >= 2, vstages)
 
-    # qa.candidate_recheck: 第一层自相矛盾(candidate=True 但 verdict=无关)
+    # qa.candidate_recheck: 第一层自相矛盾(candidate=True 但 verdict=不重要)
     # -> 定向重判
     from tests.test_solve_ux import _recheck
     cli_c = FakeClient([
-        _verdict(cand=True, verdict="无关"),
+        _verdict(cand=True, verdict="不重要"),
         _recheck("是", ids=["f2"]),
     ])
     wc = PuzzleWriter(client=cli_c, runtime_cfg=cfg)

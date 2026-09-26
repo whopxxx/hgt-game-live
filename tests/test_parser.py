@@ -36,7 +36,7 @@ def main():
         ("1|是|好眼力", "是"),
         ("1. **#他哭了吗** → **是**  \n（他喝了汤之后哭了。）", "是"),
         ("1、不是，因为今天这碗汤的味道完全不对。", "不是"),
-        ("1）无关", "无关"),
+        ("1）无关", "不重要"),  # legacy 文本 -> 三态映射(Issue #65)
         ("1. **#汤里有他认识的人吗** → **是**  \n（有类似的元素）", "是"),
     ]
     for raw, want in shapes:
@@ -93,7 +93,7 @@ def main():
 """
     res, _ = parse_answers(verbose, mkq(4))
     got = {r.qid: r.verdict for r in res}
-    want = {1: "不是", 2: "是", 3: "无关", 4: "是"}
+    want = {1: "不是", 2: "是", 3: "不重要", 4: "是"}  # legacy「无关」->「不重要」
     fail += check("长解释体 4 题", got == want, f"got={got}")
     fail += check("点评被抽取", any(r.comment for r in res), [r.comment for r in res])
 
@@ -169,7 +169,8 @@ def main():
     fail += check("开头'不是'仍然正确", res and res[0].verdict == "不是", res)
     tricky3 = "1. 无关。这和谜底没有关系。"
     res, _ = parse_answers(tricky3, mkq(1))
-    fail += check("开头'无关'仍然正确", res and res[0].verdict == "无关", res)
+    fail += check("legacy'无关'文本映射到'不重要'(Issue #65)",
+                  res and res[0].verdict == "不重要", res)
 
     # ---- 9. 谜题解析: 四种实测变体 ----
     print("[谜题: 实测变体]")

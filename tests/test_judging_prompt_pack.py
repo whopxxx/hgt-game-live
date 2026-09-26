@@ -207,8 +207,8 @@ def test_pack_files_and_versions():
               PP.stage_version(stage))
     frag = PP.load_fragment("completion_specificity")
     check("共享 fragment 可加载", "特异性硬规则" in frag)
-    check("judging 总版本", PP.HAIGUITANG_JUDGING_PROMPT_VERSION
-          == "haiguitang-judging-v1")
+    check("judging 总版本(Issue #65 v2)", PP.HAIGUITANG_JUDGING_PROMPT_VERSION
+          == "haiguitang-judging-v2")
     # 5 大类协议 v2: generation 侧 Contract/Audit 分类语义变化 ->
     # generation 总版本 bump(判题侧未变, 不受牵动)。
     check("generation 总版本 = haiguitang-generation-v3",
@@ -220,14 +220,16 @@ def test_pack_files_and_versions():
           != PP.HAIGUITANG_GENERATION_PROMPT_VERSION)
     # 单一来源: recheck 与 verify 都**引用** fragment, 而不是各抄一份
     root = PP.JUDGING_PROMPT_ROOT
-    for fname in ("candidate-recheck-v1.md", "completion-verify-v1.md"):
+    for fname in ("candidate-recheck-v2.md", "completion-verify-v1.md"):
         raw = (root / fname).read_text(encoding="utf-8")
         check(f"{fname} 用 include 标记引用共享 fragment",
               raw.count("{{fragment:completion_specificity}}") == 1)
         check(f"{fname} 没有把规则抄进正文",
               "特异性硬规则" not in raw)
-    for fname in ("answer-v1.md", "candidate-recheck-v1.md",
-                  "completion-verify-v1.md", "completion-specificity-v1.md"):
+    for fname in ("answer-v2.md", "candidate-recheck-v2.md",
+                  "completion-verify-v1.md", "completion-specificity-v1.md",
+                  # ---- Issue #65: v1 原样冻结保留, 不覆盖不删除 ----
+                  "answer-v1.md", "candidate-recheck-v1.md"):
         check(f"{fname} 存在", (root / fname).is_file())
     # 展开后两个 stage 看到的共享文本逐字一致
     cv = PP.load_prompt("completion_verify")
@@ -258,20 +260,20 @@ def test_loader_negatives():
                 check("缺文件被拒", False, "没抛")
             except PP.PromptPackError as e:
                 check("缺文件被拒", "missing" in str(e), str(e)[:60])
-            (Path(td) / "answer-v1.md").write_text("   \n", encoding="utf-8")
+            (Path(td) / "answer-v2.md").write_text("   \n", encoding="utf-8")
             try:
                 PP.load_prompt("answer")
                 check("空文件被拒", False, "没抛")
             except PP.PromptPackError as e:
                 check("空文件被拒", "empty" in str(e), str(e)[:60])
-            (Path(td) / "answer-v1.md").write_text(
+            (Path(td) / "answer-v2.md").write_text(
                 "你好 {name}", encoding="utf-8")
             try:
                 PP.load_prompt("answer")
                 check("占位符被拒", False, "没抛")
             except PP.PromptPackError as e:
                 check("占位符被拒", "placeholder" in str(e), str(e)[:60])
-            (Path(td) / "answer-v1.md").write_text(
+            (Path(td) / "answer-v2.md").write_text(
                 "引用 {{fragment:missing_one}}", encoding="utf-8")
             try:
                 PP.load_prompt("answer")
@@ -316,8 +318,12 @@ def test_tool_schemas():
           in items["required"], items["required"])
     check("verdict **不再**无条件必填", "verdict" not in items["required"],
           items["required"])
-    check("verdict enum 仍是 是/不是/无关",
-          items["properties"]["verdict"]["enum"] == ["是", "不是", "无关"])
+    check("verdict enum 是三态 是/不是/不重要(Issue #65)",
+          items["properties"]["verdict"]["enum"] == ["是", "不是", "不重要"])
+    check("「无关」已从 enum 删除",
+          "无关" not in items["properties"]["verdict"]["enum"])
+    check("「不确定」不存在",
+          "不确定" not in items["properties"]["verdict"]["enum"])
     check("established/touched/candidate 字段齐",
           {"touched_fact_ids", "established_fact_ids",
            "solution_candidate", "comment"} <= set(items["properties"]))
@@ -473,9 +479,9 @@ def test_verdict_path_and_provenance():
           fc.calls[0]["system"] == PP.load_prompt("answer"))
     check("stage=qa.answer", fc.calls[0]["stage"] == "qa.answer")
     check("provenance: judging 总版本",
-          r.judging_prompt_version == "haiguitang-judging-v1")
+          r.judging_prompt_version == "haiguitang-judging-v2")
     check("provenance: answer stage 版本",
-          r.answer_prompt_version == "answer-v1")
+          r.answer_prompt_version == "answer-v2")
     check("普通 support 自报不经复核直接建立(非 completion)",
           r.established_fact_ids == ["f3"])
 
@@ -540,7 +546,7 @@ def test_tool_failure_fixture_c():
     check("established/completion 全空", r.established_fact_ids == []
           and r.completion_verified_fact_ids == [])
     check("不建立 touched", r.touched_fact_ids == [])
-    check("**绝不**产出「无关」", r.verdict != "无关")
+    check("**绝不**产出业务裁决冒充", r.verdict == "未判定")
     check("自由文本点评不再泄漏成裁决",
           "的猜测" not in (r.comment or ""), r.comment)
     check("恰好 1 次调用", len(fc.calls) == 1)
@@ -615,7 +621,7 @@ def test_candidate_only_from_model():
 # ======================================================================
 def _recheck_setup():
     first = LLMResult(tool_input={"answers": [{
-        "id": 1, "response_kind": "verdict", "verdict": "无关",
+        "id": 1, "response_kind": "verdict", "verdict": "不重要",
         "comment": "", "solution_candidate": True,
         "touched_fact_ids": [], "established_fact_ids": []}]}, model="m")
     return first
@@ -628,7 +634,7 @@ def test_recheck_two_directions():
                                                 verified=["f1"])])
     out, _ = _run(fc, "她就是被父亲藏在门外的亲生女儿")
     r = out[0]
-    check("矛盾(候选+无关)触发 Recheck",
+    check("矛盾(候选+不重要)触发 Recheck",
           fc.calls[1]["tool"]["name"] == "emit_candidate_recheck")
     check("恰好 2 次调用", len(fc.calls) == 2)
     check("修复为 verdict=是", r.verdict == "是"
@@ -639,7 +645,7 @@ def test_recheck_two_directions():
           all(c["tool"]["name"] != "emit_completion_match"
               for c in fc.calls))
     check("provenance: recheck stage 版本",
-          r.candidate_recheck_prompt_version == "candidate-recheck-v1")
+          r.candidate_recheck_prompt_version == "candidate-recheck-v2")
     check("recheck system 来自 Pack 文件",
           fc.calls[1]["system"] == PP.load_prompt("candidate_recheck"))
     # 方向 B: 修成 rephrase(第一层把闲聊标成了候选)
@@ -647,7 +653,7 @@ def test_recheck_two_directions():
     out, _ = _run(fc, "哈哈哈主播好搞笑")
     r = out[0]
     check("修复为 rephrase", r.response_kind == "rephrase" and r.verdict == "")
-    check("不伪造「无关」", r.verdict != "无关")
+    check("rephrase 无伪造裁决", r.verdict == "")
     check("candidate 清零", not r.solution_candidate)
     check("无建立", r.established_fact_ids == []
           and r.completion_verified_fact_ids == [])
@@ -795,16 +801,16 @@ def test_archive_provenance_and_frontend():
     from story.state import QARec
     rec = QARec(qid=3, user_name="甲", text="怎么做馊饭？", verdict="",
                 kind="qa", response_kind="rephrase",
-                judging_prompt_version="haiguitang-judging-v1",
-                answer_prompt_version="answer-v1",
-                candidate_recheck_prompt_version="candidate-recheck-v1")
+                judging_prompt_version="haiguitang-judging-v2",
+                answer_prompt_version="answer-v2",
+                candidate_recheck_prompt_version="candidate-recheck-v2")
     d = rec.to_archive()
     check("archive 有 response_kind", d["response_kind"] == "rephrase")
     check("archive 有 judging/answer prompt 版本",
-          d["judging_prompt_version"] == "haiguitang-judging-v1"
-          and d["answer_prompt_version"] == "answer-v1")
+          d["judging_prompt_version"] == "haiguitang-judging-v2"
+          and d["answer_prompt_version"] == "answer-v2")
     check("archive 有 recheck 版本(发生过才有值)",
-          d["candidate_recheck_prompt_version"] == "candidate-recheck-v1")
+          d["candidate_recheck_prompt_version"] == "candidate-recheck-v2")
     check("archive verify 版本缺省空",
           d["completion_verify_prompt_version"] == "")
     j = rec.to_json()
@@ -827,8 +833,8 @@ def test_archive_provenance_and_frontend():
     check("前端不做关键词语义判断",
           'text.includes("为什么")' not in app
           and 'text.includes("怎么")' not in app)
-    check("rephrase 不进连续无关折叠(折叠仍按 verdict==='无关')",
-          'r.verdict === "无关"' in app)
+    check("rephrase 不进连续不重要折叠(折叠按 verdict==='不重要')",
+          'r.verdict === "不重要"' in app)
     css = io.open("web/style.css", encoding="utf-8").read()
     check("样式表有 .v-rephrase", ".v-rephrase" in css)
 
@@ -890,32 +896,33 @@ def test_recheck_verified_contract():
         缺失     -> malformed -> unavailable(schema 必填 + Python 门)
 
     旧代码有两条洗数据通道: rephrase 带 verified 被清掉后照单接受;
-    无关+candidate=false+verified=["f1"] 被 `v != IRRELEVANT` 守卫
-    静默清成 []。都是"坏结构 -> 洗干净 -> 当合法结果继续用"。
+    无关(现「不重要」)+candidate=false+verified=["f1"] 被
+    `v != UNIMPORTANT` 守卫静默清成 []。都是
+    "坏结构 -> 洗干净 -> 当合法结果继续用"。
     """
     print("\n[#54-R2] Recheck verified_completion_fact_ids 合同")
     from story.parser import UNAVAILABLE as UNA
 
-    # ---- review 点名的精确用例: 无关 + candidate=false + verified=["f1"] ----
+    # ---- review 点名的精确用例: 不重要 + candidate=false + verified=["f1"] ----
     fc = FakeClient([
         _recheck_setup(),
         LLMResult(tool_input={
-            "response_kind": "verdict", "verdict": "无关",
+            "response_kind": "verdict", "verdict": "不重要",
             "solution_candidate": False,
             "verified_completion_fact_ids": ["f1"]}, model="m")])
     out, _ = _run(fc, "怎么做馊饭？")
     r = out[0]
-    check("无关 + verified=[f1] -> 整条 unavailable",
+    check("不重要 + verified=[f1] -> 整条 unavailable",
           r.verdict == UNA and r.status == "unavailable",
           (r.verdict, r.status))
     check("verified 没有被洗成 [] 后继续用",
           r.completion_verified_fact_ids == []
           and r.established_fact_ids == []
           and r.candidate_recheck_prompt_version
-          == "candidate-recheck-v1")
+          == "candidate-recheck-v2")
 
     # ---- verified 缺失: 三个类别都是 malformed ----
-    for kind, verdict, cand in (("verdict", "无关", False),
+    for kind, verdict, cand in (("verdict", "不重要", False),
                                 ("verdict", "是", True),
                                 ("rephrase", "", False)):
         fc = FakeClient([
@@ -938,10 +945,10 @@ def test_recheck_verified_contract():
 
     # ---- 合规形态全部畅通 ----
     fc = FakeClient([_recheck_setup(),
-                     _recheck("verdict", "无关", False, verified=[])])
+                     _recheck("verdict", "不重要", False, verified=[])])
     out, _ = _run(fc, "怎么做馊饭？")
-    check("无关 + verified=[] 畅通",
-          out[0].verdict == "无关" and out[0].status == "ok")
+    check("不重要 + verified=[] 畅通",
+          out[0].verdict == "不重要" and out[0].status == "ok")
     fc = FakeClient([_recheck_setup(), _recheck("rephrase", "", False)])
     out, _ = _run(fc, "哈哈哈好笑")
     check("rephrase + verified=[] 畅通",
@@ -956,6 +963,100 @@ def test_recheck_verified_contract():
     rc = _TOOL_CANDIDATE_RECHECK["input_schema"]
     check("schema required 含 verified_completion_fact_ids",
           "verified_completion_fact_ids" in rc["required"], rc["required"])
+
+
+# ======================================================================
+# Issue #65: QA v7 三态回归 fixture(§11) —— 语义权威不变, 判据是
+# scripted 模型按三态合同返回, 代码忠实接受。
+# ======================================================================
+def _tool_verdict(verdict, cand=False, touched=None, est=None):
+    return LLMResult(tool_input={"answers": [{
+        "id": 1, "response_kind": "verdict", "verdict": verdict,
+        "comment": "c" if verdict in ("是", "不是") else "",
+        "solution_candidate": cand,
+        "touched_fact_ids": list(touched or []),
+        "established_fact_ids": list(est or []),
+    }]}, model="m")
+
+
+def _tool_rephrase():
+    return LLMResult(tool_input={"answers": [{
+        "id": 1, "response_kind": "rephrase", "verdict": "",
+        "comment": "请换成具体的是/不是问题",
+        "solution_candidate": False,
+        "touched_fact_ids": [], "established_fact_ids": [],
+    }]}, model="m")
+
+
+def test_i65_three_state_fixtures():
+    """§11 A-D: 三态语义 fixture(不经 Python 文本规则)。"""
+    print("\n[I65-fixtures] A 明确否定 / B 未定义不影响 / C 明确为真 / D 细节")
+    # A: 事实表明确否定 -> 不是
+    fc = FakeClient([_tool_verdict("不是", touched=["f1"])])
+    out, _ = _run(fc, "门外女人是父亲的亲生女儿吗")
+    check("A: 明确可否定 -> 不是", out[0].verdict == "不是"
+          and out[0].status == "ok")
+    # B: 未定义且不影响核心谜底 -> 不重要(facts 未定义, established 空)
+    fc = FakeClient([_tool_verdict("不重要")])
+    out, _ = _run(fc, "她后来出院了吗")
+    check("B: 细节未定义且不影响 -> 不重要", out[0].verdict == "不重要")
+    check("B: 不重要不建立任何 fact", out[0].established_fact_ids == [])
+    # C: 事实表明确支持 -> 是
+    fc = FakeClient([_tool_verdict("是", touched=["f1"], est=["f1"])])
+    out, _ = _run(fc, "门外女人与父亲有血缘关系吗")
+    check("C: 明确为真 -> 是", out[0].verdict == "是")
+    # D: 真正无助于谜题的具体细节 -> 不重要
+    fc = FakeClient([_tool_verdict("不重要")])
+    out, _ = _run(fc, "她今天穿的是红鞋吗")
+    check("D: 无助解题的细节 -> 不重要", out[0].verdict == "不重要")
+    # E: 非 proposition -> rephrase(不是第四种 verdict)
+    fc = FakeClient([_tool_rephrase()])
+    out, _ = _run(fc, "发生了什么？")
+    check("E: 非命题 -> rephrase(不是 verdict)",
+          out[0].response_kind == "rephrase" and out[0].verdict == "")
+
+
+def test_i65_unimportant_contract():
+    """§6/§7/§8: 不重要的 comment/established/统计合同。"""
+    print("\n[I65-contract] 不重要: 空 comment / 不建立 / 进 verdict_counts")
+    eng, clk = boot()
+    eng.submit_danmaku("u1", "甲", "#她后来出院了吗")
+    clk.advance(20.0)
+    acts = [a for a in eng.tick() if a.kind == ActionKind.ANSWER]
+    p = acts[0].payload
+    # 模型返回: 不重要 + comment 空 + established 空
+    eng.submit_qa([QAResult(qid=p["qid"], verdict="不重要", comment="",
+                            touched_fact_ids=["f3"],
+                            established_fact_ids=["f1"])],  # 恶意/异常自报
+                  expect_round=p["expect_round"],
+                  expect_spec_key=p["expect_spec_key"])
+    check("不重要 -> established 强制为空(哪怕自报 f1)",
+          eng._established_fact_ids == set(), eng._established_fact_ids)
+    check("不重要 -> 不推进 completion/通关", eng.phase == Phase.QA)
+    check("不重要 -> 计入 verdict_counts(正常互动量, §8)",
+          eng._verdict_counts.get("不重要") == 1, eng._verdict_counts)
+    log = eng.snapshot().qa_log
+    last = log[-1] if log else {}
+    check("不重要 -> 是一条正常 qa 记录(不算 unavailable)",
+          last.get("verdict") == "不重要", last.get("verdict"))
+    check("不重要 comment 空时不带模板话术",
+          not last.get("comment") or "发 #" not in last.get("comment"))
+
+
+def test_i65_verdict_enum_hard_frozen():
+    """§5: Python 门与 schema 完全一致; 无关/不确定都进不来。"""
+    print("\n[I65-enum] enum 精确冻结 + Python 门一致")
+    items = _TOOL_ANSWER["input_schema"]["properties"]["answers"]["items"]
+    schema_enum = items["properties"]["verdict"]["enum"]
+    check("schema enum 精确 = 是/不是/不重要",
+          schema_enum == ["是", "不是", "不重要"], schema_enum)
+    from story import parser as P
+    for bad in ("无关", "不确定"):
+        fc = FakeClient([_tool_verdict(bad)])
+        out, _ = _run(fc, "什么都可以")
+        check(f"schema 外 verdict={bad!r} -> 未判定(fail closed)",
+              out[0].verdict == P.UNAVAILABLE and out[0].status == "unavailable",
+              (out[0].verdict, out[0].status))
 
 
 # ======================================================================
@@ -982,6 +1083,9 @@ def main():
     test_archive_provenance_and_frontend()
     test_protocol_doc_semantic_authority()
     test_heuristics_out_of_qa_business()
+    test_i65_three_state_fixtures()
+    test_i65_unimportant_contract()
+    test_i65_verdict_enum_hard_frozen()
     print()
     if FAIL[0]:
         print(f"FAILED: {FAIL[0]} check(s)")

@@ -3,7 +3,7 @@
 """竖屏 AI 海龟汤直播 —— 入口。
 
     AI 出一个诡异谜题 -> 观众发 #问题 追问 -> AI 对每条提问**秒回**裁决
-    (是 / 不是 / 无关 / 接近了) -> 有人猜中核心真相 -> 揭晓谜底
+    (是 / 不是 / 不重要 / 接近了) -> 有人猜中核心真相 -> 揭晓谜底
     -> 展示 30 秒 -> 自动出下一题
 
 用法:
@@ -261,6 +261,10 @@ class Director:
         if not cfg.no_llm:
             self._answer_pool = ThreadPoolExecutor(
                 max_workers=max(1, cfg.qa_max_inflight), thread_name_prefix="answer")
+        # ---- Issue #65 §9: 同题同问成功结果 cache ----
+        # key=(round, spec_key, normalized_text) -> QAResult。身份里带
+        # round+spec, 换题自然失效; 有界(防长直播内存增长)。
+        self._qa_verdict_cache: dict = {}
 
         self.engine.model_requested = cfg.llm.model
         self.engine.source = cfg.source_label
@@ -746,11 +750,43 @@ class Director:
 
         注意: **不做** in-flight 去重锁。并发 5 是刻意的 —— 由引擎的
         qa_max_inflight 控制总量, 池大小与之一致。
+
+        ## Issue #65 §9: 同题同问成功结果复用
+
+        同一道题(round_index + spec_key)里, 规范化后**完全相同**的提问
+        若已有一次成功裁决(ok 的 verdict/rephrase), 直接复用 —— 不再
+        调 Answer LLM。防止"同一句'她死了吗'前后判成两个结果"的漂移,
+        也省一次调用。只缓存成功结果; 未判定/技术失败不缓存(下一次
+        同问会重新调)。换题(round/spec 变化)自然失效。
         """
+        # ---- 同问一致性 cache 查询(确定性, 无 LLM) ----
+        key = self._qa_cache_key(payload)
+        if key is not None:
+            cached = self._qa_verdict_cache.get(key)
+            if cached is not None:
+                qid = payload["qid"]
+                log.info("同问复用(Issue #65): %r -> %s (qid=%d)",
+                         payload.get("text", "")[:20], cached.verdict, qid)
+                r = QAResult(
+                    qid=qid, verdict=cached.verdict,
+                    comment=cached.comment,
+                    response_kind=cached.response_kind,
+                    touched_fact_ids=list(cached.touched_fact_ids or []),
+                    established_fact_ids=[],
+                    completion_verified_fact_ids=[],
+                    solution_candidate=False)
+                self._dispatch(self.engine.submit_qa(
+                    [r],
+                    expect_round=payload.get("expect_round"),
+                    expect_spec_key=payload.get("expect_spec_key")))
+                self.push()
+                return
         pool = self._answer_pool
         if pool is None:
             # --no-llm: 用固定裁决, 但仍要回填, 否则提问会一直挂着
             verdict = self._fake_verdict(payload.get("text", ""))
+            self._maybe_cache_qa(payload, QAResult(
+                qid=payload["qid"], verdict=verdict))
             self._dispatch(self.engine.submit_qa(
                 [QAResult(qid=payload["qid"], verdict=verdict)],
                 expect_round=payload.get("expect_round"),
@@ -758,6 +794,63 @@ class Director:
             self.push()
             return
         pool.submit(self._answer_work, payload)
+
+    # ---- Issue #65 §9: 同题同问一致性 cache ----
+    #
+    # ## 为什么放在 Director 而不是 Engine / Writer
+    #
+    # cache 的价值是"**这一发不用调 LLM**"。Engine 是纯状态机(它只该
+    # 决定"要不要派 worker"), Writer 拿到调用时钱已经花出去了。能拦在
+    # `pool.submit` 之前的只有 Director。
+    #
+    # ## cache 身份(§9 冻结)
+    #
+    #     round_index + spec_key + normalized exact question
+    #
+    # normalization 只做: strip + 折叠连续空白。**禁止**同义词 /
+    # embedding / 编辑距离 / 关键词 / regex 语义归并 —— 第一版只保证
+    # 规范化后完全相同的文本命中。身份里有 round+spec, 换题自然失效,
+    # 不需要显式清理; 容量有上限防长直播内存增长。
+    #
+    # ## 只缓存成功结果
+    #
+    #     缓存: status=ok 且 response_kind ∈ {verdict, rephrase}
+    #     不缓存: 未判定 / timeout / transport error / malformed
+    #
+    # 技术失败缓存住会让"再发一次吧"变成永久故障 —— 失败必须可重试。
+    _QA_CACHE_MAX = 64
+
+    @staticmethod
+    def _qa_normalize(text: str) -> str:
+        """cache 的问题规范化: 只做 trim + 折叠连续空白(§9 冻结口径)。"""
+        return " ".join(str(text or "").split())
+
+    def _qa_cache_key(self, payload: dict) -> Optional[tuple]:
+        """`(round, spec_key, normalized_text)`; 身份不全时返回 None
+        (不缓存, 行为退化为逐条调用 —— 与旧版一致)。"""
+        rnd = payload.get("expect_round")
+        sk = payload.get("expect_spec_key")
+        if rnd is None or not sk:
+            return None
+        return (int(rnd), str(sk), self._qa_normalize(payload.get("text", "")))
+
+    def _maybe_cache_qa(self, payload: dict, result: QAResult) -> None:
+        """成功语义结果进 cache。只写 status=ok 的 verdict/rephrase。"""
+        if getattr(result, "status", "ok") != "ok":
+            return
+        rk = getattr(result, "response_kind", "verdict")
+        if rk not in ("verdict", "rephrase"):
+            return
+        if result.verdict == P.UNAVAILABLE or (rk == "verdict"
+                                               and not result.verdict):
+            return
+        key = self._qa_cache_key(payload)
+        if key is None:
+            return
+        self._qa_verdict_cache[key] = result
+        # 简单容量护栏: dict 保持插入序, 超限丢最早的。
+        while len(self._qa_verdict_cache) > self._QA_CACHE_MAX:
+            self._qa_verdict_cache.pop(next(iter(self._qa_verdict_cache)))
 
     def _answer_work(self, payload: dict) -> None:
         qid = payload["qid"]
@@ -791,12 +884,16 @@ class Director:
                      time.time() - t0,
                      (results[0].verdict if results else f"失败: {err}"))
             if not results:
-                # 解析不出 -> 给"未判定", **不是**"无关"。
-                # "无关"是断言"你的猜测与谜底无关", 那是错误信息, 会把观众
-                # 的思路带偏; "未判定"只说明系统这次没答上, 诚实且不误导。
+                # 解析不出 -> 给"未判定"(Issue #65: 技术失败态),
+                # 绝不冒充任何业务裁决 —— 那会把观众的思路带偏。
                 results = [QAResult(qid=qid, verdict=P.UNAVAILABLE,
                                     comment="刚才网络抖了一下，再发一次吧",
                                     status="unavailable")]
+            else:
+                # ---- Issue #65 §9: 只缓存成功结果 ----
+                # 未判定/技术失败**不缓存**(下一次同问必须重新调 LLM);
+                # 复核改判后的最终 verdict 才是可复用的一致答案。
+                self._maybe_cache_qa(payload, results[0])
             self._dispatch(self.engine.submit_qa(
                 results, error=err,
                 model=getattr(self.writer.client.cfg, "model", None),
@@ -1501,7 +1598,7 @@ class Director:
         return p, a
 
     def _fake_verdict(self, text: str) -> str:
-        """离线: 用关键词给个像样的裁决, 让演示不至于全是'无关'。
+        """离线: 用关键词给个像样的裁决(演示用, 非生产判据)。
 
         注意要**保守**: 真实模型只在说到核心真相时才判'揭晓',
         这里也只在明显命中核心词时才揭晓, 否则离线演示会一题一问就结束。
@@ -1512,7 +1609,7 @@ class Director:
         if any(w in t for w in ("海龟汤", "味道", "肉汤", "解药")):
             return "接近了"
         if any(w in t for w in ("天气", "名字", "几点", "老板")):
-            return "无关"
+            return "不重要"
         if any(w in t for w in ("死", "自杀", "杀", "毒", "病", "毒发")):
             return "是"
         return "不是"

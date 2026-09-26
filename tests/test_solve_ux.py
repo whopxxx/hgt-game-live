@@ -814,10 +814,10 @@ def test_closeout_b3_irrelevant_never_establishes():
         established_fact_ids=["f1"])
     check("f1 已建立", eng._established_fact_ids == {"f1"},
           eng._established_fact_ids)
-    # 关键攻击: 用「无关」去建立最后一条 completion fact
-    ask(eng, clk, "u2", "乙", "随便问问", verdict="无关",
+    # 关键攻击: 用「不重要」去建立最后一条 completion fact
+    ask(eng, clk, "u2", "乙", "随便问问", verdict="不重要",
         established_fact_ids=["f2"])
-    check("「无关」不建立事实", eng._established_fact_ids == {"f1"},
+    check("「不重要」不建立事实", eng._established_fact_ids == {"f1"},
           eng._established_fact_ids)
     check("不通关", eng.phase == Phase.QA, eng.phase)
     check("胜者仍为空", not eng._solved_by, eng._solved_by)
@@ -834,7 +834,7 @@ def test_closeout_b3_verdict_matrix():
     cases = [
         (YES, "ok", True, "「是」可以建立 completion"),
         (NO, "ok", False, "「不是」不能建立 completion"),
-        ("无关", "ok", False, "「无关」不能建立"),
+        ("不重要", "ok", False, "「不重要」不能建立"),
         (UNAVAILABLE, "unavailable", False, "「未判定」不能建立"),
         ("揭晓", "ok", False, "「揭晓」不能建立"),
     ]
@@ -1265,7 +1265,7 @@ def test_final_closeout_status_must_be_ok():
     cases = [
         (YES, "ok", True, "是 + ok -> 建立 completion"),
         (NO, "ok", False, "不是 + ok -> 不建立 completion"),
-        ("无关", "ok", False, "无关 + ok -> 不建立"),
+        ("不重要", "ok", False, "不重要 + ok -> 不建立"),
         (UNAVAILABLE, "unavailable", False, "未判定 + unavailable -> 不建立"),
         (YES, "unavailable", False, "是 + unavailable -> 不建立"),
         (YES, "error", False, "是 + error -> 不建立(fail closed)"),
@@ -1821,8 +1821,8 @@ def test_v6_case9_trigger_matrix():
     check("**「不是」+ 自报 f2 -> 仍复核(2 次)**", n == 2, n)
     n, _ = run(verdict="不是", cand=False)
     check("「不是」+ candidate=False + 无自报 -> 不调(1 次)", n == 1, n)
-    n, _ = run(verdict="无关", cand=False)
-    check("「无关」+ candidate=False + 无自报 -> 不调(1 次)", n == 1, n)
+    n, _ = run(verdict="不重要", cand=False)
+    check("「不重要」+ candidate=False + 无自报 -> 不调(1 次)", n == 1, n)
     n, out = run(est=["f1"])
     check("第一层已补 f1 -> 仍调, 只缺 f2", n == 2, n)
     # ⚠️ A1: 第一层**自报**了 f1+f2 也要复核 —— 那正是"自报不能直接通关"
@@ -2086,7 +2086,7 @@ def test_v6_b_text_fallback_variants_all_normalized():
               out[0].verdict if out else None)
     check("parser 确实会把其中多条映射成 P.SOLVE(否则本测试没意义)",
           seen_solve >= 2, seen_solve)
-    # tool 分支: '揭晓' 不是 是/不是/无关 -> 结构合同无效 -> 未判定
+    # tool 分支: '揭晓' 不是 是/不是/不重要 -> 结构合同无效 -> 未判定
     # (旧合同是"降级为「是」"; #53 不再由代码替模型修语义, §11。)
     fc = FakeClient([LLMResult(tool_input={"answers": _TOOL_SOLVE}, model="m")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -2236,7 +2236,7 @@ def test_v6_first_layer_never_owns_victory():
     print("\n[v6] 第一层永不产出 P.SOLVE")
     spec = auction_spec()
     # tool 路径: 所有可能的 verdict 值 + 越界值
-    for v in ["是", "不是", "无关", "揭晓", "SOLVE", "solved", ""]:
+    for v in ["是", "不是", "不重要", "无关", "揭晓", "SOLVE", "solved", ""]:
         fc = FakeClient([LLMResult(tool_input={"answers": [{
             "id": 1, "verdict": v, "comment": "c",
             "solution_candidate": False, "touched_fact_ids": [],
@@ -2679,7 +2679,7 @@ def test_r1_n_non_qa_rows_are_filtered():
         kind="qa", status="unavailable", commit_seq=101,
         completion_contribution_fact_ids=["f2"]))
     eng._qa_archive.append(QARec(
-        qid=91, user_name="无关观众", text="她吃了吗", verdict="无关",
+        qid=91, user_name="细节观众", text="她吃了吗", verdict="不重要",
         kind="qa", commit_seq=102,
         completion_contribution_fact_ids=["f2"]))
     c = _contrib(eng)
@@ -2933,7 +2933,7 @@ def test_a1_ordering_is_stable_and_reference_ordered():
 
 
 # ======================================================================
-# A2: candidate=True 却判「无关」-> 定向重判
+# A2: candidate=True 却判「不重要」-> 定向重判
 # ======================================================================
 def _recheck(verdict="是", ids=None, cand=None, kind="verdict"):
     """A2/C0 重判的 canned 返回。
@@ -2946,16 +2946,16 @@ def _recheck(verdict="是", ids=None, cand=None, kind="verdict"):
     合规回包必须显式给(空数组也算显式)。
     """
     d = {"response_kind": kind, "verdict": verdict,
-         "solution_candidate": (verdict != "无关") if cand is None else cand,
+         "solution_candidate": (verdict != "不重要") if cand is None else cand,
          "verified_completion_fact_ids": list(ids or [])}
     return LLMResult(tool_input=d, model="m")
 
 
 def test_a2_r3_candidate_irrelevant_triggers_recheck():
-    """**Live-R3 / C0-A**: candidate=true + 无关 -> 重判, **恰好 2 次**调用。
+    """**Live-R3 / C0-A**: candidate=true + 不重要 -> 重判, **恰好 2 次**调用。
 
     用本场那句类似表达: "歌正好四十分钟, 汤到这个时间正好做好" ——
-    它是个 concrete explanation, 却被第一层判成"无关"。这是语义内部
+    它是个 concrete explanation, 却被第一层判成"不重要"。这是语义内部
     矛盾, 原样上屏等于给观众一条**错误信息**。
 
     ⚠️ C0: 这条路径上重判**自己**确认 completion, **不再**进入
@@ -2963,10 +2963,10 @@ def test_a2_r3_candidate_irrelevant_triggers_recheck():
     `qa_inflight_timeout=25s`, 正确答案会被判成超时。所以这里是
     `== 2` 而不是 `>= 2`(旧断言写 `>= 2`, 于是第 3 次调用从来没被测出来)。
     """
-    print("\n[A2-R3 / C0-A] candidate=True + 无关 -> 定向重判 (恰好 2 次)")
+    print("\n[A2-R3 / C0-A] candidate=True + 不重要 -> 定向重判 (恰好 2 次)")
     spec = auction_spec()
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关"),        # 自相矛盾的第一层
+        _verdict(cand=True, verdict="不重要"),        # 自相矛盾的第一层
         _recheck("是", ids=["f2"]),                 # 重判 + 自己确认 f2
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -2985,8 +2985,8 @@ def test_a2_r3_candidate_irrelevant_triggers_recheck():
           n == 2 and all(c["tool"]["name"] != "emit_completion_match"
                          for c in fc.calls),
           [c["tool"]["name"] for c in fc.calls])
-    check("**最终 verdict 不再是「无关」**",
-          out and out[0].verdict != "无关", out[0].verdict if out else None)
+    check("**最终 verdict 不再是「不重要」**",
+          out and out[0].verdict != "不重要", out[0].verdict if out else None)
     check("重判成「是」", out and out[0].verdict == "是",
           out[0].verdict if out else None)
     check("**重判确认的 f2 进了 established**",
@@ -3006,7 +3006,7 @@ def test_c0_recheck_does_not_inherit_primary_established():
     spec = frame_spec()
     # 第一层自报 f4(support, 非 completion)+ candidate=True + 无关
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关", established=["f4"]),
+        _verdict(cand=True, verdict="不重要", established=["f4"]),
         _recheck("是", ids=[]),                     # 重判确认**没有** completion
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -3026,14 +3026,14 @@ def test_c0_recheck_does_not_inherit_primary_established():
 def test_c0_recheck_can_keep_irrelevant_with_candidate_false():
     """**C0-C**: 矛盾可能来自 `solution_candidate` —— 闲聊被误标成候选。
 
-    重判回「无关 + candidate=false」时**必须接受「无关」**,
+    重判回「不重要 + candidate=false」时**必须接受「不重要」**,
     不能硬改成「不是」(那不是"否定了某命题", 而是"根本没有命题")。
     """
     print("\n[C0-C] 误标候选的闲聊 -> 重判回 无关+candidate=false")
     spec = auction_spec()
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关"),
-        _recheck("无关", cand=False),               # 正解: 它本来就该是无关
+        _verdict(cand=True, verdict="不重要"),
+        _recheck("不重要", cand=False),               # 正解: 它本来就该是不重要
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "主播好厉害啊",
@@ -3042,20 +3042,20 @@ def test_c0_recheck_can_keep_irrelevant_with_candidate_false():
                         core_answer=spec.core_answer,
                         room_established_fact_ids=[])
     check("恰好 2 次", len(fc.calls) == 2, len(fc.calls))
-    check("**接受「无关」**(不硬改「不是」)",
-          out and out[0].verdict == "无关", out[0].verdict if out else None)
+    check("**接受「不重要」**(不硬改「不是」)",
+          out and out[0].verdict == "不重要", out[0].verdict if out else None)
     check("**candidate 被纠正为 false**",
           out and out[0].solution_candidate is False,
           out[0].solution_candidate if out else None)
     check("**不再自相矛盾**",
-          out and not (out[0].solution_candidate and out[0].verdict == "无关"),
+          out and not (out[0].solution_candidate and out[0].verdict == "不重要"),
           out[0].solution_candidate if out else None)
     check("不建立 fact", out and out[0].established_fact_ids == [],
           out[0].established_fact_ids if out else None)
 
 
 def test_c0_recheck_self_contradictory_reply_fails_closed():
-    """**C0-D**: 重判自己返回 `candidate=True + 无关` -> fail closed。
+    """**C0-D**: 重判自己返回 `candidate=True + 不重要` -> fail closed。
 
     模型自相矛盾时不能放行 —— 那是"你知道有问题却放行", 与
     `_apply_review` 的 quality_checks 同一套 fail-closed 推理。
@@ -3065,7 +3065,7 @@ def test_c0_recheck_self_contradictory_reply_fails_closed():
     for label, bad in (
             ("无关+candidate=true",
              LLMResult(tool_input={"response_kind": "verdict",
-                                   "verdict": "无关",
+                                   "verdict": "不重要",
                                    "solution_candidate": True}, model="m")),
             ("candidate 缺失",
              LLMResult(tool_input={"response_kind": "verdict",
@@ -3083,7 +3083,7 @@ def test_c0_recheck_self_contradictory_reply_fails_closed():
             ("response_kind 缺失(Issue #53)",
              LLMResult(tool_input={"verdict": "是",
                                    "solution_candidate": True}, model="m"))):
-        fc = FakeClient([_verdict(cand=True, verdict="无关"), bad])
+        fc = FakeClient([_verdict(cand=True, verdict="不重要"), bad])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
                             spec=spec,
@@ -3107,7 +3107,7 @@ def test_a2_r3_can_recheck_to_no():
     print("\n[A2-R3b / C0-B] 重判可以落到「不是」(恰好 2 次)")
     spec = auction_spec()
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关"),
+        _verdict(cand=True, verdict="不重要"),
         _recheck("不是"),
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -3137,7 +3137,7 @@ def test_a2_recheck_failure_becomes_unavailable():
                                    "verdict": "或许",
                                    "solution_candidate": True}, model="m")),
             ("schema 不符", LLMResult(tool_input={"other": 1}, model="m"))):
-        fc = FakeClient([_verdict(cand=True, verdict="无关"), bad])
+        fc = FakeClient([_verdict(cand=True, verdict="不重要"), bad])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, err = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
                             spec=spec,
@@ -3185,7 +3185,7 @@ def test_c1_recheck_failure_is_terminal_without_contract():
             ("空 tool input", LLMResult(tool_input=None, model="m")),
             ("异常", RuntimeError("boom")),
             ("schema 不符", LLMResult(tool_input={"other": 1}, model="m"))):
-        fc = FakeClient([_verdict(cand=True, verdict="无关"), bad, bait])
+        fc = FakeClient([_verdict(cand=True, verdict="不重要"), bad, bait])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
                           spec=spec,
@@ -3214,7 +3214,7 @@ def test_c1_recheck_success_is_terminal_without_contract():
     spec = auction_spec()
     bait = LLMResult(tool_input={"is_guess": True, "cause_hit": True,
                                  "mechanism_hit": True}, model="m")
-    fc = FakeClient([_verdict(cand=True, verdict="无关"),
+    fc = FakeClient([_verdict(cand=True, verdict="不重要"),
                      _recheck("是", ids=[]), bait])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
@@ -3257,34 +3257,34 @@ def test_c0_call_budget_matrix():
 
     cases = [
         # (标签, canned, 期望次数)
-        ("普通 QA(candidate=False+无关)",
-         [_verdict(cand=False, verdict="无关")], 1),
+        ("普通 QA(candidate=False+不重要)",
+         [_verdict(cand=False, verdict="不重要")], 1),
         ("普通 completion(cand=True+是+自报)",
          [_verdict(established=["f2"], cand=True, verdict="是"),
           _completion_match(["f2"])], 2),
         ("cand=False 但自报 completion",
          [_verdict(established=["f2"], cand=False, verdict="是"),
           _completion_match(["f2"])], 2),
-        ("**candidate=True + 无关 -> 重判**",
-         [_verdict(cand=True, verdict="无关"),
+        ("**candidate=True + 不重要 -> 重判**",
+         [_verdict(cand=True, verdict="不重要"),
           _recheck("是", ids=["f2"])], 2),
-        ("candidate=True + 无关 -> 重判成不是",
-         [_verdict(cand=True, verdict="无关"),
+        ("candidate=True + 不重要 -> 重判成不是",
+         [_verdict(cand=True, verdict="不重要"),
           _recheck("不是")], 2),
-        ("candidate=True + 无关 -> 重判回无关",
-         [_verdict(cand=True, verdict="无关"),
-          _recheck("无关", cand=False)], 2),
+        ("candidate=True + 不重要 -> 重判回不重要",
+         [_verdict(cand=True, verdict="不重要"),
+          _recheck("不重要", cand=False)], 2),
     ]
     for label, canned, want in cases:
         n, _ = run(canned)
         check(f"{label}: 恰好 {want} 次", n == want, n)
         check(f"{label}: **不超过 2 次**", n <= 2, n)
 
-    # 无合同时**重判仍然触发**(触发条件是 candidate+无关, 与合同无关)——
+    # 无合同时**重判仍然触发**(触发条件是 candidate+「不重要」, 与合同无关)——
     # 只是没有 completion 可确认。仍然是 2 次。
-    n, _ = run([_verdict(cand=True, verdict="无关"),
+    n, _ = run([_verdict(cand=True, verdict="不重要"),
                 _recheck("是", ids=[])], contract=[])
-    check("无合同 + candidate+无关: 2 次(重判照常)", n == 2, n)
+    check("无合同 + candidate+不重要: 2 次(重判照常)", n == 2, n)
     check("无合同: 不超过 2 次", n <= 2, n)
     # 无合同 + 不自相矛盾 -> 1 次。
     n, _ = run([_verdict(cand=False, verdict="是")], contract=[])
@@ -3294,16 +3294,16 @@ def test_c0_call_budget_matrix():
 def test_a2_r4_normal_qa_still_one_call():
     """**Live-R4**: 普通问答("有人死吗")仍恰好 1 次 LLM。
 
-    重判只在 candidate=True + 无关 时触发。不要把所有 QA 都变成双调用。
+    重判只在 candidate=True + 「不重要」时触发。不要把所有 QA 都变成双调用。
     """
     print("\n[A2-R4] 普通 QA 仍 1 次")
-    fc = FakeClient([_verdict(cand=False, verdict="无关")])
+    fc = FakeClient([_verdict(cand=False, verdict="不重要")])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
     out, err = w.answer("谜面?", "谜底。", [], 1, "甲", "有人死吗",
                         facts=_FACTS, completion_fact_ids=["f1"])
     check("**只调了一次**", len(fc.calls) == 1, len(fc.calls))
-    check("candidate=False 的「无关」原样保留",
-          out and out[0].verdict == "无关",
+    check("candidate=False 的「不重要」原样保留",
+          out and out[0].verdict == "不重要",
           out[0].verdict if out else None)
 
 
@@ -3331,16 +3331,17 @@ def test_a2_candidate_yes_is_untouched():
 def test_a2_recheck_verdict_definition_frozen_in_prompt():
     """ANSWER_SYSTEM / 重判 prompt 的语义边界必须写死。
 
-    C0 起重判**可以**回「无关」—— 因为矛盾可能来自 `solution_candidate`
-    (闲聊被误标成完整解候选)。旧版本把 enum 锁成 是/不是, 会把这种输入
-    硬判成「不是」, 给观众另一条错误信息。这条测试冻结修正后的语义。
+    C0 起重判**可以**回「不重要」(Issue #65 前为「无关」)—— 因为矛盾
+    可能来自 `solution_candidate`(闲聊被误标成完整解候选)。旧版本把
+    enum 锁成 是/不是, 会把这种输入硬判成「不是」, 给观众另一条错误
+    信息。这条测试冻结修正后的语义。
     """
     print("\n[A2-prompt] verdict 边界写进 prompt")
     S = ANSWER_SYSTEM  # Pack 别名(Issue #53)
     R = _PP.load_prompt("candidate_recheck")
     from story.llm import _TOOL_CANDIDATE_RECHECK as T
-    check("有「还不足以解题 != 无关」",
-          "不足以解题" in S and "无关" in S, S[:200])
+    check("有「还不足以解题 != 不重要」(Issue #65 三态)",
+          "不足以解题" in S and "不重要" in S, S[:200])
     check("「是」的定义含'只说对了一部分'", "只说对了一部分" in S)
     check("重判 prompt 说明自相矛盾", "自相矛盾" in R or "不可能同时" in R)
     # C0: 矛盾可能来自两侧, prompt 必须显式列出, 否则模型只会往
@@ -3374,7 +3375,7 @@ def test_c0_recheck_seeded_ids_are_already_verified():
     print("\n[C0-seed] 重判确认的 completion 直接生效, 非法 id 仍被过滤")
     spec = frame_spec()
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关"),
+        _verdict(cand=True, verdict="不重要"),
         _recheck("是", ids=["f2", "f999", "f4"]),   # f2 合法; f999 不存在; f4 非合同
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -3400,7 +3401,7 @@ def test_c0_recheck_never_produces_solve():
     print("\n[C0-solve] 重判不产生 solved")
     spec = frame_spec()                       # 合同 = ["f2"], 单条
     fc = FakeClient([
-        _verdict(cand=True, verdict="无关"),
+        _verdict(cand=True, verdict="不重要"),
         _recheck("是", ids=["f2"]),            # 正好覆盖满合同
     ])
     w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
@@ -3426,7 +3427,7 @@ def test_a2_engine_never_accepts_irrelevant_candidate():
     spec = auction_spec()
     for bad in (LLMResult(tool_input=None, model="m"),
                 LLMResult(error="x", model="m")):
-        fc = FakeClient([_verdict(cand=True, verdict="无关"), bad])
+        fc = FakeClient([_verdict(cand=True, verdict="不重要"), bad])
         w = PuzzleWriter(client=fc, runtime_cfg=fc.runtime_cfg)
         out, _ = w.answer(spec.puzzle, spec.answer, [], 1, "甲", "他是谁",
                           spec=spec,

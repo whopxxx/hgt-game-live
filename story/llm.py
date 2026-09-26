@@ -997,7 +997,7 @@ def _blueprint_block_for_review(bp) -> str:
 def _facts_block(spec: "PuzzleSpec", completion_fact_ids=None) -> str:
     """把 spec 的 facts 渲染成给裁决模型的"判定依据"块。
 
-    facts 是主持判断"是/不是/无关"的**唯一依据**(方案 §22)。每条带上
+    facts 是主持判断"是/不是/不重要"的**唯一依据**(方案 §22)。每条带上
     id 与 kind, 让模型能把 `touched_fact_ids` 填对。
 
     `completion_fact_ids` 非空时, 属于通关合同的那几条会额外标上
@@ -3175,7 +3175,8 @@ _TOOL_ANSWER = {
                             "description": (
                                 "这句话属于哪一类:\n"
                                 "  verdict  -> 用户给出了一个当前谜题可以"
-                                "裁决的命题(可判真假), 用 是/不是/无关 回答。\n"
+                                "裁决的命题(可判真假), 用 是/不是/不重要 "
+                                "回答。\n"
                                 "  rephrase -> 你理解了这句话, 但它没有提供"
                                 "可裁决的命题(开放式索取信息/要求直接解释/"
                                 "闲聊)。此时 verdict 必须为空, 不要伪造。\n"
@@ -3185,12 +3186,15 @@ _TOOL_ANSWER = {
                         },
                         "verdict": {
                             "type": "string",
-                            "enum": ["是", "不是", "无关"],
+                            "enum": ["是", "不是", "不重要"],
                             "description": (
                                 "仅 response_kind=verdict 时填写: "
-                                "是/不是/无关。**没有「揭晓」** —— 通关由系统"
-                                "另行判定, 不归你负责。response_kind=rephrase "
-                                "时必须为空/不填。"),
+                                "是/不是/不重要。**没有「揭晓」** —— 通关由"
+                                "系统另行判定, 不归你负责。"
+                                "「不重要」= 命题可理解、事实表未定义、且"
+                                "该细节不影响解题; 不要因为\"事实表没写\""
+                                "就判\"不是\"。response_kind=rephrase 时"
+                                "必须为空/不填。"),
                         },
                         "comment": {"type": "string",
                                     "description": "不超过 12 字的点评, 不剧透"},
@@ -3255,7 +3259,7 @@ _TOOL_ANSWER = {
                                  "touched_fact_ids"],
                     # ---- Issue #53 §9: `verdict` **不再**是无条件必填 ----
                     # 它的合法性由代码按 response_kind 做条件一致性检查
-                    # (verdict -> 必须是 是/不是/无关; rephrase -> 必须为
+                    # (verdict -> 必须是 是/不是/不重要; rephrase -> 必须为
                     # 空)。让 schema 把 verdict 设成必填会逼模型给 rephrase
                     # 伪造一个裁决 —— 那正是本合同要拆掉的混淆。
                     #
@@ -6956,9 +6960,9 @@ class PuzzleWriter:
                 qid, f"response_kind={rk!r} 不在 contract 里")
 
         v = str(a.get("verdict", "") or "").strip()
-        if v not in (P.YES, P.NO, P.IRRELEVANT):
+        if v not in (P.YES, P.NO, P.UNIMPORTANT):
             return self._qa_unavailable(
-                qid, f"verdict={v!r} 不是 是/不是/无关")
+                qid, f"verdict={v!r} 不是 是/不是/不重要")
         # ---- Issue #53 §12: candidate **只**来自模型的结构化自报 ----
         # 旧的 `or _looks_like_solution(text)` 兜底已删除 —— Python 根据
         # "所以/因此/是因为/字数"强行把 candidate 改成 true, 等于代码
@@ -7012,7 +7016,7 @@ class PuzzleWriter:
 
         `completion_fact_ids` 非空(= 这道题有 v5 通关合同)时:
 
-            Answer 只做 是/不是/无关 + touched + established
+            Answer 只做 是/不是/不重要 + touched + established
             + solution_candidate(保留为**分析指标**)
             **不调 Final Judge, 也不产生 P.SOLVE**
 
@@ -7175,7 +7179,7 @@ class PuzzleWriter:
                 and str(getattr(r0, "status", "") or "") == "ok"
                 and r0.response_kind == "verdict"
                 and r0.solution_candidate is True
-                and r0.verdict == P.IRRELEVANT):
+                and r0.verdict == P.UNIMPORTANT):
             # ---- C1 closeout: **进入重判即终局, 成功失败都 return** ----
             #
             # 这条分支一旦触发, "第一层的输出整体不可信"就已经成立 ——
@@ -7388,7 +7392,7 @@ class PuzzleWriter:
             #     是/不是  -> list 合规后**才**允许进入 missing-id filtering
             # 旧代码在这之前有两条洗数据通道: rephrase 带 verified 被
             # 清掉后照单接受; 无关 + candidate=false + verified=["f1"]
-            # 走到下面的 `v != IRRELEVANT` 守卫把 ["f1"] 静默清成 []。
+            # 走到下面的 `v != UNIMPORTANT` 守卫把 ["f1"] 静默清成 []。
             # 都是"坏结构 -> 洗干净 -> 当合法结果继续用", 全部 fail closed。
             if not isinstance(raw_verified, list):
                 self._recheck_failed(
@@ -7434,7 +7438,7 @@ class PuzzleWriter:
                                      f"response_kind={rk!r}" if rk
                                      else "无有效返回")
                 return False
-            if v not in (P.YES, P.NO, P.IRRELEVANT):
+            if v not in (P.YES, P.NO, P.UNIMPORTANT):
                 self._recheck_failed(r0, text, f"verdict={v!r}")
                 return False
             # solution_candidate 必须显式给出 —— 缺失/类型不对按失败处理,
@@ -7443,8 +7447,11 @@ class PuzzleWriter:
                 self._recheck_failed(r0, text, f"candidate={cand!r}")
                 return False
             # ---- 自洽硬门: 不合法组合一律 fail closed ----
-            if v == P.IRRELEVANT and cand:
-                self._recheck_failed(r0, text, "无关 + candidate=True")
+            # (Issue #65: 「无关」退役; 同一矛盾形状现在长在
+            #  「不重要」上 —— "在尝试完整解释谜底"却判"这个细节
+            #  不影响解题"同样自相矛盾。)
+            if v == P.UNIMPORTANT and cand:
+                self._recheck_failed(r0, text, "不重要 + candidate=True")
                 return False
             if v in (P.YES, P.NO) and not cand:
                 # 是/不是 说明它是个命题 —— 但 candidate=false 意味着
@@ -7455,9 +7462,9 @@ class PuzzleWriter:
             # "这句话与 case 无关"和"这句话建立了通关事实 f1"不可能同时
             # 成立。旧代码在这里把 ["f1"] 静默清成 [] 然后当合法「无关」
             # 用 —— 洗数据。fail closed: 整条 unavailable。
-            if v == P.IRRELEVANT and raw_verified:
+            if v == P.UNIMPORTANT and raw_verified:
                 self._recheck_failed(
-                    r0, text, f"无关 + verified={raw_verified!r}")
+                    r0, text, f"不重要 + verified={raw_verified!r}")
                 return False
 
             # ---- 确认 completion(自己就是 verifier, 不再转交) ----
@@ -7466,7 +7473,7 @@ class PuzzleWriter:
             # `_completion_verify` 同一套: 不许借机把观众没说过的 fact
             # 塞进来)。
             verified: list = []
-            if v != P.IRRELEVANT and missing:
+            if v != P.UNIMPORTANT and missing:
                 for x in raw_verified:
                     fid = str(x).strip()
                     # 只接受 missing 里的真实 id —— 与 `_completion_verify`
@@ -7576,7 +7583,7 @@ class PuzzleWriter:
 
         **fail-open for conversation, fail-closed for victory state**:
 
-            保留第一层 verdict(是/不是/无关)
+            保留第一层 verdict(是/不是/不重要)
             保留 direct_noncompletion
             completion **一条都不推进**
             不 solved
@@ -8204,7 +8211,7 @@ class PuzzleWriter:
         # 又还给了模型的自由文本, 与冻结的设计直接冲突。
         #
         # 现在: 拿不到有效的 `emit_judgement` 结构就是**技术失败**。
-        # 上层仍然保留第一层"是/不是/无关"的裁决(那是 Answer 阶段的产物),
+        # 上层仍然保留第一层"是/不是/不重要"的裁决(那是 Answer 阶段的产物),
         # 但**绝不能因此揭晓** —— 通关必须由结构化的 cause+mechanism 命中
         # 推出。
         return JudgeResult(failed=True, error=res.error or "裁判无有效返回")

@@ -549,51 +549,51 @@ window.addEventListener("load", async () => {
     check(sysRows.length && !sysRows[0].textContent.includes("系统："),
           "系统行**不该**带观众名前缀: " + (sysRows[0] && sysRows[0].textContent));
 
-    // ⑩.5 单条「无关」不得把上一条重复画出来
+    // ⑩.5 单条「不重要」不得把上一条重复画出来
     //     (实测 bug: 折叠起点算错, [是, 无关] 会把"是"那行画两遍)
     send({phase: "qa", puzzle_index: 7, story_index: 7, puzzle: "重复测试。",
           qa_log: [
             {qid: 1, user_name: "甲", text: "唯一问题A", verdict: "是", comment: "", kind: "qa"},
-            {qid: 2, user_name: "乙", text: "唯一问题B", verdict: "无关", comment: "", kind: "qa"},
+            {qid: 2, user_name: "乙", text: "唯一问题B", verdict: "不重要", comment: "", kind: "qa"},
           ], qa_total: 2});
     const dupRows = [...document.querySelectorAll(".qa-row")].map(r => r.textContent);
-    check(dupRows.length === 2, "单条无关应显示 2 行, 实际 " + dupRows.length);
+    check(dupRows.length === 2, "单条不重要应显示 2 行, 实际 " + dupRows.length);
     check(dupRows.filter(t => t.includes("唯一问题A")).length === 1,
           "'唯一问题A' 不应重复出现: " + JSON.stringify(dupRows));
     check(dupRows.filter(t => t.includes("唯一问题B")).length === 1,
           "'唯一问题B' 不应重复出现: " + JSON.stringify(dupRows));
 
-    // ⑪ 连续「无关」折叠: 只留最近 2 条 + 一行"已折叠"
+    // ⑪ 连续「不重要」折叠: 只留最近 2 条 + 一行"已折叠"
     const mkIrr = (from, to) => {
       const a = [];
       for (let i = from; i <= to; i++) {
-        a.push({qid: i, user_name: "观众" + i, text: "无关问题" + i,
-                verdict: "无关", comment: "", kind: "qa"});
+        a.push({qid: i, user_name: "观众" + i, text: "不重要问题" + i,
+                verdict: "不重要", comment: "", kind: "qa"});
       }
       return a;
     };
-    // 6 条连续无关 -> 折叠 4 条, 显示 2 条 + 1 行折叠提示
+    // 6 条连续不重要 -> 折叠 4 条, 显示 2 条 + 1 行折叠提示
     send({phase: "qa", puzzle_index: 6, story_index: 6, puzzle: "折叠测试。",
           qa_log: mkIrr(1, 6), qa_total: 6});
     const irrRows = [...document.querySelectorAll(".qa-row")];
     const fold = document.querySelector(".qa-row.kind-fold");
-    check(fold, "连续无关应出现折叠行");
+    check(fold, "连续不重要应出现折叠行");
     check(fold && fold.textContent.includes("4"),
           "折叠行应标出折叠了几条: " + (fold && fold.textContent));
-    check(irrRows.length === 3, "6 条无关应显示为 2 条 + 1 折叠行, 实际 " + irrRows.length);
-    // 只留最近两条(无关问题5 / 无关问题6)
+    check(irrRows.length === 3, "6 条不重要应显示为 2 条 + 1 折叠行, 实际 " + irrRows.length);
+    // 只留最近两条(不重要问题5 / 不重要问题6)
     const shownTexts = irrRows.map(r => r.textContent).join("|");
-    check(!shownTexts.includes("无关问题1：") && !shownTexts.includes("无关问题2："),
-          "被折叠的旧无关不应出现在列表里: " + shownTexts);
-    check(shownTexts.includes("无关问题6"), "最近的无关应保留");
-    // 无关被打断时, 两段各自折叠
+    check(!shownTexts.includes("不重要问题1：") && !shownTexts.includes("不重要问题2："),
+          "被折叠的旧不重要不应出现在列表里: " + shownTexts);
+    check(shownTexts.includes("不重要问题6"), "最近的不重要应保留");
+    // 不重要被打断时, 两段各自折叠
     const mixed = mkIrr(7, 9).concat(
       [{qid: 10, user_name: "甲", text: "关键问题", verdict: "是", comment: "", kind: "qa"}])
       .concat(mkIrr(11, 13));
     send({phase: "qa", puzzle_index: 6, story_index: 6, puzzle: "折叠测试。",
           qa_log: mixed, qa_total: 13});
     check(document.querySelectorAll(".qa-row.kind-fold").length === 2,
-          "两段无关应各自折叠成 2 行, 实际 "
+          "两段不重要应各自折叠成 2 行, 实际 "
           + document.querySelectorAll(".qa-row.kind-fold").length);
     check(document.querySelector(".qa-row:not(.kind-fold) .q")
           || document.body.textContent.includes("关键问题"),
