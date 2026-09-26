@@ -816,6 +816,11 @@ class Config:
 
     # ---- 谜题循环 ----
     reveal_hold_seconds: float = 60.0     # 揭晓展示时长(用户指定 60s)
+    # ---- Issue #60: REVEALED 互动窗口 ----
+    # 本题评分 #1~#5 只在 REVEALED 的**前**这么长(默认 30s)开放;
+    # 主题投票 #a~#e 覆盖整个 reveal_hold_seconds, 不另设开关。
+    # 它是"互动层"的时间语义, 不改变揭晓正文三阶段(15/45/60)的呈现。
+    rating_window_seconds: float = 30.0
     # 揭晓 60 秒分**三段**(U2):
     #   0 .. reveal_core_focus_seconds        只显示核心答案(超大字号)
     #   core_focus .. reveal_detail_seconds   追加完整解释(共同解谜隐藏)
@@ -856,6 +861,14 @@ class Config:
     # 一次补到 12；即便单候选通过率只有四成，也还有足够缓冲吸收连续失败。
     pool_target_size: int = 12
     pool_min_size: int = 8
+    # ---- Issue #60 §10: category-aware 库存水位 ----
+    # 每类 low_water/target(五类同值, 简单水位第一版)。直播消费后某类
+    # eligible 库存低于 low_water -> 该类 maintenance refill, 补回 target。
+    # 旧的 pool_min_size/pool_target_size(全局库存 latch)保留兼容, 但
+    # **category-aware 调度是新的权威**: 两套 latch 同时看, 谁缺补谁 ——
+    # 见 prefetcher 里对调度优先级的说明。
+    pool_category_low_water: int = 8
+    pool_category_target: int = 10
     # 下一题**此刻能不能播**的最低要求(与长期库存分开, 见 pool.py)。
     # 实播踩到的坑: 池里 6 道候选全被当前窗口挡住 -> 回落现场生成,
     # 观众干等 10–40 秒; 而 stock=6 让补池认为健康, 一道都不补。
@@ -867,7 +880,16 @@ class Config:
     # 十题全挤在同一 mechanism), 补进来的新题也会被同一条件挡住 ——
     # 没有上限就是无限生成 + 无限烧网关配额, 而 playable 永远不动。
     # 到顶只 warning, 让运维看见"补了但没用", 不是静默空转。
-    pool_max_size: int = 16
+    # ---- Issue #60 §10: 硬上限必须能容纳 50+ distinct 库存, 并给
+    # observed miss / in-flight overshoot 留余量 —— 从 16 提到 60。
+    pool_max_size: int = 60
+    # ---- Issue #60 §14: 直播后台补题的**硬并发上限** ----
+    # 同时最多 N 条 generation pipeline(默认 2)。这是硬要求不是目标:
+    # tick 只补空闲 slot; 每个 worker 独立 client + PuzzleWriter; 结果走
+    # 队列而不是单槽, 2 个 worker 同时完成不互相覆盖。
+    # 开播前 bulk prefill 的 5 并发在 prefill_pool.py 另行配置(§17),
+    # 两者是不同的进程与不同的预算, 不共用这一个值。
+    pool_prefetch_concurrency: int = 2
     # 补池总开关。**与 pool_enabled 解耦**: 关掉它 = 不后台生成, 但
     # 手工/脚本灌进池子的存量题**照常用**。网关故障时就是靠这一条
     # 停掉后台生成、同时继续播已有的题(pool_enabled=False 做不到 ——
@@ -1285,6 +1307,11 @@ class Config:
             warns.append(
                 f"pool_playable_min({self.pool_playable_min}) 为负, 已按 0 处理"
                 f"(0 = 关掉\"下一题缺货\"这个触发条件, 只看长期库存)。"
+            )
+        if self.pool_prefetch_concurrency < 1:
+            warns.append(
+                f"pool_prefetch_concurrency({self.pool_prefetch_concurrency}) "
+                f"非法, 已按 1 处理(并发下限是 1)。"
             )
         # ---- 揭晓窗口 ----
         if not (0 <= self.reveal_core_focus_seconds < self.reveal_hold_seconds):

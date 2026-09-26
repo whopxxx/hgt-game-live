@@ -874,16 +874,23 @@ def test_prefetch_module_does_not_touch_engine_writes():
 
 
 def _spec_for_prefetch(i: int):
-    """第 i 道**能过 _validate_pool_spec** 的题。
+    """第 i 道**能过 _validate_pool_spec** 的题, 内容按 i 轮换。
 
     不能随便造 —— 池的准入门要求: solve_atoms 2~4 条且必须含
     mechanism, hints 恰好 3 条, 且 **fair_clue 的 quote 必须出现在谜面
-    正文里**。所以这里直接复用 `mk_spec()` 的完整自洽骨架, 只换 title
-    和签名以外的东西 —— 换谜面正文就得连 clues 一起换, 没必要。
+    正文里**。
+
+    ⚠️ Issue #60 §16: 本套件的种子题与生成题现在都要过**最终 atomic
+    admission**(谜面文本 too_similar 即拒)。所以不能像旧版那样只换
+    title、共用同一份灯塔谜面 —— 那正是"同一批并发产物互相撞相似门"
+    的形状, 新闸门会正确地把它拒掉。这里复用 test_prefetch 的 5 套
+    **完整故事各不相同**的模板(与那边同一批夹具), 保证:
+      * fill() 种的题(用例里偏移 53 起编号)与 worker 生成的题(i 从 1
+        起)落在**不同**的模板上(53 % 5 != 0, 恒不撞同一套);
+      * 连续生成的两道也互不撞相似门。
     """
-    s = mk_spec()
-    s.title = f"题{i}"
-    return s
+    from test_prefetch import generated_variant
+    return generated_variant(i)
 
 
 def _mkpf_with_pt(playtester, **cfgkw):

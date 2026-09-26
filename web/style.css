@@ -243,6 +243,34 @@ html, body {
   color: rgba(212,175,110,.85); font-size: 30px; text-align: center;
 }
 
+/* ---- Issue #60 §5: REVEALED 互动层(评分 #1~#5 / 主题 #a~#e) ---- */
+/* 行内紧凑布局: 不与核心答案/贡献链抢空间(45~60s contribution 仍可读) */
+#reveal-interaction {
+  flex: 0 0 auto;
+  display: flex; flex-direction: row; justify-content: center;
+  gap: 28px; flex-wrap: nowrap;
+  padding: 8px 0 0;
+}
+#reveal-interaction.hidden { display: none; }
+#rating-box, #theme-box {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 6px; min-width: 0;
+}
+#rating-box.closed { opacity: .38; }   /* 30s 后评分截止 -> 弱化 */
+#rating-title, #theme-title {
+  color: rgba(212,175,110,.9); font-size: 26px; letter-spacing: 2px;
+}
+#rating-dist, #theme-options {
+  display: flex; gap: 10px; flex-wrap: nowrap; justify-content: center;
+}
+.rating-pill, .theme-pill {
+  color: #e8dcc3; background: rgba(255,255,255,.06);
+  border: 1px solid rgba(212,175,110,.35);
+  border-radius: 999px; padding: 4px 14px;
+  font-size: 24px; white-space: nowrap;
+}
+.theme-pill b { color: #d4af6e; margin-left: 4px; }
+
 /* ================= 下半部 ================= */
 /* 下半部工作区: `--workspace-top` 是 #top 与 #bottom / #reveal 的**唯一**
    分界值, 由 app.js 的 layout() 写入。三处引用同一个变量 -> 不可能错位。 */

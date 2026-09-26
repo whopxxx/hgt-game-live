@@ -340,7 +340,7 @@ class Director:
 
             # ---- Q10: AI 试玩(默认关闭) ----
             # 装配权在这里, 不在 PoolPrefetcher 里 —— 因为 Playtester 需要
-            # (a) host_writer = 上面那个 pf_writer, (b) should_continue =
+            # (a) host_writer = prefetch 的 writer, (b) should_continue =
             # 后台补池自己的生命周期谓词(`_background_should_continue`),
             # 两者都是本层的协作者。
             #
@@ -349,21 +349,38 @@ class Director:
             # 直播忙不忙不再拥有"打断后台"的权力。谓词取的是 prefetcher
             # 的方法本身(而不是快照一个 bool): 它在试玩的每一轮之前被重新
             # 调用, 所以 `request_stop()` 立即生效。
+            #
+            # ⚠️ Issue #60 §14: 构造顺序变了 —— playtester 必须在
+            # prefetcher **之后**建。§14 起每个 worker 有独立的
+            # PuzzleWriter(`_last_reject` / 审稿侧信道是实例状态),
+            # host 也要用其中一份(与生成 worker 同批的 slot-0 writer),
+            # 而不是它下面那个旧的 base `pf_writer` —— 否则
+            # `pf._playtester.host is pf.writer` 会裂, 且 host 的
+            # `_last_reject` 与 worker 状态分叉。
             playtester = None
-            if (getattr(cfg, "playtest_enabled", False)
-                    and pf_writer is not None):
-                from story.playtest import Playtester
-                playtester = Playtester(
-                    player_client=pf_client,
-                    host_writer=pf_writer,
-                    should_continue=self._prefetcher_should_continue,
-                    max_turns=getattr(cfg, "playtest_max_turns", 10))
-
             self._prefetcher = PoolPrefetcher(
                 cfg=cfg, pool=self.pool, writer=pf_writer,
                 probe_inputs=self.engine.snapshot_generation_inputs,
                 pick_blueprint=self._pick_blueprint,
-                rng=pf_rng)
+                rng=pf_rng,
+                # ---- Issue #60 §14: bounded concurrency=2 ----
+                # 每个 worker **独立** client + PuzzleWriter —— writer 的
+                # `_last_reject` / `_last_review_*` 是实例状态, 两个并发
+                # worker 共用一个会把审稿 provenance 互相污染(与上面
+                # live/prefetch 分实例同一条理由)。
+                writer_factory=lambda slot: (
+                    PuzzleWriter(
+                        client=AnthropicMessagesClient(_pf_llm),
+                        runtime_cfg=cfg)
+                    if pf_client is not None else pf_writer))
+            if (getattr(cfg, "playtest_enabled", False)
+                    and pf_client is not None):
+                from story.playtest import Playtester
+                playtester = Playtester(
+                    player_client=pf_client,
+                    host_writer=self._prefetcher.writer,
+                    should_continue=self._prefetcher_should_continue,
+                    max_turns=getattr(cfg, "playtest_max_turns", 10))
             if playtester is not None:
                 self._prefetcher.set_playtester(playtester)
 
@@ -611,6 +628,11 @@ class Director:
             self._riddle(action.payload)        # 单 worker
         elif k == ActionKind.HINT:
             self._hint(action.payload)
+        elif k == ActionKind.ROUND_CLOSEOUT:
+            # ---- Issue #60 §6: REVEALED freeze 的 closeout 落盘 ----
+            # 增强功能: 写失败 log error 并 **fail-open**, 绝不影响直播。
+            # Engine 是权威, 这里只搬运; 每题恰好一个动作(幂等由 Engine 保证)。
+            self._write_round_closeout(action.payload)
         elif k == ActionKind.REVEAL:
             # 真人猜中在 Engine 内已经只计一次；这里把同一事实持久化。
             # event_id = session + round 做第二层幂等，防异常重派同一 action
@@ -826,36 +848,33 @@ class Director:
                 # 额外的 try —— 它的失败模式就是"回落"。
                 # Step 06: 这一发是为第几题要的。原样带给引擎做身份校验。
                 expect_round = payload.get("expect_round")
+                # ---- Issue #60 §7/§13: 主题投票选出的下一题类型 ----
+                # Engine 在 freeze 时选出并放进 RIDDLE payload; 无票为空。
+                # Director 只搬运, 不从前端状态反推。
+                requested_category = str(
+                    payload.get("requested_category", "") or "").strip()
                 spec = None
                 source = "live_generate"
-                # ---- G4-2 §三: 取题顺序 generated -> curated -> 现场生成 ----
-                #
-                # ⚠️ **curated 不再抢最高优先级**。H2-G 原本把它排在最前
-                # ("外部好题的认知反转密度比 AI 现场造的高"), G4-2 推翻了
-                # 这条产品决定:
-                #
-                #     默认直播的唯一主生成体系是 keyword2。
-                #     curated 是补充题源, 不是默认主产品。
-                #
-                # 两个后果:
-                #   1. `prefer_curated` 默认 False -> 这一段整体不跑
-                #      (curated_pool 是 None), 观众只感受到一套生成风格;
-                #   2. 即使显式 `--curated`, generated 池**仍然排前** ——
-                #      否则一开 curated 就立刻被外部题淹没, 默认口径
-                #      与 opt-in 口径的差别会大到不像同一个产品。
-                #
-                # `pop_next` 在两处都一样: 准入重校验 + 两遍选择 +
-                # 先落盘再交付。所以优先级只影响**顺序**, 不影响**标准**。
+                # ---- G4-2 §三 + Issue #60 §13: 取题顺序 ----
+                # 有 selected category:
+                #     generated pool pop_next(category)
+                #     -> curated(同样按类 eligibility)
+                #     -> selected-category 现场生成(GenerationBrief)
+                #     -> 引擎最终兜底
+                # selected category **不得**被无关题 silent fallback。
+                # 无 selected category: 逐位保留现有 free path 顺序。
                 if self.pool is not None:
                     spec = self.pool.pop_next(
                         recent_signatures=recent,
-                        avoid=payload.get("avoid"))
+                        avoid=payload.get("avoid"),
+                        category=requested_category)
                     if spec is not None:
                         source = "keyword2_pool"
                 if spec is None and self.curated_pool is not None:
                     spec = self.curated_pool.pop_next(
                         recent_signatures=recent,
-                        avoid=payload.get("avoid"))
+                        avoid=payload.get("avoid"),
+                        category=requested_category)
                     if spec is not None:
                         source = "curated"
 
@@ -902,14 +921,38 @@ class Director:
                     kw_bag, kw_meta, kw_seed = self._keyword_bag()
                     if kw_bag is not None:
                         from story.keyword_seed import keyword_spec
+                        # ---- Issue #60 §13: selected-category 现场生成 ----
+                        # 有投票主题时用 GenerationBrief(requested_category)
+                        # 定向生成; observed categories 完全不含 selected 的
+                        # 合格题可以入统一池(不浪费), 但**绝不能**直接上屏
+                        # 冒充投票命中的主题 —— 记 theme_fulfillment_failed
+                        # 并交回引擎继续按现有纪律重试。
+                        brief = None
+                        if requested_category:
+                            from story.haiguitang_protocol import GenerationBrief
+                            brief = GenerationBrief(
+                                requested_category=requested_category)
                         spec, why = keyword_spec(
                             self.writer, kw_bag, kw_seed,
                             avoid=payload.get("avoid"), recent=recent,
                             should_continue=None,
-                            corpus_version=kw_meta.get("corpus_version", ""))
+                            corpus_version=kw_meta.get("corpus_version", ""),
+                            brief=brief)
                         if spec is None:
                             failure = ("keyword2 现场生成未成题(%s)" % why)
                             log.warning("出题失败, 交回引擎走兜底: %s", failure)
+                        elif (requested_category
+                              and requested_category not in
+                              (spec.categories or [])):
+                            log.warning(
+                                "theme_fulfillment_failed: requested=%s "
+                                "observed=%s —— 合格题不入屏(不冒充投票主题), "
+                                "继续按 setting 纪律请求 %s",
+                                requested_category, list(spec.categories or []),
+                                requested_category)
+                            failure = ("theme_fulfillment_failed: observed "
+                                       f"categories={list(spec.categories or [])} "
+                                       f"不含 requested={requested_category}")
                         else:
                             source = "keyword2_live"
                             self._submit_spec(spec, source,
@@ -1165,6 +1208,47 @@ class Director:
         (facts/atoms/clues/hints) + blueprint/signature + 一整套 metrics。
         下一轮分析要能直接算, 不必再去日志里刨。
         """
+        return self._archive_reveal_impl(payload, text)
+
+    def _write_round_closeout(self, payload: dict) -> None:
+        """Issue #60 §6: round closeout 追加落盘(append-only, fail-open)。
+
+        现有 `_archive_reveal` 在谜底刚生成时就写 `puzzle.jsonl`(早于
+        60 秒互动), 所以互动结果**绝不**硬塞进那条早期 archive —— 这是
+        独立的一份 `data/round_closeout.jsonl`, 以 session+puzzle_index
+        为稳定身份。
+
+        只记 aggregate(不落每个观众的 uid 投票); 写失败只 log error,
+        **fail-open** —— 评分/投票日志坏了不能把直播停掉(与
+        `_archive_reveal` 的"失败即停"恰好相反, 两者职责不同)。
+        """
+        try:
+            rec = {
+                "session": self.session_id,
+                "puzzle_index": payload.get("session_round"),
+                "rating_count": payload.get("rating_count", 0),
+                "rating_sum": payload.get("rating_sum", 0),
+                "rating_average": payload.get("rating_average", 0.0),
+                "rating_distribution": payload.get("rating_distribution",
+                                                   {}),
+                "theme_vote_totals": payload.get("theme_vote_totals", {}),
+                "theme_vote_count": payload.get("theme_vote_count", 0),
+                "selected_category": payload.get("selected_category", ""),
+                "tie": bool(payload.get("tie")),
+                "no_vote": bool(payload.get("no_vote")),
+                "revealed_at": payload.get("revealed_at"),
+                "frozen_at": payload.get("frozen_at"),
+                "ts": time.time(),
+            }
+            path = os.path.join("data", "round_closeout.jsonl")
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:                       # noqa: BLE001
+            # fail-open: 绝不因 analytics 写失败影响直播主线。
+            log.exception("round closeout 落盘失败(忽略, 不影响直播)")
+
+    def _archive_reveal_impl(self, payload: dict, text: str) -> None:
         snap = self.engine.snapshot()
         model = getattr(getattr(self.writer, "client", None), "cfg", None)
         model = getattr(model, "model", "no-llm") if model else "no-llm"

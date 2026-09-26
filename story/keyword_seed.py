@@ -326,6 +326,28 @@ class KeywordBag:
         #: 诊断计数 —— 报告与日志要能看到重试真的发生在什么水平。
         self.retries_total = 0
         self.relaxed_total = 0
+        # ---- Issue #60 §15: draw 的**状态转移原子化** ----
+        #
+        # 并发(2/5 worker)之后, 一只共享 bag 会被多个线程同时 draw。
+        # 无锁时 `self._rng.randrange` 内部推进状态不是原子的: 两个线程
+        # 可能拿到同一个"下一个随机数", 于是 draw_index 重复、cooldown
+        # 窗口被打穿、"同一 session seed 的提交/draw 顺序可审计"这条
+        # 性质一起消失。
+        #
+        # 同步策略: **整次 draw 持锁**。临界区是纯内存计算(词表 randrange
+        # + 窗口检查 + 追加窗口), 微秒级, 不需要更细的粒度; 换来的是
+        #
+        #     * draw_index 单调唯一(1..N 完整);
+        #     * `served` 不丢增量;
+        #     * recent keyword/pair cooldown 不被并发打穿;
+        #     * "提交顺序即 draw 顺序"仍可审计(锁内的串行化点就是
+        #       审计点)。
+        #
+        # ⚠️ 绝不允许"每个 worker 各建一只 bag": 那会从 index=1 重复
+        # 起、重复 pair、cooldown 各自为政(§15 明确禁止)。共享一只 +
+        # 锁是唯一正确的形状。
+        import threading
+        self._draw_lock = threading.Lock()
 
     # ---- 内部 ----
     def _pair_key(self, a: str, b: str) -> tuple:
@@ -335,6 +357,12 @@ class KeywordBag:
     # ---- 公开 ----
     def draw(self) -> dict:
         """抽**两个不同**的词并返回。返回 `{keywords, slots, index, relaxed}`。
+
+        ## 并发安全(Issue #60 §15)
+
+        **整次 draw 持 `_draw_lock`**(状态转移原子化)。单线程行为与
+        历史逐位一致 —— 同 seed 的 draw 序列不变, 只是并发时被串行化。
+        见 `__init__` 里对锁策略的完整论证。
 
         ## 重试与放宽的顺序(§五)
 
@@ -351,6 +379,11 @@ class KeywordBag:
         `slots` 恒为 `[]` —— 独立词库没有槽位概念(§四: "不要要求不同
         slot")。留着这个 key 只为调用方与日志的形状不变。
         """
+        with self._draw_lock:
+            return self._draw_locked()
+
+    def _draw_locked(self) -> dict:
+        """`draw` 的本体(调用方须持 `_draw_lock`)。"""
         n = len(self.keywords)
         kc = min(self._kc, max(0, n - 1))
         pc = min(self._pc, max(0, n * (n - 1) // 2 - 1))

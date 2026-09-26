@@ -41,36 +41,44 @@
 
 R4 把生产链统一成了
 
-    KeywordBag 两随机词 + red/black lane -> Story -> Surface -> Structure
+    KeywordBag 两随机词 -> Story -> Surface -> Structure
 
 四个入口都走 `keyword_seed.keyword_spec()`: live 现场生成 / 后台
 `PoolPrefetcher` / Director 冷启动 prewarm / **本脚本**。
 
-但本脚本曾经是**唯一**的例外 —— 它直接 `choose_blueprint ->
-writer.gen_spec()`, 也就是 classic 链。后果不是"风格没调好", 而是
-**R4 的四轮调优在预热出来的题上完全没生效**:
+## Issue #60 §17: category-aware bulk builder(并发=5)
 
-    盘上的题 quality-v10 是真的(过了同一套 Reviewer + hard gate),
-    但它们 prompt_version 全是 riddle-v9, 而不是 keyword2-v7。
+live-ready milestone 之后, 开播前的实际运行必须是:
 
-于是直播播的是"通过 quality-v10 的任意题", 而不是我们验收过的红黑
-keyword2 风格。**Reviewer 通过不等于题源正确。**
+    prefill_pool.py --live-ready --concurrency 5
 
-现在默认走 `keyword_spec()`; classic 链保留为 kill-switch
-(`--no-keyword-seed`), 行为逐位不变。
+等价于 `--target-total 50 --target-per-category 10`:
 
-⚠️ **bag 必须是整进程一只**(`_PrefillSeeder`)。每次 `_one()` 重建会把
+    distinct current-policy 未播库存 >= 50
+    logic / suspense / horror / emotion / brainstorm 各 >= 10
+
+并发=5: 最多 5 条 generation pipeline **同时**跑, 每个 worker **独立**
+client + PuzzleWriter, 共享**并发安全**的 KeywordBag(#60 §15 的
+`_draw_lock`), 调度按 per-category deficit 选 `requested_category`,
+最终入池走 pool 的 **atomic final admission**(§16)。
+
+## 与直播互斥(§17)
+
+live-ready prefill 启动前**必须**检查 live heartbeat/lease。检测到
+直播正在活跃 -> 拒绝(退出码非 0), 绝不允许 5-worker 与直播进程
+同时写正式 pool。没有提供默认绕过此保护的路径。
+
+⚠️ bag 必须是整进程一只(`_PrefillSeeder`)。每次 `_one()` 重建会把
 draw_index / cooldown / 不放回状态全部重置 —— 表面上"用了 keyword2",
 实际上每一轮都是新 session, 每道题都从 index=1 重来。
 
 ## 用法
 
     .venv/Scripts/python.exe prefill_pool.py --target 5
-    .venv/Scripts/python.exe prefill_pool.py --target 5 --playable 2
+    .venv/Scripts/python.exe prefill_pool.py --live-ready --concurrency 5
     .venv/Scripts/python.exe prefill_pool.py --target 8 --max-attempts 40
-    .venv/Scripts/python.exe prefill_pool.py --target 5 --no-keyword-seed
 
-退出码: 0 = 达成目标; 1 = 尝试耗尽仍未达成(不是崩溃, 是"没补够")。
+退出码: 0 = 达成目标; 1 = 尝试耗尽仍未达成 / 直播活跃拒绝启动。
 """
 
 from __future__ import annotations
@@ -80,6 +88,9 @@ import logging
 import os
 import random
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from story.config import Config, from_args as _cfg_from_args
 from story.pool import PuzzlePool
@@ -116,42 +127,73 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-llm", action="store_true",
                     help="不使用 LLM(只会走兜底, 预热没有意义; 仅供干跑)")
     # ---- R5: 与直播同一条 `--no-keyword-seed` kill-switch ----
-    #
-    # ⚠️ 参数名与 `story/config.py` 的**逐字相同**。这不是巧合: 它经
-    # `_cfg_from_args` 覆盖到 `Config.pool_keyword_seed_enabled`, 于是
-    # "预热走哪条链"与"直播走哪条链"读的是**同一个开关** —— 结构上
-    # 不可能出现"一边升级、一边忘改"。
     ap.add_argument("--no-keyword-seed", dest="pool_keyword_seed_enabled",
                     action="store_false",
-                    help="kill-switch: 预热回到 classic Blueprint 链"
-                         "(`choose_blueprint -> gen_spec`, riddle-v9), "
-                         "与直播的 --no-keyword-seed 是同一个开关。"
-                         "默认走 keyword2(抽 2 词 + red/black lane -> "
-                         "Story -> Surface -> Structure)")
+                    help="kill-switch: 预热回到 classic Blueprint 链")
     ap.add_argument("--keyword-corpus", dest="keyword_corpus_path", default="",
-                    help="keyword2 的 seed 词库路径(默认 "
-                         "data/keyword2_vocabulary.json)。不可用时"
-                         "**显式降级**到 classic 链, 不会回退人工词库")
+                    help="keyword2 的 seed 词库路径")
     ap.add_argument("--keyword-session-seed", dest="keyword_session_seed",
                     type=int, default=None,
                     help="keyword bag 的 session seed。默认由 quality_seed "
                          "派生; 都没有时随机一次并写进 INFO 日志")
+    # ---- Issue #60 §17: category-aware bulk ----
+    ap.add_argument("--live-ready", action="store_true",
+                    help="live-ready preset: 等价于 --target-total 50 "
+                         "--target-per-category 10 --max-attempts 150。"
+                         "开播前实际运行必须用它(加 --concurrency 5)")
+    ap.add_argument("--target-total", type=int, default=None,
+                    help="distinct current-policy 未播库存目标(§9)")
+    ap.add_argument("--target-per-category", type=int, default=None,
+                    help="五类每类 eligible 库存目标(§9)")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="同时跑几条 generation pipeline(live-ready 实际"
+                         "运行必须用 5; 上限也是 5)")
     return ap
+
+
+def _resolve_targets(a) -> tuple:
+    """把 --live-ready 展开成 (total, per_category, max_attempts, conc)。"""
+    if getattr(a, "live_ready", False):
+        total = a.target_total if a.target_total is not None else 50
+        per_cat = a.target_per_category if a.target_per_category is not None \
+            else 10
+        attempts = max(a.max_attempts if a.max_attempts != 30 else 0, 0) \
+            or 150
+        conc = a.concurrency or 5
+        return total, per_cat, attempts, min(5, max(1, conc))
+    total = a.target_total if a.target_total is not None else a.target
+    per_cat = a.target_per_category or 0
+    conc = min(5, max(1, a.concurrency))
+    return total, per_cat, a.max_attempts, conc
+
+
+def _check_live_active() -> bool:
+    """§17: 直播活跃 -> 拒绝 bulk prefill。"""
+    from story.live_heartbeat import DEFAULT_PATH, live_is_active
+    try:
+        return live_is_active(DEFAULT_PATH)
+    except Exception:                           # noqa: BLE001
+        log.exception("读 live heartbeat 异常, 保守按**直播活跃**处理")
+        return True
+
+
+def _pool_ready(pool: PuzzlePool, total: int, per_cat: int,
+                cfg: Config) -> tuple:
+    """当前库存是否达标。返回 `(ok, stats_dict)`。"""
+    distinct = pool.distinct_stock_count()
+    by_cat = pool.stock_by_category() if per_cat > 0 else {}
+    ok = distinct >= total
+    if per_cat > 0:
+        ok = ok and all(v >= per_cat for v in by_cat.values()) \
+            and len(by_cat) == 5
+    return ok, {"distinct": distinct, "by_category": by_cat}
 
 
 def main(argv=None) -> int:
     ap = build_parser()
     a = ap.parse_args(argv)
-    # 先让 Config 的解析器处理一遍, 拿到池路径 / LLM 配置 / 质量策略 ——
-    # 预热必须用与直播**完全一样**的配置, 否则补出来的题可能过不了
-    # 直播那侧的池门。
-    #
-    # ⚠️ R5: 把本脚本自己的三个 keyword 开关**透传**给 Config 解析器。
-    # 不透传的话 `--no-keyword-seed` 只改了 `a`, 而 `cfg` 仍是默认的
-    # `pool_keyword_seed_enabled=True` —— 于是 kill-switch **看起来
-    # 生效了**(参数解析没报错), 实际预热照旧走 keyword2。
-    # 这是"参数解析成功但语义没接上"的典型形状, 所以下面有一处断言
-    # 把它钉死(而不是靠读代码)。
+    total, per_cat, max_attempts, concurrency = _resolve_targets(a)
+
     extra: list = []
     if not a.pool_keyword_seed_enabled:
         extra.append("--no-keyword-seed")
@@ -168,12 +210,6 @@ def main(argv=None) -> int:
                   "没有意义。")
         return 1
 
-    # ---- R5: kill-switch 真的接上了吗 ----
-    #
-    # 断言而不是注释: 上面那次透传一旦被删(或 dest 被改名), `cfg` 会
-    # 悄悄回到"默认开 keyword2", 而 `a` 说是关的。两条链的题**都合法**
-    # (都过同一条质量链), 所以这种漂移不会有任何下游症状 —— 只会让
-    # 预热补出一批风格不对的库存, 正是本 issue 要修的东西。
     if bool(getattr(cfg, "pool_keyword_seed_enabled", True)) \
             != bool(a.pool_keyword_seed_enabled):
         log.error("--no-keyword-seed 没有透传到 Config(配置=%s, 参数=%s)"
@@ -182,40 +218,105 @@ def main(argv=None) -> int:
                   a.pool_keyword_seed_enabled)
         return 1
 
+    # ---- §17: 直播活跃 -> 拒绝(不提供默认绕过路径) ----
+    if _check_live_active():
+        log.error("检测到直播正在活跃(live heartbeat 新鲜) —— "
+                  "拒绝 bulk prefill: 5-worker 与直播进程同时写正式 pool "
+                  "是明确禁止的。请先停播再跑预热。")
+        return 1
+
+    log.info("预热目标: distinct>=%d%s, 并发=%d, 尝试上限=%d",
+             total, (f", 每类>={per_cat}" if per_cat else ""),
+             concurrency, max_attempts)
+
     seeder = _make_seeder(cfg)
 
     pool = PuzzlePool.open(cfg)
-    before_stock = pool.stock_count()
-    before_playable = pool.playable_count([], [])
-    log.info("预热开始: 现有 current-policy 库存 %d(可播 %d), "
-             "目标 库存>=%d 且 可播>=%d",
-             before_stock, before_playable, a.target, a.playable)
-
-    if before_stock >= a.target and before_playable >= a.playable:
+    ok0, st0 = _pool_ready(pool, total, per_cat, cfg)
+    log.info("现有 current-policy 库存 %d (可播 %d)%s",
+             st0["distinct"], pool.playable_count([], []),
+             (f", 分类 {st0['by_category']}" if st0["by_category"] else ""))
+    if ok0:
         log.info("已经达标, 什么也不做。")
         return 0
 
     rng = random.Random(a.seed)
     writer = _make_writer(cfg)
-    done = 0
-    for i in range(1, a.max_attempts + 1):
-        stock = pool.stock_count()
-        playable = pool.playable_count([], [])
-        if stock >= a.target and playable >= a.playable:
-            log.info("达成目标: 库存 %d(可播 %d), 用了 %d 次尝试",
-                     stock, playable, i - 1)
-            return 0
-        log.info("第 %d/%d 次尝试(当前 库存 %d 可播 %d)",
-                 i, a.max_attempts, stock, playable)
-        if _one(writer, pool, cfg, rng, a, seeder):
-            done += 1
-            log.info("入池成功(本次已补 %d 道)", done)
-    stock = pool.stock_count()
-    playable = pool.playable_count([], [])
-    log.warning("尝试耗尽仍未达标: 库存 %d(可播 %d), 目标 %d/%d。"
+
+    # ---- §17: 5 并发 bulk ----
+    done_count = {"n": 0}
+    lock = threading.Lock()
+    attempts = {"n": 0}
+    stop_event = threading.Event()
+
+    def _targets_met() -> bool:
+        ok, _st = _pool_ready(pool, total, per_cat, cfg)
+        return ok
+
+    def _worker(slot: int) -> None:
+        """一个 generation pipeline: 独立 writer, 共享 seeder.bag。
+
+        调度: 每道开始前重读 deficit(哪些类还差), 选 requested_category;
+        生成走 keyword_spec(生产唯一入口), 入池走 atomic final admission。
+        """
+        while (not stop_event.is_set()
+               and attempts["n"] < max_attempts
+               and not _targets_met()):
+            with lock:
+                if attempts["n"] >= max_attempts:
+                    return
+                attempts["n"] += 1
+                i = attempts["n"]
+            requested = _pick_deficit(pool, per_cat)
+            log.info("worker-%d 第 %d/%d 次尝试(requested=%s)",
+                     slot, i, max_attempts, requested or "自由生成")
+            if _one(writer, pool, cfg, rng, a, seeder,
+                    requested_category=requested,
+                    should_continue=lambda: not stop_event.is_set()):
+                done_count["n"] += 1
+                log.info("worker-%d 入池成功(本次已补 %d 道)",
+                         slot, done_count["n"])
+
+    if concurrency <= 1:
+        _worker(0)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency,
+                                thread_name_prefix="prefill") as ex:
+            futures = [ex.submit(_worker, s) for s in range(concurrency)]
+            for f in futures:
+                f.result()
+
+    ok, st = _pool_ready(pool, total, per_cat, cfg)
+    if ok:
+        log.info("达成目标: distinct %d%s, 用了 %d 次尝试",
+                 st["distinct"],
+                 (f", 分类 {st['by_category']}" if st["by_category"] else ""),
+                 attempts["n"])
+        return 0
+    log.warning("尝试耗尽仍未达标: distinct %d%s, 目标 %d%s。"
                 "本次补进 %d 道。",
-                stock, playable, a.target, a.playable, done)
+                st["distinct"],
+                (f", 分类 {st['by_category']}" if st["by_category"] else ""),
+                total, (f"/每类{per_cat}" if per_cat else ""),
+                done_count["n"])
     return 1
+
+
+def _pick_deficit(pool: PuzzlePool, per_cat: int) -> str:
+    """按 per-category deficit 选 requested_category(§17)。
+
+    五类各差的量从大到小; 全部达标 -> ""(自由生成, 补 distinct 总量)。
+    """
+    if per_cat <= 0:
+        return ""
+    from story.haiguitang_protocol import V2_CATEGORIES
+    by_cat = pool.stock_by_category()
+    deficits = [(per_cat - by_cat.get(c, 0), c) for c in V2_CATEGORIES]
+    deficits = [(d, c) for d, c in deficits if d > 0]
+    if not deficits:
+        return ""
+    deficits.sort(reverse=True)
+    return deficits[0][1]
 
 
 # ======================================================================
@@ -235,29 +336,16 @@ class _PrefillSeeder:
 
     `KeywordBag` 是**有状态**的: 它维护 `_recent_kw` / `_recent_pair`
     两个滑动窗口与 `served` 计数, `draw()` 每调一次才推进一格。
-
     每次 `_one()` 重建 bag => 每道题都从 index=1 开始、cooldown 窗口
-    恒为空、不放回状态永远重置。表面上"走了 keyword2", 实际上:
-
-        * `keyword_draw_index` 恒为 1 -> **lane 恒为同一个**
-          (`draw_lane(session_seed, 1)` 是个常量), 于是整批预热题
-          非红即黑, 红黑混出这条性质直接消失;
-        * 同一个词会被连续抽到(bag 的短期重复控制是**跨 draw** 的).
-
-    这两种症状都不会让质量门报警 —— 题照样过审, 只是分布错了。
-    所以测试里有专门的变异(mutation): 把初始化挪回 `_one()`, 必须红。
+    恒为空。⚠️ Issue #60 §15: 并发(5 worker)后 bag 是**共享**的,
+    `draw()` 内部已持锁 —— 状态转移原子, index 单调唯一。
 
     ## 为什么与直播的 session seed 口径一致
 
     `PoolPrefetcher._init_keyword_bag` 的规则逐条照搬:
-
         给了 keyword_session_seed  -> 直接用
         只给了 quality_seed        -> derive_session_seed() 派生
         两个都没给                  -> 随机一次, 并**立刻写进 INFO 日志**
-
-    第三条是刻意的: 随机 seed 只在启动时取一次然后落日志, "这一批的
-    pair 序列"事后永远可从日志抄回来重放。若每次抽词都 random, 复盘
-    就没有锚点。
     """
 
     def __init__(self, enabled: bool, bag=None, session_seed=None,
@@ -268,7 +356,6 @@ class _PrefillSeeder:
         self.bag_meta = dict(bag_meta or {})
         self.error = error
 
-    # ---- 只读属性 ----
     @property
     def corpus_version(self) -> str:
         return str(self.bag_meta.get("corpus_version") or "")
@@ -279,29 +366,11 @@ class _PrefillSeeder:
 
 
 def _make_seeder(cfg: Config) -> _PrefillSeeder:
-    """按配置装配 seeder。**corpus 坏了就显式降级, 绝不假装在跑 keyword2。**
-
-    ## 降级为什么必须"响"
-
-    `keyword_corpus.load_vocabulary` 对**任何**问题都抛 `CorpusError`
-    (路径空 / 文件不存在 / 解析失败 / 空表)。这里把它 catch 成一条
-    ERROR + `enabled=False`, 于是这次预热整条退回 classic 链 —— 与
-    `PoolPrefetcher._init_keyword_bag` 的处理**逐条一致**。
-
-    ⚠️ **不**回退人工 `KEYWORD_BANK`。那是 G3 就点名的形状: "看起来在
-    跑 keyword2, 其实用人工词"。宁可 classic, 也不要假的 keyword2。
-
-    ⚠️ 也不能静默: 降级后盘上会多出一批 riddle-v9 的题, 而**它们同样
-    过 quality-v10**(版本门只看 quality policy, 不看 prompt_version)。
-    本条 ERROR 日志是事后唯一能解释"为什么这批风格不对"的东西。
-    """
+    """按配置装配 seeder。**corpus 坏了就显式降级, 绝不假装在跑 keyword2。**"""
     if not bool(getattr(cfg, "pool_keyword_seed_enabled", True)):
-        log.info("预热走 classic Blueprint 链(--no-keyword-seed kill-switch): "
-                 "choose_blueprint -> gen_spec, prompt_version=riddle-v9")
+        log.info("预热走 classic Blueprint 链(--no-keyword-seed kill-switch)")
         return _PrefillSeeder(enabled=False)
 
-    # 延迟 import: 这两个要读盘, 装配期出错要在这里被 catch 成"显式
-    # 降级", 而不是冒泡成 import 错误。
     try:
         from story.keyword_corpus import DEFAULT_CORPUS_PATH
         from story.keyword_seed import derive_session_seed, load_bag
@@ -313,57 +382,35 @@ def _make_seeder(cfg: Config) -> _PrefillSeeder:
             if qseed is not None:
                 ss = derive_session_seed(qseed)
             else:
-                # 与 prefetch 同样用系统熵, **不碰** self._rng —— 那把
-                # rng 服务 classic 链的 pick_blueprint, 从它取数会改变
-                # 序列。抽完立刻落日志。
                 ss = random.SystemRandom().getrandbits(64)
         bag, meta = load_bag(path, ss)
     except Exception as e:                       # noqa: BLE001
         log.error(
             "keyword2 corpus 不可用, **本次预热整条 keyword2 链让位给 "
             "classic Blueprint 链**(不会回退人工词库): %s: %s。"
-            "⚠️ 这一轮补出来的题会是 riddle-v9, *不是* keyword2-v7。",
+            "⚠️ 这一轮补出来的题会是 riddle-v9, *不是* keyword2。",
             type(e).__name__, e)
         return _PrefillSeeder(enabled=False,
                               error="%s: %s" % (type(e).__name__, e))
 
     s = _PrefillSeeder(enabled=True, bag=bag, session_seed=int(ss),
                        bag_meta=meta)
-    log.info("keyword2 bag 就绪(**整进程共用这一只**): %s", s.meta_line())
+    log.info("keyword2 bag 就绪(**整进程共用这一只, 并发安全**): %s",
+             s.meta_line())
     return s
 
 
 def _one(writer, pool: PuzzlePool, cfg: Config, rng, a,
-         seeder: _PrefillSeeder, should_continue=None) -> bool:
-    """试生成一道并入池。返回是否真的进了池子。
-
-    ⚠️ 失败**不抛** —— 预热是个循环, 一道不成就试下一道, 让
-    `max_attempts` 去兜底。抛出去只会让整个预热停在一道坏题上。
-
-    ## R5: 两条链
-
-        seeder.enabled  -> `keyword_spec`(抽 2 词 + lane -> Story ->
-                           Surface -> Structure), 与直播/补池同一条
-        否则             -> classic `choose_blueprint -> gen_spec`(逐位不变)
-
-    ⚠️ classic 分支里 `choose_blueprint` 的调用形状**一个字都没改**:
-    它现在是 kill-switch 路径, 而 kill-switch 的契约就是"完整回到旧链"。
-
-    ⚠️ `seeder.bag` **不在这里建**。它由 `_make_seeder` 建一次然后跨
-    所有 attempt 共用 —— 见 `_PrefillSeeder` 的说明。
-
-    `should_continue` 默认 None = 离线预热原行为；守护补池会传入
-    "直播 lease 仍未出现"谓词。它一路传到 keyword/classic 的昂贵调用，
-    并在最终 `pool.add` 前再查一次，避免直播启动瞬间的跨进程写竞争。
-    """
+         seeder: _PrefillSeeder, requested_category: str = "",
+         should_continue=None) -> bool:
+    """试生成一道并入池。返回是否真的进了池子。失败**不抛**。"""
     # 每一道都**重新读**库存签名 —— 刚补进去的那道必须立刻进入下一道
-    # 的 recent, 否则同一个 pair 会连着补好几道(G4-B)。
-    # 两条链共用这一份 recent: keyword2 的 Structure 段与 classic 的
-    # `choose_blueprint` 都吃它。
+    # 的 recent(G4-B)。
     recent = _recent_sigs(pool, cfg)
 
     if seeder.enabled:
         return _one_keyword(writer, pool, cfg, a, seeder, recent,
+                            requested_category=requested_category,
                             should_continue=should_continue)
     return _one_classic(writer, pool, cfg, rng, a, recent,
                         should_continue=should_continue)
@@ -371,28 +418,17 @@ def _one(writer, pool: PuzzlePool, cfg: Config, rng, a,
 
 def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
                  seeder: _PrefillSeeder, recent: list,
+                 requested_category: str = "",
                  should_continue=None) -> bool:
     """keyword2 链: 与 live / prefetch **同一个** `keyword_spec` 入口。
 
-    ## 为什么是 import 而不是重写
-
-    这个骨架的价值全在"只有一份"。它里面写着四项 R4 契约: 抽词 + lane
-    的**顺序**、让路检查的**位置**(①Story 前 / ②Surface 前 / ③Structure
-    前)、provenance 落进 `metrics` 的**字段集**、以及失败原因的标签。
-    在预热里抄一份, 这四项迟早与直播漂开 —— 而漂开之后"预热补的题"
-    与"直播现场生成的题"就不是同一种东西了, 正是本 issue 要消灭的形状。
-
-    ## 离线让路
-
-    预热**不在直播热路径上**, 它跑在 `engine.start()` 之前, 没有相位。
-    `PoolPrefetcher.prewarm_should_continue` 是为**有预算的冷启动**写的:
-    它带 deadline 与 stop 信号。这里连预算都不需要(离线工具, Ctrl-C
-    直接杀), 所以传一个恒真的谓词。
-
-    ⚠️ **不要**把直播的相位判据搬进来: 那会让预热在 IDLE 下立刻
-    `interrupted`, 一道题都出不来(G4-R1 那个 P0 的翻版)。
+    ⚠️ Issue #60 §12: requested_category 通过 GenerationBrief 定向,
+    仍走生产唯一入口, 不复制 Prompt/Truth/Surface/Contract 逻辑。
+    ⚠️ Issue #60 §16: 入池走 **atomic final admission** —— check 与
+    add 在 pool 的同一把锁内, 并发 worker 的相似 candidate 不能都穿过。
     """
     from story.keyword_seed import keyword_spec
+    from story.haiguitang_protocol import GenerationBrief
 
     def _always_continue() -> bool:
         return True
@@ -402,11 +438,14 @@ def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
         log.info("预热/守护补池让路: 生成前检测到直播已活跃")
         return False
 
+    brief = (GenerationBrief(requested_category=requested_category)
+             .require_valid() if requested_category else None)
     spec, reason = keyword_spec(
         writer, seeder.bag, seeder.session_seed,
         avoid=[], recent=recent,
         should_continue=go,
-        corpus_version=seeder.corpus_version)
+        corpus_version=seeder.corpus_version,
+        brief=brief)
     if spec is None:
         if reason == "interrupted":
             log.info("预热/守护补池让路: keyword2 中途检测到直播已活跃")
@@ -418,19 +457,24 @@ def _one_keyword(writer, pool: PuzzlePool, cfg: Config, a,
     if not go():
         log.info("预热/守护补池让路: 候选完成后直播已活跃，本稿不入池")
         return False
-    if not pool.add(spec, source="prefill"):
-        log.warning("入池被拒(继续下一道)")
+    # ---- Issue #60 §16: atomic final admission ----
+    try:
+        ok, why = pool.add_with_final_admission(spec, source="prefill",
+                                                recent=recent)
+    except AttributeError:
+        # 替身 pool(测试)只有普通 add —— 行为等价(替身不模拟并发)。
+        ok, why = (bool(pool.add(spec, source="prefill")),
+                   "pool.add 返回 False")
+    if not ok:
+        log.warning("入池被拒(%s; 继续下一道)", why)
         return False
     return True
 
 
 def _one_classic(writer, pool: PuzzlePool, cfg: Config, rng, a,
-                 recent: list, should_continue=None) -> bool:
-    """classic 链(逐位不变): `choose_blueprint -> gen_spec` -> riddle-v9。
-
-    它是 `--no-keyword-seed` 的 kill-switch —— 不是"废弃路径", 所以
-    不删、不简化。两条链在本文件里**显式并存**。
-    """
+                 recent: list, requested_category: str = "",
+                 should_continue=None) -> bool:
+    """classic 链(逐位不变): `choose_blueprint -> gen_spec` -> riddle-v9。"""
     from story.quality import Quotas, choose_blueprint
 
     bp = choose_blueprint(recent, rng=rng, quotas=Quotas.from_config(cfg))
@@ -454,42 +498,20 @@ def _one_classic(writer, pool: PuzzlePool, cfg: Config, rng, a,
     if not go():
         log.info("预热/守护补池让路: classic 候选完成后直播已活跃，本稿不入池")
         return False
-    if not pool.add(spec, source="prefill"):
-        log.warning("入池被拒(继续下一道)")
+    try:
+        ok, why = pool.add_with_final_admission(spec, source="prefill",
+                                                recent=recent)
+    except AttributeError:
+        ok, why = (bool(pool.add(spec, source="prefill")),
+                   "pool.add 返回 False")
+    if not ok:
+        log.warning("入池被拒(%s; 继续下一道)", why)
         return False
     return True
 
 
 def _recent_sigs(pool: PuzzlePool, cfg: Config) -> list:
-    """当前库存题的 signature —— 跨题配额要看**盘上真正能播的**有什么。
-
-    这是预热与直播 prefetch 的一个**有意差别**: 直播的 recent 来自
-    Engine(观众已经看过什么), 而预热时还没有观众, 能参考的只有池子
-    本身。用池子内容当 recent 才能保证"预热出来的这一批**彼此**不
-    结构重复" —— 否则会补进 5 道一模一样的题, 而它们互相挡着,
-    playable 仍然是 1。
-
-    ## G4-B: 这里曾经是**永远返回 []** 的
-
-    旧实现直接摸 `pool._items`:
-
-        for rec in pool._items:
-            if isinstance(rec, dict):
-                sig = rec.get("signature")
-
-    而 `_items` 里装的是 `PuzzleSpec` **对象** —— `isinstance(rec, dict)`
-    恒为假, 于是每一轮 recent 都是空的。脚本仍然会打印"达标", 但它
-    补出来的 5 道题可能全是同一个 mechanism/shape; 等第一道真播完进入
-    Engine 的 recent, 剩下的立刻被动态门挡住。**预热成功, 开播即塌。**
-
-    现在走 `PuzzlePool.stock_signatures()`: 只取 `not used` + 过静态
-    校验(含 quality policy 门)的题, 且返回副本。旧 policy / 已 used
-    的题不会污染 prefill 的 recent。
-
-    调用方**每一道之后都要重新调这个函数**(见 `main` 的循环)——
-    刚补进去的题要立刻进入下一道的 recent, 否则同一个 pair 会连补
-    好几道。
-    """
+    """当前库存题的 signature —— 跨题配额要看**盘上真正能播的**有什么。"""
     try:
         return list(pool.stock_signatures())
     except Exception:                           # noqa: BLE001

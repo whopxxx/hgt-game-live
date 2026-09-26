@@ -33,6 +33,12 @@
     revealContrib: $("reveal-contrib"),
     revealContribTitle: $("reveal-contrib-title"),
     revealContribList: $("reveal-contrib-list"),
+    // ---- Issue #60 §5: REVEALED 互动层 ----
+    revealInteraction: $("reveal-interaction"),
+    ratingBox: $("rating-box"), ratingTitle: $("rating-title"),
+    ratingDist: $("rating-dist"),
+    themeBox: $("theme-box"), themeTitle: $("theme-title"),
+    themeOptions: $("theme-options"),
     top: $("top"), bottom: $("bottom"), content: $("content"),
     qa: $("qa"), qaBody: $("qa-body"),
     thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
@@ -324,6 +330,60 @@
     };
   }
 
+  // ---- Issue #60 §5: REVEALED 互动层 ----
+  //
+  // 前端只显示服务端权威状态(reveal_interaction), 不自行推断窗口
+  // 是否开放 —— 评分/投票开没开, 只认快照, 绝不从 next_puzzle_ms
+  // 自算。0~30s 评分+主题并排; 30s 后 rating_open=false 时评分区
+  // 弱化(关闭态), 主题投票成为主要 CTA。45~60s contribution 内容
+  // 仍可读 —— 本面板按行内紧凑布局渲染, 不挤占正文空间。
+  function renderRevealInteraction(s) {
+    const ri = s.reveal_interaction || null;
+    const on = !!(ri && s.phase === "revealed");
+    el.revealInteraction.classList.toggle("hidden", !on);
+    if (!on) return;
+
+    // ---- 评分 ----
+    el.ratingBox.classList.toggle("closed", ri.rating_open === false);
+    if (ri.rating_open === false && el.ratingTitle.textContent !== "评分已截止") {
+      el.ratingTitle.textContent = "评分已截止";
+    } else if (ri.rating_open !== false && el.ratingTitle.textContent !== "给本题评分：发送 #1~#5") {
+      el.ratingTitle.textContent = "给本题评分：发送 #1~#5";
+    }
+    const dist = ri.rating_distribution || {};
+    let distHtml = "";
+    for (const k of ["1", "2", "3", "4", "5"]) {
+      const n = dist[k] || 0;
+      distHtml += "<span class='rating-pill'>" + k + "★ " + n + "</span>";
+    }
+    if (el.ratingDist.dataset.sig !== distHtml) {
+      el.ratingDist.innerHTML = distHtml;
+      el.ratingDist.dataset.sig = distHtml;
+    }
+
+    // ---- 主题投票 ----
+    const opts = ri.theme_options || [];
+    let optsHtml = "";
+    for (const o of opts) {
+      optsHtml += "<span class='theme-pill'>#" + o.code + " " + o.label
+        + " <b>" + (o.votes || 0) + "</b></span>";
+    }
+    if (el.themeOptions.dataset.sig !== optsHtml) {
+      el.themeOptions.innerHTML = optsHtml;
+      el.themeOptions.dataset.sig = optsHtml;
+    }
+    // freeze 后显示选中的主题(§5: 60s 显示最终 selected theme)。
+    const sel = ri.selected_category || "";
+    if (sel && ri.frozen) {
+      const lbl = (opts.find(o => o.category === sel) || {}).label || sel;
+      const title = "下一题：" + lbl;
+      if (el.themeTitle.textContent !== title) el.themeTitle.textContent = title;
+    } else if (!ri.frozen) {
+      const defTitle = "下一题主题：发送 #a~#e（可改票）";
+      if (el.themeTitle.textContent !== defTitle) el.themeTitle.textContent = defTitle;
+    }
+  }
+
   function renderReveal(s) {
     const on = !!(s.revealed_answer && (s.phase === "revealed" || s.phase === "revealing"));
     el.reveal.classList.toggle("hidden", !on);
@@ -406,6 +466,8 @@
     } else {
       el.revealNext.textContent = "";
     }
+    // ---- Issue #60: 互动层(评分/主题投票) ----
+    renderRevealInteraction(s);
   }
 
   // ================= 下半部: 问答流 =================

@@ -577,9 +577,18 @@ def test_next_puzzle_cycle():
     clk.advance(2)
     acts = eng.tick()
     check("过 30s 开新题", eng.phase == Phase.SETTING, eng.phase)
-    check("BROADCAST 先于 RIDDLE",
-          kinds(acts) == [ActionKind.BROADCAST, ActionKind.RIDDLE], kinds(acts))
-    check("new_puzzle 标记", acts[0].payload.get("new_puzzle") is True, acts[0].payload)
+    # ---- Issue #60: 60s freeze 先发一个 ROUND_CLOSEOUT(落盘互动结果),
+    # 再 BROADCAST(new_puzzle) + RIDDLE。无票时 selected_category 为 ""。
+    check("CLOSEOUT+BROADCAST 先于 RIDDLE",
+          kinds(acts) == [ActionKind.ROUND_CLOSEOUT, ActionKind.BROADCAST,
+                          ActionKind.RIDDLE], kinds(acts))
+    check("closeout 幂等字段(no_vote)",
+          acts[0].kind == ActionKind.ROUND_CLOSEOUT
+          and acts[0].payload.get("no_vote") is True
+          and acts[0].payload.get("selected_category") == "",
+          acts[0].payload)
+    check("new_puzzle 标记", acts[1].payload.get("new_puzzle") is True,
+          acts[1].payload)
     eng.submit_riddle("新谜面", "新谜底", title="T2")
     s = eng.snapshot()
     check("puzzle_index=2", s.puzzle_index == 2, s.puzzle_index)

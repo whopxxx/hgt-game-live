@@ -2515,8 +2515,29 @@ def _r5_writer(i=0, **kw):
     任意两个 i 都不同 —— 而尾巴是追加的从句, 原谜面的两条 `fair_clues`
     quote 都还在, 不会引入夹具自相矛盾。
     """
+    # ⚠️ Issue #60 §16 之后, 入池要过 final admission(too_similar 对
+    # 盘上库存)。三条候选必须**文本上真正不同** —— 前缀是完全不同的
+    # 场景段(两条原 quote 仍保持在谜面里, 不引入夹具自相矛盾)。
     tail = "这与他那天穿的%s号外套有关吗?" % (i + 1)
-    return _R5Writer(surface={"puzzle": good_spec().puzzle + tail}, **kw)
+    # 三条候选**场景各自不同**(谜面文本真正差异大), 但都包含原两条
+    # fair_clue quote("只在退潮的那几个小时亮" / "涨潮后他反而把灯熄
+    # 掉")—— 不引入夹具自相矛盾, 且 3-gram 重叠低于 0.22 阈值。
+    bodies = (
+        # 0: 老人守塔, 以潮汐为暗号
+        "守塔的老人在日志里只写潮汐的数字, 他的灯只在退潮的那几个小时亮。"
+        "涨潮后他反而把灯熄掉, 独自划着小船到礁石区撒下一袋碎贝壳, "
+        "然后把灯重新点亮, 一言不发。镇上没人知道他撒的是什么。",
+        # 1: 女工程师接管灯塔, 灯语发报
+        "接手灯塔的女工程师把灯芯改成了手摇发电, 她的灯只在退潮的那几"
+        "个小时亮。涨潮后他反而把灯熄掉这句话贴在她前世的门上, 而她"
+        "每晚都对着海面用灯打出三长两短的节奏, 像在给谁发报。",
+        # 2: 失忆水手回到塔下, 只认灯不认人
+        "一个失忆的水手流落到岛上, 却熟练地给灯塔上油。他守着的灯只在"
+        "退潮的那几个小时亮。涨潮后他反而把灯熄掉, 摸黑走到礁石边, "
+        "把一枚生锈的怀表沉进水里, 然后回到塔里安稳睡去。",
+    )
+    puzzle = bodies[i % len(bodies)] + tail
+    return _R5Writer(surface={"puzzle": puzzle}, **kw)
 
 
 def test_r5_prefill_default_goes_through_keyword_spec():
@@ -3224,6 +3245,109 @@ def test_h4e_live_fixture_last_night_window_still_serves_curated():
               dr.engine._spec_source)
 
 
+
+
+# ======================================================================
+# Issue #60 §8: Category-aware Pool
+# ======================================================================
+def _v2_spec(categories, primary=None, i=700):
+    """一道 protocol v2 的合格题(带五类标签)。
+
+    ⚠️ v2 校验合同要求 completion fact 带 public_text(canonical text
+    不得作为展示 fallback)—— 照实补上, 否则静态门正确地拒绝它。
+    """
+    s = good_spec(
+        puzzle=f"编号{i}的钟楼每到整点就反着敲，镇上的人却都很安心。为什么？",
+        answer=f"编号{i}的反敲声是给夜航船的暗号, 顺敲声才代表警戒。",
+        # fair_clues 与谜面**逐字对齐**(validator 检查 quote 是谜面子串)
+        fair_clues=[
+            FairClue(quote=f"每到整点就反着敲", supports_atoms=["a1"]),
+            FairClue(quote="镇上的人却都很安心", supports_atoms=["a2"]),
+        ],
+    )
+    s.protocol_version = "haiguitang-v2"
+    s.difficulty = "medium"          # v2 合同: difficulty 必须枚举内
+    s.primary_category = primary or categories[0]
+    s.categories = list(categories)
+    for f in s.facts:
+        if f.kind == "core" and not f.public_text:
+            f.public_text = f.text[:12]
+    return s
+
+
+def test_i60_v2_categories_eligibility():
+    """§8: eligibility = theme in spec.categories; 多标签同时计数。"""
+    print("\n[I60-P1] 多标签库存同时计入多个 category")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(_v2_spec(["logic", "brainstorm"]))
+        by_cat = pool.stock_by_category()
+        check("logic +1", by_cat["logic"] == 1, by_cat)
+        check("brainstorm +1(多标签重叠)", by_cat["brainstorm"] == 1, by_cat)
+        check("suspense 0", by_cat["suspense"] == 0, by_cat)
+        check("distinct 只计 1 道", pool.distinct_stock_count() == 1,
+              pool.distinct_stock_count())
+
+
+def test_i60_pop_next_category_primary_first():
+    """§8: pop_next(category) primary 优先; primary 空才 secondary。"""
+    print("\n[I60-P2] primary 优先, secondary fallback")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        prim = _v2_spec(["logic"], primary="logic", i=801)
+        # secondary 命中: primary=brainstorm, categories 含 logic(v2 合同:
+        # primary 必须在 categories 里, 所以多标签)。
+        sec = _v2_spec(["brainstorm", "logic"], primary="brainstorm", i=802)
+        check("夹具: secondary 题合法入池", pool.add(sec) is True)
+        got = pool.pop_next(recent_signatures=[], category="logic")
+        check("primary 无 -> secondary 合法 fallback",
+              got is sec, got and got.puzzle[:20])
+        pool2 = PuzzlePool.open(mkcfg(d))
+        pool2.add(prim)
+        pool2.add(sec)
+        got2 = pool2.pop_next(recent_signatures=[], category="logic")
+        check("**primary 命中优先**", got2 is prim, got2 and got2.puzzle[:20])
+
+
+def test_i60_pop_never_returns_unrelated_category():
+    """§8: 绝不偷偷 pop 一个不含该 category 的题假装满足投票。"""
+    print("\n[I60-P3] unrelated category 永不返回")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(_v2_spec(["emotion", "suspense"]))     # 不含 horror
+        got = pool.pop_next(recent_signatures=[], category="horror")
+        check("不含该类 -> None(回落, 不假装)", got is None, got)
+
+
+def test_i60_used_disappears_from_all_categories():
+    """§8: 题一旦 used, 从所有相关 category 统计消失。"""
+    print("\n[I60-P4] used 后从所有 category 消失")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        pool.add(_v2_spec(["logic", "brainstorm"]))
+        check("加入后 distinct=1", pool.distinct_stock_count() == 1)
+        pool.pop_next(recent_signatures=[])      # 交付 -> used
+        by_cat = pool.stock_by_category()
+        check("logic 归零", by_cat["logic"] == 0, by_cat)
+        check("brainstorm 归零", by_cat["brainstorm"] == 0, by_cat)
+        check("distinct 归零", pool.distinct_stock_count() == 0,
+              pool.distinct_stock_count())
+
+
+def test_i60_legacy_never_counts_as_v2_stock():
+    """§8/§9: 历史/unknown 协议题不得冒充五类库存。"""
+    print("\n[I60-P5] legacy 不冒充 v2 readiness")
+    with tmpdir() as d:
+        pool = PuzzlePool.open(mkcfg(d))
+        legacy = good_spec()            # protocol_version=""(legacy)
+        pool.add(legacy)
+        check("v1/legacy 不计入任何类",
+              all(v == 0 for v in pool.stock_by_category().values()),
+              pool.stock_by_category())
+        got = pool.pop_next(recent_signatures=[], category="logic")
+        check("legacy 不被按类 pop 出来", got is None, got)
+
+
 def main():
     tests = [
         # 验收点 1
@@ -3334,6 +3458,12 @@ def main():
         test_h4e_pool_kind_is_explicit_not_inferred,
         test_h4e_fallback_loop_protection,
         test_h4e_live_fixture_last_night_window_still_serves_curated,
+        # ---- Issue #60 §8: Category-aware Pool ----
+        test_i60_v2_categories_eligibility,
+        test_i60_pop_next_category_primary_first,
+        test_i60_pop_never_returns_unrelated_category,
+        test_i60_used_disappears_from_all_categories,
+        test_i60_legacy_never_counts_as_v2_stock,
     ]
     for t in tests:
         # ---- 每个用例单独兜异常 ----

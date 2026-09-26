@@ -35,6 +35,11 @@ from .state import (CMD_PREFIX, HINT_TOKENS, LEGACY_SKIP_TOKENS, ActionKind,
                     DanmakuItem, EngineAction, PendingQ, QARec, QAResult,
                     Phase, Snapshot)
 from .summon import LIKES_PER_SUMMON, SummonLedger
+# ---- Issue #60: REVEALED 互动(评分 #1~#5 / 主题投票 #a~#e) ----
+from .interaction import (RatingLedger, ThemeVoteLedger,
+                          THEME_CATEGORY_ORDER, THEME_CATEGORY_LABELS,
+                          THEME_CODE_TO_CATEGORY, THEME_VOTE_CODES,
+                          user_key)
 
 log = logging.getLogger("story.engine")
 
@@ -305,6 +310,27 @@ class RoundEngine:
         self._like_notice_seq = 0
         #: 旧换题指令(墓碑)被消费的条数 —— 观察用, 不参与任何逻辑。
         self._legacy_skip_consumed = 0
+
+        # ---- Issue #60: REVEALED 互动层(评分 + 下一题主题投票) ----
+        #
+        # 评分 #1~#5 只在 REVEALED 前 30s 开(一人一份可改);
+        # 主题票 #a~#e 整个 60s 开(一人一票可改)。60s 到点由
+        # `_tick_revealed_locked` freeze **恰好一次**, 选出
+        # `next_category` 带进下一轮 RIDDLE。
+        self._rating_ledger = RatingLedger()
+        self._theme_ledger = ThemeVoteLedger()
+        #: REVEALED 进入时刻(monotonic)。评分窗口(前 30s)与
+        #: snapshot 的 `rating_open` 都从它推 —— 与 `_next_puzzle_deadline`
+        #: 同源(进入 REVEALED 时 `now + reveal_hold_seconds`)。
+        self._revealed_at: Optional[float] = None
+        #: freeze 后选出的下一题主题("" = 无票)。它必须**活过** SETTING
+        #: 里的 ledger 清空(§7: 正在生成的 requested category 不能因
+        #: 上一轮投票清账而丢失), 由 `_enter_setting_locked` 显式消费。
+        self._next_category = ""
+        #: closeout 幂等标记: freeze 恰好发出一次 ROUND_CLOSEOUT。
+        self._closeout_sent = False
+        #: 互动 token(#1~#5/#a~#e)被确定性消费的条数(观察用)。
+        self._interaction_tokens_consumed = 0
 
     # ==================================================================
     # 生命周期
@@ -751,6 +777,32 @@ class RoundEngine:
                 _detail("旧换题指令已停用, 已消费(不 reveal/不进 QA): %s",
                         norm[:20])
                 return []
+
+            # ---- Issue #60: 互动 token 是 deterministic command ----
+            #
+            # `#1..#5`(评分)与 `#a..#e`(下一题主题)必须在这里**精确**
+            # 识别并消费, 绝不掉进普通 `#问题` 路径送进 Answer LLM ——
+            # 与上面的墓碑同一条纪律。**不做子串匹配**: `#abc` 不是
+            # `#a`, `#12` 不是 `#1`(`norm` 已 casefold, 所以 `#A`~`#E`
+            # 自然等价命中)。窗口外的命中一律静默消费(tombstone),
+            # 给一条 0 成本的确定性反馈; 消费时机在 QA 之前的公共层,
+            # 所以 QA / SETTING / REVEALING / REVEALED 都不会把 token
+            # 泄给 LLM。
+            rating_tok = self._rating_token_locked(norm)
+            theme_tok = self._theme_token_locked(norm)
+            if rating_tok is not None or theme_tok is not None:
+                self._interaction_tokens_consumed += 1
+                if rating_tok is not None:
+                    acted = self._record_rating_locked(
+                        wid, user_name, rating_tok, now)
+                else:
+                    acted = self._record_theme_vote_locked(
+                        wid, user_name, theme_tok, now)
+                if acted:
+                    return [EngineAction(ActionKind.BROADCAST, {
+                        "phase_changed": False})]
+                return []
+
             if norm in HINT_TOKENS or any(t in norm for t in HINT_TOKENS):
                 # 观众主动要提示(#提示)。界面上不宣传这个指令(免得大家
                 # 一直刷提示 = 剧透), 但观众自己发了就给。
@@ -1394,6 +1446,10 @@ class RoundEngine:
             self.phase = Phase.REVEALED
             _detail("阶段 -> REVEALED (第 %d 题揭晓)", self._puzzle_index)
             self._next_puzzle_deadline = now + self.cfg.reveal_hold_seconds
+            # ---- Issue #60: 互动窗口开启 ----
+            # 评分前 30s / 主题票整个 60s; `_closeout_sent` 复位。
+            self._revealed_at = now
+            self._closeout_sent = False
             reason = self._reveal_pending_reason
             if reason in ("solved", "ai_solved") and self._solved_by:
                 self._notice = f"{self._solved_by} 猜中了！汤底揭晓"
@@ -1486,6 +1542,11 @@ class RoundEngine:
         """
         p = {"reason": reason}
         p.update(self._generation_inputs_locked())
+        # ---- Issue #60 §7: 上一轮投票选出的主题带进 RIDDLE ----
+        # 首轮 / retry / deferred 都走这一个函数, 所以字段不会在重试时丢。
+        # 无票时为空串 = 无主题偏好。worker 原样带回; Engine 仍是权威,
+        # 前端状态绝不参与反推。
+        p["requested_category"] = self._next_category
         # `expect_round`: 这一发是**为第几题**要的。worker 交付时必须
         # 原样带回, `submit_riddle` 会拿它与当前 `round_index` 比对 ——
         # 不符即丢弃。见 `submit_riddle` 的 `expect_round` 说明。
@@ -2059,24 +2120,38 @@ class RoundEngine:
         return []
 
     def _tick_revealed_locked(self, now: float) -> list[EngineAction]:
-        if self._next_puzzle_deadline is None or now < self._next_puzzle_deadline:
-            return []
-        self._next_puzzle_deadline = None
-        # 记下**谜面本身**(不只是标题) —— 标题常常为空, 光靠标题根本挡不住
-        # 重复出题。这里存的是模型真正需要避开的东西。
-        if self._puzzle:
-            self._used_titles.append(self._puzzle.strip()[:60])
-            # 只留最近 12 条, prompt 不至于膨胀
-            if len(self._used_titles) > 12:
-                self._used_titles = self._used_titles[-12:]
-        log.info("谜底展示结束, 开启第 %d 题", self._puzzle_index + 1)
-        return self._enter_setting_locked(now, reason="riddle")
+        acts: list[EngineAction] = []
+        # ---- Issue #60: 60s 到点先 freeze 互动(恰好一次) ----
+        # freeze 发出的 ROUND_CLOSEOUT 由 Director 落盘; 选出的
+        # `next_category` 在下面的 `_enter_setting_locked` 里消费。
+        # 到点但 `stop()` 抢先的场景不 freeze —— 那时直播已结束。
+        if self._next_puzzle_deadline is not None and now >= self._next_puzzle_deadline:
+            acts.extend(self._freeze_interaction_locked(now))
+            self._next_puzzle_deadline = None
+            # 记下**谜面本身**(不只是标题) —— 标题常常为空, 光靠标题根本挡不住
+            # 重复出题。这里存的是模型真正需要避开的东西。
+            if self._puzzle:
+                self._used_titles.append(self._puzzle.strip()[:60])
+                # 只留最近 12 条, prompt 不至于膨胀
+                if len(self._used_titles) > 12:
+                    self._used_titles = self._used_titles[-12:]
+            log.info("谜底展示结束, 开启第 %d 题", self._puzzle_index + 1)
+            acts.extend(self._enter_setting_locked(now, reason="riddle"))
+            return acts
+        # stop() 等异常路径让 REVEALED 悬着时也要在 deadline 前收票——
+        # 但正常路径只走上面; 这里只是防御, 不额外发动作。
+        return acts
 
     # ==================================================================
     # 阶段进入
     # ==================================================================
     def _enter_setting_locked(self, now: float, reason: str) -> list[EngineAction]:
         self._release_current_ai_player_locked()
+        # ---- Issue #60 §7: SETTING 开始时清上一轮 vote/rating ledger,
+        # 但 `next_category` **不在**这里清 —— 它是 `_riddle_action_locked`
+        # 与 Director 取题的依据, 必须活到该题真正交付或最终失败为止。
+        # 它在下一轮 freeze(`_freeze_interaction_locked`)时被覆盖。
+        # (stop 路径下保持原值无害: 引擎已停, 不会再发 RIDDLE。)
         # ---- Issue #43 §4: round 级资源在新题开始时清零 ----
         # 上一题没用完的 AI opportunity / 进度加成 / 未兑现的预约全部
         # 作废 —— 它们是"当前题"资源, 不带进下一题。**绝不清**的是
@@ -2542,6 +2617,127 @@ class RoundEngine:
         })]
 
     # ==================================================================
+    # Issue #60: REVEALED 互动(评分 / 主题投票)
+    # ==================================================================
+    @staticmethod
+    def _rating_token_locked(norm: str) -> Optional[int]:
+        """`#1..#5` 的**精确** token。norm 已去 #/标点并 casefold。"""
+        return int(norm) if norm in ("1", "2", "3", "4", "5") else None
+
+    @staticmethod
+    def _theme_token_locked(norm: str) -> Optional[str]:
+        """`#a..#e` 的**精确** token -> category; 非 token 返回 None。"""
+        return THEME_CODE_TO_CATEGORY.get(norm)
+
+    def _record_rating_locked(self, wid, user_name: str, score: int,
+                              now: float) -> bool:
+        """收下一条评分。窗口外返回 False(已消费, 不给动作)。"""
+        if not self._rating_open_locked(now):
+            _detail("评分丢弃[窗口外] %s: #%d", user_name, score)
+            return False
+        self._rating_ledger.record(user_key(wid, user_name), score)
+        _detail("评分收下 #%d from %s (窗口内, 可改)", score, user_name)
+        return True
+
+    def _record_theme_vote_locked(self, wid, user_name: str,
+                                  category: str, now: float) -> bool:
+        """收下一张主题票。窗口外(REVEALED 已 freeze / 非 REVEALED)丢弃。"""
+        if not self._theme_open_locked():
+            _detail("主题票丢弃[窗口外] %s: #%s", user_name, category)
+            return False
+        self._theme_ledger.record(user_key(wid, user_name), category)
+        _detail("主题票收下 #%s from %s (可改票)", category, user_name)
+        return True
+
+    def _rating_open_locked(self, now: float) -> bool:
+        """评分窗口: 只在 REVEALED 的前 `rating_window_seconds` 开。"""
+        if self.phase != Phase.REVEALED or self._revealed_at is None:
+            return False
+        return (now - self._revealed_at) < max(
+            0.0, float(getattr(self.cfg, "rating_window_seconds", 30.0)))
+
+    def _theme_open_locked(self) -> bool:
+        """主题投票窗口: 整个 REVEALED 开; freeze 之后关。"""
+        return (self.phase == Phase.REVEALED
+                and not self._closeout_sent)
+
+    def _freeze_interaction_locked(self, now: float) -> list:
+        """60s 到点: freeze 评分与主题票, 恰好一次。
+
+        有票 -> 最高票 category(`next_category`), 平票按固定五类顺序
+        取先(确定性 tie-break, 见 `ThemeVoteLedger.select_category`)。
+        无票 -> `""`(无主题偏好, 下一题沿用通用取题路径)。
+
+        freeze 后 ledger **立即清空**(下一轮重新收集), 但选出的
+        `next_category` 留在引擎上, 由 `_enter_setting_locked` 消费 ——
+        清账绝不能丢掉正在生成的 requested category(§7)。
+        同时发出一次 ROUND_CLOSEOUT 动作给 Director 落盘(§6)。
+        """
+        if self._closeout_sent:
+            return []
+        self._closeout_sent = True
+        rating = self._rating_ledger.stats()
+        theme_totals = self._theme_ledger.totals()
+        votes = self._theme_ledger.count()
+        tie = self._theme_ledger.is_tie()
+        self._next_category = self._theme_ledger.select_category()
+        self._rating_ledger.clear()
+        self._theme_ledger.clear()
+        if self._next_category:
+            log.info("REVEALED 互动 freeze: 下一题主题=%s (票数 %d, tie=%s)",
+                     self._next_category, votes, tie)
+        else:
+            log.info("REVEALED 互动 freeze: 无主题票, 下一题走通用取题")
+        return [EngineAction(ActionKind.ROUND_CLOSEOUT, {
+            "session_round": self._puzzle_index,
+            "rating_count": rating["count"],
+            "rating_sum": rating["sum"],
+            "rating_average": rating["average"],
+            "rating_distribution": rating["distribution"],
+            "theme_vote_totals": theme_totals,
+            "theme_vote_count": votes,
+            "selected_category": self._next_category,
+            "tie": tie,
+            "no_vote": votes == 0,
+            "revealed_at": self._revealed_at,
+            "frozen_at": now,
+        })]
+
+    def _reveal_interaction_snapshot_locked(self, now: float) -> dict:
+        """Snapshot 的公开互动状态(前端只认它, 不自行推窗口)。"""
+        rating_open = self._rating_open_locked(now)
+        vote_open = self._theme_open_locked()
+        opts = []
+        totals = self._theme_ledger.totals() if vote_open or \
+            self.phase == Phase.REVEALED else {c: 0
+                                               for c in THEME_CATEGORY_ORDER}
+        for code, cat in zip(THEME_VOTE_CODES, THEME_CATEGORY_ORDER):
+            opts.append({
+                "code": code,
+                "category": cat,
+                "label": THEME_CATEGORY_LABELS[cat],
+                "votes": totals.get(cat, 0),
+            })
+        rating = (self._rating_ledger.stats()
+                  if self.phase == Phase.REVEALED
+                  else {"distribution": {"1": 0, "2": 0, "3": 0, "4": 0,
+                                         "5": 0},
+                        "count": 0, "sum": 0, "average": 0.0})
+        return {
+            "rating_open": rating_open,
+            "rating_distribution": rating["distribution"],
+            "rating_count": rating["count"],
+            "theme_vote_open": vote_open,
+            "theme_options": opts,
+            "selected_category": (
+                self._next_category
+                if self._closeout_sent
+                and self.phase in (Phase.REVEALED, Phase.SETTING)
+                else ""),
+            "frozen": self._closeout_sent,
+        }
+
+    # ==================================================================
     # 内部辅助
     # ==================================================================
     def _append_qa_locked(self, rec: QARec) -> None:
@@ -2819,6 +3015,9 @@ class RoundEngine:
                 # 点赞推进的显式呈现事件(§16): 服务端组稿 + seq 去重,
                 # 前端不从 questions_earned 的 delta 推断"AI 被召唤"。
                 like_progress_notice=self._like_notice,
+                # ---- Issue #60 §5: REVEALED 互动权威状态 ----
+                # 前端只认这份快照判断窗口开放, 不从 next_puzzle_ms 自推。
+                reveal_interaction=self._reveal_interaction_snapshot_locked(now),
                 stat_questions=self._questions_total,
                 stat_answered=self._answered_total,
                 stat_solved=self._solved_total,
