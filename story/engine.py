@@ -2003,6 +2003,14 @@ class RoundEngine:
         return self._real_elapsed_locked(now) + max(
             0.0, self._round_progress_bonus_seconds)
 
+    def _auto_reveal_remaining_locked(self, now: float) -> float:
+        """自动揭晓还需多久：有效时间轴与真实 QA 底线须同时满足。"""
+        return max(0.0,
+                   (self.cfg.max_hints + 1) * self.cfg.hint_seconds
+                   - self._effective_elapsed_locked(now),
+                   self.cfg.puzzle_min_qa_seconds
+                   - self._real_elapsed_locked(now))
+
     def _tick_qa_locked(self, now: float) -> list[EngineAction]:
         acts: list[EngineAction] = []
 
@@ -2127,7 +2135,7 @@ class RoundEngine:
             # 一波点赞爆点"不能把题直接烧掉。真人真实通关(合同覆盖 /
             # legacy SOLVE)不经过这里, 不受此限。守在下面的分支里每拍
             # 重新判, 真实时间一到自然揭晓。
-            if real_elapsed < self.cfg.puzzle_min_qa_seconds:
+            if self._auto_reveal_remaining_locked(now) > 0:
                 _detail("effective 已过揭晓阈值但真实 QA 不足 %.0fs "
                         "(real=%.0fs), 揭晓被最低保护压住",
                         self.cfg.puzzle_min_qa_seconds, real_elapsed)
@@ -2311,18 +2319,18 @@ class RoundEngine:
 
         ## 谁算贡献
 
-        `completion_contribution_fact_ids` 非空 = 这条真人问答在**实际
-        提交的那一刻**首次为房间补进了一块通关拼图(见 R1)。
+        `completion_contribution_fact_ids` 非空 = 真人 QA 或 AI 玩家公开 ask
+        在**实际提交的那一刻**首次为房间补进了一块通关拼图(见 R1)。
 
         因此下面这些**一律不算**, 哪怕它们和谜底有关:
           - support / exclusion fact:   建立了也不推进通关;
           - `touched_fact_ids`:          只是问过这个方向;
           - 重复确认(别人早说过了):       贡献是空的;
-          - hint / nudge:                `kind != "qa"`;
+          - hint / nudge:                `kind` 不属于 `qa` / `ai_player`;
           - 「未判定」:                   `status != "ok"`;
           - 「不重要」:                   它没确认/否定任何东西(Issue #65)。
-        将来 Step 14 的 Detective 也**绝不能**算进来 —— 这一层是
-        "真人共同解谜"的表彰, 系统自己推出来的不算。
+        AI 的公开贡献不计入真人 leaderboard。将来 Step 14 的 Detective
+        也**绝不能**算进来：系统内部自己推出来的不算公开问答贡献。
 
         ## 排序: 按真实提交顺序, 不按 archive 顺序
 
@@ -3015,10 +3023,10 @@ class RoundEngine:
             # `_puzzle_started` 会是 0.0, 真值判断会把它当成"没有开始"。
             if self.phase == Phase.QA and self._puzzle_started is not None:
                 n = self.cfg.hint_seconds
-                real = self._real_elapsed_locked(now)
                 eff = self._effective_elapsed_locked(now)
                 time_slot = int(eff // n)
                 slot = max(time_slot, self._hints_given)
+                reveal_remaining = self._auto_reveal_remaining_locked(now)
                 if self._hints_given < self.cfg.max_hints:
                     next_level = self._hints_given + 1
                     remaining = max(0.0, next_level * n - eff)
@@ -3029,13 +3037,15 @@ class RoundEngine:
                                     self._hint_cooldown_until - now,
                                     self._hint_retry_at - now,
                                     0.0)
-                    ev_kind = "hint"
-                    ev_label = f"距第 {next_level} 条自动提示"
+                    if reveal_remaining <= remaining:
+                        remaining = reveal_remaining
+                        ev_kind = "reveal"
+                        ev_label = "距揭晓"
+                    else:
+                        ev_kind = "hint"
+                        ev_label = f"距第 {next_level} 条自动提示"
                 else:
-                    remaining = max(0.0, (self.cfg.max_hints + 1) * n - eff)
-                    # §9: 自动揭晓 = effective 过阈值 **且** 真实过最低保护。
-                    remaining = max(remaining,
-                                    max(0.0, self.cfg.puzzle_min_qa_seconds - real))
+                    remaining = reveal_remaining
                     ev_kind = "reveal"
                     ev_label = "距揭晓"
                 ev_ms = max(0, int(remaining * 1000))
