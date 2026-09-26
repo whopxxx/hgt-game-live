@@ -96,6 +96,7 @@ from typing import Any, Optional
 
 from .puzzle import (DOMAINS, EMOTION_MODES, MECHANISM_FAMILIES, RELATIONS,
                      SOLUTION_SHAPES, TIME_SHAPES, PuzzleSpec)
+from .haiguitang_protocol import public_puzzle_meta
 from .quality import (QUALITY_POLICY_VERSION, Quotas, cross_puzzle_gate,
                       cross_puzzle_gate_split,
                       too_similar, validate_blueprint, validate_reveal_adherence,
@@ -1025,6 +1026,11 @@ class PuzzlePool:
             return False, (f"quality policy 不兼容"
                            f"(spec={spec_policy!r}, "
                            f"current={QUALITY_POLICY_VERSION!r})")
+        meta = public_puzzle_meta(spec)
+        if not all(meta.get(key) for key in (
+                "difficulty", "difficulty_label", "primary_category",
+                "primary_category_label", "categories", "category_labels")):
+            return False, "缺少完整的直播展示元数据"
 
         # ---- curated 准入政策门(H3-A) ----
         #
