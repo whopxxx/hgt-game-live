@@ -427,9 +427,8 @@ class RoundEngine:
             round 进度加成         +N * like_progress_seconds_per_bucket
 
         只有 SETTING / QA 消费 pulse:
-            SETTING  记入"正在准备的这一题", 进 QA 后生效; 本身不加速
-                     出题、不重复提交 RIDDLE、不派发任何 AI 动作。
-            QA       主战场: 一次性入账 + 一个聚合公告。
+            SETTING  只记 AI 玩家机会，不提前消耗新题的 QA 时间。
+            QA       AI 玩家机会与时间加成一次性入账。
         其它 phase(REVEALING / REVEALED / IDLE / STOPPED):
             只推进高水位与遥测 —— **不入账当前题、不带入下一题、
             不发公告**。REVEALED 的 60 秒是 #45 评分+主题投票的窗口,
@@ -456,9 +455,10 @@ class RoundEngine:
                 return []
             # ---- 一次性入账(当前题) ----
             self._ai_player_ledger.earn(pulses)
-            self._round_progress_bonus_seconds += (
-                pulses * max(0.0, float(
-                    self.cfg.like_progress_seconds_per_bucket)))
+            if self.phase == Phase.QA:
+                self._round_progress_bonus_seconds += (
+                    pulses * max(0.0, float(
+                        self.cfg.like_progress_seconds_per_bucket)))
             self._push_like_notice_locked(pulses)
             return [EngineAction(ActionKind.BROADCAST, {
                 "like_progress_pulses": pulses,
@@ -487,7 +487,7 @@ class RoundEngine:
         """
         self._like_notice_seq += 1
         if self.phase == Phase.SETTING:
-            text = "❤️ 点赞助攻已累积，新题开始后生效"
+            text = "❤️ 点赞助攻已累积，AI玩家将在新题开始后加入"
         elif pulses > 1:
             text = f"❤️ 点赞助攻 ×{pulses}！AI玩家获得更多行动机会，游戏加速"
         else:
@@ -3017,13 +3017,20 @@ class RoundEngine:
                 n = self.cfg.hint_seconds
                 real = self._real_elapsed_locked(now)
                 eff = self._effective_elapsed_locked(now)
-                slot = int(eff // n)
-                if slot < self.cfg.max_hints:
-                    # 距下一格提示: bonus 在两条点赞事件之间是常数,
-                    # 所以"effective 还差多少"就等于"真实还差多少"。
-                    remaining = max(0.0, (slot + 1) * n - eff)
+                time_slot = int(eff // n)
+                slot = max(time_slot, self._hints_given)
+                if self._hints_given < self.cfg.max_hints:
+                    next_level = self._hints_given + 1
+                    remaining = max(0.0, next_level * n - eff)
+                    per = int(getattr(self.cfg, "hint_questions_per_level", 20) or 0)
+                    if per > 0 and sum(self._verdict_counts.values()) >= next_level * per:
+                        remaining = 0.0
+                    remaining = max(remaining,
+                                    self._hint_cooldown_until - now,
+                                    self._hint_retry_at - now,
+                                    0.0)
                     ev_kind = "hint"
-                    ev_label = f"距第 {slot + 1} 条提示"
+                    ev_label = f"距第 {next_level} 条自动提示"
                 else:
                     remaining = max(0.0, (self.cfg.max_hints + 1) * n - eff)
                     # §9: 自动揭晓 = effective 过阈值 **且** 真实过最低保护。

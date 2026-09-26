@@ -3580,6 +3580,12 @@ def test_h1_b_time_after_question_does_not_repeat():
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("20 问 -> Hint 1", len(got) == 1, got)
     eng.submit_hint("提示一")
+    early = eng.snapshot()
+    check("提前 Hint1 后倒计时指向 Hint2",
+          early.hint_count == 1 and early.next_event_kind == "hint"
+          and "第 2 条" in early.next_event_label
+          and early.timeline_slot >= early.hint_count,
+          (early.next_event_label, early.timeline_slot))
     # 空转到 5 分钟时间格
     clk.advance(301)
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
@@ -3605,12 +3611,21 @@ def test_h1_c_cooldown_prevents_back_to_back():
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("**40 问但冷却未过 -> 不发 Hint 2**", not got,
           [a.payload for a in got])
+    waiting = eng.snapshot()
+    check("Hint2 冷却倒计时非负且指向第二条",
+          waiting.next_event_ms >= 0
+          and "第 2 条" in waiting.next_event_label)
     # 冷却过了
     clk.advance(50)
     got = [a for a in eng.tick() if a.kind == ActionKind.HINT]
     check("**45s 后 -> Hint 2**", len(got) == 1, got)
     check("level=2", got and got[0].payload["level"] == 2,
           got[0].payload if got else None)
+    eng.submit_hint("提示二")
+    two = eng.snapshot()
+    check("提前 Hint2 后倒计时指向 Hint3",
+          two.hint_count == 2 and "第 3 条" in two.next_event_label
+          and two.timeline_slot >= 2)
 
 
 def test_h1_d_only_successful_human_verdicts_count():
@@ -3680,6 +3695,10 @@ def test_h1_e_question_count_never_reveals():
     check("**仍在 QA(没被问答数刷到揭晓)**",
           eng.phase == Phase.QA, (eng.phase, clk.t))
     check("提示给满 3 条就停", eng._hints_given == 3, eng._hints_given)
+    full = eng.snapshot()
+    check("三条提示后下一事件是揭晓",
+          full.next_event_kind == "reveal"
+          and full.timeline_slot >= full.hint_count)
     # 时间轴走完才揭晓
     clk.advance(N * 4)
     eng.tick()

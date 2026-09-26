@@ -14,8 +14,7 @@ Issue #43: 统一点赞推进机制 —— 专用回归套件。
   §16/§17 快照: 显式点赞公告事件 + 同源时间轴
   §28 REVEALED 60 秒不被点赞缩短
 
-产品语义一句话: 每新增 100 赞 = 1 个 pulse = 当前题 AI 机会 +1 **且**
-当前题有效时间 +30s(内部调参值, UI 永不显示秒数)。
+每新增 100 赞 = 1 pulse。SETTING 只给 AI 机会；QA 另给时间加成。
 """
 
 from __future__ import annotations
@@ -196,7 +195,8 @@ def test_round_opportunity_reset_on_new_round():
 def test_setting_pulses_credit_current_round():
     """§5/§22: SETTING 的 pulse 记入正在准备的题; SETTING 本身不发 AI。"""
     print("\n[LP-5] SETTING 阶段的 pulse 不浪费")
-    eng, clk = RoundEngine(mkcfg()), FakeClock()
+    clk = FakeClock()
+    eng = RoundEngine(mkcfg(), clock=clk)
     eng.start()
     assert eng.phase == Phase.SETTING
     like(eng, 0)                      # 基线 0
@@ -206,8 +206,11 @@ def test_setting_pulses_credit_current_round():
     check("SETTING 公告中性、round 指向正在准备的题",
           notice and notice["phase"] == "setting"
           and notice["round_index"] == 1
-          and "新题开始后生效" in notice["text"],
+          and "AI玩家将在新题开始后加入" in notice["text"]
+          and "游戏加速" not in notice["text"],
           notice)
+    check("SETTING 不提前消耗时间",
+          eng._round_progress_bonus_seconds == 0)
     check("SETTING 不谎称 AI 正在行动",
           notice and "正在" not in notice["text"], notice and notice["text"])
     acts = eng.tick()
@@ -216,6 +219,9 @@ def test_setting_pulses_credit_current_round():
     eng.submit_riddle("谜面。为什么？", "谜底", now=clk.t)
     check("进 QA 后 SETTING 期间的额度可用",
           eng._ai_player_ledger.available == 2, led_snapshot(eng))
+    check("新题 Hint1 倒计时完整",
+          299000 <= eng.snapshot().next_event_ms <= 300000,
+          eng.snapshot().next_event_ms)
 
 
 def test_revealing_revealed_pulses_not_credited():
