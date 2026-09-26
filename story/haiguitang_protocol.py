@@ -433,18 +433,22 @@ def public_puzzle_meta(spec) -> dict:
         v2                 直接使用 spec 的五类字段(observed);
         haiguitang-v1      通过 `LEGACY_V1_DISPLAY_CATEGORY` 收敛成五类
                            (原始 spec **不被修改**, 兼容层只读);
-        legacy("")/无分类  返回 **空 dict** —— 前端安静隐藏,
-                           绝不显示"未知 · 未分类";
-        非法/未知值         fail safe: 那一条被丢弃, **不给前端编一个
-                           分类**(与 validator 的 fail closed 是两码事:
-                           这里是展示层, 宁可少显示也不编数据)。
+        legacy("")/unknown 整体返回 **空 dict** —— 难度也不下发。
+                           前端安静隐藏, 绝不显示"未知 · 未分类"。
 
-    硬边界:
+    硬边界(review 5324564684 Blocker 3):
 
-        - `primary` 永远排在 `categories` 第一位;
-        - 映射后去重(保持首次出现顺序);
-        - `requested_category` 是生成意图, **绝不出现**在输出里 ——
-          它不是 observed 分类事实, 不许下发直播前端;
+        - 分类**整体自洽**才下发: `primary_category` 非法/为空、或缺席
+          于 categories、或没有任何合法 category 时, **分类四把键整体
+          不出现** —— 绝不把某个 secondary "晋升"成新的 primary。
+          从坏数据猜分类 = 给前端编一个事实, 那是 fail closed 的展示层
+          对偶面: 宁可少显示, 不可编数据。
+        - 难度**只在协议版本受支持时**随分类规则一起判定(legacy("")/
+          unknown 一律不下发, 与"legacy 无分类 -> 空 metadata"同一条
+          冻结合同); v1/v2 下难度合法就给, 非法就不给。
+        - `primary` 永远排在 `categories` 第一位; 映射后去重
+          (保持首次出现顺序)。
+        - `requested_category` 是生成意图, **绝不出现**在输出里。
         - 输出只有上面六把键, 不夹带任何 hidden truth
           (answer / facts / completion ids 全都不在这里)。
     """
@@ -465,21 +469,33 @@ def public_puzzle_meta(spec) -> dict:
             return LEGACY_V1_DISPLAY_CATEGORY.get(cat, "")
         return ""                      # legacy("")/unknown -> 不展示
 
-    # ---- categories: 按该版本映射/过滤, primary 恒排第一, 去重 ----
-    cats: list = []
-    for c in ([primary] if primary else []) + [str(x) for x in raw_cats]:
-        d = _display(c)
-        if d and d not in cats:
-            cats.append(d)
-
-    # ---- 组装(缺什么就不给什么; 全缺 -> 空 dict) ----
     out: dict = {}
+    if version not in (PROTOCOL_V1, PROTOCOL_V2):
+        # legacy("") / unknown: 整体空(难度也不下发) —— 前端安静隐藏。
+        return out
+
+    # ---- 难度: 版本受支持且值合法才下发 ----
     if diff in DIFFICULTY_LABELS:
         out["difficulty"] = diff
         out["difficulty_label"] = DIFFICULTY_LABELS[diff]
-    if cats:
-        out["primary_category"] = cats[0]
-        out["primary_category_label"] = CATEGORY_LABELS[cats[0]]
+
+    # ---- 分类: **整体自洽**才下发 ----
+    #
+    # primary 必须非空、能映射到五类、并且真的是 spec 里声明的
+    # categories 之一 —— 三者缺一, 说明这道题的 observed 分类数据
+    # 不自洽, 此时**全部**分类键都不出现, 绝不退而求其次拿某个
+    # secondary 顶上(那等于代码替审核员重选了一次 primary)。
+    mapped_primary = _display(primary)
+    declared = [_display(c) for c in raw_cats]
+    declared = [d for d in declared if d]
+    if mapped_primary and mapped_primary in declared:
+        # primary 恒排第一, 其余按 spec 声明顺序去重接在后面。
+        cats: list = [mapped_primary]
+        for d in declared:
+            if d not in cats:
+                cats.append(d)
+        out["primary_category"] = mapped_primary
+        out["primary_category_label"] = CATEGORY_LABELS[mapped_primary]
         out["categories"] = cats
         out["category_labels"] = [CATEGORY_LABELS[c] for c in cats]
     return out

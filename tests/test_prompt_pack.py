@@ -61,9 +61,10 @@ def check(name, cond, extra=""):
 # ======================================================================
 def test_all_stages_load():
     print("\n[P1] 六个 stage 都能从盘上加载")
-    check("stage 登记表精确 6 个",
+    check("stage 登记表精确 7 个",
           sorted(STAGES) == ["audit", "audit_safety", "audit_truthfulness",
-                             "contract", "surface", "truth"], sorted(STAGES))
+                             "audit_v1", "contract", "surface", "truth"],
+          sorted(STAGES))
     for stage in STAGES:
         text = load_prompt(stage)
         check(f"{stage} 可加载且非空", bool(text.strip()), stage)
@@ -76,6 +77,29 @@ def test_all_stages_load():
     check("contract / audit stage 指向 v2 文件",
           STAGES["contract"] == ("contract-v2.md", "contract-v2")
           and STAGES["audit"] == ("audit-v2.md", "audit-v2"), STAGES)
+    check("audit_v1 stage 指向历史 audit-v1.md(冻结保留)",
+          STAGES["audit_v1"] == ("audit-v1.md", "audit-v1"), STAGES)
+    # ---- review 5324564684 Blocker 1: v2 协议文字版必须存在 ----
+    # 代码切 v2 之后, "haiguitang/protocol/" 下必须有版本化的 v2.md
+    # 作为文字版单一事实来源; v1.md 冻结保留(不被覆盖)。
+    _proto_root = PROMPT_ROOT.parent.parent / "protocol"
+    v2doc = _proto_root / "v2.md"
+    v1doc = _proto_root / "v1.md"
+    check("haiguitang/protocol/v2.md 存在且非空",
+          v2doc.exists() and bool(v2doc.read_text(encoding="utf-8").strip()),
+          str(v2doc))
+    check("haiguitang/protocol/v1.md 仍存在(v1 冻结保留)",
+          v1doc.exists() and bool(v1doc.read_text(encoding="utf-8").strip()),
+          str(v1doc))
+    _v2text = v2doc.read_text(encoding="utf-8")
+    check("v2.md 声明五个大类",
+          all(c in _v2text for c in V2_CATEGORIES), "v2.md 类目缺失")
+    check("v2.md 声明版本常量",
+          "haiguitang-v2" in _v2text and "haiguitang-v1" in _v2text,
+          "v2.md 版本声明缺失")
+    check("v2.md 定义 legacy 展示映射与 public_puzzle_meta 合同",
+          "LEGACY_V1_DISPLAY_CATEGORY" in _v2text
+          and "public_puzzle_meta" in _v2text, "v2.md 展示合同缺失")
     # 静态性: 六份文件都不含 {placeholder}(§6)
     for stage in STAGES:
         check(f"{stage} 无模板变量(全静态)", "{" not in load_prompt(stage))
@@ -748,12 +772,96 @@ def test_single_source_of_prompts():
     # legacy CHECK_SYSTEM 仍在(classic/curated 用) —— 但 v1 链走 loader
     check("legacy CHECK_SYSTEM 保留(classic/curated 用)",
           hasattr(L, "CHECK_SYSTEM"))
-    # _review_spec 的 v1 分支真的用了 load_prompt("audit"):
-    # 用一份 v1 spec + FakeClient 走一遍, system 必须等于文件文本。
-    spec, _reason, cli, _w = _run_pipeline(_v1_contract_payload(2))
-    check("v1 题的审稿 system == audit-v1.md",
-          cli.calls[3]["system"] == load_prompt("audit"),
-          cli.calls[3]["system"][:40])
+    # ---- review 5324564684 Blocker 2 行为测试 ----
+    # 不能只测 check_tool 的 schema —— 必须**真实走一遍 shared
+    # Reviewer**, 验证同一次调用发出去的 system prompt 与 tool schema
+    # 是**同一个协议版本**。
+    _test_reviewer_prompt_schema_paired_versions()
+
+
+def _audit_categories_of(tool):
+    """从一份审稿 tool schema 里取 primary_category 的 enum。"""
+    return tool["input_schema"]["properties"]["primary_category"]["enum"]
+
+
+def _test_reviewer_prompt_schema_paired_versions():
+    """**行为级**: Reviewer 发出的 system prompt 与 tool schema 同版本。
+
+    review 5324564684 Blocker 2: 历史 v1 spec 进 shared Reviewer 时,
+    曾经出现 "system = audit-v2(五类文字) + schema = v1 11 类" 的
+    打架 —— 模型按五类填, 代码按 11 类拒。这里用真实 `_review_spec`
+    路径(带 FakeClient)逐版本验证配对:
+
+        v1 spec -> system == audit-v1.md 且 schema enum == 11 类
+        v2 spec -> system == audit-v2.md 且 schema enum == 5 类
+    """
+    # ---- v1 spec: 真 keyword2 spec(第 4 次调用 = review)是 v1 路径? ----
+    # keyword2 链产的是 v2 spec, 所以先拿它验证 v2 配对;
+    # 再把同一个 payload 喂给一条**v1 spec** 的 review 调用。
+    spec_v2, _r2, cli_v2, _w2 = _run_pipeline(
+        _v1_contract_payload(2, primary_category="suspense",
+                             categories=["suspense", "brainstorm"]),
+        review_result=LLMResult(tool_input=_review_payload(
+            "pass", primary_category="suspense",
+            categories=["suspense", "brainstorm"])))
+    check("(前置)keyword2 产 v2 spec", spec_v2.protocol_version == V2,
+          spec_v2.protocol_version)
+    call_v2 = cli_v2.calls[3]
+    check("v2 Reviewer: system == audit-v2.md(逐字)",
+          call_v2["system"] == load_prompt("audit"),
+          call_v2["system"][:40])
+    check("v2 Reviewer: system 含五类语义锚(是 v2 文件的证据)",
+          "五大类" in call_v2["system"]
+          and "emotion     情感" in call_v2["system"],
+          call_v2["system"][:120])
+    check("v2 Reviewer: schema enum == v2 五类(同一次调用的 tool)",
+          _audit_categories_of(call_v2["tool"]) == list(V2_CATEGORIES),
+          _audit_categories_of(call_v2["tool"]))
+
+    # ---- v1 spec: 走**真实** _review_spec(不是 _v1_check_tool 直调) ----
+    from tests.test_haiguitang_protocol import _v1_spec as _proto_v1_spec
+    from story.haiguitang_protocol import V1_CATEGORIES
+    spec_v1 = _proto_v1_spec(2, primary="crime", categories=("crime",),
+                             requested="")
+    # 审稿回传必须与它**在审的那道题**一致: 谜面/谜底原样带回,
+    # fair_clue quote 逐字出自 spec 的谜面(代码会验)。
+    review_v1 = _review_payload("pass", puzzle=spec_v1.puzzle,
+                                answer=spec_v1.answer,
+                                core_answer=spec_v1.core_answer,
+                                completion_fact_ids=list(
+                                    spec_v1.completion_fact_ids),
+                                fair_clues=[
+                                    {"quote": spec_v1.fair_clues[0].quote,
+                                     "supports_atoms":
+                                         spec_v1.fair_clues[0].supports_atoms},
+                                ],
+                                primary_category="crime",
+                                categories=["crime"])
+    cli_v1 = FakeClient([LLMResult(tool_input=review_v1)])
+    w_v1 = PuzzleWriter(client=cli_v1, runtime_cfg=Config(
+        sim_path="x", no_llm=True))
+    reviewed, why, rewrite, _tech = w_v1._review_spec(spec_v1)
+    check("v1 Reviewer: 成功回稿", reviewed is not None, why)
+    check("v1 Reviewer: protocol_version 保持 v1",
+          reviewed is not None and reviewed.protocol_version == V1,
+          getattr(reviewed, "protocol_version", None))
+    call_v1 = cli_v1.calls[0]
+    check("v1 Reviewer: system == audit-v1.md(逐字, 不是 audit-v2)",
+          call_v1["system"] == load_prompt("audit_v1"),
+          call_v1["system"][:40])
+    check("v1 Reviewer: system 是 v1 11 类文字(不含'五大类'一节)",
+          "五大类" not in call_v1["system"],
+          call_v1["system"][:120])
+    check("v1 Reviewer: system 不含五类分类表行(v2 独有)",
+          "emotion     情感" not in call_v1["system"],
+          call_v1["system"][:120])
+    check("v1 Reviewer: schema enum == 历史 11 类(同一次调用的 tool)",
+          _audit_categories_of(call_v1["tool"]) == list(V1_CATEGORIES),
+          _audit_categories_of(call_v1["tool"]))
+    check("v1 Reviewer: prompt 版本与 schema 版本一致(不异版本配对)",
+          (call_v1["system"] == load_prompt("audit_v1"))
+          == (_audit_categories_of(call_v1["tool"]) == list(V1_CATEGORIES)),
+          "prompt/schema 版本错位")
 
 
 # ======================================================================

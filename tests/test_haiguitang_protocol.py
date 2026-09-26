@@ -866,22 +866,26 @@ def test_public_puzzle_meta():
     check("v1 多类目: 映射后去重且 primary 第一",
           mm["categories"] == ["suspense", "brainstorm", "emotion"], mm)
 
-    # ---- legacy / 缺分类: 空 metadata(前端安静隐藏) ----
+    # ---- legacy / unknown: 整体空 metadata(前端安静隐藏) ----
+    # (review 5324564684 Blocker 3: legacy/unknown 连难度也不下发 ——
+    #  半套元数据等于暗示"这题有合法分类数据"。)
     check("legacy 无分类 -> {}",
           public_puzzle_meta(_legacy_spec(2)) == {},
           public_puzzle_meta(_legacy_spec(2)))
-    check("legacy 只带 difficulty -> 只有难度两把键",
-          list(public_puzzle_meta(
-              _patch_spec(_legacy_spec(2), difficulty="hard")))
-          == ["difficulty", "difficulty_label"],
-          public_puzzle_meta(_patch_spec(_legacy_spec(2), difficulty="hard")))
-    check("v2 只带分类 -> 无难度键",
+    check("legacy + difficulty=medium -> 仍 {}(难度也不下发)",
+          public_puzzle_meta(
+              _patch_spec(_legacy_spec(2), difficulty="medium")) == {},
+          public_puzzle_meta(
+              _patch_spec(_legacy_spec(2), difficulty="medium")))
+    check("v2 只带分类 -> 无难度键(难度缺就不编)",
           "difficulty" not in public_puzzle_meta(
               _patch_spec(_v1_spec(2, protocol=V2, difficulty="",
                                    primary="horror", categories=("horror",),
                                    requested=""))),
           "缺难度时不得编造")
-    # ---- 非法数据 fail safe: 不给前端编分类(合法字段照常给) ----
+    # ---- 非法数据 fail safe: 绝不从坏数据猜分类 ----
+    # primary 非法/为空 -> 分类四把键整体不出现, **绝不**把 secondary
+    # "晋升"成新的 primary(review Blocker 3)。
     bad = _patch_spec(_v1_spec(2, protocol=V2, primary="mystery",
                                categories=("mystery",), requested=""))
     mb = public_puzzle_meta(bad)
@@ -889,6 +893,33 @@ def test_public_puzzle_meta():
           "primary_category" not in mb and "categories" not in mb, mb)
     check("非法类目不影响合法的 difficulty",
           mb.get("difficulty_label") == "中等", mb)
+    # primary 缺席(空)但 secondary 合法: 不得晋升 secondary
+    no_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="",
+                                      categories=("suspense", "brainstorm"),
+                                      requested=""))
+    mn = public_puzzle_meta(no_primary)
+    check("primary 为空 -> 无分类键(不晋升 secondary)",
+          not ({"primary_category", "primary_category_label",
+                "categories", "category_labels"} & set(mn)), mn)
+    check("primary 为空时 difficulty 仍下发",
+          mn.get("difficulty_label") == "中等", mn)
+    # primary 非法但 secondary 合法: 同样不晋升
+    bad_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="crime",
+                                       categories=("suspense",),
+                                       requested=""))
+    mbp = public_puzzle_meta(bad_primary)
+    check("primary 非法(v2 无此值)且 categories 不含 primary 映射 -> "
+          "无分类键(不晋升)",
+          not ({"primary_category", "primary_category_label"}
+               & set(mbp)), mbp)
+    # primary 合法但缺席于 categories 声明: 不自洽 -> 整体不给
+    orphan_primary = _patch_spec(_v1_spec(2, protocol=V2, primary="horror",
+                                          categories=("suspense",),
+                                          requested=""))
+    mo = public_puzzle_meta(orphan_primary)
+    check("primary 不在 categories 里 -> 无分类键(不自洽不猜)",
+          not ({"primary_category", "primary_category_label"}
+               & set(mo)), mo)
     unknown = _patch_spec(_legacy_spec(2), protocol_version="banana")
     check("unknown protocol -> 空 metadata",
           public_puzzle_meta(unknown) == {}, public_puzzle_meta(unknown))

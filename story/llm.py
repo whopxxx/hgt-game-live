@@ -6172,7 +6172,15 @@ class PuzzleWriter:
 
         res = self.client.messages(
             # ---- Issue #50 §51: v1 时代结构合同 -> Prompt Pack audit; 其余原样 ----
-            load_prompt("audit") if _v1_review else CHECK_SYSTEM,
+            # ---- review 5324564684 Blocker 2: audit 文字与 schema 同版本 ----
+            # 历史 v1 题 -> audit-v1.md(11 类文字), 与它那套 11 类
+            # tool schema 配对; v2 题 -> audit-v2.md(五类文字), 与五类
+            # schema 配对。system prompt 与 check_tool(spec) 的类别
+            # 枚举**必须**由同一个 protocol_version 决定, 绝不允许
+            # "v2 五类 prompt + v1 11 类 schema"(或反过来)打架。
+            # legacy/current/curated 仍走 CHECK_SYSTEM, 逐位不变。
+            load_prompt("audit_v1" if _is_v1(spec) else "audit")
+            if _v1_review else CHECK_SYSTEM,
             user, max_tokens=max_tokens,
                                    # H4-D1 §二: schema 按题裁 —— curated 题
                                    # 只问 curated 那一套(见 `check_tool`)。

@@ -90,6 +90,11 @@ STAGES: dict = {
     # ---- 5 大类协议 v2: Contract / Audit 的分类文字换 v2 文件 ----
     # 历史 contract-v1.md / audit-v1.md **保留在盘上**(它们是 v1 时代
     # 的合同文本, 不能覆盖其含义), 但当前生成链已指向 v2。
+    # ---- review 5324564684 Blocker 2: prompt 与 schema 必须同版本 ----
+    # 历史 v1 题进 shared Reviewer 时, audit 文字必须回退到 audit-v1.md
+    # (11 类文字), 与它那套 11 类 tool schema 配对 —— 绝不允许
+    # "audit-v2 五类 prompt + v1 11 类 schema"打架。
+    "audit_v1": ("audit-v1.md", "audit-v1"),
     "contract": ("contract-v2.md", "contract-v2"),
     "audit": ("audit-v2.md", "audit-v2"),
     "audit_truthfulness": ("audit-truthfulness-v1.md",
