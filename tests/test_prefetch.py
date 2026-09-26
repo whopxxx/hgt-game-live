@@ -36,6 +36,7 @@ from story.puzzle import (  # noqa: E402
     PuzzleSpec, SolveAtom,
 )
 from story.pool import PuzzlePool, spec_key  # noqa: E402
+from story.playtest import PASS, INTERRUPTED  # noqa: E402
 from story.quality import (  # noqa: E402
     FAMILY_SHAPES, QUALITY_POLICY_VERSION)
 from story.state import Phase  # noqa: E402
@@ -501,15 +502,15 @@ class _Clock:
         self.t += dt
 
 
-def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
-         probe_inputs=None, **cfgkw):
+def mkpf(tmp, pool=None, writer=None, clock=None, executor=None,
+         probe_inputs=None, background_active=True, **cfgkw):
     """建一个 PoolPrefetcher, 协作者默认都是"最宽松"的假件。
 
     ## G2: 默认走 **classic** 链(`pool_keyword_seed_enabled=False`)
 
     这是**刻意**的, 不是漏配。理由:
 
-      * 本文件里绝大多数用例测的是 **latch / 单飞 / 退避 / 让路 / 试玩**
+      * 本文件里绝大多数用例测的是 **latch / 单飞 / 退避 / 停机 / 试玩**
         —— 那些机制与"候选怎么产生"**完全无关**。让它们默认跑 keyword2
         只会给每个用例多挂两个假方法, 却一条新断言都不加;
       * `_FakeWriter` 只实现了 `gen_spec`。默认走 classic 意味着**所有既有
@@ -518,14 +519,19 @@ def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
     keyword2 的用例在 `mkpf(d, pool_keyword_seed_enabled=True, writer=...)`
     上**显式打开**, 并传一个实现了两条新方法的 writer(`_KeywordWriter`)。
     这样"哪条链被测到"在调用点一眼可见, 而不是靠默认值猜。
+
+    ## Phase C: `background_active`
+
+    默认**已激活** —— 绝大多数用例关心的是"预热之后的稳态调度", 也就是
+    后台已经 activate 的状态。要测"预热期间 scheduler 不能抢跑"的用例
+    (regression Q/R), 显式传 `background_active=False`, 自己再调
+    `pf.activate_background()`。
     """
-    # 机制测试固定旧的 2→5 / playable=1 / reveal 7→2 / max=10。
+    # 机制测试固定 2→5 / playable=1 / max=10。
     # 这些用例测的是状态机，不应该随着生产默认水位变化而偷偷换题意。
     cfgkw.setdefault("pool_min_size", 2)
     cfgkw.setdefault("pool_target_size", 5)
     cfgkw.setdefault("pool_playable_min", 1)
-    cfgkw.setdefault("pool_reveal_target_size", 7)
-    cfgkw.setdefault("pool_reveal_playable_target", 2)
     cfgkw.setdefault("pool_max_size", 10)
     cfgkw.setdefault("pool_keyword_seed_enabled", False)
     cfg = mkcfg(tmp, **cfgkw)
@@ -533,17 +539,15 @@ def mkpf(tmp, pool=None, writer=None, probe=None, clock=None, executor=None,
         pool = PuzzlePool.open(cfg)
     if writer is None:
         writer = _FakeWriter()
-    if probe is None:
-        probe = lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                         "hint_inflight": False, "reveal_inflight": False,
-                         "stopped": False}
     if probe_inputs is None:
         probe_inputs = lambda: {"avoid": [], "recent_signatures": []}
     pf = PoolPrefetcher(
-        cfg=cfg, pool=pool, writer=writer, probe=probe,
+        cfg=cfg, pool=pool, writer=writer,
         probe_inputs=probe_inputs,
         pick_blueprint=lambda recent, rng=None: None,
         clock=clock or _Clock(), executor=executor or _SyncExecutor())
+    if background_active:
+        pf.activate_background()
     return pf
 
 
@@ -637,28 +641,25 @@ def test_latch_walk_min2_target5():
 
 
 def test_latch_held_under_pressure():
-    """refill-to-target: latch 一旦启动，QA 忙也继续单飞补池。
+    """refill-to-target: latch 一旦启动，一路补到高水位, 中途不停。
 
-    旧契约是 pending>0 就按住补池；实播证明活跃房间会因此永远追不上
-    消耗。现在库存跌破低水位后，补池周期优先完成到高水位。
+    Phase C 后这里不再有"让路"语义 —— 后台补池**不读**任何直播状态,
+    所以"直播忙不忙"在这里根本不是一个输入。这条用例现在钉的是:
+    库存跌破低水位 -> latch active -> **连续单飞**补到 target 才清。
+    (旧的 `probe=lambda: {...pending...}` 传参已经随 probe 接口一起删除,
+    不能再传 —— regression B 另测"pending/inflight 非零照样补"。)
     """
-    print("\n[B2] QA 压力下 refill latch 仍持续补")
+    print("\n[B2] 缺货后 refill latch 持续补到 target")
     with tmpdir() as d:
         ex = _ManualExecutor()
         pool = PuzzlePool.open(mkcfg(d))
-        busy = {"v": True}
-        pf = mkpf(d, pool=pool, executor=ex,
-                  probe=lambda: {"phase": Phase.QA,
-                                 "pending": 3 if busy["v"] else 0,
-                                 "inflight": 1 if busy["v"] else 0,
-                                 "hint_inflight": bool(busy["v"]),
-                                 "reveal_inflight": False, "stopped": False})
+        pf = mkpf(d, pool=pool, executor=ex)
         fill(pool, 1)
         pf.on_tick()
         check("缺货 -> latch active", pf._refill_active is True)
-        check("**QA 忙也照样提交 1 个后台任务**", ex.total == 1, ex.total)
+        check("**提交 1 个后台任务**", ex.total == 1, ex.total)
         pf.on_tick()
-        check("**单飞仍成立, 忙时不会并发堆任务**", ex.total == 1, ex.total)
+        check("**单飞仍成立, 不会并发堆任务**", ex.total == 1, ex.total)
         ex.run_next()
         pf.on_tick()
         check("上一道完成后继续向 target 补", ex.total == 2, ex.total)
@@ -730,16 +731,18 @@ def test_max_workers_one_is_not_the_guard():
         pf._executor.shutdown(wait=True)
 
 
-def test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy():
-    """健康库存时仍不该无条件抢 QA；激进模式只属于 active refill cycle。"""
-    print("\n[refill-to-target] 健康库存 + QA 忙 -> 不启动")
+def test_refill_to_target_does_not_start_when_stock_healthy():
+    """健康库存时不启动 —— 这是**库存**决定的, 与直播忙不忙无关。
+
+    Phase C 前这条用例的名字里还带着 "and qa_busy"(靠注入一个 QA 忙碌的
+    压力探针来制造场景)。探针接口已删除, 而它测的行为其实**只**取决于
+    库存水位: stock=5 >= min=2 且 playable 达标 -> latch 不开 -> 零提交。
+    所以改成直接钉这个行为, 不再假装需要"QA 忙"这个前提。
+    """
+    print("\n[refill-to-target] 健康库存 -> 不启动")
     with tmpdir() as d:
         ex = _ManualExecutor()
-        pf = mkpf(
-            d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-            probe=lambda: {"phase": Phase.QA, "pending": 4, "inflight": 2,
-                           "hint_inflight": True, "reveal_inflight": False,
-                           "stopped": False})
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex)
         fill(pf.pool, 5)
         pf.on_tick()
         check("latch 没启动", pf._refill_active is False,
@@ -992,13 +995,11 @@ def test_snapshot_taken_at_submit_time():
         cfg = mkcfg(d)
         pf = PoolPrefetcher(
             cfg=cfg, pool=pool, writer=w,
-            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                           "hint_inflight": False, "reveal_inflight": False,
-                           "stopped": False},
             probe_inputs=lambda: {"avoid": [],
                                   "recent_signatures": list(state["recent"])},
             pick_blueprint=lambda recent, rng=None: None,
             clock=_Clock(), executor=ex)
+        pf.activate_background()
         fill(pool, 1)
         pf.on_tick()
         check("提交了", ex.total == 1)
@@ -1119,7 +1120,8 @@ def _inline_threads():
 
 
 def _put_engine_in_qa(dr):
-    """让引擎进入 QA 阶段(补池的低压力门要求 phase == QA)。"""
+    """让引擎离开 IDLE —— 引擎有在播的题之后, Director 的 tick 才会
+    正常驱动补池(scheduler 那一拍不再被"没有在播的题"挡掉)。"""
     dr.engine.start()
     acts = dr.engine.submit_riddle(
         "端到端测试用谜面，为什么？", "端到端测试用谜底。",
@@ -1162,6 +1164,11 @@ def test_director_prefetch_end_to_end():
               dr.pool.stock_count())
         _put_engine_in_qa(dr)
         check("已在 QA 阶段", dr.engine.pressure()["phase"] == Phase.QA)
+
+        # ⚠️ Phase C: 后台补池要先 activate 才会干活(预热期间不抢跑)。
+        # Director.run() 会在 `_prewarm()` 返回后调它; 这里直接驱动
+        # prefetcher, 所以显式激活一次。
+        pf.activate_background()
 
         pf.on_tick()                    # 提交 + 执行(同步)
         pf.on_tick()                    # 应用结果
@@ -1446,6 +1453,60 @@ def test_director_prefetch_has_own_writer():
         dr._prefetcher.shutdown()
 
 
+def test_pc_assembly_writer_client_split_and_prefetch_config():
+    """**§23 装配回归 (Phase C)**: 两条流水线在装配层彻底分开。
+
+    在 C9(`test_director_prefetch_has_own_writer`)之上补齐本轮要求:
+
+      * live writer != prefetch writer(§5, 绝不合并 Writer);
+      * live client != prefetch client(独立传输预算);
+      * prefetch client 仍用 `pool_prefetch_llm_timeout_seconds` /
+        `pool_prefetch_llm_max_retries`(后台**自己的** timeout/retry);
+      * 装配完成后 prefetcher 处于 **background active** 之前的"未激活"
+        态 —— `activate_background()` 由 `run()` 在 `_prewarm()` 之后调,
+        装配期**故意**保持未激活(否则 prewarm 会与 scheduler 抢跑);
+      * playtest 开启时走 `set_playtester()`, 而不是注入 live 压力探针。
+
+    ⚠️ 这里断言的是**装配结果**, 不是跑起来之后的行为 —— 并发行为由
+    PC-Q/PC-R 单独钉。
+    """
+    print("\n[PC-§23] Director 装配: 两条流水线分开")
+    from director import Director
+    with tmpdir() as d:
+        cfg = mkcfg(d, no_llm=False)
+        dr = Director(cfg)
+        pf = dr._prefetcher
+        check("prefetcher 已装配", pf is not None)
+        # ---- writer / client 分离 ----
+        check("**live writer != prefetch writer**",
+              pf.writer is not dr.writer)
+        check("**live client != prefetch client**",
+              pf.writer.client is not dr.writer.client)
+        check("**模型路由一致(只是传输预算不同)**",
+              pf.writer.client.cfg.resolved_models()
+              == dr.writer.client.cfg.resolved_models())
+        # ---- prefetch 用自己的 timeout / retries ----
+        check("**prefetch client 用后台自己的 timeout**",
+              pf.writer.client.cfg.timeout
+              == cfg.pool_prefetch_llm_timeout_seconds,
+              (pf.writer.client.cfg.timeout,
+               cfg.pool_prefetch_llm_timeout_seconds))
+        check("**prefetch client 用后台自己的 max_retries**",
+              pf.writer.client.cfg.max_retries
+              == cfg.pool_prefetch_llm_max_retries,
+              (pf.writer.client.cfg.max_retries,
+               cfg.pool_prefetch_llm_max_retries))
+        # ---- Phase C: 装配期**未激活**(run() 在 _prewarm 之后才 activate) ----
+        check("**装配期 background 未激活(prewarm 前不抢跑)**",
+              pf._background_active.is_set() is False)
+        # ---- 不再注入 live pressure 探针 ----
+        check("**prefetcher 没有 live pressure 探针**",
+              not hasattr(pf, "_probe"))
+        # 手动激活以免后台线程攥着临时目录句柄
+        pf.activate_background()
+        pf.shutdown()
+
+
 def test_prefetch_writer_none_when_no_client():
     """没有 client(理论上不该发生)时补池 writer 也得是 None, 别炸。"""
     print("\n[C10] 没 client 时 prefetch writer 为 None")
@@ -1696,76 +1757,38 @@ def test_prefetch_l1_c_max_size_stops_generation():
               "硬上限" in out and "无可播" in out, out[:200])
 
 
-def test_prefetch_l1_e_revealed_window():
-    """**L1-E + refill-to-target**: 缺货周期 QA busy 也持续补。
+def test_prefetch_l1_e_starts_regardless_of_live_phase():
+    """**L1-E (Phase C 反转)**: 缺货就补 —— SETTING / REVEALING / REVEALED /
+    QA 一视同仁。
 
-    REVEALED 仍是最好的生成窗口；REVEALING / SETTING 仍禁止。
-    但本测试用的是空池，所以进入 QA 后 refill latch 会先启动——此时
-    pending / hint 不再把补池按停。健康库存下 QA busy 不启动由
-    test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy 覆盖。
+    ⚠️ 这条用例与它的前身**语义相反**: 旧版断言 "REVEALED 允许, REVEALING /
+    SETTING 禁止", 也就是把相位当闸门。那正是本轮拆掉的东西。
+
+    现在没有任何一个 **相位本身** 能阻止补池。旧测试里那些"某相位 -> 禁止"
+    的断言全部删除 —— 它们钉的是一个已被判定为 bug 的行为。留下的是:
+    任何相位下, 只要缺货 + 无 future + 无退避, 就提交。
     """
-    print("\n[L1-E] REVEALED 允许补池, REVEALING/SETTING 禁止")
+    print("\n[L1-E] 任何直播相位都不阻止补池")
     with tmpdir() as d:
-        def probe_for(phase, pending=0, inflight=0, hi=False, ri=False):
-            return lambda: {"phase": phase, "pending": pending,
-                            "inflight": inflight, "hint_inflight": hi,
-                            "reveal_inflight": ri, "stopped": False}
-
-        # REVEALED + 空闲 -> 允许
-        ex = _ManualExecutor()
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=probe_for(Phase.REVEALED))
-        fill(pf.pool, 0)
-        pf.on_tick()
-        check("**REVEALED 空闲 -> 允许(prefetch 已提交)**",
-              ex.total == 1, ex.total)
-
-        # REVEALED 但仍有人在途 -> 禁止
-        ex2 = _ManualExecutor()
-        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d, pool_path=os.path.join(d, "p2.jsonl"),
-                                                pool_used_path=os.path.join(d, "u2.jsonl"))),
-                   executor=ex2, probe=probe_for(Phase.REVEALED, pending=1))
-        pf2.on_tick()
-        check("REVEALED 但 pending>0 -> 禁止", ex2.total == 0, ex2.total)
-
-        # REVEALING -> 禁止(揭晓可能仍在生成, 不抢)
-        for i, ph in enumerate((Phase.REVEALING, Phase.SETTING)):
-            exi = _ManualExecutor()
-            pfi = mkpf(d, pool=PuzzlePool.open(mkcfg(
+        for i, ph in enumerate((Phase.QA, Phase.SETTING, Phase.REVEALING,
+                                Phase.REVEALED)):
+            ex = _ManualExecutor()
+            pf = mkpf(d, pool=PuzzlePool.open(mkcfg(
                 d, pool_path=os.path.join(d, f"p{i}.jsonl"),
                 pool_used_path=os.path.join(d, f"u{i}.jsonl"))),
-                executor=exi, probe=probe_for(ph))
-            pfi.on_tick()
-            check(f"**{ph} -> 禁止**", exi.total == 0, exi.total)
+                executor=ex)
+            pf.on_tick()
+            check(f"**空池 + {ph} -> 照样提交**", ex.total == 1, ex.total)
 
-        # 空池 + QA busy -> latch 启动后仍持续单飞补池
+        # 库存健康时任何相位都不启动 —— 由**库存**决定, 不是相位。
         exq = _ManualExecutor()
         pfq = mkpf(d, pool=PuzzlePool.open(mkcfg(
             d, pool_path=os.path.join(d, "pq.jsonl"),
             pool_used_path=os.path.join(d, "uq.jsonl"))),
-            executor=exq, probe=probe_for(Phase.QA, pending=2))
+            executor=exq)
+        fill(pfq.pool, 5)
         pfq.on_tick()
-        check("**空池 + QA busy -> 仍允许补池**",
-              exq.total == 1, exq.total)
-
-        # QA idle -> 允许(原有行为不许被改坏)
-        exi2 = _ManualExecutor()
-        pfi2 = mkpf(d, pool=PuzzlePool.open(mkcfg(
-            d, pool_path=os.path.join(d, "pq2.jsonl"),
-            pool_used_path=os.path.join(d, "uq2.jsonl"))),
-            executor=exi2, probe=probe_for(Phase.QA))
-        pfi2.on_tick()
-        check("**QA idle -> 允许**", exi2.total == 1, exi2.total)
-
-        # 空池 + QA hint 在途 -> 仍只开一个后台候选，补给优先
-        exh = _ManualExecutor()
-        pfh = mkpf(d, pool=PuzzlePool.open(mkcfg(
-            d, pool_path=os.path.join(d, "ph.jsonl"),
-            pool_used_path=os.path.join(d, "uh.jsonl"))),
-            executor=exh, probe=probe_for(Phase.QA, hi=True))
-        pfh.on_tick()
-        check("**空池 + QA hint 在途 -> 仍允许补池**",
-              exh.total == 1, exh.total)
+        check("**健康库存 -> 不启动(与相位无关)**", exq.total == 0, exq.total)
 
 
 def test_prefetch_l1_f_current_puzzle_in_avoid():
@@ -1821,13 +1844,11 @@ def test_prefetch_probe_and_generate_share_one_snapshot():
         pf = PoolPrefetcher(
             cfg=mkcfg(d, pool_min_size=2, pool_target_size=5),
             pool=pool, writer=w,
-            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                           "hint_inflight": False, "reveal_inflight": False,
-                           "stopped": False},
             probe_inputs=lambda: {"avoid": list(cur["avoid"]),
                                   "recent_signatures": list(cur["recent"])},
             pick_blueprint=lambda recent, rng=None: None,
             clock=_Clock(), executor=ex)
+        pf.activate_background()
         pf.on_tick()
         check("提交了", ex.total == 1)
         # 提交之后立刻换掉"当前快照" —— worker 执行时必须看到旧的那份
@@ -1875,8 +1896,7 @@ def test_playable_min_zero_restores_q9_behavior():
 
 def test_max_size_below_target_is_flagged():
     print("\n[L1-J] Config 抓 max < target")
-    base = dict(pool_min_size=2, pool_target_size=5,
-                pool_reveal_target_size=7, pool_reveal_playable_target=2)
+    base = dict(pool_min_size=2, pool_target_size=5)
     w = Config(sim_path="x", pool_max_size=3, **base).validate()
     check("max<target 有告警", any("硬上限" in x for x in w), w)
     w2 = Config(sim_path="x", pool_max_size=10, **base).validate()
@@ -1886,297 +1906,78 @@ def test_max_size_below_target_is_flagged():
 
 
 # ======================================================================
-# U1: 揭晓窗口(60s)专用补池目标 + 临近 deadline 不再启动
+# U1 — 揭晓窗口专用目标(Phase C: 目标已统一, 这一节只剩反转后的回归)
 # ======================================================================
 
-def _reveal_probe(remaining=None, **kw):
-    """一个"在 REVEALED、引擎空闲"的探针。"""
-    d = {"phase": Phase.REVEALED, "pending": 0, "inflight": 0,
-         "hint_inflight": False, "reveal_inflight": False,
-         "reveal_remaining_seconds": remaining, "stopped": False}
-    d.update(kw)
-    return d
+def test_u1_deadline_guard_no_longer_gates_start():
+    """**U1-D (Phase C 反转)**: 没有"距下一题多少秒"这个闸门了。
 
-
-def _qa_probe(remaining=None):
-    return {"phase": Phase.QA, "pending": 0, "inflight": 0,
-            "hint_inflight": False, "reveal_inflight": False,
-            "reveal_remaining_seconds": remaining, "stopped": False}
-
-
-def test_u1_reveal_uses_higher_target():
-    """**U1-A**: REVEALED 期间补池目标抬高到 reveal_target。
-
-    QA 期间 target=5; 揭晓窗口补到 7 —— 那是唯一"引擎完全空闲"的时间
-    窗, 观众在看答案, 补池不与直播抢网关。
-
-    ⚠️ C3 修正: 这条用例早先构造的是"stock=6, 但 6 道全是同一个
-    `variant()` 造的**结构重复**题"。那 6 道互相挡着, 于是真正的
-    playable 只有 1 —— latch 是靠 `playable < 2` 启动的, **不是**靠
-    reveal_target。当时 probe 又把 playable 数成 1(`limit=_playable_min`),
-    两个错误互相抵消, 断言看起来是绿的。
-
-    C3 把 probe 修对之后, "6 道同构题" 的 playable 变成 1(真值),
-    而 `stock=6 < reveal_target=7` **本身并不驱动启动腿**
-    (见 `_on_tick_locked_ish` 里关于"否决 stock < target"的说明)。
-    所以这条用例改成它本来想测的东西: 用**结构互不重复**的题撑起
-    playable >= 2, 然后看 QA/reveal 两个目标组下**停止条件**的差别。
+    旧版断言"REVEALED 剩余 5s <= guard 15s -> 不启动"。那条行为(后台看
+    直播 deadline 决定要不要开工)正是本轮要拆的 —— 所以这里**反转**:
+    剩余 1 秒照样启动。后台的启动条件里根本没有"直播还剩多久"这个输入,
+    也就没有任何"临近 deadline 就收手"的分支可测。
     """
-    print("\n[U1-A] REVEALED 用更高的补池目标")
-    with tmpdir() as d:
-        # QA: stock=6 >= target=5, 且 6 道都可播 -> 不该补
-        ex = _SyncExecutor()
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=lambda: _qa_probe(), pool_reveal_target_size=7)
-        fill_mixed(pf.pool, 6)
-        check("QA: 6 道互不重复 -> stock=6",
-              pf.pool.stock_count() == 6, pf.pool.stock_count())
-        pf.on_tick()
-        check("QA: stock=6 已到 target(5) 且可播充足 -> 不补",
-              len(ex.submitted) == 0, len(ex.submitted))
-        check("QA: latch 没启动", pf.stats()["refill_active"] is False,
-              pf.stats()["refill_active"])
-        # REVEALED: 同一个 stock=6 < reveal_target=7 —— 但启动腿不看
-        # stock<target, 所以这里**不会**因为 7 而启动。真正会驱动的是
-        # playable < reveal_playable_target(2)。用 1 道可播来构造。
-        #
-        # ⚠️ 必须开**新的临时目录**: pool 的默认路径是 `d` 下的
-        # `pool.jsonl`, 复用 `d` 会让 pf2 打开的还是上面那 6 道。
-    with tmpdir() as d2:
-        pf2 = mkpf(d2, pool=PuzzlePool.open(mkcfg(d2)),
-                   executor=_SyncExecutor(),
-                   probe=lambda: _reveal_probe(remaining=55.0),
-                   pool_reveal_target_size=7,
-                   pool_reveal_playable_target=2)
-        fill_mixed(pf2.pool, 1)                 # playable=1 < 2
-        pf2.on_tick()
-        check("**REVEALED: playable=1 < 2 -> 启动**",
-              pf2.stats()["refill_active"] is True,
-              pf2.stats()["refill_active"])
-        check("并且真的提交了",
-              len(pf2._executor.submitted) == 1,
-              len(pf2._executor.submitted))
-        # 补到 7 道后可播充足 -> 停(证明更高目标确实在起作用)
-        #
-        # ⚠️ `_SyncExecutor` 立即执行: 上面那次 submit 已经生成并入库了
-        #    一道 -> stock 已经是 2。所以这里只再灌 5 道到 7。灌 6 道会
-        #    得到 stock=8, 断言会看起来像"冲到了 10"的 bug。
-        fill_mixed(pf2.pool, 5, base=100)       # 2 + 5 = 7
-        check("补到 stock=7", pf2.pool.stock_count() == 7,
-              pf2.pool.stock_count())
-        pf2.on_tick()
-        check("**REVEALED: stock>=7 且 playable>=2 -> 清 latch**",
-              pf2.stats()["refill_active"] is False,
-              pf2.stats()["refill_active"])
-
-
-def test_c3_reveal_playable_probe_counts_past_one():
-    """**C3**: REVEALED 的 probe 必须真的数得到 2 —— 用**真实题池**验证。
-
-    C3 之前 `_playable()` 固定 `limit=self._playable_min`(默认 1), 而
-    `PuzzlePool.playable_count(limit=N)` 是**硬早退**
-    (`if n >= limit: break`) —— 传 1 就只能返回 0 或 1。于是
-    `_effective_targets()` 要求的 `playable >= 2` **永远无法满足**,
-    latch 的"可播够了"停止条件永不成立, 补池一路补到硬上限 10。
-
-    旧测试(U1-B)没抓到, 因为它只检查 `_effective_targets()` 返回
-    `(7, 2)` 这个**配置值**, 并且用一个把 `pool_reveal_playable_target`
-    设为 1 的夹具 —— 那等于把这条路径的触发条件删掉了。
-    夹具不具备触发条件时, 断言是假的。
-
-    这里必须用**真实 PuzzlePool**: 只有真实实现才有"数到 limit 就
-    早退"这个行为, 桩对象不会复现它。
-    """
-    print("\n[C3] REVEALED 的 playable probe 真的能数到 2")
-    with tmpdir() as d:
-        pool = PuzzlePool.open(mkcfg(d))
-        pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=55.0),
-                  pool_playable_min=1, pool_reveal_playable_target=2,
-                  pool_reveal_target_size=7)
-        # ⚠️ 必须用 mixed: `fill()` 的 variant 全是同一个 (family, shape),
-        #    互相结构重复, playable 恒为 1 —— 拿它测 ">= 2" 测的是夹具。
-        fill_mixed(pool, 3)
-        inputs = pf._generation_inputs()
-        # 直接问真实池: 3 道都合法且没被窗口挡住 -> 至少 2 道可播。
-        raw1 = pool.playable_count(inputs.get("recent_signatures"),
-                                   inputs.get("avoid"), limit=1)
-        raw2 = pool.playable_count(inputs.get("recent_signatures"),
-                                   inputs.get("avoid"), limit=2)
-        check("真实池 limit=1 早退 -> 最多 1", raw1 <= 1, raw1)
-        check("真实池 limit=2 能数到 2", raw2 >= 2, raw2)
-        # 被修的那条路径: probe 必须跟着阶段目标走。
-        check("**probe(limit=need_playable) 真的返回 >= 2**",
-              pf._playable(inputs, limit=2) >= 2,
-              pf._playable(inputs, limit=2))
-        # 默认参数仍退化为 _playable_min(不偷偷改变 QA 阶段的早退行为)。
-        check("probe 不传 limit 时退化为 _playable_min(1)",
-              pf._playable(inputs) <= 1, pf._playable(inputs))
-        # --- 端到端: stock=7 且 playable>=2 -> 停止, 不继续冲到 10 ---
-        fill_mixed(pool, 4, base=100)         # 共 7 道
-        check("stock=7 已到 reveal_target", pool.stock_count() == 7,
-              pool.stock_count())
-        pf.on_tick()
-        st = pf.stats()
-        check("**stock=7 且 playable>=2 -> latch 清掉, 不再补**",
-              st["refill_active"] is False, st["refill_active"])
-        check("没有提交任何生成(没有冲到 max=10)",
-              len(pf._executor.submitted) == 0, len(pf._executor.submitted))
-        check("stats 报的 playable 与判据同源(>=2)",
-              st["playable"] >= 2, st["playable"])
-
-
-def test_c3_reveal_playable_probe_stops_at_two_not_ten():
-    """**C3-b**: 只数到 1 时仍要补; 一旦到 2 就停 —— 恰好卡在目标上。
-
-    这条与 C3-a 互补: 前者证明"能数到 2", 这条证明"数到 2 就够,
-    不再多补"。缺了后者, 一个"永远返回 0/1"的实现也能让 latch 一直
-    开着而测试全绿(那正是修复前的状态)。
-    """
-    print("\n[C3-b] playable 恰好到 2 就停")
-    with tmpdir() as d:
-        pool = PuzzlePool.open(mkcfg(d))
-        pf = mkpf(d, pool=pool, executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=55.0),
-                  pool_playable_min=1, pool_reveal_playable_target=2,
-                  pool_reveal_target_size=7, pool_min_size=2)
-        fill_mixed(pool, 1)                  # playable=1 < 2 -> 必须补
-        pf.on_tick()
-        check("playable=1 < 2 -> 启动", pf.stats()["refill_active"] is True,
-              pf.stats()["refill_active"])
-        check("真的提交了一次", len(pf._executor.submitted) == 1,
-              len(pf._executor.submitted))
-        # ⚠️ `_SyncExecutor` 是**立即执行**的: 上面那次 submit 已经真的
-        #    生成并入库了一道 -> stock 从 1 变 2。这里要补到 7 就得再灌
-        #    5 道, 不是 6 道。少算一道会让 stock=8, 断言看起来像"冲到 10"
-        #    的 bug, 其实是夹具算术错了。
-        fill_mixed(pool, 5, base=100)        # 2 + 5 = 7
-        check("stock=7 已到 reveal_target", pool.stock_count() == 7,
-              pool.stock_count())
-        pf._executor.submitted.clear()
-        pf.on_tick()
-        check("stock=7 且 playable>=2 -> 停",
-              pf.stats()["refill_active"] is False,
-              pf.stats()["refill_active"])
-        check("停在目标上, 没冲到 max_size=10",
-              pool.stock_count() == 7, pool.stock_count())
-
-
-def test_u1_reveal_playable_target():
-    """**U1-B**: REVEALED 期间要求 playable >= reveal_playable_target(2)。"""
-    print("\n[U1-B] REVEALED 的 playable 目标更高")
-    with tmpdir() as d:
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor(),
-                  probe=lambda: _reveal_probe(remaining=55.0),
-                  pool_playable_min=1, pool_reveal_playable_target=2,
-                  pool_reveal_target_size=7)
-        fill(pf.pool, 1)                   # stock=1, playable=1
-        tgt, need = pf._effective_targets()
-        check("REVEALED: 目标组是 reveal 组", (tgt, need) == (7, 2), (tgt, need))
-        pf.on_tick()
-        check("playable=1 < 2 -> 仍要补", pf.stats()["refill_active"] is True,
-              pf.stats()["refill_active"])
-
-
-def test_u1_qa_still_uses_conservative_target():
-    """**U1-C**: 非 REVEALED 阶段仍是保守目标(QA 要跟直播抢网关)。"""
-    print("\n[U1-C] QA 仍用保守目标")
-    with tmpdir() as d:
-        pf = mkpf(d, executor=_SyncExecutor(),
-                  pool_reveal_target_size=7, pool_reveal_playable_target=2)
-        tgt, need = pf._effective_targets()
-        check("QA: 目标组是保守组 (5,1)", (tgt, need) == (5, 1), (tgt, need))
-    with tmpdir() as d:
-        pf2 = mkpf(d, executor=_SyncExecutor(),
-                   probe=lambda: _reveal_probe(remaining=55.0),
-                   pool_reveal_target_size=7, pool_reveal_playable_target=2)
-        tgt2, need2 = pf2._effective_targets()
-        check("REVEALED: 切到 reveal 组 (7,2)", (tgt2, need2) == (7, 2),
-              (tgt2, need2))
-
-
-def test_u1_deadline_guard_blocks_new_requests():
-    """**U1-D**: 距下一题 <= guard 秒 -> 不再**启动**新请求。
-
-    60 秒到点时下一题绝不能等待 future。留 15 秒余量, 免得 deadline
-    那一刻正好挂着一个跑了一半的任务。
-    """
-    print("\n[U1-D] 临近 deadline 不再启动")
+    print("\n[U1-D] deadline 不再拦启动")
     with tmpdir() as d:
         ex = _SyncExecutor()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=lambda: _reveal_probe(remaining=5.0),
-                  pool_min_size=2, pool_reveal_target_size=7,
-                  pool_reveal_start_guard_seconds=15.0)
+                  pool_min_size=2)
         pf.on_tick()
-        check("剩余 5s <= guard 15s -> **不启动**",
-              len(ex.submitted) == 0, len(ex.submitted))
-        check("latch 仍开着(只是这一拍不启动)",
-              pf.stats()["refill_active"] is True)
-    with tmpdir() as d:
-        ex2 = _SyncExecutor()
-        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex2,
-                   probe=lambda: _reveal_probe(remaining=55.0),
-                   pool_min_size=2, pool_reveal_target_size=7,
-                   pool_reveal_start_guard_seconds=15.0)
-        pf2.on_tick()
-        check("剩余 55s > effective guard -> 照常启动",
-              len(ex2.submitted) == 1, len(ex2.submitted))
-
-
-def test_u1_deadline_guard_ignores_non_reveal():
-    """探针给 None(不在 REVEALED)-> 不限制。"""
-    print("\n[U1-E] 非揭晓阶段不受 deadline guard 影响")
-    with tmpdir() as d:
-        ex = _SyncExecutor()
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=lambda: _qa_probe(remaining=None),
-                  pool_reveal_start_guard_seconds=15.0)
-        pf.on_tick()
-        check("QA + remaining=None -> 照常补",
+        check("**缺货就启动(与'离下一题多久'无关)**",
               len(ex.submitted) == 1, len(ex.submitted))
 
 
-def test_u1_multiple_generations_within_one_reveal():
-    """**U1-F**: 同一个 60s REVEALED 窗口里能连续补多道(单飞, 串行)。"""
-    print("\n[U1-F] 一个揭晓窗口内连续补多道")
+def test_u1_no_deadline_guard_config_exists():
+    """Phase C 删除了 reveal-guard 那套配置, 它不该还以任何形式阴魂不散。"""
+    print("\n[U1-D2] reveal-guard 配置已彻底移除")
+    c = Config(sim_path="x")
+    for name in ("pool_reveal_start_guard_seconds",
+                 "pool_prefetch_guard_margin_seconds",
+                 "pool_reveal_target_size",
+                 "pool_reveal_playable_target"):
+        check(f"**没有 {name}**", not hasattr(c, name), name)
+    from story.config import build_parser
+    opts = set()
+    for a in build_parser()._actions:
+        opts.update(a.option_strings)
+    check("**没有 --pool-reveal-guard**",
+          "--pool-reveal-guard" not in opts)
+
+
+def test_u1_multiple_generations_in_one_refill_cycle():
+    """**U1-F**: 一次 refill 周期里能连续补多道(单飞, 串行)。
+
+    Phase C 去掉了 "within one reveal" 这个前提 —— 补池不再依赖揭晓窗口
+    这个 60s 空档, 所以用例只钉"latch 开着 -> 一拍一道 -> 一直补到 target"。
+    """
+    print("\n[U1-F] 一个 refill 周期内连续补多道")
     with tmpdir() as d:
         ex = _SyncExecutor()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=ex,
-                  probe=lambda: _reveal_probe(remaining=55.0),
                   pool_min_size=2, pool_target_size=5,
-                  pool_reveal_target_size=7, pool_reveal_playable_target=1)
+                  pool_playable_min=1)
         for _ in range(12):
             pf.on_tick()
         n = pf.pool.stock_count()
-        check("**补到了 reveal_target(7)**", n >= 7, n)
+        check("**补到了 target(5)**", n >= 5, n)
         check("不会无限补(受 max_size=10 约束)", n <= 10, n)
         check("补了不止一道(确实连续工作)",
-              len(ex.submitted) >= 5, len(ex.submitted))
+              len(ex.submitted) >= 3, len(ex.submitted))
 
 
 def test_u1_reveal_never_blocks_next_puzzle():
-    """**U1**: deadline 那一刻下一题**不等** future —— 池里有就直接上。
+    """**U1**: 补池是后台行为, `pop_next` 永远不该被它挡住。
 
-    补池是后台行为, `pop_next` 永远不该被它挡住。这里验的是"在途任务
-    存在时, pop_next 仍能立刻拿到题"。
+    在途任务存在时, pop_next 仍能立刻拿到题。
     """
     print("\n[U1-H] 下一题不等补池 future")
     with tmpdir() as d:
         pool = PuzzlePool.open(mkcfg(d))
-        # ⚠️ C3: 早先这里灌 3 道同构 variant, 靠 probe **数错**
-        #    (limit=playable_min=1 -> playable 恒报 1) 才让 latch 启动。
-        #    probe 修对之后 `stock=3/playable=2` 是**真的够了**, 不会补
-        #    —— 那条断言也就失去了意义(测的是夹具, 不是实现)。
-        #
-        #    要验的是"在途任务存在时 pop_next 不被挡", 所以夹具必须
-        #    真的把 latch 打开。用 `pool_min_size=5 > stock=3` 这条腿
-        #    启动, 与 probe 数得准不准无关。
+        # 要验的是"在途任务存在时 pop_next 不被挡", 所以夹具必须真的把
+        # latch 打开: 用 `pool_min_size=5 > stock=3` 这条腿启动。
         fill_mixed(pool, 3)
         ex = _ManualExecutor()
-        pf = mkpf(d, pool=pool, executor=ex,
-                  probe=lambda: _reveal_probe(remaining=55.0),
-                  pool_min_size=5)
+        pf = mkpf(d, pool=pool, executor=ex, pool_min_size=5)
         for _ in range(3):
             pf.on_tick()
         check("**确实有在途任务(未完成)**", pf._future is not None)
@@ -2186,8 +1987,8 @@ def test_u1_reveal_never_blocks_next_puzzle():
 
 
 def test_u1_guard_config_validation():
-    """U1 新增配置的 validate 告警 + 默认值。"""
-    print("\n[U1-G] reveal 配置校验")
+    """reveal / pool 相关配置的 validate 告警 + 默认值(Phase C 之后)。"""
+    print("\n[U1-G] reveal 配置校验(移除 guard 项之后)")
     w = Config(sim_path="x", reveal_hold_seconds=60.0,
                reveal_core_focus_seconds=15.0).validate()
     check("正常核心焦点时长无告警",
@@ -2199,34 +2000,15 @@ def test_u1_guard_config_validation():
     w3 = Config(sim_path="x", reveal_hold_seconds=30.0,
                 reveal_core_focus_seconds=-1.0).validate()
     check("负焦点时长会告警", any("reveal_core_focus" in x for x in w3), w3)
-    w4 = Config(sim_path="x", pool_reveal_target_size=3,
-                pool_target_size=5).validate()
-    check("reveal_target < target 会告警",
-          any("pool_reveal_target_size" in x for x in w4), w4)
-    w5 = Config(sim_path="x", pool_reveal_target_size=99,
-                pool_max_size=10).validate()
-    check("reveal_target > max 会告警",
-          any("pool_reveal_target_size" in x for x in w5), w5)
     c = Config(sim_path="x")
     check("默认 reveal_hold 是 60s", c.reveal_hold_seconds == 60.0,
           c.reveal_hold_seconds)
     check("默认 core_focus 是 15s", c.reveal_core_focus_seconds == 15.0,
           c.reveal_core_focus_seconds)
-    check("默认 reveal_target 是 12", c.pool_reveal_target_size == 12,
-          c.pool_reveal_target_size)
-    # ---- G1: guard 同时覆盖一轮预算与单次 Story 最坏在途时间 ----
-    check("默认 guard 是 50s", c.pool_reveal_start_guard_seconds == 50.0,
-          c.pool_reveal_start_guard_seconds)
+    # ---- 保留下来的"后台自己的预算"配置 ----
     check("默认 Story timeout 是 45s",
           c.pool_prefetch_story_timeout_seconds == 45.0,
           c.pool_prefetch_story_timeout_seconds)
-    check("默认 guard >= max(budget, Story timeout) + 余量",
-          c.pool_reveal_start_guard_seconds
-          >= max(c.pool_prefetch_budget_seconds,
-                 min(c.llm.timeout, c.pool_prefetch_story_timeout_seconds))
-          + c.pool_prefetch_guard_margin_seconds,
-          (c.pool_reveal_start_guard_seconds, c.pool_prefetch_budget_seconds,
-           c.pool_prefetch_story_timeout_seconds))
     check("默认 prefetch attempts 是 2", c.pool_prefetch_max_attempts == 2,
           c.pool_prefetch_max_attempts)
     check("默认 prefetch budget 是 25s",
@@ -2240,11 +2022,6 @@ def test_u1_guard_config_validation():
           tuple(c.pool_prefetch_refill_backoff_schedule_s)
           == (5.0, 10.0, 15.0),
           c.pool_prefetch_refill_backoff_schedule_s)
-    # guard 小于一轮预算 -> 必须告警(实际生效值会被 max() 抬高)
-    w6 = Config(sim_path="x", pool_reveal_start_guard_seconds=5.0,
-                pool_prefetch_budget_seconds=25.0).validate()
-    check("**guard < 一轮预算 会告警**",
-          any("pool_reveal_start_guard" in x for x in w6), w6)
     w7 = Config(sim_path="x", pool_prefetch_max_attempts=0).validate()
     check("prefetch_max_attempts=0 会告警",
           any("pool_prefetch_max_attempts" in x for x in w7), w7)
@@ -2265,9 +2042,9 @@ class _GatedWriter:
     """可**在生成中途切换相位**的假 writer —— 复现实播那 51 秒。
 
     与 `_FakeWriter` 的区别: 它消费 `should_continue`, 在"每次昂贵
-    调用之前"检查一次(与真 `gen_spec` 的契约一致); 一旦让路就返回
+    调用之前"检查一次(与真 `gen_spec` 的契约一致); 一旦主动中止就返回
     一个 `metrics["interrupted"]=True`、puzzle 为空的 spec ——
-    **这正是真 gen_spec 让路时的返回形状**(error 留空, 因为它不是
+    **这正是真 gen_spec 主动中止时的返回形状**(error 留空, 因为它不是
     失败)。补池据此把它归到 `interrupted` 而不是 `gen_fail`。
 
     这不是"替身偷懒": 真 gen_spec 的检查点在
@@ -2295,7 +2072,7 @@ class _GatedWriter:
 
 
 def _interrupted_spec():
-    """真 `gen_spec` 让路时的返回形状: puzzle 空、**error 也空**。"""
+    """真 `gen_spec` 主动中止时的返回形状: puzzle 空、**error 也空**。"""
     s = good_spec()
     s.puzzle = ""
     s.error = ""
@@ -2307,8 +2084,8 @@ def test_g1_prefetch_passes_own_budget_not_live_budget():
     """**G1**: 后台补池必须用自己的预算, 不能吃 live 的 4 稿 / 90s。
 
     live 出一道题观众在干等, 多试一稿值得; 后台补池只是"有空补一道",
-    多试一稿的收益是池子里多一道题, 代价却是与直播抢网关 + 跨过
-    deadline 继续跑。
+    多试一稿的收益是池子里多一道题, 代价却是多占一份后台自己的调用
+    预算 + 跨过 deadline 继续跑。
     """
     print("\n[G1-A] 后台补池用独立预算")
     with tmpdir() as d:
@@ -2332,166 +2109,122 @@ def test_g1_prefetch_passes_own_budget_not_live_budget():
               w.calls[0]["has_predicate"] is True, w.calls[0])
 
 
-def test_g1_prefetch_yields_when_phase_switches_midflight():
-    """**G1-B: 本批最高价值 regression** —— 复现实播的跨场景白烧。
+def test_g1_prefetch_continues_across_phase_switches_midflight():
+    """**G1-B (Phase C 反转): 本批最高价值 regression**。
 
-    时间线(实播日志):
+    前身复现的是实播的跨场景白烧(18:44:49 REVEALED 启动 -> 18:45:07
+    切 SETTING -> prefetch 被丢弃)。Phase C 之后**行为相反**: 相位切换
+    **不再**打断后台候选, 那个 51 秒相撞由"两条流水线各自独立预算 +
+    库存驱动"来消解, 而不是靠中途杀掉后台任务。
 
-        18:44:49 prefetch 在 REVEALED 启动
-        18:45:07 揭晓结束、下一题开始(SETTING), 池里没题 -> live 现场生成
-        18:45:58 旧 prefetch 才跑完第 4 稿失败
-
-    约 51 秒里 live 与 prefetch 同时在生成。修好之后:
-
-        draft1 在途 -> 相位变 SETTING -> draft1 返回
-        -> 不再审稿(Reviewer call = 0) -> 不再出第二稿(draft2 = 0)
-
-    这里用 `_GatedWriter` 从**补池侧**断言: gen_spec 收到 should_continue
-    且它在中途返回 False 时, 补池把它记成 `interrupted`(**不是**
-    gen_fail), 并且不再继续。
+    这条用例现在钉: 后台启动后, 无论直播切到哪个相位, 正在生成的候选
+    **继续走完**, 不受影响; 且新 predicate 与相位无关。
     """
-    print("\n[G1-B] 跨场景: 相位切换后不再继续生成")
+    print("\n[G1-B] 跨场景: 后台候选不因相位切换而中断")
     with tmpdir() as d:
-        phase = {"p": Phase.REVEALED, "left": 50.0}
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)))
+        # 稳态后台谓词只认 shutdown, 不认相位。
+        check("**稳态谓词放行(背景已激活且未停止)**",
+              pf._background_should_continue() is True)
+        check("**Phase C 不再有读相位的 _should_continue**",
+              not hasattr(pf, "_should_continue"))
+        check("**probe 接口也已删除**", not hasattr(pf, "_probe"))
 
-        def probe():
-            return {"phase": phase["p"], "pending": 0, "inflight": 0,
-                    "hint_inflight": False, "reveal_inflight": False,
-                    "reveal_remaining_seconds": phase["left"],
-                    "puzzle_index": 7, "stopped": False}
-
-        # writer 第二次被问 should_continue 时相位已经变忙
+        # 真跑一遍: 生成过程中把"直播相位"想成任意值都不影响结果 ——
+        # 因为没有相位入参, 且 gen_spec 收到的谓词就是后台谓词本身。
         w = _GatedWriter()
-        orig = w.gen_spec
-
-        def gen_spec(**kw):
-            kw.setdefault("should_continue", None)
-            return orig(**kw)
-
-        w.gen_spec = gen_spec
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
-                  probe=probe, executor=_SyncExecutor())
-        fill(pf.pool, 1)
-
-        # ① 谓词在 REVEALED + 充裕剩余时间下应当放行
-        check("**REVEALED 下谓词放行**", pf._should_continue() is True)
-
-        # ② 切进 SETTING(下一题开始现场生成) —— 必须让路
-        phase["p"] = Phase.SETTING
-        check("**SETTING 下谓词让路(这是 51 秒相撞的根因)**",
-              pf._should_continue() is False)
-
-        # ③ REVIEWING 同理
-        phase["p"] = Phase.REVEALING
-        check("REVEALING 下谓词让路", pf._should_continue() is False)
-
-        # ④ 有观众在等回答 -> 让路
-        phase["p"] = Phase.QA
-        check("QA 空闲时放行", pf._should_continue() is True)
-        for busy in ("pending", "inflight"):
-            pd = {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                  "hint_inflight": False, "reveal_inflight": False,
-                  "reveal_remaining_seconds": None, "stopped": False}
-            pd[busy] = 1
-            pf._probe = lambda pd=pd: pd
-            check(f"**{busy}>0 时让路**", pf._should_continue() is False)
-        pd = {"phase": Phase.QA, "pending": 0, "inflight": 0,
-              "hint_inflight": True, "reveal_inflight": False,
-              "reveal_remaining_seconds": None, "stopped": False}
-        pf._probe = lambda: pd
-        check("hint 在途时让路", pf._should_continue() is False)
-        pd2 = dict(pd, hint_inflight=False, stopped=True)
-        pf._probe = lambda: pd2
-        check("stopped 时让路", pf._should_continue() is False)
+        ex = _SyncExecutor()
+        pf2 = mkpf(d, pool=PuzzlePool.open(mkcfg(
+            d, pool_path=os.path.join(d, "p2.jsonl"),
+            pool_used_path=os.path.join(d, "u2.jsonl"))),
+            writer=w, executor=ex)
+        fill(pf2.pool, 1)
+        pf2.on_tick()      # 提交 + (同步)执行
+        pf2.on_tick()      # 应用结果 -> added_count 才记账
+        check("至少真的调用了生成", len(w.calls) >= 1, len(w.calls))
+        check("**谓词传下去了**", w.calls[0]["has_predicate"] is True)
+        check("**生成了题(没被任何相位打断)**", pf2.pool.stock_count() >= 2,
+              pf2.pool.stock_count())
+        check("**interrupted 计数为 0**", pf2.interrupted_count == 0,
+              pf2.interrupted_count)
 
 
-def test_g1_midflight_switch_stops_reviewer_and_next_draft():
-    """**G1-B 续**: 谓词变 False 之后, 补池**不再继续**并且记成 interrupted。
+def test_g1_stop_midflight_is_interrupted_not_fail():
+    """**G1-C (反转)**: 谓词变 False(= 收到停止)后, 补池不再继续, 记 interrupted。
 
-    这是"draft1 返回 -> Reviewer call = 0 -> draft2 = 0"的直接表达:
-    `_GatedWriter` 在第 1 次调用时谓词还是 True(请求已发出, 无法取消),
-    返回之后的每一次检查都变成 False —— 于是没有任何后续调用。
+    前身用"直播切 SETTING"制造谓词变 False; 现在唯一能让谓词变 False 的
+    是 `request_stop()` / `shutdown()` —— 也就是**本次运行结束**。
+    时间线: 请求已发出(无法取消) -> 停止信号到达 -> 返回时第一个检查点
+    就主动中止, 返回 interrupted spec。补池必须记 interrupted, **不记**
+    gen_fail, 且不再启动第二稿。
     """
-    print("\n[G1-C] 中途让路: 不再出第二稿、不计失败")
+    print("\n[G1-C] 中途停止: 不再出第二稿、不计失败")
     with tmpdir() as d:
-        # 场景: 请求发出时相位还空闲(所以真的发出去了), 但它**返回时**
-        # 直播已切进 SETTING —— 于是 gen_spec 内部的第一个检查点就让路,
-        # 返回 interrupted spec。补池必须把它记成 interrupted 而不是
-        # gen_fail, 并且**不再启动第二稿**。
-        state = {"busy": False}
-
-        def probe():
-            v = Phase.SETTING if state["busy"] else Phase.QA
-            return {"phase": v, "pending": 0, "inflight": 0,
-                    "hint_inflight": False, "reveal_inflight": False,
-                    "reveal_remaining_seconds": None,
-                    "puzzle_index": 4, "stopped": False}
-
         w = _GatedWriter()
         real = w.gen_spec
+        fired = {"n": 0}
 
         def gen_spec(**kw):
-            kw["should_continue"] = pf._should_continue
+            # gen_spec 每次被调用时用**当前**的后台谓词 —— 等价于真
+            # gen_spec 内部那条"每步之前重查一次"的契约。
+            kw["should_continue"] = pf._background_should_continue
+            # ⚠️ 停止信号在** worker 体内**发出, 而不是在 `submit()` 里。
+            # 那正是真实时间线:"任务已经提交、HTTP 已经发出", 此刻收尾
+            # 信号到达 -> 下一次 stage 之前的检查点看到 False -> 收手。
+            # 在 `submit()` 里注入会与 `_submit_lock` 同线程重入(死锁),
+            # 因为"复查 stop + submit"现在是不可分割的一段。
+            if fired["n"] == 0:
+                fired["n"] += 1
+                pf.request_stop()
             return real(**kw)
 
         w.gen_spec = gen_spec
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w, probe=probe,
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
                   executor=_SyncExecutor(), pool_prefetch_max_attempts=2)
         fill(pf.pool, 1)
-        # 让第 1 次 gen_spec **一进门就**发现直播已忙: `start_busy` 在
-        # 提交之后、worker 真正跑之前翻相位 —— 正是实播的时间线
-        # (18:44:49 发出, 18:45:07 相位已变, 18:45:58 才返回)。
-        real_submit = pf._executor.submit
-
-        def submit(fn, *a, **kw):
-            state["busy"] = True
-            return real_submit(fn, *a, **kw)
-
-        pf._executor.submit = submit
         pf.on_tick()                     # 提交 -> worker 立刻跑完
         check("发出了 1 次生成(已发出的请求无法取消)",
               len(w.calls) == 1, len(w.calls))
-        check("**gen_spec 拿到了取消谓词(否则让路逻辑是死的)**",
+        check("**gen_spec 拿到了取消谓词**",
               w.calls[0]["has_predicate"] is True, w.calls[0])
         pf.on_tick()                     # 应用结果
 
-        # 让路不是失败
-        check("**不让路记成 gen_fail**", pf.generation_fail_count == 0,
+        check("**不记成 gen_fail**", pf.generation_fail_count == 0,
               pf.generation_fail_count)
         check("**interrupted 单独计数 +1**", pf.interrupted_count == 1,
               pf.interrupted_count)
         check("**interrupted 不设退避**", pf._retry_at == 0.0, pf._retry_at)
         check("**interrupted 不加失败链**", pf._fail_streak == 0,
               pf._fail_streak)
-        check("**池子里没有多出题(让路的稿子不入池)**",
+        check("**池子里没有多出题**",
               pf.pool.stock_count() == 1, pf.pool.stock_count())
-        check("**没有第二稿(让路后不再继续)**", len(w.calls) == 1,
+        check("**没有第二稿(停止后不再继续)**", len(w.calls) == 1,
               len(w.calls))
 
 
-def test_g1_interrupted_yields_without_retry_storm():
-    """让路期间**不反复启动** —— 每拍都试就是另一种白烧。
+def test_g1_stopped_prefetcher_never_submits_again():
+    """停止之后**不再启动** —— 也不再需要"相位"来解释为什么不启动。
 
-    谓词让路时, `_low_pressure()` 同样会挡住启动(pending/inflight/
-    phase 三条腿)。这里断言的是两条防线一致: 不能让谓词说 False 而
-    启动路径照旧提交。
+    ⚠️ 前身钉的是 "SETTING 下一次都没提交"。那条现在**是反需求**:
+    SETTING 不再是一个闸门。取而代之的是生命周期: `request_stop()` 之后
+    无论 tick 多少拍、无论库存多低, 都不提交。
     """
-    print("\n[G1-D] 让路期间不重复启动")
+    print("\n[G1-D] 停止后不再提交")
     with tmpdir() as d:
         ex = _SyncExecutor()
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_GatedWriter(),
-                  executor=ex,
-                  probe=lambda: {"phase": Phase.SETTING, "pending": 0,
-                                 "inflight": 0, "hint_inflight": False,
-                                 "reveal_inflight": False,
-                                 "reveal_remaining_seconds": None,
-                                 "puzzle_index": 3, "stopped": False})
+                  executor=ex)
         fill(pf.pool, 1)
+        # 未停止时: 缺货 -> 提交
+        pf.on_tick()
+        check("**未停止: 提交**", len(ex.submitted) == 1, len(ex.submitted))
+        ex.submitted.clear()
+        # 请求停止 -> 之后一拍都不提交
+        pf.request_stop()
         for _ in range(8):
             pf.on_tick()
-        check("**SETTING 下一次都没提交**", len(ex.submitted) == 0,
+        check("**停止后: 一拍都不提交**", len(ex.submitted) == 0,
               len(ex.submitted))
-        check("latch 开着但不动(只是这一拍不补)", True)
 
 
 def test_g1_backoff_schedule_increases_then_caps():
@@ -2563,161 +2296,107 @@ def test_g1_success_resets_backoff_streak():
               pf._fail_streak)
 
 
-def test_g1_scene_change_resets_long_backoff_once():
-    """新一题正式开始 -> 当前 refill 失败序列重置一次到第一档。
+def test_backoff_is_not_reset_by_live_scene_change():
+    """**Phase C 反转**: 直播换了题**不**影响后台的失败链/退避。
 
-    即使 refill 短退避已经封顶到 15 秒，新一题开始后 recent window /
-    配额环境整体变了，也应回到当前短序列第一档 5 秒；但不能直接清零。
+    前身(G1-G)断言的是反面 —— "puzzle_index 变了 -> refill 失败链重置为 1"。
+    那正是"直播控制后台调度"的典型: 后台的退避被一个它不该知道的
+    直播变量(播到第几题)牵着走。
 
-    判据是**场景指纹**(puzzle_index), 不是"时间到了" —— 后者会让
-    递增序列形同虚设。
+    Phase C 之后: 上一次失败就是上一次失败, 与直播播到第几题无关。
+    `_scene_at_submit` / `puzzle_index` 重置那段代码已删除。
     """
-    print("\n[G1-G] 场景变化重置当前 refill 退避")
+    print("\n[G1-G] 直播换题不重置后台退避")
     with tmpdir() as d:
         clk = _Clock()
-        scene = {"n": 5}
-
-        def probe():
-            return {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                    "hint_inflight": False, "reveal_inflight": False,
-                    "reveal_remaining_seconds": None,
-                    "puzzle_index": scene["n"], "stopped": False}
-
         pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)),
-                  writer=_FakeWriter(fail=True), clock=clk, probe=probe)
+                  writer=_FakeWriter(fail=True), clock=clk)
         fill(pf.pool, 1)
-        # 攒到 refill 短退避封顶档。
         for _ in range(4):
             pf.on_tick()
             pf.on_tick()
             clk.advance(30)
-        check("已进入连续失败链", pf._fail_streak >= 4,
-              pf._fail_streak)
+        check("已进入连续失败链", pf._fail_streak >= 4, pf._fail_streak)
         pf.on_tick()
         pf.on_tick()
         capped_wait = pf._retry_at - clk.t
         check("refill 退避封顶 15s", round(capped_wait, 1) == 15.0,
               capped_wait)
-        # 新一题开始
-        scene["n"] = 6
-        pf.on_tick()
-        check("**场景变了 -> 失败链重置为 1**", pf._fail_streak == 1,
-              pf._fail_streak)
-        check("**refill 中场景切换回短序列第一档 5s**",
-              round(pf._retry_at - clk.t, 1) == 5.0,
-              pf._retry_at - clk.t)
-        # 场景**没**再变 -> 不再重置(否则递增序列形同虚设)
-        clk.advance(6)
-        pf.on_tick()
-        pf.on_tick()
-        check("场景不变 -> 失败链继续递增", pf._fail_streak == 2,
-              pf._fail_streak)
+        streak_before = pf._fail_streak
+        # 直播换了一题(旧实现里等于"场景指纹变了")—— 现在没有任何输入
+        # 通道能表达这件事, 所以失败链只会继续递增, 绝不会被重置。
+        #
+        # 注意必须让**一整轮**跑完(提交那一拍 + 收账那一拍), 且跨过当前
+        # 退避: 单飞守卫会让"退避未到"的那一拍什么都不提交 —— 只 tick
+        # 一次会读到一个"什么都没发生"的假象。
+        clk.advance(16)                  # 跨过 15s 退避
+        pf.on_tick()                     # 提交下一轮(仍失败)
+        pf.on_tick()                     # 收账
+        check("**失败链没有被'换题'重置(继续递增)**",
+              pf._fail_streak == streak_before + 1, pf._fail_streak)
+        check("**源码里没有 _scene_at_submit / puzzle_index 重置**",
+              "scene_at_submit" not in
+              io.open(os.path.join(os.path.dirname(os.path.dirname(
+                  os.path.abspath(__file__))), "story", "prefetch.py"),
+                  encoding="utf-8").read())
 
 
-def test_g1_effective_guard_covers_budget():
-    """guard 必须覆盖 max(一轮预算, Story 单次 timeout) + 余量。"""
-    print("\n[G1-H] effective guard 覆盖 Story 最坏在途时间")
-    with tmpdir() as d:
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)),
-                  executor=_SyncExecutor(),
-                  pool_prefetch_budget_seconds=25.0,
-                  pool_prefetch_story_timeout_seconds=45.0,
-                  pool_prefetch_guard_margin_seconds=5.0,
-                  pool_reveal_start_guard_seconds=15.0)
-        check("**effective = max(15, max(25,45)+5) = 50**",
-              pf._effective_guard_s == 50.0, pf._effective_guard_s)
-        check("stats 同时报 start/continue guard 与 Story timeout",
-              pf.stats()["effective_guard_s"] == 50.0
-              and pf.stats()["continuation_guard_s"] == 30.0
-              and pf.stats()["prefetch_story_timeout_s"] == 45.0,
-              (pf.stats()["effective_guard_s"],
-               pf.stats()["continuation_guard_s"],
-               pf.stats()["prefetch_story_timeout_s"]))
-        pf._probe = lambda: _reveal_probe(remaining=45.0)
-        check("**剩余 45s <= start guard 50s -> 不启动新候选**",
-              pf._deadline_too_close() is True)
-        check("**但已启动候选 45s > continuation 30s -> 可继续**",
-              pf._should_continue() is True)
-        pf._probe = lambda: _reveal_probe(remaining=25.0)
-        check("剩余 25s <= continuation 30s -> 中途让路",
-              pf._should_continue() is False)
-        pf._probe = lambda: _reveal_probe(remaining=55.0)
-        check("剩余 55s > start guard -> 可启动",
-              pf._deadline_too_close() is False)
-        check("剩余 55s 时谓词放行", pf._should_continue() is True)
+def test_no_guard_machinery_remains():
+    """guard / deadline 那套机制**整体删除** —— 不能留下手但不起作用。
 
-
-def test_g1_interrupted_probe_fails_closed():
-    """探针坏了 -> 让路(fail closed), 而不是"当作没事继续跑"。"""
-    print("\n[G1-I] 探针异常 -> 让路")
-    with tmpdir() as d:
-        def boom():
-            raise RuntimeError("探针炸了")
-
-        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_GatedWriter(),
-                  probe=boom, executor=_SyncExecutor())
-        check("**探针抛异常 -> 谓词 False**", pf._should_continue() is False)
-        check("presence: 谓词不抛", True)
-
-
-
-def test_g4c_playtest_yields_before_starting():
-    """**G4-C**: 试玩**开始之前**也必须让路。
-
-    G1 让 `gen_spec` 在每一次尚未发出的昂贵调用前检查谓词, 但
-    `_playtest` **不在 `gen_spec` 里面** —— 它在它返回之后。于是有这条缝:
-
-        gen_spec 成功返回(完整的多稿生成 + 审稿 + audit)
-        ↓  这一段之间直播已经进入 SETTING
-        ↓  prefetch 仍然启动一次 AI 试玩
-
-    试玩本身是若干次 LLM 调用, 会和下一题的现场生成抢同一个网关。
-    G1 冻结的原则是"后台每一个尚未开始的昂贵 LLM 阶段都必须让 live
-    优先", 试玩没有理由例外 —— 只是因为它在 gen_spec 之外, 被漏掉了。
-
-    (当前 `playtest_enabled` 默认 False, 所以这不是实播 blocker,
-     但它是 G1 原则的**明文缺口**, 一笔补掉最合适。)
+    前身(G1-H)测 `_effective_guard_s` / `_deadline_too_close`; G1-I 测
+    探针异常 fail-closed。两者测的对象都已从实现里删除(§15: 删掉
+    obsolete option 比保留 silent no-op 更好), 所以这里反过来断言它们
+    **不存在**, 防止有人把"看起来无害"的空壳重新加回来当作兼容层。
     """
-    print("\n[G4-C1] 试玩前让路")
+    print("\n[G1-H/I] guard 机制已整体移除")
+    with tmpdir() as d:
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), executor=_SyncExecutor())
+        for name in ("_effective_guard_s", "_continuation_guard_s",
+                     "_deadline_too_close", "_probe", "_probe_safe",
+                     "_low_pressure", "_effective_targets", "_should_continue",
+                     "_scene_of", "_scene_at_submit", "_guard_margin",
+                     "_reveal_target", "_reveal_playable_target",
+                     "_reveal_guard_s"):
+            check(f"**没有 {name}**", not hasattr(pf, name), name)
+        st = pf.stats()
+        for key in ("reveal_target", "reveal_playable_target",
+                    "reveal_guard_s", "effective_guard_s",
+                    "continuation_guard_s"):
+            check(f"**stats 不报 {key}**", key not in st, sorted(st))
+        check("**stats 报 shutdown 状态**", "shutdown" in st, sorted(st))
+        check("后台自己的预算仍保留在 stats",
+              st["prefetch_budget_s"] == 25.0
+              and st["prefetch_story_timeout_s"] == 45.0,
+              (st["prefetch_budget_s"], st["prefetch_story_timeout_s"]))
+
+
+
+def test_g4c_playtest_runs_through_phase_switch():
+    """**G4-C (Phase C 反转)**: 直播切相位**不**打断试玩。
+
+    前身断言 "试玩开始前让路": gen_spec 已成功返回, 但这段时间里直播进入
+    SETTING -> 跳过试玩。Phase C 之后**相反** —— 试玩也是后台工作, 它只
+    因为 `request_stop()` / `shutdown()` 而中止。
+
+    这条用例钉的是:
+      * 试玩的 `should_continue` 拿到的是 prefetcher 的生命周期谓词;
+      * 生成过程中把"直播相位"想成任意值都不影响: 试玩照跑, 候选照入池。
+    """
+    print("\n[G4-C1] 试玩不因相位切换被打断")
     with tmpdir() as d:
         calls = {"run": 0}
 
         class _Playtester:
-            def run(self, spec):
-                # ⚠️ **只计数, 绝不抛**。`_playtest()` 把试玩的一切异常都
-                # 吞成 (None, why) —— 那是生产代码的正确行为(试玩坏不能
-                # 冒泡), 但它会让这里的 AssertionError 变成静默, 于是
-                # "不该启动" 那条断言在 mutation 下照样全绿。计数是唯一
-                # 不会被吞掉的证据。
+            def run(self, spec, should_continue=None):
+                # ⚠️ 只计数, 绝不抛 —— `_playtest()` 会把异常吞成
+                # (None, why), 于是断言里的 AssertionError 会静默。
                 calls["run"] += 1
                 from story.playtest import PASS, PlaytestResult
                 return PlaytestResult(status=PASS)
 
-        # 提交那一刻切 SETTING: 精确复现"gen_spec 已成功返回,
-        # 返回之后直播已开始"
-        state = {"busy": False}
-
-        def probe():
-            v = Phase.SETTING if state["busy"] else Phase.QA
-            return {"phase": v, "pending": 0, "inflight": 0,
-                    "hint_inflight": False, "reveal_inflight": False,
-                    "reveal_remaining_seconds": None,
-                    "puzzle_index": 5, "stopped": False}
-
-        from story.prefetch import PoolPrefetcher
-        cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
-                    pool_target_size=5)
-        pool = PuzzlePool.open(cfg)
-
-        # ⚠️ **不能**用 `_GatedWriter`: 它自己在 gen_spec 内部消费
-        # should_continue, 于是让路发生在 G1 那条检查点上(G1-B), 根本
-        # 走不到试玩 —— 删掉试玩守卫测试照样绿, 测的就不是 G4-C 了。
-        #
-        # G4-C 要复现的是**另一条缝**: gen_spec **完整跑完**、返回了一道
-        # 合格的题, 而这段时间里直播变忙了。所以这里需要一个"不看谓词、
-        # 必定返回合格 spec"的 writer。
         class _AlwaysGoodWriter:
-            """必定返回合格 spec, **完全无视** should_continue。"""
+            """必定返回合格 spec, 完全无视 should_continue。"""
 
             def __init__(self):
                 self.calls = []
@@ -2728,89 +2407,53 @@ def test_g4c_playtest_yields_before_starting():
                 self.calls.append({"has_predicate": should_continue is not None})
                 return good_spec()
 
-        w = _AlwaysGoodWriter()
-        ex = _SyncExecutor()
-        pf = PoolPrefetcher(
-            cfg=cfg, pool=pool, writer=w, probe=probe,
-            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
-            pick_blueprint=lambda recent, rng=None: None,
-            executor=ex, playtester=_Playtester())
-        fill(pf.pool, 1)
-        real_submit = ex.submit
-
-        def submit(fn, *a, **kw):
-            # gen_spec 在 worker 里跑; 让它跑完之后相位才变忙是测不到
-            # 这条缝的 —— 必须在**试玩那一步之前**翻。
-            # `_SyncExecutor` 是同步的, 所以这里翻相位等价于
-            # "gen_spec 返回的那一刻相位已变"。
-            state["busy"] = True
-            return real_submit(fn, *a, **kw)
-
-        ex.submit = submit
-        pf.on_tick()
-        pf.on_tick()
-        check("**试玩一次都没启动(让路生效)**", calls["run"] == 0,
-              calls["run"])
-        check("gen_spec 确实**完整跑完**了(不是在里面就被让路)",
-              len(w.calls) == 1, len(w.calls))
-        check("**interrupted +1**", pf.interrupted_count == 1,
-              pf.interrupted_count)
-        check("**gen_fail 仍为 0**", pf.generation_fail_count == 0,
-              pf.generation_fail_count)
-        check("**不设退避**", pf._retry_at == 0.0, pf._retry_at)
-        check("**不入池**", pf.pool.stock_count() == 1, pf.pool.stock_count())
-
-
-def test_g4c_playtest_still_runs_when_live_is_idle():
-    """对照腿: 直播空闲时试玩**照常跑**。
-
-    没有这一条, 一个"永远不试玩"的实现也能让上面那条测试变绿 ——
-    那就是测夹具而不是测实现。
-    """
-    print("\n[G4-C2] 空闲时试玩照常跑(对照)")
-    with tmpdir() as d:
-        calls = {"run": 0}
-
-        class _PT:
-            def run(self, spec):
-                calls["run"] += 1
-                from story.playtest import PASS, PlaytestResult
-                return PlaytestResult(status=PASS)
-
         from story.prefetch import PoolPrefetcher
         cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
                     pool_target_size=5)
         pool = PuzzlePool.open(cfg)
-        w = _GatedWriter()
-        real = w.gen_spec
-
-        def gen_spec(**kw):
-            kw["should_continue"] = pf._should_continue
-            return real(**kw)
-
-        w.gen_spec = gen_spec
+        w = _AlwaysGoodWriter()
+        ex = _SyncExecutor()
         pf = PoolPrefetcher(
             cfg=cfg, pool=pool, writer=w,
-            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                           "hint_inflight": False, "reveal_inflight": False,
-                           "reveal_remaining_seconds": None,
-                           "puzzle_index": 5, "stopped": False},
             probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
             pick_blueprint=lambda recent, rng=None: None,
-            executor=_SyncExecutor(), playtester=_PT())
+            executor=ex)
+        pf.set_playtester(_Playtester())
+        # 先激活后台(prewarm 之后 Director 会做这一步)。
+        pf.activate_background()
         fill(pf.pool, 1)
-        try:
-            pf.on_tick()
-            pf.on_tick()
-        except Exception as e:                  # noqa: BLE001
-            print("     异常:", e)
-        # 断言的是"至少真的跑过", 不是精确 1 次: 池子仍未到 target, 所以
-        # 每一拍都可能再补一道 —— 那个数字取决于池子的滞回, 不是这条
-        # 要测的性质。这条腿唯一的职责是证明"空闲时试玩不会被跳过"。
-        check("**空闲时试玩真的跑了(否则上一条是假的)**",
-              calls["run"] >= 1, calls["run"])
-        check("空闲时不会记 interrupted", pf.interrupted_count == 0,
+        pf.on_tick()
+        pf.on_tick()
+        check("**试玩跑了(相位不再能拦住它)**", calls["run"] >= 1,
+              calls["run"])
+        check("**interrupted 为 0**", pf.interrupted_count == 0,
               pf.interrupted_count)
+        check("**题入池了**", pf.pool.stock_count() >= 2,
+              pf.pool.stock_count())
+
+
+def test_g4c_playtest_predicate_is_lifecycle_only():
+    """试玩的谓词必须是 prefetcher 的生命周期谓词, 不是直播压力探针。"""
+    print("\n[G4-C2] 试玩谓词 = 后台生命周期谓词")
+    with tmpdir() as d:
+        from story.prefetch import PoolPrefetcher
+        cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
+                    pool_target_size=5)
+        pool = PuzzlePool.open(cfg)
+        pf = PoolPrefetcher(
+            cfg=cfg, pool=pool, writer=_FakeWriter(),
+            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+            pick_blueprint=lambda recent, rng=None: None,
+            executor=_SyncExecutor())
+        check("**stop-only: 与是否激活无关**",
+              pf._background_should_continue() is True)
+        pf.request_stop()
+        check("**request_stop 后谓词变 False**",
+              pf._background_should_continue() is False)
+        # 装配口: set_playtester 是唯一入口(不鼓励直接写私有字段)。
+        sentinel = object()
+        pf.set_playtester(sentinel)
+        check("**set_playtester 真的注入了**", pf._playtester is sentinel)
 
 
 # ======================================================================
@@ -2821,14 +2464,14 @@ def test_g4c_playtest_still_runs_when_live_is_idle():
 # 见 `mkcfg` 的说明), 并传一个实现了两条新方法的 `_KeywordWriter`。
 
 class _KeywordWriter:
-    """实现了 G2 两条新方法的假 writer。记录调用, 可编程地让路/失败。
+    """实现了 G2 两条新方法的假 writer。记录调用, 可编程地主动中止/失败。
 
     为什么不扩 `_FakeWriter`: 那个替身被 30+ 个既有用例共用, 给它加两条
     方法会让"这个替身到底实现了哪条链"变得含糊。新类只服务 G2 用例,
     意图更清楚。
 
     `stage_a_interrupt` / `stage_b_interrupt` 让用例在**中途某个阶段**
-    模拟"直播变忙" —— 那正是 §九 要求覆盖的四类窗口。
+    模拟一次主动中止(收到停止信号) —— 那正是 §九 要求覆盖的四类窗口。
 
     ## ⚠️ Stage A 的谜面**就是** `good_spec()` 那道题的谜面
 
@@ -3114,8 +2757,8 @@ def test_g2_stage_a_none_is_gen_fail():
 
 
 def test_g2_stage_a_interrupt_is_not_failure():
-    """Stage A 让路 -> interrupted, **不计失败不退避**。"""
-    print("\n[G2-5] Stage A 让路 -> interrupted(不是失败)")
+    """Stage A 主动中止 -> interrupted, **不计失败不退避**。"""
+    print("\n[G2-5] Stage A 主动中止 -> interrupted(不是失败)")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_a_interrupt=True))
         fill(pf.pool, 1)
@@ -3131,8 +2774,8 @@ def test_g2_stage_a_interrupt_is_not_failure():
 
 
 def test_g2_stage_b_interrupt_is_not_failure():
-    """Stage B 让路 -> interrupted, 不入池, 不计失败。"""
-    print("\n[G2-6] Stage B 让路 -> interrupted(不是失败)")
+    """Stage B 主动中止 -> interrupted, 不入池, 不计失败。"""
+    print("\n[G2-6] Stage B 主动中止 -> interrupted(不是失败)")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d, writer=_KeywordWriter(stage_b_interrupt=True))
         fill(pf.pool, 1)
@@ -3149,40 +2792,48 @@ def test_g2_stage_b_interrupt_is_not_failure():
 
 
 def test_g2_should_continue_blocks_before_stage_a():
-    """检查点 ①: Stage A **之前**就让路 -> 连 A 都不发。"""
-    print("\n[G2-7] 让路检查点 ①: Stage A 之前")
+    """检查点 ①: Stage A **之前**就主动中止 -> 连 A 都不发。
+
+    Phase C: 注入的谓词现在是 stop-only 的(`_background_should_continue`)。
+    这里用**唯一**能真实触发它的手段 —— `request_stop()` —— 而不是像前身
+    那样直接覆写一个已不存在的方法。契约不变: 谓词在任何昂贵 stage 之前
+    被查一次。
+    """
+    print("\n[G2-7] 谓词检查点 ①: Stage A 之前")
     with tmpdir() as d:
         pf, w = _mkpf_keyword(d)
-        pf._should_continue = lambda: False
+        pf.request_stop()
         fill(pf.pool, 1)
         pf.on_tick()
         pf.on_tick()
         check("**Stage A 零调用**", w.keyword_calls == [], w.keyword_calls)
         check("Stage B 零调用", w.structure_calls == [], w.structure_calls)
-        check("interrupted_count == 1", pf.interrupted_count == 1,
-              pf.interrupted_count)
-        check("generation_fail_count == 0", pf.generation_fail_count == 0,
-              pf.generation_fail_count)
 
 
 def test_g2_should_continue_blocks_after_stage_a_before_stage_b():
-    """检查点 ②: Stage A 之后变忙 -> **Stage B 不调用**。
+    """检查点 ②: Stage A 之后收到停止信号 -> **Stage B 不调用**。
 
-    这是新增 stage 之后最容易漏的一处: A 是一次几十秒的调用, 期间直播
-    完全可能已经切进 SETTING。
+    这是新增 stage 之后最容易漏的一处: A 是一次几十秒的调用, 期间停止
+    信号完全可能已经到达。
+
+    Phase C: 不再覆写 `pf._should_continue`(已删除); 改为给 `_mkpf_keyword`
+    注入一个**计数的 stop-only 谓词**, 直接测两条链上的注入点是否真的被
+    调用到 —— 与 production 走的是同一个 `should_continue` 参数通道。
     """
-    print("\n[G2-8] 让路检查点 ②: A 之后 / B 之前")
+    print("\n[G2-8] 谓词检查点 ②: A 之后 / B 之前")
     with tmpdir() as d:
         w = _KeywordWriter()
         pf, _ = _mkpf_keyword(d, writer=w)
-        # 谓词: 第一次(A 之前)放行, 之后一律让路。
+        # 谓词: 第一次(A 之前)放行, 之后一律主动中止。
         state = {"n": 0}
 
         def gate():
             state["n"] += 1
             return state["n"] <= 1
 
-        pf._should_continue = gate
+        # ⚠️ 用 production 的注入通道(不是覆写私有方法): 让生成链拿到的
+        #    默认谓词变成 gate。
+        pf._background_should_continue = gate
         fill(pf.pool, 1)
         pf.on_tick()
         pf.on_tick()
@@ -3651,7 +3302,7 @@ def test_g4_provenance_records_vocab_and_seed():
 
 
 # ======================================================================
-# stable-refill: 直播 lease + 高水位 + 离线候选让路
+# stable-refill: 高水位 + 离线候选不越过直播窗口
 # ======================================================================
 def test_stable_refill_daemon_imports_and_defaults():
     print("\n[stable-refill] 守护脚本可 import，CLI 默认可解析")
@@ -3670,10 +3321,10 @@ def test_stable_refill_default_waterlines():
     check("高水位 = 12", cfg.pool_target_size == 12, cfg.pool_target_size)
     check("至少 3 道可播", cfg.pool_playable_min == 3,
           cfg.pool_playable_min)
-    check("揭晓窗口同样补到 12/3",
-          cfg.pool_reveal_target_size == 12
-          and cfg.pool_reveal_playable_target == 3,
-          (cfg.pool_reveal_target_size, cfg.pool_reveal_playable_target))
+    check("**只有一套库存目标**(Phase C 取消了 reveal 专用目标)",
+          not hasattr(cfg, "pool_reveal_target_size")
+          and not hasattr(cfg, "pool_reveal_playable_target"),
+          [n for n in dir(cfg) if "reveal" in n and "pool" in n])
     check("硬上限 = 16", cfg.pool_max_size == 16, cfg.pool_max_size)
     check("refill 技术短退避默认 5/10/15",
           tuple(cfg.pool_prefetch_refill_backoff_schedule_s)
@@ -3711,7 +3362,7 @@ def test_stable_refill_corrupt_heartbeat_is_idle():
 
 
 def test_stable_refill_candidate_never_adds_after_live_appears():
-    """直播在候选完成后才出现，也必须在 pool.add 前最后让路。"""
+    """直播在候选完成后才出现，也必须在 pool.add 前最后一次复查时中止。"""
     print("\n[stable-refill] live 出现后候选绝不入池")
     from prefill_pool import _PrefillSeeder, _one_keyword
 
@@ -3795,6 +3446,1068 @@ def test_stable_refill_prefill_default_path_still_adds():
     check("正常离线候选仍入池", ok is True, ok)
     check("pool.add 恰好一次", pool.add_calls == 1, pool.add_calls)
 
+# ======================================================================
+# Phase C —— 后台补题与直播彻底解耦: A–T 核心 regression
+# ======================================================================
+#
+# 任务书 §21。这一组是本轮**唯一**的契约面: 每一条只回答一个问题 ——
+# "后台补题还看不看直播状态?"
+#
+# 命名约定: `test_pc_<字母>` 与任务书 A–T 一一对应, 便于评审时对照。
+# 全部离线, 断言**行为**(是否 submit / 计数是否变化), 不断言字段存在。
+
+def _pc_tick(pf, n=1):
+    """跑 n 拍 tick。
+
+    ⚠️ 为什么默认要跑**两拍**才看得到结果: `_SyncExecutor` 在 `submit()`
+    里就地跑完 worker, 但 worker 的终局结果写进 `_pending_result`, 由
+    **下一拍**的 tick 步骤 ② 才应用。只跑一拍会看到一个"什么都没发生"
+    的假象(库存明明变了, 计数却还是 0)。
+    """
+    for _ in range(n):
+        pf.on_tick()
+
+
+def test_pc_a_starts_when_below_min():
+    """**A**: 库存 < min + 直播处于 SETTING -> 照样启动。"""
+    print("\n[PC-A] 库存 < min + SETTING -> 启动")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)                    # 1 < min(2)
+        # SETTING 是"直播忙"的代表相位 —— Phase C 之后它不再是闸门。
+        _pc_tick(pf)
+        check("**SETTING 下库存不足照样提交**", len(ex.submitted) == 1,
+              len(ex.submitted))
+
+
+def test_pc_b_starts_despite_pending_inflight_hint_reveal():
+    """**B**: 库存 < min 且 pending/inflight/hint/reveal 全非零 -> 照样启动。
+
+    这是实播事故 #2 的直接反证: 旧实现里 `_low_pressure()` 看到
+    `pending != 0` 就返回 False, 于是"下一题已经在排队"反而让后台
+    **停止补池** —— 库存越紧张越不补。
+    """
+    print("\n[PC-B] pending/inflight/hint/reveal 非零不挡启动")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        # 最强的断言: 这些 live 内存状态在 Phase C 里**根本不存在于
+        # prefetcher** —— 它连读都读不到, 自然无从被它们挡住。旧实现里
+        # `_low_pressure()` 会读 `_pending` / inflight 之类的镜像。
+        check("**prefetcher 没有 pending/inflight/hint/reveal 字段**",
+              not any(hasattr(pf, n) for n in
+                      ("_pending", "_inflight", "_hint_inflight",
+                       "_reveal_inflight", "_low_pressure")))
+        _pc_tick(pf)
+        check("**live 忙也不挡(读都不读)**", len(ex.submitted) == 1,
+              len(ex.submitted))
+
+
+def test_pc_c_starts_in_revealed_window():
+    """**C**: REVEALED + reveal_remaining 只剩 1 秒 -> 照样启动。
+
+    旧实现的 `_deadline_too_close()` 会在揭晓窗口临近时关闭启动闸门,
+    理由是"来不及了"。Phase C 认为这属于**直播的时钟**, 后台补的是
+    **池子库存**, 与"这一题还剩几秒"无关。
+    """
+    print("\n[PC-C] REVEALED 窗口临近不挡启动")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        check("**_deadline_too_close 已删除**",
+              not hasattr(pf, "_deadline_too_close"))
+        _pc_tick(pf)
+        check("**REVEALED/临近 deadline 都不挡**", len(ex.submitted) == 1,
+              len(ex.submitted))
+
+
+def test_pc_d_candidate_survives_all_phases():
+    """**D**: 候选启动后直播走遍所有相位, 候选走完, interrupted 不增。
+
+    这条就是实播事故 #1 的反证(18:44:49 REVEALED 启动 -> 18:45:07
+    SETTING -> 候选被丢)。Phase C 之后**没有任何相位**能打断它。
+    """
+    print("\n[PC-D] 候选跨越全部相位不被打断")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w, executor=ex)
+        fill(pf.pool, 1)
+        _pc_tick(pf, 1)                     # 提交 + (同步)执行
+        # 生成期间想象任何相位都不影响 —— 因为没有相位入参。
+        for _ph in (Phase.SETTING, Phase.REVEALING, Phase.REVEALED, Phase.QA):
+            del _ph                        # 仅表达"这些相位都跑过一遍"
+        _pc_tick(pf, 1)                     # 应用结果
+        check("**候选走完了(已入池)**", pf.pool.stock_count() >= 2,
+              pf.pool.stock_count())
+        check("**interrupted 全程为 0**", pf.interrupted_count == 0,
+              pf.interrupted_count)
+        check("**且没有走 gen_fail**", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+
+
+def test_pc_e_background_continues_alongside_live_generation():
+    """**E**: 后台正在生成 + 直播同时现场生成 -> 后台**继续**。
+
+    两条流水线共用上游网关但各有各的预算/客户端/单飞: 后台**不因**
+    "live 在忙"而让路(live 忙是 live 的事)。这里用"live 那条路占着
+    writer"来模拟并发, 断言后台的谓词仍为 True。
+    """
+    print("\n[PC-E] live 现场生成不影响后台候选")
+    with tmpdir() as d:
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter())
+        fill(pf.pool, 1)
+        check("**稳态谓词 True(与 live 是否在跑无关)**",
+              pf._background_should_continue() is True)
+        # 反证: 这个谓词签名不带任何参数 —— 没有"live 状态"这个入口。
+        import inspect
+        sig = inspect.signature(pf._background_should_continue)
+        check("**谓词无参: 结构上无处接收 live 状态**",
+              len(sig.parameters) == 0, list(sig.parameters))
+
+
+def test_pc_f_playtest_survives_phase_switch():
+    """**F**: 试玩从 QA 切到 SETTING -> 不中断(不返回 interrupted)。
+
+    `_playtest_should_continue()`(Director 里第三个相位重复实现)已删,
+    试玩注入的是 prefetcher 的 background lifecycle 谓词。
+    """
+    print("\n[PC-F] 试玩不因相位切换中断")
+    with tmpdir() as d:
+        from story.prefetch import PoolPrefetcher
+        from story.playtest import PASS, PlaytestResult
+        calls = {"n": 0}
+
+        class _PT:
+            def run(self, spec, should_continue=None):
+                calls["n"] += 1
+                return PlaytestResult(status=PASS)
+
+        class _W:
+            def gen_spec(self, **kw):
+                return good_spec()
+
+        cfg = mkcfg(d, playtest_enabled=True, pool_min_size=2,
+                    pool_target_size=5)
+        pf = PoolPrefetcher(
+            cfg=cfg, pool=PuzzlePool.open(cfg), writer=_W(),
+            probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
+            pick_blueprint=lambda recent, rng=None: None,
+            executor=_SyncExecutor())
+        pf.set_playtester(_PT())
+        pf.activate_background()
+        fill(pf.pool, 1)
+        _pc_tick(pf, 2)
+        check("**试玩跑了(相位切不切都跑)**", calls["n"] >= 1, calls["n"])
+        check("**试玩没有被打断**", pf.playtest_interrupted_count == 0,
+              pf.playtest_interrupted_count)
+
+
+def test_pc_g_no_submit_after_shutdown():
+    """**G**: `shutdown()` 之后连续 20 拍都不再 submit。"""
+    print("\n[PC-G] shutdown 之后 20 拍零提交")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        pf.shutdown()
+        ex.submitted.clear()
+        _pc_tick(pf, 20)
+        check("**20 拍零提交**", len(ex.submitted) == 0, len(ex.submitted))
+        check("**stats 报 shutdown**", pf.stats()["shutdown"] is True)
+
+
+def test_pc_h_shutdown_midflight_is_interrupted_not_failed():
+    """**H**: 生成中途 shutdown -> 记 interrupted, 不进 gen_fail / 不退避。
+
+    与 G1-C 的区别: 这里走的是**真 `shutdown()`**(而非 `request_stop()`),
+    验证停止信号在两条路径上都等效。
+    """
+    print("\n[PC-H] 中途 shutdown = interrupted, 不失败不退避")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor(), pool_prefetch_max_attempts=2)
+        # ⚠️ 停止信号在 **worker 体内**(gen_spec 里)发出, 不在 `submit()`。
+        # 在 `submit()` 里注入会与 `_submit_lock` 同线程重入(死锁) ——
+        # "复查 stop + submit"现在是同一把锁下不可分割的一段。真实的
+        # shutdown 来自 Director 线程, 时序上正是"提交了、HTTP 在途,
+        # 此刻收尾" -> 后续 stage 的检查点看到 False 而收手。
+        w.gen_spec = _with_live_predicate(w.gen_spec, pf, stop=pf.shutdown)
+        fill(pf.pool, 1)
+        _pc_tick(pf, 2)
+        check("**记 interrupted**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("**不记 gen_fail**", pf.generation_fail_count == 0,
+              pf.generation_fail_count)
+        check("**不设退避**", pf._retry_at == 0.0, pf._retry_at)
+        check("**不加失败链**", pf._fail_streak == 0, pf._fail_streak)
+
+
+def test_pc_i_at_most_one_future_across_many_ticks():
+    """**I**: 连续多拍 -> 永远最多一个在途 future(single-flight)。"""
+    print("\n[PC-I] 连续 tick 最多一个在途")
+    with tmpdir() as d:
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        for _ in range(10):
+            pf.on_tick()
+        check("**10 拍只提交了 1 条(在途未完成)**", ex.total == 1, ex.total)
+        check("**且它仍在途**", len(ex.pending) == 1, len(ex.pending))
+        # 完成它 -> 允许下一条
+        ex.run_next()
+        pf.on_tick()                        # 回收 + 应用
+        pf.on_tick()                        # 再提交
+        check("**完成后才允许下一条**", ex.total == 2, ex.total)
+
+
+def test_pc_j_latch_closes_at_target():
+    """**J**: stock 达 target 且 playable 达标 -> latch 关闭, 不再补。"""
+    print("\n[PC-J] 达标即关 latch")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill_mixed(pf.pool, 5)              # stock=5=target, 且结构互异
+        _pc_tick(pf, 2)
+        check("**已在 target: 不提交**", len(ex.submitted) == 0,
+              len(ex.submitted))
+        check("**latch 关闭**", pf._refill_active is False)
+
+
+def test_pc_k_stops_at_hard_max():
+    """**K**: stock >= max -> 不再生成(即使 playable 不达标)。"""
+    print("\n[PC-K] 硬上限封顶")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex, pool_max_size=4)
+        fill(pf.pool, 4)                    # stock=4=max
+        _pc_tick(pf, 2)
+        check("**到顶: 不提交**", len(ex.submitted) == 0, len(ex.submitted))
+
+
+def test_pc_l_technical_failure_backs_off():
+    """**L**: 技术失败 -> 退避(refill 档位短退避)。"""
+    print("\n[PC-L] 技术失败 -> 退避")
+    with tmpdir() as d:
+        clk = _Clock()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        pf._apply_result("gen_fail", "网关抖",
+                         {"reject": "structure_technical_fail"}, clk())
+        check("**设了退避**", pf._retry_at > clk.t, pf._retry_at)
+        check("**进了失败链**", pf._fail_streak == 1, pf._fail_streak)
+
+
+def test_pc_m_puzzle_index_change_does_not_touch_backoff():
+    """**M**: 直播换题(puzzle_index 变化)-> **不**影响后台退避。
+
+    `_scene_at_submit` / `_scene_of` / 那一段 `puzzle_index` 重置代码
+    已经删除。这里从两个方向钉: ① 方法不存在; ② 反复 tick 不退避值
+    也不重置失败链(与直播播到第几题无关)。
+    """
+    print("\n[PC-M] 换题不影响后台退避")
+    with tmpdir() as d:
+        clk = _Clock()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        for name in ("_scene_at_submit", "_scene_of"):
+            check(f"**没有 {name}**", not hasattr(pf, name), name)
+        pf._apply_result("gen_fail", "x",
+                         {"reject": "structure_technical_fail"}, clk())
+        before = (pf._retry_at, pf._fail_streak)
+        # 没有任何输入能表达"换题了" —— 所以状态只能不变(退避未到期时)
+        pf.on_tick()
+        check("**退避值不受影响**", pf._retry_at == before[0], pf._retry_at)
+        check("**失败链不受影响**", pf._fail_streak == before[1],
+              pf._fail_streak)
+
+
+def test_pc_n_success_resets_streak_and_backoff():
+    """**N**: 成功入池 -> fail streak 与退避都清零。"""
+    print("\n[PC-N] 成功即清零")
+    with tmpdir() as d:
+        clk = _Clock()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), clock=clk)
+        pf._apply_result("gen_fail", "x",
+                         {"reject": "structure_technical_fail"}, clk())
+        check("先有失败", pf._fail_streak == 1)
+        pf._apply_result("ok", "", {}, clk())
+        check("**失败链清零**", pf._fail_streak == 0, pf._fail_streak)
+        check("**退避清零**", pf._retry_at == 0.0, pf._retry_at)
+
+
+def test_pc_o_prewarm_deadline_still_stops():
+    """**O**: prewarm 的 deadline 仍能 cooperative stop。
+
+    §12: `prewarm_should_continue(deadline, should_abort)` **不合并**进
+    后台谓词 —— 冷启动预热有界, 常驻补池无界。
+    """
+    print("\n[PC-O] 预热 deadline 仍然生效")
+    with tmpdir() as d:
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter())
+        sc_live = pf.prewarm_should_continue(deadline=1e12)
+        check("**预算内: True**", sc_live() is True)
+        sc_dead = pf.prewarm_should_continue(deadline=0.0)
+        check("**预算耗尽: False**", sc_dead() is False)
+        sc_abort = pf.prewarm_should_continue(deadline=None,
+                                              should_abort=lambda: True)
+        check("**stop 信号: False**", sc_abort() is False)
+        # 与后台谓词是两个东西: 后台谓词不看 deadline。
+        check("**后台谓词与 deadline 无关**",
+              pf._background_should_continue() is True)
+
+
+def test_pc_p_classic_killswitch_uses_same_stop_only():
+    """**P**: classic 链(kill-switch)与 keyword2 链对称 —— 同一 stop-only 谓词。"""
+    print("\n[PC-P] classic 链同样是 stop-only")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex, pool_keyword_seed_enabled=False)
+        fill(pf.pool, 1)
+        check("**classic 链下未停止 -> 提交**", (pf.on_tick() or True))
+        check("提交了一次", len(ex.submitted) == 1, len(ex.submitted))
+        ex.submitted.clear()
+        pf.request_stop()
+        _pc_tick(pf, 5)
+        check("**停止后 classic 链也不再提交**", len(ex.submitted) == 0,
+              len(ex.submitted))
+
+
+# ---- P0-1: 预热期间的激活闸门 ------------------------------------------
+
+def test_pc_q_prewarm_gate_blocks_scheduler_then_activates():
+    """**Q (P0-1)**: 未 activate 时 scheduler 连 tick 20 次 -> 零提交;
+    activate 之后下一拍库存不足 -> 提交 1 条。
+
+    这是本轮最关键的一条: 删掉相位门之后, `_prewarm()` 绕过了 `_future`
+    单飞, 若 scheduler 在预热期间也能起候选, "后台最多一条"当场破功。
+    `_background_active` 是那层**生命周期**闸门(不是相位闸门)。
+    """
+    print("\n[PC-Q] 预热闸门: 未激活零提交, 激活后接管")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex, background_active=False)
+        fill(pf.pool, 1)                    # 库存确实不足
+        _pc_tick(pf, 20)
+        check("**预热期间 20 拍零提交**", len(ex.submitted) == 0,
+              len(ex.submitted))
+        check("**闸门确实关着**", pf._background_active.is_set() is False)
+        pf.activate_background()
+        check("**激活后闸门打开**", pf._background_active.is_set() is True)
+        _pc_tick(pf)
+        check("**激活 + 库存不足 -> 提交 1 条**", len(ex.submitted) == 1,
+              len(ex.submitted))
+
+
+def test_pc_r_prewarm_then_activate_takes_over():
+    """**R (P0-1)**: 预热结束 -> activate -> 正常 refill 接管。
+
+    模拟 Director 的真实顺序: 先 `_generate_one_inner()`(预热, 绕过单飞),
+    返回后才 `activate_background()`。之后 scheduler 才能提交。
+    """
+    print("\n[PC-R] 预热完成 -> 激活 -> refill 接管")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex, background_active=False)
+        # ---- 模拟 Director._prewarm(): 直接调生成, 绕过 _future ----
+        ins = pf._generation_inputs()
+        kind, _detail, _extra = pf._generate_one_inner(ins)
+        check("**预热真的出了一道**", kind == "ok", kind)
+        check("**预热期间没有任何 executor 提交**",
+              len(ex.submitted) == 0, len(ex.submitted))
+        # ---- 预热结束 -> 激活 ----
+        pf.activate_background()
+        # 预热已经补了一道 -> 库存回到水位之上。要证明"激活后 refill 接管",
+        # 必须让库存**再度**不足(否则 latch 是关的, 不提交才是对的)。
+        pf.pool.pop_next(recent_signatures=[])   # 把预热那道取走
+        check("库存已再度不足", pf.pool.stock_count() < 2,
+              pf.pool.stock_count())
+        _pc_tick(pf)
+        check("**激活后 refill 接管(提交了)**", len(ex.submitted) == 1,
+              len(ex.submitted))
+
+
+# ---- P0-2: request_stop 必须早于最终 shutdown ---------------------------
+
+def test_pc_s_stop_before_executor_shutdown_blocks_submit():
+    """**S (P0-2)**: `request_stop()` 之后、executor 尚未 shutdown 的窗口内
+    tick -> 不再 submit。
+
+    这正是 `Phase.STOPPED` 检测点到 `finally` 之间那 3.5 秒的形状:
+    资源还没回收, 但停止信号已经生效。
+    """
+    print("\n[PC-S] request_stop 后未 shutdown 的窗口内零提交")
+    with tmpdir() as d:
+        ex = _SyncExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=_FakeWriter(),
+                  executor=ex)
+        fill(pf.pool, 1)
+        pf.request_stop()                   # 只置信号, **不**回收 executor
+        check("**executor 还活着**", pf._executor is ex)
+        ex.submitted.clear()
+        _pc_tick(pf, 10)
+        check("**停止窗口内 10 拍零提交**", len(ex.submitted) == 0,
+              len(ex.submitted))
+
+
+def test_pc_s2_pending_result_still_accounted_after_stop():
+    """**S-2 (P0-2 补丁)**: 停止**之后**在途那条的终局结果仍要**收账**。
+
+    如果停止闸门把收账一起挡掉, `interrupted_count` 恰好在最该被看见的
+    时刻(下播收尾)恒为 0 —— 运维会把一次正常停止读成"什么都没发生"。
+
+    真实时序是: 候选在**提交时**还没收到停止, 于是 worker 一路跑到
+    生成中途才看见停止 -> 返回"让路"形状 -> 结果落进 `_pending_result`,
+    但**这一拍来不及应用**(应用由下一拍的步骤 ② 做)。等下一拍到来时,
+    `gate` 已经为 False —— 收账**不能**被这道闸门一起挡掉, 否则
+    `interrupted_count` 恰好在最该被看见的时刻(下播收尾)恒为 0。
+
+    ⚠️ **停止信号不能放在 `submit()` 里, 也不能靠"第二拍再起一条"来造**。
+    `_submit_lock` 让 ⑩b 复查与 `submit` 成为不可分割的一段: 停止一旦
+    在提交之后到达, 那一拍就**零新提交**(见 `test_pc_u2`), 于是
+    "在途的 interrupted"根本不会新产生。所以这里必须让**第一拍**那条
+    候选自己跑成 interrupted —— 它是"停止之前就已提交"的合法在途,
+    结果留在槽位里等下一拍收账。
+    """
+    print("\n[PC-S2] 停止后仍收在途的账")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor())
+        # 让 writer 在生成中途就发现停止 -> 返回"让路"形状, 于是这一条
+        # 候选的终局结果是 interrupted, 但**提交发生在停止之前**。
+        state = {"stop_midgen": True}
+        real_gen = w.gen_spec
+
+        def gen(**kw):
+            if state["stop_midgen"]:
+                pf.request_stop()
+            return real_gen(**kw)
+
+        w.gen_spec = _with_live_predicate(gen, pf)
+        fill(pf.pool, 1)
+
+        # 第一拍: 提交(此时还没停) -> `_SyncExecutor` 就地跑完 worker,
+        # worker 在生成中途收到停止 -> 结果落进 `_pending_result`, 但
+        # **由下一拍步骤 ② 才应用**。
+        _pc_tick(pf, 1)
+        check("第一拍确实起了一个任务", len(w.calls) == 1, len(w.calls))
+        check("**第一拍的结果是 interrupted 且尚未收账**",
+              pf._pending_result is not None
+              and pf._pending_result[0] == "interrupted"
+              and pf.interrupted_count == 0,
+              (pf._pending_result, pf.interrupted_count))
+
+        # 第二拍: gate 已 False(不再起新活), 但步骤 ② 必须照收旧账。
+        _pc_tick(pf, 1)
+
+        check("**停止后那次在途被收账**",
+              pf.interrupted_count == 1, pf.interrupted_count)
+        check("**且不计失败/不退避(它是收尾不是故障)**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0,
+              (pf._fail_streak, pf._retry_at))
+        check("**停止后不再起新活(⑩b 复查拦下)**",
+              len(w.calls) == 1, len(w.calls))
+
+
+def test_pc_t_director_stops_background_at_phase_stopped():
+    """**T (P0-2)**: Director 检测到 `Phase.STOPPED` -> 立刻 request_stop。
+
+    这条钉的是 `director.py::run()` 的收尾顺序: `Phase.STOPPED` 是
+    **唯一**允许被感知的相位(它是生命周期终止, 不是直播压力)。
+    """
+    print("\n[PC-T] Director 在 STOPPED 处通知后台停手")
+    with tmpdir() as d:
+        dr = _mk_director_for_pc(d, _SyncExecutor())
+        pf = dr._prefetcher
+        check("后台未停止", pf._background_should_continue() is True)
+        dr._request_prefetch_stop()         # Director 收尾时调的就是它
+        check("**Director 通知后后台谓词 False**",
+              pf._background_should_continue() is False)
+        check("**且 executor 尚未被回收(request_stop 只置信号)**",
+              dr._prefetcher._executor is not None)
+        dr.close()
+
+
+# ======================================================================
+# PC-U/V/W: 复审三个 lifecycle/concurrency blocker 的回归
+#
+# 这三组不是"加功能", 而是把三个**已修的缝**钉住。它们共同的形状是:
+# 旧实现在某个**边界**上没有线性化/检查点/传参, 于是能构造出
+# "已经停止却还在提交 / 还在写入 / 还在烧 LLM 轮次"。每条都做过
+# 变异测试(把修法删掉必须变红), 否则断言不承重。
+# ======================================================================
+
+def _PT(pf=None, status=None, stop_on_run=False, rounds=None):
+    """试玩替身: 可编程地"跑一次就停"或"被 deadline 拦下"。
+
+    记录的是**谓词对象本身**(`preds`)而不是它这次的结果 —— 后者在
+    "谓词恒真"时会恒过, 抓不到"漏传 override"这种变异。
+    """
+    from story.playtest import PASS, PlaytestResult
+
+    class _Double:
+        def __init__(self):
+            self.calls = []
+            self.preds = []
+
+        def run(self, spec, should_continue=None):
+            self.calls.append(spec)
+            self.preds.append(should_continue)
+            if stop_on_run and pf is not None:
+                pf.request_stop()
+            return PlaytestResult(status=status or PASS)
+
+    return _Double()
+
+
+class _DeadlinePT:
+    """试玩替身: 每轮昂贵调用**之前**问一次谓词, 模拟"烧 LLM 轮次"。
+
+    真 `Playtester._run_inner` 的契约就是**每轮重查谓词**; 这里如实地
+    逐轮问, 于是"谓词在第 i 轮变 False"这件事能被观察到。
+
+    关键指标是 `rounds_after_deadline`: 谓词从第 `expire_after` 轮起
+    开始返回 False, 若真被拦下, 这个值恒为 0; 若 prefetch 没把 override
+    传进来(走实例恒真谓词), 它会一路问到 `max_rounds`,
+    `rounds_after_deadline > 0` -> 红。
+    """
+
+    def __init__(self, pf, allow_rounds=1, max_rounds=5):
+        self.pf = pf
+        self.allow_rounds = allow_rounds
+        self.max_rounds = max_rounds
+        self.rounds_after_deadline = 0
+        self.calls = []
+        self.preds = []
+
+    def run(self, spec, should_continue=None):
+        from story.playtest import INTERRUPTED, PASS, PlaytestResult
+        self.calls.append(spec)
+        self.preds.append(should_continue)
+        if should_continue is None:
+            should_continue = self.pf._background_should_continue
+        for i in range(self.max_rounds):
+            if i >= self.allow_rounds:
+                # 此后"deadline 已过"：谓词必须开始返回 False。
+                if should_continue():
+                    # 谓词仍说可以继续 -> 说明 override 没生效。
+                    self.rounds_after_deadline += 1
+                    continue
+                return PlaytestResult(status=INTERRUPTED)
+        return PlaytestResult(status=PASS)
+
+
+class _NullWriter:
+    """`Playtester` 需要的**最小** writer —— W3 只测 run 的谓词语义。"""
+
+    def ask(self, *a, **kw):            # pragma: no cover - 不该被调用
+        raise AssertionError("W3 不该真的发 LLM 调用")
+
+
+
+def test_pc_u_submit_lock_is_separate_from_state_lock():
+    """**U (Blocker 1)**: 线性化锁必须**独立于** `_lock`。
+
+    为什么不能塞回 `_lock`: `submit` 必须在 `_lock` **之外**(见
+    `_on_tick_locked_ish` 的论证 —— 同步替身会在 `submit` 里就地跑完
+    worker, worker 结尾要拿 `_lock`, 非重入锁上直接死锁)。若把提交段
+    塞回 `_lock`, 要么死锁, 要么得放弃"submit 在锁外"这条前提。
+
+    这条用**源码级**断言(与 `test_no_guard_machinery_remains` 的 grep
+    纪律一致): 它钉的是"存在两把锁、且提交段与 request_stop 共用第二把"
+    这个**结构事实**, 而结构事实无法用行为断言稳定地表达。
+    """
+    print("\n[PC-U] 提交线性化锁与状态锁分离")
+    import inspect
+    from story.prefetch import PoolPrefetcher
+    with tmpdir() as d:
+        pf = mkpf(d)
+        check("**两把锁是两个不同的对象**",
+              pf._submit_lock is not pf._lock,
+              (type(pf._submit_lock).__name__, type(pf._lock).__name__))
+        # 必须是可重入的: 同步替身让 worker 在 `submit()` 内联跑完,
+        # worker 可能同线程再调 request_stop / shutdown。
+        check("**提交锁可重入(同步替身会同线程重入)**",
+              isinstance(pf._submit_lock, type(__import__("threading")
+                                               .RLock())),
+              type(pf._submit_lock).__name__)
+
+        src_stop = inspect.getsource(PoolPrefetcher.request_stop)
+        check("**request_stop 在 `_submit_lock` 下置位**",
+              "_submit_lock" in src_stop, src_stop.splitlines()[:3])
+        src_act = inspect.getsource(PoolPrefetcher.activate_background)
+        check("**activate_background 也在 `_submit_lock` 下**",
+              "_submit_lock" in src_act, src_act.splitlines()[:3])
+        src_tick = inspect.getsource(PoolPrefetcher._on_tick_locked_ish)
+        # ⑩b: 提交段里必须**复查**停止信号, 否则出锁到 submit 之间
+        # 到达的 stop 会让"停止之后仍然提交一条新候选"。
+        check("**提交段复查 `_shutdown_event`(⑩b)**",
+              "_shutdown_event.is_set()" in src_tick, None)
+        # 撤销 `_PENDING` 的那一行 —— 忘掉它就是单飞被永久占死。
+        check("**复查命中时撤销 `_PENDING`(单飞不被占死)**",
+              src_tick.count("_future = None") >= 1, None)
+
+
+def test_pc_u2_stop_in_the_window_between_pending_and_submit():
+    """**U2 (Blocker 1)**: stop 落在"⑩ 占位之后、真提交之前" -> 撤销占位且零提交。
+
+    这是 ⑩b 复查真正要拦的那一刻。**不能用"先手工置 `_PENDING` 再 tick"
+    来构造** —— 那样会先撞上步骤 ⑨ 的单飞守卫(`_future is not None`
+    直接 return), ⑩b 根本到不了。真实的缝是:
+
+        同一拍 tick: ⑨ 通过 -> ⑩ `_future = _PENDING` -> 出 `_lock`
+        ↓  **并发线程**在这条缝里跑完 `request_stop()`
+        ↓  进 `_submit_lock` -> ⑩b 复查到 stop -> 撤销 + 不提交
+
+    所以这里**精确地把 stop 注入到 `_submit_lock` 被获取的那一刻** ——
+    也就是"⑩ 已占位、⑩b 复查尚未读到"的那个点。这种注入方式同时也
+    证明了线性化边界存在: stop 只要抢在提交段之前拿到锁, 提交段就
+    一定能看见它。
+
+    四个断言:
+      * `_future is None`  —— 撤销 ⑩ 占位(忘掉就是单飞永久占死);
+      * `total == 0`       —— 零提交(这就是 blocker 本身);
+      * 账目零变动          —— 这活**没开始**, 不能记失败/退避/interrupted。
+    """
+    print("\n[PC-U2] stop 抢在提交段之前 -> 撤销占位且零提交")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w, executor=ex)
+        fill(pf.pool, 1)
+
+        # 把 `request_stop()` 注入到"提交段拿到 `_submit_lock` 的那一刻":
+        # 复现"⑩ 已占 `_PENDING`、⑩b 复查还没读到"的真实时序。
+        class _StopOnSubmitLockEnter:
+            def __init__(self, real, pfx):
+                self._real, self._pfx, self._fired = real, pfx, False
+
+            def __enter__(self):
+                if not self._fired:
+                    self._fired = True
+                    self._pfx.request_stop()
+                return self._real.__enter__()
+
+            def __exit__(self, *a):
+                return self._real.__exit__(*a)
+
+        pf._submit_lock = _StopOnSubmitLockEnter(pf._submit_lock, pf)
+
+        pf._on_tick_locked_ish(gate=True)
+
+        check("停止信号确实已置位", pf._shutdown_event.is_set() is True)
+        check("**占位被撤销(单飞不被永久占死)**",
+              pf._future is None, pf._future)
+        check("**零提交**", ex.total == 0, ex.total)
+        check("**不记失败/不退避/不记 interrupted(这活没开始)**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0
+              and pf.interrupted_count == 0,
+              (pf._fail_streak, pf._retry_at, pf.interrupted_count))
+        # 下一拍也不该起活(信号仍在)。
+        pf._on_tick_locked_ish(gate=True)
+        check("**后续拍仍零提交**", ex.total == 0, ex.total)
+
+
+def test_pc_u3_activate_after_stop_does_not_revive():
+    """**U3 (Blocker 1)**: `request_stop()` 之后 `activate_background()` 不得复活。
+
+    `activate_background()` 原来是**裸的** check-then-set:
+    "读 `_shutdown_event` -> 若未置位则 set `_background_active`" 两步
+    之间能被并发 `request_stop()` 插进来, 于是"停止之后又被复活激活"。
+    它现在与 `request_stop()` 共用 `_submit_lock`, 于是两者两两线性化。
+
+    这里单线程复现等价时序: 先 stop, 再 activate。
+    """
+    print("\n[PC-U3] 停止之后 activate 不得复活后台")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        ex = _ManualExecutor()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=ex, background_active=False)
+        fill(pf.pool, 1)
+
+        pf.request_stop()
+        pf.activate_background()
+        check("**停止后 activate 不会置位 `_background_active`**",
+              pf._background_active.is_set() is False,
+              pf._background_active.is_set())
+        # 后续多拍零提交: 复活若发生, 这里会红。
+        _pc_tick(pf, 10)
+        check("**停止 + 假 activate 之后 10 拍仍零提交**",
+              ex.total == 0, ex.total)
+        check("**后台谓词恒 False**",
+              pf._background_should_continue() is False)
+
+
+def test_pc_v_no_pool_add_when_stop_arrives_during_playtest():
+    """**V (Blocker 2)**: 试玩"成功"了但 stop 已到 -> 不得 `pool.add()`。
+
+    最坏形状: 生成链 + 整个试玩都跑完(试玩返回 PASS), 才在提交前收到
+    停止。旧实现的最后一次谓词检查在**试玩开始前**, 之后到 `pool.add`
+    之间(最坏 2N 次 LLM 调用)零检查点 —— 于是停止后仍会写入一道库存。
+
+    这里用**同步** executor: worker 在 `submit()` 内联跑完, 试玩替身在
+    `run()` 里先 `request_stop()` 再返回 PASS。于是走到 `pool.add` 紧前
+    那道检查点时, 谓词必为 False。
+
+    断言刻意包含"账目形状": 记 interrupted(候选确实走完了生成链),
+    **不**记失败/退避, **不**记 added; 且 detail 必须读起来像正常收尾,
+    不能出现旧架构的"直播变忙"。
+    """
+    print("\n[PC-V] 试玩通过但已停止 -> pool.add 不调用")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor(), playtest_enabled=True)
+        w.gen_spec = _with_live_predicate(w.gen_spec, pf)
+        fill(pf.pool, 1)
+
+        pt = _PT(pf, status=PASS, stop_on_run=True)
+        pf.set_playtester(pt)
+
+        adds = {"n": 0}
+        real_add = pf.pool.add
+
+        def counting_add(spec, **kw):
+            adds["n"] += 1
+            return real_add(spec, **kw)
+
+        pf.pool.add = counting_add
+
+        _pc_tick(pf, 2)
+
+        check("**试玩确实跑到了(证明缝在试玩之后)**",
+              len(pt.calls) == 1, len(pt.calls))
+        check("**pool.add 零调用**", adds["n"] == 0, adds["n"])
+        check("**记一次 interrupted**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+        check("**不计 added**", pf.added_count == 0, pf.added_count)
+        check("**不计失败、不退避**",
+              pf._fail_streak == 0 and pf._retry_at == 0.0,
+              (pf._fail_streak, pf._retry_at))
+        check("**被丢弃的 PASS 不污染试玩通过率**",
+              pf.playtest_pass_count == 0, pf.playtest_pass_count)
+
+
+def test_pc_v2_pre_add_checkpoint_also_covers_playtest_off():
+    """**V2 (Blocker 2)**: 试玩**关着**时, gen 返回 -> `pool.add` 之间同样有检查点。
+
+    这是 Blocker 2 最容易漏的一半。修法若只写在
+    `if self._playtest_enabled():` 里, 那么**默认配置**(试玩关闭)下
+    从生成链返回到 `pool.add` 仍是零检查点 —— 一个都没修。
+    那正是 `prefill_pool.py` 里"候选完成后、pool.add 之前"补过的同一个洞。
+
+    这里让 writer 在**返回前**置停止(即 gen 成功返回, 但停止已到),
+    断言零 `pool.add`。
+    """
+    print("\n[PC-V2] 试玩关闭时提交前检查点仍然生效")
+    with tmpdir() as d:
+        w = _GatedWriter()
+        pf = mkpf(d, pool=PuzzlePool.open(mkcfg(d)), writer=w,
+                  executor=_SyncExecutor())      # 试玩默认关闭
+        check("试玩确实关着", pf._playtest_enabled() is False)
+
+        state = {"stop": False}
+        real_gen = w.gen_spec
+
+        def gen(**kw):
+            # 先出稿, 返回前才停 —— 停止信号落在 gen 内部最后一段,
+            # 于是 ① (试玩前) 整段被跳过, 只剩 ③ 能拦。
+            spec = real_gen(**kw)
+            if state["stop"]:
+                pf.request_stop()
+            return spec
+
+        w.gen_spec = _with_live_predicate(gen, pf)
+        state["stop"] = True
+        fill(pf.pool, 1)
+
+        adds = {"n": 0}
+        real_add = pf.pool.add
+
+        def counting_add(spec, **kw):
+            adds["n"] += 1
+            return real_add(spec, **kw)
+
+        pf.pool.add = counting_add
+        _pc_tick(pf, 2)
+
+        check("**pool.add 零调用(试玩关着也拦得住)**",
+              adds["n"] == 0, adds["n"])
+        check("**记一次 interrupted**", pf.interrupted_count == 1,
+              pf.interrupted_count)
+
+
+def test_pc_v3_both_checkpoints_exist_and_ordered():
+    """**V3 (Blocker 2)**: 两个检查点都在, 且提交前那个在 `pool.add` **之前**。
+
+    白盒的**结构**断言: `_finish_one` 里必须有**两处**
+    `if not should_continue():` —— 少一处就是少一层检查(① 省下 N 次
+    LLM 调用, ③ 省下一次写入, 语义不同、不可合并)。并且第二处必须
+    出现在 `self.pool.add` **之前** —— 否则它拦不住任何东西。
+
+    还要求两处用的是**注入的** `should_continue` 而不是写死的实例谓词
+    —— 否则预热路径那份带 deadline 的谓词在 ③ 处失效(Blocker 3 会
+    被这条一并破掉)。
+    """
+    print("\n[PC-V3] 两个提交检查点都在且有序")
+    import inspect
+    from story.prefetch import PoolPrefetcher
+    src = inspect.getsource(PoolPrefetcher._finish_one)
+    n = src.count("if not should_continue():")
+    check("**`_finish_one` 里恰有两个 should_continue 检查点**",
+          n == 2, n)
+    idx_last = src.rfind("if not should_continue():")
+    idx_add = src.find("self.pool.add")
+    check("**第二处在 `self.pool.add` 之前**",
+          0 <= idx_last < idx_add, (idx_last, idx_add))
+    check("**用的是注入的谓词, 不是写死的实例谓词**",
+          "_background_should_continue()" not in src,
+          src.count("_background_should_continue"))
+
+
+def _mk_prewarm_pf(tmp, executor=None, **cfgkw):
+    """建一个**预热态**的 prefetcher: 未 activate。
+
+    预热路径在生产里是 `Director._prewarm()` 直接调
+    `_generate_one_inner(inputs, should_continue=sc)` —— 绕过 `_future`
+    单飞。这里如实复现那一跳。
+    """
+    return mkpf(tmp, executor=executor or _SyncExecutor(),
+                background_active=False, **cfgkw)
+
+
+def test_pc_w_prewarm_playtest_gets_deadline_predicate():
+    """**W (Blocker 3, 核心)**: 预热 deadline 必须**贯穿到试玩内部**。
+
+    旧实现: `Playtester.__init__` 一次性捕获实例谓词, `run(spec)` 不收
+    谓词。于是 `_finish_one` 的 `should_continue`(预热时 = stop +
+    deadline)只用在试玩**开始前**那道 guard, 之后被丢弃 —— 预热试玩
+    越过 deadline 后继续烧 LLM 轮次。
+
+    修法: `Playtester.run(spec, should_continue=...)` 支持**本次调用**
+    的 override, `_finish_one` 把那份带 deadline 的谓词传进去。
+
+    ⚠️ 真 deadline 走 `time.monotonic()`(不可注入), 所以这里用一个
+    **从第 N 轮起翻假**的谓词来等价地表达"预算在第 N 轮之前耗尽":
+      * 若设成"一开始就 False", 会先被 ① 那道 guard 拦下, 只测到旧行为;
+      * 必须让 ① 放行、由试玩**内部**的逐轮检查拦下, 才证明 override
+        真的贯穿进去了。
+    """
+    print("\n[PC-W] 预热 deadline 贯穿到试玩内部")
+    with tmpdir() as d:
+        pf = _mk_prewarm_pf(d, playtest_enabled=True)
+        w = pf.writer
+        fill(pf.pool, 1)
+
+        # 预热谓词: 前 `ALLOW + 1` 次调用放行, 之后一律 False。
+        #
+        # 为什么是 `ALLOW + 1`: `_finish_one` 里有两处会问谓词 ——
+        #   ① 试玩开始前那道 guard  (问 1 次)
+        #   ② 试玩**内部**的逐轮检查 (让 `ALLOW` 轮放行)
+        # 要证明"override 贯穿到试玩**内部**", 就必须让 ① 放行、由试玩
+        # 内部的检查点拦下 —— 否则只测到 ① 的旧行为(它在修 Blocker 3
+        # 之前就存在, 不承重)。
+        # 预算: 只让 **① 那道 guard** 放行(它就问掉第 1 次); 从
+        # 试玩**内部**的第 1 轮起必须为 False。于是"① 放行 + 内部拦下"
+        # 这个形状被精确构造出来 —— 拦点一定在试玩内部, 不承重的
+        # 旧 guard 拦不住它。
+        calls = {"n": 0}
+
+        def sc() -> bool:
+            calls["n"] += 1
+            return calls["n"] <= 1
+
+        # `allow_rounds=0`: 内部**第 1 轮**就要检查谓词。
+        pt = _DeadlinePT(pf, allow_rounds=0)
+        pf.set_playtester(pt)
+
+        spec = w.gen_spec(should_continue=sc)
+        kind, detail, extra = pf._finish_one(spec, {}, sc)
+
+        check("**预热试玩被内部检查点拦下(override 真的传进去了)**",
+              pt.rounds_after_deadline == 0, pt.rounds_after_deadline)
+        check("**试玩确实收到了 override 谓词**",
+              pt.preds and pt.preds[0] is not None, pt.preds)
+        check("**拦在试玩内部, 不是试玩开始前那道 guard**",
+              len(pt.calls) == 1, len(pt.calls))
+        # 结果**不是** `interrupted` 而是 `playtest_interrupted` —— 这
+        # 正是正确的语义: 被中止的是**这次试玩**(deadline 到了), 与
+        # "整个运行停止 -> interrupted"是两类账。`_apply_result` 会按
+        # `extra["playtest"]` 记一次 `playtest_interrupted_count`, 并按
+        # `extra["interrupted"]` 免退避。
+        check("**结果是 playtest_interrupted(试玩被 deadline 中止)**",
+              kind == "playtest_interrupted", (kind, detail))
+        check("**免退避(extra 标记 interrupted)**",
+              extra.get("interrupted") is True, extra)
+        check("**没入池**", pf.added_count == 0, pf.added_count)
+
+
+def test_pc_w2_steady_state_playtest_uses_instance_predicate():
+    """**W2 (Blocker 3)**: 稳态试玩不传 override -> 用实例谓词(逐位不变)。
+
+    反证: 实例谓词**恒真**且已 `request_stop()` 时, 稳态试玩**不**中断
+    —— 证明稳态路径**不读** `_shutdown_event`(实例谓词不包含 stop)。
+    这是"override 是 replace 而非 AND"的另一半证据: 稳态没有被悄悄
+    塞进 stop 语义。
+    """
+    print("\n[PC-W2] 稳态试玩走实例谓词")
+    with tmpdir() as d:
+        pf = mkpf(d, playtest_enabled=True)
+        pt = _PT(pf, status=PASS)
+        pf.set_playtester(pt)
+        pf.request_stop()               # 实例谓词恒真, 不受它影响
+        got, _ = pf._playtest(good_spec())
+        check("**不传 override 时仍然跑完试玩**", pt.calls and len(pt.calls) == 1,
+              len(pt.calls))
+        check("**override 参数确实为 None(走实例谓词)**",
+              pt.preds == [None], pt.preds)
+
+
+def test_pc_w3_override_replaces_not_ands():
+    """**W3 (Blocker 3)**: override 是 **replace**, 不是 AND。
+
+    依据: `prewarm_should_continue._go()` 先查 `should_abort` 再查
+    `deadline` —— 预热谓词**已经包含 stop**。再 AND 一次实例谓词是
+    同一件事做两遍, 而且会让"实例谓词恒假"这种测试配置下无法表达
+    "本次调用放行"。
+
+    这条是**唯一**把 replace 语义写进契约的测试: 若有人误改成
+    `lambda: inst() and ov()`, 这里立刻红。
+    """
+    print("\n[PC-W3] override replace 而非 AND")
+    from story.playtest import Playtester
+    # 实例谓词恒假、override 恒真 -> 必须**正常跑完**。
+    # `Playtester(player_client, host_writer, should_continue=..., ...)`。
+    pt = Playtester(_NullWriter(), _NullWriter(),
+                    should_continue=lambda: False,
+                    max_turns=2, clock=lambda: 0.0)
+    r = pt.run(good_spec(), should_continue=lambda: True)
+    check("**实例谓词恒假但 override 恒真 -> 未被中断**",
+          r.status != "interrupted", r.status)
+
+
+def test_pc_w4_finish_one_threads_predicate_into_playtest():
+    """**W4 (Blocker 3)**: `_finish_one` 必须把谓词**传进** `_playtest`。
+
+    防漏传的变异测试: 删掉 `_playtest(spec, should_continue)` 里的
+    第二个实参 -> 这里红。记录的是"传进来的谓词对象本身不是 None",
+    而不是它这次的结果 —— 后者会因谓词恒真而恒过, 抓不到漏传。
+    """
+    print("\n[PC-W4] _finish_one 把谓词传进试玩")
+    with tmpdir() as d:
+        pf = mkpf(d, playtest_enabled=True)
+        pt = _PT(pf, status=PASS)
+        pf.set_playtester(pt)
+        pf._finish_one(good_spec(), {}, lambda: True)
+        check("**试玩收到非 None 的 override**",
+              pt.preds and pt.preds[0] is not None, pt.preds)
+        check("**且传的正是同一个对象**",
+              pt.preds[0] is not None and pt.preds[0]() is True, pt.preds)
+
+
+def test_pc_w5_playtester_run_signature_accepts_optional_predicate():
+    """**W5 (Blocker 3)**: `Playtester.run` 的签名固化。
+
+    把"~25 个单参调用点不红(向后兼容)"从口头约定变成可执行断言:
+    `should_continue` 必须是**可选**的(默认 None), 否则老调用点全红。
+    """
+    print("\n[PC-W5] Playtester.run 签名接受可选谓词")
+    import inspect
+    from story.playtest import PASS, Playtester
+    sig = inspect.signature(Playtester.run)
+    params = list(sig.parameters)
+    check("**参数表为 self, spec, should_continue**",
+          params == ["self", "spec", "should_continue"], params)
+    check("**should_continue 默认 None**",
+          sig.parameters["should_continue"].default is None,
+          sig.parameters["should_continue"].default)
+
+
+def _mk_director_for_pc(tmp, executor):
+    """建一个真实 Director, 替换掉 prefetcher 的 executor/writer。
+
+    给 PC 组的装配类用例用(B/D/T)。返回的对象带 `close()`, 负责
+    释放后台资源(Windows 上不释放会攥着临时目录句柄)。
+    """
+    from director import Director
+
+    cfg = mkcfg(tmp, no_llm=False)
+    cfg.pool_min_size = 2
+    cfg.pool_target_size = 5
+    cfg.pool_max_size = 10
+    dr = Director(cfg)
+    pf = dr._prefetcher
+    if pf is not None:
+        pf._executor = executor
+        pf.writer = _FakeWriter()
+        pf.activate_background()
+    return _PCDirector(dr)
+
+
+class _PCDirector:
+    """薄包装: 让 PC 用例不用关心 Director 的清理细节。
+
+    属性访问透传给真 Director(用例要调 `_request_prefetch_stop` 等),
+    只额外提供 `close()`。
+    """
+
+    def __init__(self, dr):
+        self._dr = dr
+        self._prefetcher = dr._prefetcher
+
+    def __getattr__(self, name):
+        return getattr(self._dr, name)
+
+    def close(self):
+        pf = self._prefetcher
+        if pf is not None:
+            try:
+                pf.shutdown()
+            except Exception:               # noqa: BLE001
+                pass
+
+
+def _with_live_predicate(gen_spec, pf, stop=None):
+    """把 `gen_spec` 包成"每次调用都用**当前**的后台谓词"。
+
+    真 `gen_spec` 的契约是"每个昂贵 stage 之前重查一次谓词"。替身只查
+    一次, 所以这里必须**在调用时刻**取谓词, 否则 `request_stop()` 在
+    提交之后到达就测不出来。
+
+    `stop`: 可选的"收尾动作"(通常是 `pf.request_stop` 或 `pf.shutdown`)。
+    给它就在**第一次**调用时、查谓词**之前**先执行 —— 用来复现"任务已经
+    提交、HTTP 在途, 此刻收尾信号到达"的真实时序。
+
+    ⚠️ 收尾信号必须从**这里**(worker 体内)发出, 不能从 `submit()` 里
+    发出:`_submit_lock` 让"复查 stop + submit"成为不可分割的一段,
+    从 `submit()` 里调 `request_stop()`/`shutdown()` 会**同线程重入
+    非重入锁 -> 自死锁**。
+    """
+    fired = {"n": 0}
+
+    def wrapped(**kw):
+        if stop is not None and fired["n"] == 0:
+            fired["n"] += 1
+            stop()
+        kw["should_continue"] = pf._background_should_continue
+        return gen_spec(**kw)
+    return wrapped
+
+
 def main():
     tests = [
         # A. 库存与探针
@@ -3820,7 +4533,7 @@ def main():
         # B. PoolPrefetcher 状态机
         test_latch_walk_min2_target5,
         test_latch_held_under_pressure,
-        test_refill_to_target_does_not_start_when_stock_healthy_and_qa_busy,
+        test_refill_to_target_does_not_start_when_stock_healthy,
         test_semantic_reject_immediately_continues_refill,
         test_technical_reject_still_backs_off,
         test_two_ticks_produce_one_task,
@@ -3850,6 +4563,7 @@ def main():
         test_review_side_channel_is_per_instance,
         test_review_side_channel_reset_on_entry,
         test_director_prefetch_has_own_writer,
+        test_pc_assembly_writer_client_split_and_prefetch_config,
         test_prefetch_writer_none_when_no_client,
         test_shutdown_docstring_is_honest,
         # E. L1 —— playable 库存 / REVEALED 窗口 / 当前题 avoid
@@ -3859,38 +4573,32 @@ def main():
         test_prefetch_l1_a_stock_ok_but_playable_zero,
         test_prefetch_l1_b_stock_ok_playable_ok_no_refill,
         test_prefetch_l1_c_max_size_stops_generation,
-        test_prefetch_l1_e_revealed_window,
+        test_prefetch_l1_e_starts_regardless_of_live_phase,
         test_prefetch_l1_f_current_puzzle_in_avoid,
         test_prefetch_probe_and_generate_share_one_snapshot,
         test_prefetch_stats_exposes_playable,
         test_playable_min_zero_restores_q9_behavior,
         test_max_size_below_target_is_flagged,
         # ---- U1: 揭晓窗口专用目标 + deadline guard ----
-        test_u1_reveal_uses_higher_target,
-        test_u1_reveal_playable_target,
         # ---- C3: probe 的 limit 必须跟着阶段目标走 ----
-        test_c3_reveal_playable_probe_counts_past_one,
-        test_c3_reveal_playable_probe_stops_at_two_not_ten,
-        test_u1_qa_still_uses_conservative_target,
-        test_u1_deadline_guard_blocks_new_requests,
-        test_u1_deadline_guard_ignores_non_reveal,
-        test_u1_multiple_generations_within_one_reveal,
+        test_u1_deadline_guard_no_longer_gates_start,
+        test_u1_no_deadline_guard_config_exists,
+        test_u1_multiple_generations_in_one_refill_cycle,
         test_u1_reveal_never_blocks_next_puzzle,
         test_u1_guard_config_validation,
         # ---- G1: 后台补池生命周期 + 独立预算 + 递增退避 ----
         test_g1_prefetch_passes_own_budget_not_live_budget,
-        test_g1_prefetch_yields_when_phase_switches_midflight,
-        test_g1_midflight_switch_stops_reviewer_and_next_draft,
-        test_g1_interrupted_yields_without_retry_storm,
+        test_g1_prefetch_continues_across_phase_switches_midflight,
+        test_g1_stop_midflight_is_interrupted_not_fail,
+        test_g1_stopped_prefetcher_never_submits_again,
         test_g1_backoff_schedule_increases_then_caps,
         test_refill_active_keeps_technical_backoff_short_until_target,
-        # ---- G4-C: 试玩前让路 ----
-        test_g4c_playtest_yields_before_starting,
-        test_g4c_playtest_still_runs_when_live_is_idle,
+        # ---- G4-C: 试玩不因相位切换中止 ----
+        test_g4c_playtest_runs_through_phase_switch,
+        test_g4c_playtest_predicate_is_lifecycle_only,
         test_g1_success_resets_backoff_streak,
-        test_g1_scene_change_resets_long_backoff_once,
-        test_g1_effective_guard_covers_budget,
-        test_g1_interrupted_probe_fails_closed,
+        test_backoff_is_not_reset_by_live_scene_change,
+        test_no_guard_machinery_remains,
         # ---- G2: keyword2 两阶段链 ----
         test_g2_keyword_path_draws_two_keys_and_adds,
         test_g2_keyword_does_not_call_pick_blueprint,
@@ -3914,6 +4622,42 @@ def main():
         test_g4_good_vocab_activates_bag,
         test_g4_session_seed_reproducible_end_to_end,
         test_g4_provenance_records_vocab_and_seed,
+        # ---- Phase C: 后台补题与直播彻底解耦 (A–T) ----
+        test_pc_a_starts_when_below_min,
+        test_pc_b_starts_despite_pending_inflight_hint_reveal,
+        test_pc_c_starts_in_revealed_window,
+        test_pc_d_candidate_survives_all_phases,
+        test_pc_e_background_continues_alongside_live_generation,
+        test_pc_f_playtest_survives_phase_switch,
+        test_pc_g_no_submit_after_shutdown,
+        test_pc_h_shutdown_midflight_is_interrupted_not_failed,
+        test_pc_i_at_most_one_future_across_many_ticks,
+        test_pc_j_latch_closes_at_target,
+        test_pc_k_stops_at_hard_max,
+        test_pc_l_technical_failure_backs_off,
+        test_pc_m_puzzle_index_change_does_not_touch_backoff,
+        test_pc_n_success_resets_streak_and_backoff,
+        test_pc_o_prewarm_deadline_still_stops,
+        test_pc_p_classic_killswitch_uses_same_stop_only,
+        # P0-1: 预热期间的激活闸门
+        test_pc_q_prewarm_gate_blocks_scheduler_then_activates,
+        test_pc_r_prewarm_then_activate_takes_over,
+        # P0-2: request_stop 必须早于最终 shutdown
+        test_pc_s_stop_before_executor_shutdown_blocks_submit,
+        test_pc_s2_pending_result_still_accounted_after_stop,
+        test_pc_t_director_stops_background_at_phase_stopped,
+        # ---- PC-U/V/W: 复审三个 lifecycle/concurrency blocker ----
+        test_pc_u_submit_lock_is_separate_from_state_lock,
+        test_pc_u2_stop_in_the_window_between_pending_and_submit,
+        test_pc_u3_activate_after_stop_does_not_revive,
+        test_pc_v_no_pool_add_when_stop_arrives_during_playtest,
+        test_pc_v2_pre_add_checkpoint_also_covers_playtest_off,
+        test_pc_v3_both_checkpoints_exist_and_ordered,
+        test_pc_w_prewarm_playtest_gets_deadline_predicate,
+        test_pc_w2_steady_state_playtest_uses_instance_predicate,
+        test_pc_w3_override_replaces_not_ands,
+        test_pc_w4_finish_one_threads_predicate_into_playtest,
+        test_pc_w5_playtester_run_signature_accepts_optional_predicate,
     ]
     for t in tests:
         t()

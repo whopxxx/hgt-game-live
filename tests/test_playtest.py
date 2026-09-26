@@ -5,10 +5,13 @@
 Q10 AI 试玩。核心是**两件事**:
 
     A. 隐藏信息隔离 —— Player 构造上就看不到 answer/facts/atoms/覆盖信息
-    B. 让路给直播 —— 每次 LLM 调用前重查压力, 忙了就 interrupted
+    B. 协作式取消 —— 每次 LLM 调用前重查谓词, 收到停止就 interrupted
 
 这一批(Q10a)只测零件: PlaytestResult / prompt 构造 / Player 协议 /
 基本结局判定。**不接 prefetch**(那是 Q10c)。
+
+Phase C 之后这个谓词只表达**本次运行结束(stop)**, 不再是"直播忙不忙"
+的压力探针(试玩是后台工作, 见 `story/prefetch.py` 模块 docstring)。
 """
 from __future__ import annotations
 
@@ -347,10 +350,10 @@ def test_spec_missing_answer_is_unavailable():
 
 
 # ======================================================================
-# C. 让路(每次 LLM 调用前重查)
+# C. 协作式取消(每次 LLM 调用前重查)
 # ======================================================================
 def test_interrupted_before_first_call():
-    print("\n[C1] 一开头就忙 -> interrupted, 零调用")
+    print("\n[C1] 一开头就收到停止 -> interrupted, 零调用")
     pl = _FakePlayerClient()
     host = _FakeHost()
     pt = mkpt(player=pl, host=host, cont=lambda: False)
@@ -361,8 +364,8 @@ def test_interrupted_before_first_call():
 
 
 def test_interrupted_after_player_before_host():
-    """**关键**: Player 回来后压力升高 -> 下一次 Host 调用不得发生。"""
-    print("\n[C2] Player 后变忙 -> 不调 Host")
+    """**关键**: Player 回来后收到停止 -> 下一次 Host 调用不得发生。"""
+    print("\n[C2] Player 后收到停止 -> 不调 Host")
     state = {"n": 0}
 
     def cont():
@@ -379,7 +382,7 @@ def test_interrupted_after_player_before_host():
 
 
 def test_interrupted_midway_stops_further_turns():
-    print("\n[C3] 中途变忙 -> 立即停后续轮")
+    print("\n[C3] 中途收到停止 -> 立即停后续轮")
     state = {"n": 0}
 
     def cont():
@@ -672,12 +675,10 @@ def test_prefetch_playtest_disabled_by_default():
         # 默认: 不注入 playtester
         pf = PoolPrefetcher(
             cfg=cfg, pool=pool, writer=w,
-            probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                           "hint_inflight": False, "reveal_inflight": False,
-                           "stopped": False},
             probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
             pick_blueprint=lambda recent, rng=None: None,
             executor=_Ex())
+        pf.activate_background()      # Phase C: 后台需先激活
         check("**默认没有 playtester**", pf._playtester is None)
         pf.on_tick()
         pf.on_tick()
@@ -702,7 +703,7 @@ def test_prefetch_playtest_pass_and_fail_paths():
         def __init__(self, status):
             self.status = status
 
-        def run(self, spec):
+        def run(self, spec, should_continue=None):
             r = PlaytestResult(status=self.status)
             if self.status == UNSOLVED:
                 r.reason = "max_turns"
@@ -736,7 +737,7 @@ def test_playtest_pass_then_add_fail_keeps_both_counts():
     from story.playtest import PASS, PlaytestResult
 
     class _PT:
-        def run(self, spec):
+        def run(self, spec, should_continue=None):
             return PlaytestResult(status=PASS)
 
     pf, w, clk, d = _mkpf_with_pt(_PT())
@@ -766,7 +767,7 @@ def test_interrupted_counts_but_does_not_backoff():
     from story.playtest import INTERRUPTED, PlaytestResult
 
     class _PT:
-        def run(self, spec):
+        def run(self, spec, should_continue=None):
             return PlaytestResult(status=INTERRUPTED)
 
     pf, w, clk, d = _mkpf_with_pt(_PT())
@@ -802,7 +803,7 @@ def test_playtest_off_by_flag():
     calls = []
 
     class _PT:
-        def run(self, spec):
+        def run(self, spec, should_continue=None):
             calls.append(1)
             return PlaytestResult(status=PASS)
 
@@ -939,12 +940,13 @@ def _mkpf_with_pt(playtester, **cfgkw):
     pool = PuzzlePool.open(cfg)
     pf = PoolPrefetcher(
         cfg=cfg, pool=pool, writer=_W(),
-        probe=lambda: {"phase": Phase.QA, "pending": 0, "inflight": 0,
-                       "hint_inflight": False, "reveal_inflight": False,
-                       "stopped": False},
         probe_inputs=lambda: {"avoid": [], "recent_signatures": []},
         pick_blueprint=lambda recent, rng=None: None,
-        clock=_Clk(), executor=_Ex(), playtester=playtester)
+        clock=_Clk(), executor=_Ex())
+    # Phase C: playtester 走薄装配口, 且后台要先激活(等价于 prewarm 结束)。
+    if playtester is not None:
+        pf.set_playtester(playtester)
+    pf.activate_background()
     return pf, pf.writer, pf._clock, d
 
 
@@ -992,7 +994,7 @@ def main():
         test_host_failure_is_unavailable,
         test_no_client_is_unavailable,
         test_spec_missing_answer_is_unavailable,
-        # C. 让路
+        # C. 协作式取消
         test_interrupted_before_first_call,
         test_interrupted_after_player_before_host,
         test_interrupted_midway_stops_further_turns,
@@ -1034,7 +1036,7 @@ def main():
     if FAIL[0]:
         print(f"FAIL: {FAIL[0]} 处")
         return 1
-    print("PASS: AI 试玩(隔离 + 结局 + 让路) 全部通过")
+    print("PASS: AI 试玩(隔离 + 结局 + 协作式取消) 全部通过")
     return 0
 
 

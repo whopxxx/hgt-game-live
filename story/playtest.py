@@ -79,7 +79,7 @@ log = logging.getLogger("story.playtest")
 PASS = "pass"                  # 在预算内说出完整解
 UNSOLVED = "unsolved"          # 用完轮数 / 主动放弃, 没猜中
 UNAVAILABLE = "unavailable"    # 技术故障(网关/解析), **不评价这道题**
-INTERRUPTED = "interrupted"    # 直播突然变忙, 主动让路
+INTERRUPTED = "interrupted"    # 协作式取消, 主动中止
 
 #: 结局 -> 后台策略。**唯一定义处**, 补池(Q10c)直接读它, 不要各处
 #: 重推一遍 —— "四种结局要不要退避"这种表散在两处就一定会漂移。
@@ -88,8 +88,8 @@ INTERRUPTED = "interrupted"    # 直播突然变忙, 主动让路
 #: playtest 最坏会连打 2N 次 LLM 调用; 若 UNSOLVED 后下一拍立刻再生成
 #: 一题再试玩, 即使有 single-flight, 也会排成一条连续的昂贵调用链。
 #:
-#: 为什么 INTERRUPTED 不退避: 它只是"直播忙, 我主动让路", 不是失败。
-#: 计退避会让运维数据把"直播活跃"误读成"试玩大量失败"。
+#: 为什么 INTERRUPTED 不退避: 它只是"被叫停了, 我主动收手", 不是失败。
+#: 计退避会让运维数据把"正常收尾"误读成"试玩大量失败"。
 OUTCOME_POLICY = {
     PASS:        {"drop": False, "backoff": False, "counted_fail": False},
     UNSOLVED:    {"drop": True,  "backoff": True,  "counted_fail": True},
@@ -182,6 +182,8 @@ class Playtester:
             prefetcher 自己那个), 用来跑 Host 的裁决/裁判。
         should_continue: 无参谓词, **每一次 LLM 调用之前**都查一次。
             返回 False 就立刻以 `interrupted` 退出(不 backoff)。
+            这是**默认**谓词; `run()` 可以按次覆盖它(预热路径需要
+            带 deadline 的那一份, 见 `run`)。
         max_turns: 轮数上限。
         clock: 注入时钟(测试用)。
     """
@@ -201,18 +203,37 @@ class Playtester:
         self._clock = clock
 
     # ------------------------------------------------------------------
-    def run(self, spec: Any) -> PlaytestResult:
-        """试玩一道题。**绝不抛异常** —— 任何意外都变成 unavailable。"""
+    def run(self, spec: Any,
+            should_continue: Optional[Callable[[], bool]] = None
+            ) -> PlaytestResult:
+        """试玩一道题。**绝不抛异常** —— 任何意外都变成 unavailable。
+
+        ## `should_continue` 是**本次调用**的谓词 override(可选)
+
+        None(默认) = 用构造时注入的实例谓词 —— 稳态后台补池就是这一条,
+        行为与加这个参数之前**逐位相同**。
+
+        非 None = **完全替换**实例谓词, 只用于本次调用。预热路径必须走
+        它: 预热那份谓词是 stop + **总预算**(`prewarm_should_continue`),
+        而实例谓词是 stop-only。没有这条通道时, 预热试玩会越过预算继续
+        打 LLM 轮次 —— 预算形同虚设。
+
+        ⚠️ 是 **replace**, 不是 AND。依据: 预热谓词内部先查 stop
+        (`should_abort`)再查 deadline, 所以它**已经包含** stop 语义;
+        再与实例谓词 AND 是同一件事做两遍。调用方要传就传完整的那一份。
+        """
         t0 = self._clock()
         try:
-            r = self._run_inner(spec)
+            r = self._run_inner(spec, should_continue)
         except Exception as e:                  # noqa: BLE001
             log.exception("试玩异常: %s", e)
             r = PlaytestResult(status=UNAVAILABLE, error=str(e))
         r.duration_ms = int((self._clock() - t0) * 1000)
         return r
 
-    def _run_inner(self, spec: Any) -> PlaytestResult:
+    def _run_inner(self, spec: Any,
+                   should_continue: Optional[Callable[[], bool]] = None
+                   ) -> PlaytestResult:
         puzzle = getattr(spec, "puzzle", "") or ""
         answer = getattr(spec, "answer", "") or ""
         if not puzzle or not answer:
@@ -222,10 +243,10 @@ class Playtester:
 
         tr = PlaytestResult(transcript=[{"role": "puzzle", "text": puzzle}])
         for turn in range(1, self._max_turns + 1):
-            # ---- 每次 LLM 调用之前都让路 ----
+            # ---- 每次 LLM 调用之前都检查取消 ----
             # Q9 只在任务开始时查一次零压力; 试玩里一个任务会连打
             # 2N 次调用, 持续更久, 所以必须每步重查。
-            if not self._safe_continue():
+            if not self._safe_continue(should_continue):
                 tr.status = INTERRUPTED
                 return tr
 
@@ -246,7 +267,7 @@ class Playtester:
                 return tr
 
             # ---- Host: **走生产 answer()**, 不直接调 judge ----
-            if not self._safe_continue():
+            if not self._safe_continue(should_continue):
                 tr.status = INTERRUPTED
                 return tr
             verdict, comment, err = self._host_answer(spec, puzzle, answer,
@@ -267,10 +288,18 @@ class Playtester:
         return tr
 
     # ------------------------------------------------------------------
-    def _safe_continue(self) -> bool:
-        """让路谓词。异常一律当"不该继续" —— 宁可中断也不影响直播。"""
+    def _safe_continue(self,
+                       should_continue: Optional[Callable[[], bool]] = None
+                       ) -> bool:
+        """取消谓词。异常一律当"不该继续" —— 宁可中断也不影响直播。
+
+        `should_continue` 为 None 时回退到构造时注入的实例谓词 ——
+        于是稳态路径(不传 override)行为逐位不变。
+        """
+        pred = (should_continue if should_continue is not None
+                else self._should_continue)
         try:
-            return bool(self._should_continue())
+            return bool(pred())
         except Exception:                       # noqa: BLE001
             log.exception("should_continue 异常, 当作中断")
             return False
