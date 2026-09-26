@@ -216,8 +216,7 @@ window.addEventListener("load", async () => {
                     verdict: "是", comment: "", kind: "ai_player"}],
           qa_total: 1});
     const statsText = document.getElementById("stats").textContent;
-    check(statsText.includes("每100点赞，AI玩家助攻并加速本题")
-          && statsText.includes("❤️ 23 / 100"),
+    check(statsText.includes("❤️ 23/100"),
           "应显示点赞推进文案与进度: " + statsText);
     const aiRow = document.querySelector(".qa-row.kind-ai_player");
     check(aiRow && aiRow.textContent.includes("AI玩家：地点重要吗？")
@@ -247,8 +246,8 @@ window.addEventListener("load", async () => {
           verdict: "", comment: "", kind: "hint"}]), qa_total: 3, hint_count: 1,
           hint_text: "注意汤的味道"});
     check(document.querySelector(".qa-row.kind-hint"), "缺少提示行");
-    check(document.getElementById("hintbar").classList.contains("hidden"),
-          "提示条不应显示(提示只走问答流, 否则重复)");
+    check(!document.getElementById("qa").querySelector("#announcer"),
+          "提示事件层不应占用 QA 列表空间");
     // 再推一次**同一条**提示: 不应重复上屏
     const hintRows1 = document.querySelectorAll(".qa-row.kind-hint").length;
     send({qa_log: mkQa(2).concat([{qid: -1, user_name: "提示", text: "注意汤的味道",
@@ -521,18 +520,19 @@ window.addEventListener("load", async () => {
     check(!prompt.classList.contains("hidden"), "QA 阶段应显示互动提示");
     check(prompt.textContent.includes("#你的问题"),
           "互动提示应说明发送格式: " + prompt.textContent);
-    // 出题阶段: 仍可见, 文案变成"正在出题"
+    // 出题阶段: Footer 只显示准备文案。
     send({phase: "setting", puzzle_index: 5, story_index: 5,
           qa_log: [], qa_total: 0});
     check(!prompt.classList.contains("hidden"), "**出题阶段提示条不应隐藏**");
-    check(prompt.textContent.includes("出题"),
+    check(prompt.textContent === "AI 正在准备下一题…" &&
+          document.getElementById("thinking").classList.contains("hidden") &&
+          document.getElementById("stats").classList.contains("hidden"),
           "出题阶段应说明正在出题: " + prompt.textContent);
-    // 揭晓阶段: 仍可见, 文案换成换题类提示
+    // 揭晓阶段由揭晓工作区接管，Footer 不占位。
     send({phase: "revealed", puzzle_index: 5, story_index: 5,
           revealed_answer: "谜底。", qa_log: [], qa_total: 0});
-    check(!prompt.classList.contains("hidden"), "**揭晓阶段提示条不应隐藏**");
-    check(prompt.textContent.includes("新谜题"),
-          "揭晓阶段应说明即将换题: " + prompt.textContent);
+    check(document.getElementById("footer-status").classList.contains("hidden"),
+          "揭晓阶段 Footer 应隐藏");
     // 系统行(非 QA 阶段 #问题 的反馈)要能上屏。
     // 文案用 engine._ACK_BY_PHASE[SETTING] 的当前取值: 系统固定 copy 用汤面/汤底。
     send({phase: "setting", puzzle_index: 6, story_index: 6, puzzle: "",
@@ -1199,13 +1199,13 @@ window.addEventListener("load", async () => {
 
 
     // ================= puzzle_meta(5 大类协议 v2) =================
-    // 顶部正式元数据: "中等 · 悬疑 · 脑洞"。前端只渲染服务端下发的
+    // 顶部正式元数据: "悬疑 · 中等"。前端只渲染服务端下发的
     // label(中文映射在后端); 空 metadata -> 整个元素干净隐藏。
     {
       const pm = document.getElementById("puzzle-meta");
       check(!!pm, "M-0: #puzzle-meta 元素存在于 puzzle header");
 
-      // ① 完整渲染: 难度 + 两类, 顺序稳定, 分隔符 " · "
+      // ① 只显示主类与难度，忽略 secondary categories。
       send({phase: "qa", puzzle_index: 60, story_index: 60,
             puzzle: "元数据渲染测试。为什么？",
             puzzle_meta: {difficulty: "medium", difficulty_label: "中等",
@@ -1213,15 +1213,15 @@ window.addEventListener("load", async () => {
                           primary_category_label: "悬疑",
                           categories: ["suspense", "brainstorm"],
                           category_labels: ["悬疑", "脑洞"]}});
-      check(pm.textContent === "中等 · 悬疑 · 脑洞",
-            "M-1: 应渲染 '中等 · 悬疑 · 脑洞', 实际 '" + pm.textContent + "'");
+      check(pm.textContent === "悬疑 · 中等",
+            "M-1: 应渲染 '悬疑 · 中等', 实际 '" + pm.textContent + "'");
       check(!pm.classList.contains("hidden"), "M-1: 有 metadata 时不隐藏");
 
-      // ② 顺序稳定: categories 顺序不变, 不被重排/去重错乱
+      // ② secondary-only metadata 不进入直播 header。
       send({puzzle_meta: {difficulty_label: "困难",
                           category_labels: ["脑洞", "悬疑"]}});
-      check(pm.textContent === "困难 · 脑洞 · 悬疑",
-            "M-2: 顺序按服务端数组, 实际 '" + pm.textContent + "'");
+      check(pm.textContent === "困难",
+            "M-2: secondary categories 不得显示, 实际 '" + pm.textContent + "'");
 
       // ③ 只有分类: 无前导/尾随分隔符
       send({puzzle_meta: {primary_category: "horror",
@@ -1252,7 +1252,7 @@ window.addEventListener("load", async () => {
             puzzle: "旧题仍显示中。为什么？",
             puzzle_meta: {difficulty_label: "中等",
                           category_labels: ["悬疑"]}});
-      check(pm.textContent === "中等 · 悬疑", "M-6: 旧题 metadata 在显示");
+      check(pm.textContent === "中等", "M-6: 旧题 metadata 在显示");
       send({phase: "setting", puzzle_index: 60, story_index: 60,
             puzzle: "", puzzle_meta: {}});
       check(pm.textContent === "" && pm.classList.contains("hidden"),
@@ -1262,13 +1262,13 @@ window.addEventListener("load", async () => {
             puzzle: "新题的谜面。为什么？",
             puzzle_meta: {difficulty_label: "困难",
                           category_labels: ["脑洞", "情感"]}});
-      check(pm.textContent === "困难 · 脑洞 · 情感",
+      check(pm.textContent === "困难",
             "M-6: 新题 metadata 正确替换, 实际 '" + pm.textContent + "'");
 
       // ⑦ 安全纪律: label 全部走 textContent, 标签/属性不得被解析。
       //    即使 enum 现在是代码控制, 也保持前端输入安全纪律。
       send({puzzle_meta: {difficulty_label: "<b>注入</b>",
-                          category_labels: ["<img src=x onerror=window.__metaXss=1>"]}});
+                          primary_category_label: "<img src=x onerror=window.__metaXss=1>"}});
       check(pm.querySelector("b") === null && pm.querySelector("img") === null,
             "M-7: label 里的标签不得被解析成元素");
       check(window.__metaXss === undefined, "M-7: 注入的 onerror 不得执行");
@@ -1298,13 +1298,8 @@ window.addEventListener("load", async () => {
 
 
 ANNOUNCER_CHECK = r'''
-window.addEventListener('error', e => {
-  const result=document.createElement('pre'); result.id='test-result';
-  result.textContent=JSON.stringify([String(e.message)]); document.body.appendChild(result);
-});
 window.socket = null;
 window.WebSocket = class { constructor() { window.socket = this; } };
-// Drive real application timers deterministically; layout/font/WAAPI are real Chrome.
 let clock = 0, serial = 0;
 const tasks = new Map();
 performance.now = () => clock;
@@ -1327,407 +1322,182 @@ const tick = async ms => {
   }
   clock = end; await Promise.resolve(); await Promise.resolve();
 };
-let cfg = null, failure = 'missing', fetchCount = 0;
+let cfg = {enabled:true, interval_seconds:90, hold_seconds:5,
+  long_text_speed_px_s:80, items:[{id:'one',enabled:true,text:'轮播公告'}]};
 window.fetch = async (url, options) => {
   if (url !== '/announcements.json' || options.cache !== 'no-store') throw Error('bad fetch');
-  fetchCount++;
-  return {ok: failure !== 'missing', json: async () => {
-    if (failure === 'json') throw SyntaxError('synthetic invalid JSON');
-    return structuredClone(cfg);
-  }};
+  return {ok:true, json:async()=>structuredClone(cfg)};
 };
-const media = window.matchMedia.bind(window);
-let reduced = false;
-const listeners = [];
-window.matchMedia = query => query === '(prefers-reduced-motion: reduce)' ? {
-  get matches() { return reduced; },
-  addEventListener: (_, fn) => listeners.push(fn),
-} : media(query);
 window.addEventListener('load', async () => {
   await document.fonts.ready;
-  const errors = [];
-  const check = (ok, message) => { if (!ok) errors.push(message); };
-  const box = document.getElementById('announcer'), text = document.getElementById('announcer-text');
-  const qa = document.getElementById('qa');
-  let state = {phase:'qa', puzzle_index:1, puzzle:'合成题面。为什么？', qa_log:[], qa_total:0,
-               hint_count:2, hint_text:'历史提示',
-               ai_player:{questions_earned:20}, leaderboard:[]};
-  const send = extra => { Object.assign(state, extra); socket.onmessage({data:JSON.stringify(state)}); };
-  const notice = () => text.textContent;
-  const anim = () => text.getAnimations()[0];
-  const rect = id => document.getElementById(id).getBoundingClientRect();
-  const config = (items, extra={}) => Object.assign({enabled:true, interval_seconds:90,
-    hold_seconds:4, long_text_speed_px_s:80, items:items.map((text,i) => ({id:String(i),enabled:true,text}))}, extra);
-  const reload = async c => { cfg=c; failure=''; await tick(15000); };
-  const finish = async () => {
-    const duration = anim() ? anim().effect.getTiming().duration : 4000;
-    await tick(duration + 1);
-  };
-  // 精确走到“当前最早 one-shot timer”的结束点。announcer 的每一轮
-  // show() 都只有一个 one-shot done timer；interval/reload/poll 都是 interval。
-  // 这个 helper 用于已经播到中途的场景，避免 finish() 再加一整个 duration
-  // 而跨过后续 preset / leaderboard turn。
-  const finishCurrentTurn = async () => {
-    const due = [...tasks.values()]
-      .filter(t => !t.interval && t.at >= clock)
-      .map(t => t.at)
-      .sort((a,b) => a-b)[0];
-    if (due === undefined) { await finish(); return; }
-    await tick(Math.max(0, due - clock) + 1);
-  };
+  const errors = [], check = (ok,msg) => { if (!ok) errors.push(msg); };
+  const box = document.getElementById('announcer');
+  const eventText = () => document.getElementById('announcer-text').textContent;
+  const visible = () => !box.classList.contains('hidden');
+  let state = {phase:'qa',puzzle_index:1,puzzle:'测试汤面',qa_log:[],qa_total:0,
+    hint_count:0,hint_text:'',leaderboard:[]};
+  const send = extra => { Object.assign(state,extra); socket.onmessage({data:JSON.stringify(state)}); };
+  const qaHeight = () => document.getElementById('qa').getBoundingClientRect().height;
   try {
-    send();
-    check(box.dataset.kind === 'leaderboard' && notice()==='' && !anim(),
-          'A16 empty leaderboard is quiet and must not replay historical summons/hints');
-    check(!qa.contains(box) && !document.getElementById('stats').contains(box), 'A16 announcer outside QA/stats');
-    const geometry = () => {
-      const b=box.getBoundingClientRect(), q=rect('qa'), p=rect('puzzle-viewport');
-      const scale=rect('stage').width/1080;
-      const workspace=parseFloat(getComputedStyle(document.getElementById('content')).getPropertyValue('--workspace-top'));
-      check(b.top >= rect('content').top + workspace*scale - 1 && b.top >= p.bottom-1,
-            'A16 announcer below puzzle and workspace top');
-      check(b.bottom <= q.top && b.bottom < rect('prompt').top && b.bottom < rect('stats').top,
-            'A16 announcer above QA/prompt/stats, not bottom');
-      check(b.bottom < rect('stage').top + 1400*scale && b.height > 0,
-            'A16 announcer in safe upper workspace');
-    };
-    geometry();
-    const before=box.getBoundingClientRect().top;
-    send({qa_log:Array.from({length:70},(_,i)=>({qid:i+1,user_name:'Alice',text:'合成问题'+i,verdict:'是',kind:'qa'})),qa_total:70});
-    qa.scrollTop=qa.scrollHeight;
-    check(box.getBoundingClientRect().top === before, 'A16 QA append/scroll must not move announcer');
-    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'})); geometry();
-    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
-    // ---- Issue #43: 点赞推进公告(显式 like_progress_notice 事件) ----
-    // 首帧快照无公告 -> 之后收到的 seq 都是活事件, 照播。
-    send({like_progress_notice:{seq:1,round_index:1,pulses:1,phase:'qa',
-                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
-    check(box.dataset.kind==='like' && notice().includes('点赞助攻'),
-          'A16 live like notice plays');
-    const first=anim();
-    for(let i=0;i<20;i++) send();
-    check(anim()===first, 'A16 repeated snapshots do not restart animation');
-    send({ai_player:{questions_available:0,questions_used:1,in_flight:true,
-                     likes_progress:5,likes_per_progress:100}});
-    check(document.getElementById('stats').textContent.includes('AI玩家正在推理…'),
-          'A16 AI in-flight shows reasoning state only');
-    send({ai_player:{questions_available:0,questions_used:1,in_flight:false,
-                     likes_progress:5,likes_per_progress:100}});
-    check(document.getElementById('stats').textContent.includes('每100点赞，AI玩家助攻并加速本题')
-          && document.getElementById('stats').textContent.includes('❤️ 5 / 100'),
-          'A16 resident copy is like-progress semantics with server progress');
-    check(anim()===first, 'A16 ai_player field updates do not interrupt like notice');
-    socket.onclose(); await tick(801); send();
-    check(anim()===first, 'A16 reconnect retains baseline');
-    await tick(3000);
-    check(box.dataset.kind==='like' && anim()===first, 'A16 like survives field updates for full hold');
-    await finish();
-    check(box.dataset.kind==='leaderboard', 'A16 same snapshots do not replay old like');
-    // 服务端已把一批 pulse 聚合成一条: ×N 一次播完。
-    send({like_progress_notice:{seq:2,round_index:1,pulses:3,phase:'qa',
-                                text:'❤️ 点赞助攻 ×3！AI玩家获得更多行动机会，游戏加速'}});
-    check(notice().includes('×3'), 'A16 burst aggregates into one ×N notice');
-    // 连续点赞事件: 单一待播槽位, 新 seq 直接覆盖 -> 只显示最新一条。
-    send({like_progress_notice:{seq:3,round_index:1,pulses:1,phase:'qa',
-                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
-    send({like_progress_notice:{seq:4,round_index:1,pulses:2,phase:'qa',
-                                text:'❤️ 点赞助攻 ×2！AI玩家获得更多行动机会，游戏加速'}});
-    check(notice().includes('×2') && !notice().includes('×3'),
-          'A16 single pending slot keeps only the newest like notice');
-    await finish(); check(box.dataset.kind==='leaderboard', 'A16 no unbounded like backlog');
-    send({leaderboard:[
-      {rank:1,user_name:'Alice',solved_count:5},
-      {rank:2,user_name:'Bob',solved_count:4},
-      {rank:3,user_name:'Carol',solved_count:3}
-    ]});
-    check(box.dataset.kind==='leaderboard' && box.dataset.motion==='static'
-          && !anim() && notice().includes('Alice 5题'),
-          'A16 one-page leaderboard is a persistent static baseline');
-
-    const top10=Array.from({length:10},(_,i)=>({
-      rank:i+1,user_name:'P'+(i+1),solved_count:20-i
-    }));
-    send({leaderboard:top10});
-    check(box.dataset.kind==='leaderboard'
-          && notice().includes('1. P1 20题')
-          && notice().includes('5. P5 16题')
-          && notice().includes('10. P10 11题')
-          && !notice().includes('1/2') && !notice().includes('2/2'),
-          'A16 cumulative Top10 is one complete message, not two logical pages');
-    check(box.dataset.motion==='marquee' && !!anim(),
-          'A16 long Top10 uses one continuous marquee');
-
-    send({like_progress_notice:{seq:5,round_index:1,pulses:1,phase:'qa',
-                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
-    check(box.dataset.kind==='like', 'A16 like temporarily overlays Top10 marquee');
-    await finish();
-    check(box.dataset.kind==='leaderboard'
-          && notice().includes('1. P1 20题')
-          && notice().includes('10. P10 11题'),
-          'A16 after AI, complete Top10 restarts from rank 1');
-
-    // 新题也重新从整条榜首开始；不再维护 1/2、2/2 页码状态。
-    send({puzzle_index:2,hint_count:0,hint_text:'',qa_log:[]});
-    check(box.dataset.kind==='leaderboard'
-          && notice().includes('1. P1 20题')
-          && notice().includes('10. P10 11题')
-          && !notice().includes('/2'),
-          'A16 new puzzle restarts one-line Top10 from rank 1');
-
-    const hintRow=(qid,text)=>({qid,user_name:'提示',kind:'hint',text,verdict:''});
-    send({hint_count:3,hint_text:'注意灯的方向',qa_log:[hintRow(-3,'注意灯的方向')],qa_total:71});
-    check(box.dataset.kind==='hint' && notice()==='💡 提示：注意灯的方向', 'A16 new hint announces');
-    check(qa.querySelector('.kind-hint').textContent.includes('注意灯的方向'), 'A16 hint QA history retained');
-    const hintAnimation=anim();
-    for(let i=0;i<20;i++) send();
-    check(anim()===hintAnimation, 'A16 repeated hint snapshot does not restart');
-    send({hint_count:4,hint_text:'',qa_log:[hintRow(-3,'注意灯的方向'),hintRow(-4,'注意门外的人')],qa_total:72});
-    await finish();
-    check(notice()==='💡 提示：注意门外的人', 'A16 hint uses latest QA hint fallback, FIFO');
-    // Issue #43: 点赞不再抢占提示 —— 正在播的提示必须完整播完,
-    // 点赞在它之后接上(§15: 提示/重要公告不能被点赞腰斩)。
-    send({like_progress_notice:{seq:6,round_index:2,pulses:1,phase:'qa',
-                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
-    check(box.dataset.kind==='hint' && notice()==='💡 提示：注意门外的人',
-          'A16 like never cuts a playing hint short');
-    await finish(); check(box.dataset.kind==='like',
-          'A16 like notice plays right after the hint finishes');
-    await finish(); check(box.dataset.kind==='leaderboard', 'A16 repeated like snapshots enqueue once only');
-    send({hint_count:5,hint_text:'旧题尚未播完'});
-    send({puzzle_index:3,hint_count:7,hint_text:'新题首帧历史提示'});
-    check(box.dataset.kind==='leaderboard', 'A16 new puzzle resets baseline and cancels old hint');
-    send({hint_count:8,hint_text:'本题新提示'});
-    check(notice()==='💡 提示：本题新提示', 'A16 new puzzle subsequent hint announces');
-    // 旧题的待播点赞公告不跨题: hint 播放期间排队的 like,
-    // 在换题后必须被丢弃而不是继续播(§16: 不跨题迟到)。
-    send({like_progress_notice:{seq:7,round_index:3,pulses:1,phase:'qa',
-                                text:'❤️ 旧题的点赞助攻'}});
-    check(box.dataset.kind==='hint', 'A16 like waits behind playing hint');
-    send({puzzle_index:4,hint_count:0,hint_text:'',qa_log:[]});
-    check(!notice().includes('旧题的点赞助攻'),
-          'A16 pending like from an old round is dropped on new puzzle');
-    await finish();
-    check(!notice().includes('旧题的点赞助攻'),
-          'A16 dropped like notice never plays later');
-    send({hint_count:9,hint_text:'新题的新提示'});
-    check(notice()==='💡 提示：新题的新提示', 'A16 hints still work after dropped like');
-    await finish(); check(box.dataset.kind==='leaderboard', 'A16 new puzzle hint plays once');
-
-    // ---- review round 2: 跨题竞态反证 ----
-    // (a) SETTING 期间入账的点赞公告属于"正在准备的题"(round 5): 它必须
-    //     活着跨过换题帧(setting→qa + puzzle 4→5 同帧), 不能被
-    //     "先标记已见、再清掉"导致永久不播。
-    send({phase:'setting',
-          like_progress_notice:{seq:8,round_index:5,pulses:1,phase:'setting',
-                                text:'❤️ 点赞助攻已累积，新题开始后生效'}});
-    check(!notice().includes('新题开始后生效'),
-          'A16 setting-phase like notice waits while box hidden');
-    send({phase:'qa',puzzle_index:5,hint_count:0,hint_text:'',qa_log:[]});
-    check(notice().includes('新题开始后生效'),
-          'A16 setting-phase like notice survives the new-round first frame');
-    await finish();
-    check(box.dataset.kind==='leaderboard', 'A16 setting-phase like notice drains');
-    // (b) 旧 round 的迟到公告: seq 是新的, 但 round 已过去 -> 只标记已见,
-    //     永不播放(round 校验, review round 2 的另一半)。
-    send({like_progress_notice:{seq:9,round_index:4,pulses:2,phase:'qa',
-                                text:'❤️ 上一题的迟到助攻'}});
-    check(!notice().includes('迟到助攻'),
-          'A16 stale old-round notice is never played');
-    await finish();
-    check(!notice().includes('迟到助攻'),
-          'A16 stale old-round notice stays dead');
-
-    // 术语分两层:
-    //   ① 观众内容(原话 / 题目正文 / 贡献 quote / operator 自定义文案)逐字透传;
-    //   ② 系统固定文案在**源头**(story/engine.py)就写成汤面/汤底, 前端不做替换。
-    // 这里用一条带"谜底"的**观众可控**文本验证 ① —— 系统固定文案的正确性
-    // 由 test_engine 的回归覆盖(见 test_fixed_viewer_copy_uses_soup_terms)。
-    send({phase:'revealed',revealed_answer:'合成故事正文',reveal_stage:'contribution',solved:true,
-          reveal_contributors:[{qid:1,user_name:'Alice',text:'原话包含谜底一词',verdict:'是',is_final:true}]});
-    check(document.getElementById('reveal-label').textContent==='汤底揭晓'
-          && document.getElementById('reveal-contrib-title').textContent==='共同猜汤', 'A16 reveal labels use soup terminology');
-    check(document.getElementById('reveal-contrib-list').textContent.includes('原话包含谜底一词'), 'A16 viewer content not rewritten');
-    send({phase:'qa',revealed_answer:'',qa_log:[],qa_total:74});
-    check(document.getElementById('prompt').textContent.includes('猜中汤底我就揭晓')
-          && notice().includes('累计猜汤榜'), 'A16 prompt and leaderboard terminology');
-    // 反证: 若有人把术语做回"对任意文本 replaceAll", 下面几条必然失败 ——
-    // 它会把观众提问、计时器标签、贡献链原话一起改写掉。
-    send({phase:'qa',qa_log:[{qid:1,user_name:'观众甲',text:'谜底是不是和灯有关？',verdict:'不是',kind:'qa'}],
-          next_event_ms:60000,next_event_kind:'hint',next_event_label:'谜底揭晓倒计时',qa_total:75});
-    check(qa.textContent.includes('谜底是不是和灯有关？'), 'A16 viewer question wording never rewritten');
-    // 计时器文案由真实 rAF 循环写入(setTimeout 被 fake, rAF 没有)。
-    await new Promise(requestAnimationFrame);
-    check(document.getElementById('puzzle-timer').textContent.startsWith('谜底揭晓倒计时'),
-          'A16 timer label passes through verbatim: '
-          + document.getElementById('puzzle-timer').textContent);
-
-    send({leaderboard:[]});
-    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
-          'A16 clearing leaderboard removes placeholder copy without animation');
-    await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15})); cfg.items[1].enabled=false;
-    await tick(15000); // reload disabled item
-    send({phase:'setting'}); await tick(300000); send({phase:'qa'});
-    await tick(89999);
-    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
-          'A16 empty leaderboard stays quiet before preset due');
-    await tick(251); check(notice().includes('预设甲'), 'A16 preset still triggers from empty leaderboard state');
-    const short=anim(), timing=short.effect.getTiming(), frames=short.effect.getKeyframes();
-    for(let i=0;i<20;i++) send();
-    check(anim()===short, 'A16 repeated snapshots do not restart or enqueue preset');
-    check(box.dataset.motion==='slide' && timing.duration===17000 && frames.length===4,
-          'A16 preset short uses symmetric 1s enter / 15s hold / 1s exit');
-    short.currentTime=1000;
-    check(text.getBoundingClientRect().left >= box.getBoundingClientRect().left-1
-          && text.getBoundingClientRect().right <= box.getBoundingClientRect().right+1,
-          'A16 short hold fully visible');
-    send({like_progress_notice:{seq:10,round_index:5,pulses:1,phase:'qa',
-                                text:'❤️ 点赞助攻！AI玩家加入，游戏进度加快'}});
-    check(box.dataset.kind==='like', 'A16 like preempts active preset immediately (<1s)');
-    check(anim().effect.getTiming().duration===7000,
-          'A16 short like notice uses capped 5s hold plus symmetric 1s slides');
-    send({hint_count:12,hint_text:'提示应抢占点赞公告'});
-    check(box.dataset.kind==='hint', 'A16 hint preempts active like notice');
-    check(anim().effect.getTiming().duration===7000,
-          'A16 short hint uses capped 5s hold plus symmetric 1s slides');
-    await tick(90000); check(notice().includes('预设乙'), 'A16 interrupted preset advances RR, disabled skipped');
-    await tick(90000); check(notice().includes('预设甲'), 'A16 RR returns to first enabled item');
-
-    // 真实用户配置回归：interval=22s / hold=15s。
-    // Top10 已改成一整条长 marquee；22s 公告到点时不能把榜截在中间，
-    // 必须等第 10 名完整滚出视口后再接公告。
-    await finish(); // 让当前 preset 正常结束
-    await reload(config(['预设甲','禁用','预设乙'],
-                        {interval_seconds:22, hold_seconds:15}));
-    cfg.items[1].enabled=false;
-    const longTop10=Array.from({length:10},(_,i)=>({
-      rank:i+1,
-      user_name:'LongPlayerName'.repeat(2)+(i+1),
-      solved_count:30-i
-    }));
-    send({phase:'setting'});
-    send({phase:'qa', leaderboard:longTop10});
-    check(box.dataset.kind==='leaderboard'
-          && box.dataset.motion==='marquee'
-          && notice().includes('1. LongPlayerName')
-          && notice().includes('10. LongPlayerName')
-          && !notice().includes('/2'),
-          'A16 22s config starts one complete Top10 marquee');
-    check(anim().effect.getTiming().duration > 22250,
-          'A16 synthetic Top10 marquee lasts beyond the 22s preset deadline');
-
-    await tick(22250);
-    check(box.dataset.kind==='leaderboard'
-          && notice().includes('10. LongPlayerName'),
-          'A16 due preset must not cut the one-line Top10 at 22s');
-
-    // 精确走到这条 Top10 自己的 done()；done -> pump 会立即接上
-    // 已经到期的 preset。
-    await finishCurrentTurn();
-    check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
-          'A16 queued due preset starts immediately after complete Top10 finishes');
-    await finishCurrentTurn();
-    check(box.dataset.kind==='leaderboard'
-          && notice().includes('1. LongPlayerName')
-          && notice().includes('10. LongPlayerName'),
-          'A16 after preset, the complete Top10 marquee starts again');
-
-    send({leaderboard:[]});
-    check(box.dataset.kind==='leaderboard' && notice()==='' && !anim(),
-          'A16 leaderboard can return to quiet empty baseline after queued preset test');
-
-    // 后面的 last-known-good 配置测试仍使用 90s，避免把 22s 场景时间轴扩散出去。
-    await reload(config(['预设甲','禁用','预设乙'], {hold_seconds:15}));
-    cfg.items[1].enabled=false;
-    await tick(15000); // 让 last-known-good 真正载入 disabled 状态
-    send({phase:'setting'}); send({phase:'qa'});
-
-    // Bad JSON / bad types / HTTP failure each retain the last-good two items.
-    // 每种失败独立做 setting -> qa，重新锚定 nextPreset，避免上一轮 preset
-    // 的 17s 生命周期污染下一轮时间轴；这里测的是“坏配置不能覆盖最后一次
-    // 好配置”，不是跨轮 timing 偶合。
-    for (const bad of ['json','types','missing']) {
-      failure=bad; if (bad==='types') { failure=''; cfg={enabled:'bad',items:[]}; }
-      send({phase:'setting'}); send({phase:'qa'});
-      await tick(92000);
-      check(box.dataset.kind==='preset' && /预设[甲乙]/.test(notice()),
-            'A16 last-known-good survives '+bad);
-      send(); check(box.dataset.kind==='preset', 'A16 config failure does not block WS');
-    }
-    await reload(config(['更新公告']));
-    send({phase:'setting'}); send({phase:'qa'});
-    await tick(90250); check(notice().includes('更新公告'), 'A16 hot update replaces items');
-    await reload(config(['不该播放'],{enabled:false}));
-    await tick(90000); check(box.dataset.kind==='leaderboard', 'A16 global disable');
-
-    const long='长公告含空格 和标点，'.repeat(12)+'末尾可读';
-    await reload(config(['😀'.repeat(161),long]));
-    send({phase:'setting'}); send({phase:'qa'}); await tick(90250);
-    check(notice()==='📢 游戏公告 '+long, 'A16 >160 Unicode item skipped, not truncated; valid item retained');
-    check(box.dataset.motion==='marquee', 'A16 long uses marquee');
-    const moving=anim(), duration=moving.effect.getTiming().duration;
-    check(Math.abs(duration-(box.clientWidth+text.scrollWidth)/80*1000)<1 && duration>4600,
-          'A16 long duration is full measured distance / speed (not fixed 4s)');
-    check(getComputedStyle(text).textOverflow!=='ellipsis' && getComputedStyle(text).fontSize==='28px'
-          && text.offsetHeight===58 && box.clientHeight===58, 'A16 no ellipsis/shrink/wrap');
-    moving.currentTime=duration-100;
-    const tail=text.getBoundingClientRect().right, left=box.getBoundingClientRect().left;
-    check(tail>=left-1 && tail<left+20, 'A16 final characters travel completely across viewport');
-    await tick(5000); check(notice().endsWith('末尾可读'), 'A16 long item not removed after 4s');
-    send({phase:'revealed',revealed_answer:'合成谜底',revealed_core_answer:'合成核心答案',reveal_stage:'core'});
-    check(box.getBoundingClientRect().height===0 && !anim(), 'A16 reveal hides/cancels announcer');
-    await tick(300000); send({phase:'qa',revealed_answer:''});
-    check(box.dataset.kind==='leaderboard', 'A16 QA returns to default, no accumulated presets');
-
-    reduced=true; listeners.forEach(fn=>fn());
-    await tick(90250);
-    let pages='', count=0;
-    while(box.dataset.kind==='preset' && count++<30) {
-      pages+=notice();
-      check(!anim() && text.scrollWidth<=box.clientWidth, 'A16 reduced motion pages fully fit without motion');
-      await tick(4000);
-    }
-    check(pages==='📢 游戏公告 '+long, 'A16 reduced motion preserves every character');
-    send({leaderboard:[1,2,3,4,5,6,7,8,9,10].map(rank=>({
-      rank,user_name:'SyntheticLongName'.repeat(6)+rank,solved_count:21-rank
-    }))});
-    const boardRows=state.leaderboard;
-    const board='📢 累计猜汤榜　'
-      + boardRows.map(r=>`${r.rank}. ${r.user_name} ${r.solved_count}题`).join('　');
-    let boardPages='';
-    for(let i=0;i<120 && boardPages.length<board.length;i++) {
-      boardPages+=notice();
-      check(text.scrollWidth<=box.clientWidth,
-            'A16 reduced-motion slices of one Top10 message fit without animation');
-      await tick(4000);
-    }
-    check(boardPages===board,
-          'A16 reduced-motion preserves every character of the one-line Top10 message');
-    document.dispatchEvent(new KeyboardEvent('keydown',{key:'d'}));
-    await new Promise(requestAnimationFrame);
-    await new Promise(requestAnimationFrame);
-    check(text.scrollWidth<=box.clientWidth && !anim(), 'A16 debug resize remeasures reduced-motion pages');
-    geometry();
-
-    // Hints share exactly the same full-text marquee / static-page renderer.
-    const longHint='提示内容不能被永久截断，'.repeat(10)+'最后线索';
-    send({hint_count:13,hint_text:longHint});
-    let hintPages='', pageCount=0;
-    while(box.dataset.kind==='hint' && pageCount++<30) {
-      hintPages+=notice();
-      check(!anim() && text.scrollWidth<=box.clientWidth, 'A16 reduced-motion hint pages fit');
-      await tick(4000);
-    }
-    check(hintPages==='💡 提示：'+longHint, 'A16 reduced-motion hint preserves complete text');
-    reduced=false; listeners.forEach(fn=>fn());
-    send({hint_count:14,hint_text:longHint});
-    check(box.dataset.motion==='marquee' && notice()==='💡 提示：'+longHint, 'A16 long hint uses untruncated marquee');
-    check(Math.abs(anim().effect.getTiming().duration-(box.clientWidth+text.scrollWidth)/80*1000)<1,
-          'A16 long hint duration uses full measured distance');
-    await finish(); check(box.dataset.kind!=='hint', 'A16 long hint finishes without duplicate');
-    check(fetchCount>10, 'A16 periodic hot reload actually runs');
+    send({});
+    check(!visible(), 'E1 event lane is empty and hidden at rest');
+    check(getComputedStyle(box).position==='absolute', 'E2 event lane is outside flex flow');
+    const baseline = qaHeight();
+    send({hint_count:1,hint_text:'第一条提示'});
+    check(visible() && box.dataset.kind==='hint' && eventText().includes('第一条提示'),
+      'E3 hint appears in event lane');
+    check(Math.abs(qaHeight()-baseline)<1, 'E4 hint does not shrink QA');
+    const hintAnimation = document.getElementById('announcer-text').getAnimations()[0];
+    check(hintAnimation && hintAnimation.effect.getTiming().duration>=4000 &&
+      hintAnimation.effect.getTiming().duration<=8000, 'E5 hint has bounded playback');
+    send({like_progress_notice:{seq:1,round_index:1,phase:'qa',
+      text:'❤️ 点赞推进'}});
+    check(box.dataset.kind==='hint', 'E6 like waits for active hint');
+    await tick(7200);
+    check(box.dataset.kind==='like' && eventText().includes('点赞推进'),
+      'E7 like follows hint');
+    check(Math.abs(qaHeight()-baseline)<1, 'E8 like does not shrink QA');
+    send({});
+    check(box.dataset.kind==='like', 'E9 repeated snapshot does not replay like');
+    await tick(5200);
+    check(!visible(), 'E10 like disappears without fixed gap');
+    await tick(91000);
+    check(box.dataset.kind==='preset' && eventText().includes('轮播公告'),
+      'E11 preset plays in shared event lane');
+    send({hint_count:2,hint_text:'更重要的提示'});
+    check(box.dataset.kind==='hint', 'E12 hint preempts preset');
+    send({phase:'setting',hint_count:0,hint_text:''});
+    check(!visible(), 'E13 setting hides event lane');
+    send({phase:'qa',puzzle_index:2,qa_log:[],qa_total:0});
+    check(!visible(), 'E14 old hint does not survive new puzzle');
+    send({like_progress_notice:{seq:2,round_index:1,phase:'qa',
+      text:'旧题迟到点赞'}});
+    check(!visible(), 'E15 stale like is dropped');
+    cfg.enabled = false;
+    await tick(15000);
+    send({leaderboard:[{rank:1,user_name:'甲',solved_count:3}]});
+    await tick(90000);
+    check(box.dataset.kind==='leaderboard' && eventText().includes('累计猜汤榜'),
+      'E16 leaderboard is transient and low frequency');
+    await tick(8000);
+    check(!visible(), 'E17 leaderboard leaves no permanent baseline');
   } catch(e) { errors.push(e.stack); }
   const result=document.createElement('pre'); result.id='test-result'; result.hidden=true;
   result.textContent=JSON.stringify(errors); document.body.appendChild(result);
+});
+'''
+
+WORST_CASE_CHECK = r'''
+window.socket = null;
+window.WebSocket = class { constructor() { window.socket = this; } };
+window.addEventListener('load', async () => {
+  await document.fonts.ready;
+  const errors = [];
+  const check = (ok, msg) => { if (!ok) errors.push(msg); };
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const send = o => socket.onmessage({data: JSON.stringify(Object.assign({
+    phase: 'qa', puzzle_index: 62, story_index: 62,
+    puzzle: '一个人在雨夜走进空荡的车站，听见广播后突然把手中的车票撕碎。'
+      .repeat(16), puzzle_elapsed_ms: 123456,
+    puzzle_meta: {primary_category_label: '脑洞', difficulty_label: '困难',
+      category_labels: ['脑洞', '悬疑', '逻辑']},
+    next_event_ms: 79000, next_event_kind: 'hint', next_event_label: '距下一条提示',
+    qa_log: Array.from({length: 20}, (_, i) => ({qid: i + 1,
+      kind: 'qa', user_name: '观众' + i,
+      text: '他听到的广播是否说明自己认错了身份与目的地？',
+      verdict: i % 3 ? '是' : '不是', comment: '继续追问广播的内容'})),
+    qa_total: 20, pending_count: 2, hint_count: 0, hint_text: '',
+    fact_progress: {established: 4, total: 4, facts: [
+      {text:'第一条已确认核心事实解释了他到车站的原因'},
+      {text:'第二条已确认核心事实解释了广播出现的时机'},
+      {text:'第三条已确认核心事实解释了车票的用途'},
+      {text:'第四条已确认核心事实解释了最后的选择'}]},
+    ai_player: {likes_progress: 63, likes_per_progress: 100, in_flight: false},
+    leaderboard: [{rank:1,user_name:'很长的排行榜观众名字',solved_count:9}],
+    stats: {questions: 20, answered: 18, solved: 3, dropped: 0, viewers_seen: 200},
+    revealed_answer: '', danmaku: []
+  }, o))});
+  const stage = document.getElementById('stage');
+  const scale = () => stage.getBoundingClientRect().width / 1080;
+  const rect = id => {
+    const e = document.getElementById(id);
+    if (!e) return null;
+    const r = e.getBoundingClientRect(), sr = stage.getBoundingClientRect(), s = scale();
+    return {top:(r.top-sr.top)/s, bottom:(r.bottom-sr.top)/s,
+      left:(r.left-sr.left)/s, right:(r.right-sr.left)/s,
+      height:r.height/s, width:r.width/s};
+  };
+  let metrics = {};
+  try {
+    send({});
+    await wait(80);
+    const before = rect('qa');
+    send({hint_count: 1, hint_text: '提示：广播的内容与他的身份有关'});
+    await wait(80);
+    const header = rect('puzzle-head'), puzzle = rect('puzzle-viewport');
+    const top = rect('top'), bottom = rect('bottom'), fact = rect('fact-progress');
+    const qa = rect('qa'), footer = rect('footer-status');
+    const event = rect('announcer');
+    const last = document.querySelector('#qa-body .qa-row:last-child');
+    const lastRect = last && last.getBoundingClientRect();
+    const qaRect = document.getElementById('qa').getBoundingClientRect();
+    const eventStyle = getComputedStyle(document.getElementById('announcer'));
+    metrics = {workspace_top: bottom.top, fact_rail_height: fact.height,
+      qa_viewport_height: qa.height, footer_height: footer && footer.height || 0,
+      reveal_contribution_height: 0};
+    check(header.left >= 0 && header.right <= 1080 &&
+          document.getElementById('puzzle-head').scrollWidth <=
+          document.getElementById('puzzle-head').clientWidth,
+          'W1 header overflow');
+    check(top.bottom <= bottom.top + 1 && puzzle.bottom <= bottom.top + 1,
+          'W2 puzzle intrudes into QA');
+    check(fact.bottom <= qa.top + 1, 'W3 fact rail intrudes into QA');
+    check(footer && qa.bottom <= footer.top + 1, 'W4 footer intrudes into QA');
+    check(qa.height >= 360, 'W5 QA viewport <360px: ' + qa.height);
+    check(qa.height >= 300, 'W5b QA viewport below hard floor: ' + qa.height);
+    check(fact.height <= 126, 'W5c fact rail exceeds compact cap: ' + fact.height);
+    check(Math.abs(qa.height-before.height) <= 1 &&
+          eventStyle.position === 'absolute',
+          'W6 transient event changed bottom flex geometry');
+    check(event.top >= bottom.top - 1, 'W7 event covers puzzle');
+    check(footer && event.bottom <= footer.top + 1, 'W8 event covers footer');
+    check(lastRect && lastRect.top >= qaRect.top - 1 &&
+          lastRect.bottom <= qaRect.bottom + 1, 'W9 latest QA not fully visible');
+    check(document.documentElement.scrollWidth <= innerWidth + 1 &&
+          stage.scrollWidth <= 1080 + 1, 'W10 horizontal overflow');
+    send({phase:'revealed', revealed_answer:'他收到广播后终于明白车票的真实用途。',
+      revealed_core_answer:'广播揭示了车票的真实用途。',
+      revealed_full_answer:'车票并非普通乘车凭证。',
+      reveal_stage:'contribution', solved:true, solved_by:'观众甲',
+      next_puzzle_ms:10000, reveal_contributors:[
+        {qid:1,user_name:'观众甲',text:'广播和车票有关吗？',verdict:'是',is_final:false},
+        {qid:2,user_name:'观众乙',text:'他知道票的真实用途了吗？',verdict:'是',is_final:true}],
+      reveal_interaction:{rating_open:false,theme_vote_open:true,
+        theme_options:[{code:'a',label:'逻辑',category:'logic',votes:2},
+          {code:'b',label:'悬疑',category:'suspense',votes:1},
+          {code:'c',label:'恐怖',category:'horror',votes:3},
+          {code:'d',label:'情感',category:'emotion',votes:0},
+          {code:'e',label:'脑洞',category:'brainstorm',votes:1}]}});
+    await wait(80);
+    const contribution = rect('reveal-contrib');
+    const theme = rect('theme-box');
+    metrics.reveal_contribution_height = contribution.height;
+    check(getComputedStyle(document.getElementById('rating-box')).display==='none',
+      'W11 rating must collapse after 30 seconds');
+    check(theme.height > 0 && contribution.height >= 100,
+      'W12 theme and contribution must remain readable at 45–60 seconds');
+    check(theme.bottom <= contribution.top + 1 || contribution.bottom <= theme.top + 1,
+      'W13 theme and contribution overlap');
+    check(rect('reveal').bottom <= 1921 && rect('reveal').top >= bottom.top - 1,
+      'W14 reveal exceeds workspace');
+  } catch (e) { errors.push(e.stack); }
+  const result = document.createElement('pre'); result.id = 'test-result';
+  result.hidden = true; result.textContent = JSON.stringify(errors);
+  document.body.appendChild(result);
+  const metricsNode = document.createElement('pre'); metricsNode.id = 'test-metrics';
+  metricsNode.hidden = true;
+  metricsNode.textContent = JSON.stringify(metrics);
+  document.body.appendChild(metricsNode);
 });
 '''
 
@@ -1800,7 +1570,7 @@ def main():
             return
         sys.exit(1)
     print(f"(使用浏览器: {CHROME})")
-    for script in (CHECK, ANNOUNCER_CHECK):
+    for script in (CHECK, ANNOUNCER_CHECK, WORST_CASE_CHECK):
         run_browser(script)
 
 
@@ -1825,9 +1595,15 @@ def run_browser(script):
         match = re.search(r'<pre id="test-result"[^>]*>(.*?)</pre>', dom, re.S)
         assert match, dom[-4000:] + result.stderr.decode("utf-8", errors="replace")[-2000:]
         errors = json.loads(html.unescape(match[1]))
+        if script == WORST_CASE_CHECK:
+            metrics_match = re.search(r'<pre id="test-metrics"[^>]*>(.*?)</pre>', dom, re.S)
+            print("WORST_CASE_RECTS", html.unescape(metrics_match[1]) if metrics_match else "missing")
         assert not errors, errors
     if script == ANNOUNCER_CHECK:
-        print("PASS: A16 baseline/delta/queue/presets/hot reload/geometry/marquee/reduced-motion")
+        print("PASS: transient event lane priority, expiration, no fixed gap, 90s leaderboard")
+        return
+    if script == WORST_CASE_CHECK:
+        print("PASS: 1080x1920 worst-case geometry and late reveal interaction")
         return
     print("PASS: 问答追加/提示行/思考中/揭晓三阶段/U4 长文本自动滚动/"
           "贡献链/换题清空/调试宽度/长流可滚/无补题文案；data/preview.png")

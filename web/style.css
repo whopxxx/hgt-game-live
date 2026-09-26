@@ -62,8 +62,11 @@ html, body {
   color: rgba(212,175,110,.75);
   font-size: 28px; letter-spacing: 2px;
 }
+#puzzle-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
+#puzzle-index { flex: 0 0 auto; }
 /* 中间的时间轴倒计时: "距第2条提示 04:12" */
 #puzzle-timer {
+  flex: 0 0 auto;
   color: #f0d9a8;
   font-size: 30px;
   font-weight: 600;
@@ -71,9 +74,7 @@ html, body {
 }
 #puzzle-timer.soon { color: #e8684a; }   /* 快到点了变红 */
 #puzzle-timer.hidden { display: none; }
-/* 题目元数据(5 大类协议 v2): "中等 · 悬疑 · 脑洞"。
-   辅助识别题型, 视觉层级刻意**弱于**倒计时(不抢谜面), 同一行内排布,
-   max-width 限宽防止长分类把 header 挤出屏幕。 */
+/* 主类与难度，视觉层级弱于倒计时。 */
 #puzzle-meta {
   flex: 0 1 auto;
   min-width: 0;
@@ -256,7 +257,7 @@ html, body {
   display: flex; flex-direction: column; align-items: center;
   gap: 6px; min-width: 0;
 }
-#rating-box.closed { opacity: .38; }   /* 30s 后评分截止 -> 弱化 */
+#rating-box.hidden { display: none; }
 #rating-title, #theme-title {
   color: rgba(212,175,110,.9); font-size: 26px; letter-spacing: 2px;
 }
@@ -279,7 +280,7 @@ html, body {
   top: var(--workspace-top, 900px); bottom: 0; left: 0; right: 0;
   padding: 0 80px 20px;
   display: flex; flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 }
 /* 揭晓期间下半部整个让给答案(任务书 U1)。
    ⚠️ 必须真的 `display:none`, 不能只靠 #reveal 盖住 —— 实测过:
@@ -291,10 +292,11 @@ html, body {
    这件事在 DOM 层就是真的, 而不是靠另一个元素遮挡来实现的。 */
 #bottom.hidden { display: none; }
 #announcer {
-  flex: 0 0 58px; height: 58px; min-width: 0;
+  position: absolute; left: 80px; right: 80px; height: 52px;
+  z-index: 5; pointer-events: none;
   overflow: hidden; white-space: nowrap;
   background: rgba(212,175,110,.12); border-radius: 10px;
-  color: #ffe1a0; font-size: 28px; line-height: 58px;
+  color: #ffe1a0; font-size: 27px; line-height: 52px;
 }
 #announcer-text {
   display: inline-block; width: max-content; white-space: nowrap;
@@ -310,17 +312,22 @@ html, body {
   content: ""; flex: 1 1 auto; height: 1px;
   background: linear-gradient(90deg, transparent, rgba(212,175,110,.28), transparent);
 }
+#puzzle-meta::before { content: "· "; }
 #fact-progress {
-  flex: 0 0 auto; max-height: 260px; overflow: hidden;
-  padding: 14px 20px; border: 1px solid rgba(212,175,110,.35);
-  border-radius: 12px; background: rgba(212,175,110,.08);
-  color: #f2e5c7; font-size: 28px; line-height: 1.45;
+  flex: 0 0 auto; max-height: 126px; overflow: hidden;
+  padding: 8px 16px; border-top: 1px solid rgba(212,175,110,.35);
+  border-bottom: 1px solid rgba(212,175,110,.35);
+  color: #f2e5c7; font-size: 25px; line-height: 1.25;
 }
 #fact-progress.hidden { display: none; }
-#fact-progress-title { color: #ffd98a; font-size: 30px; margin-bottom: 6px; }
-#fact-progress-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 18px; }
-#fact-progress-list > div { min-width: 0; overflow-wrap: anywhere; }
-.fact-progress-more { color: #ad9d82; font-size: 25px; }
+#fact-progress-head { display: flex; justify-content: space-between; gap: 12px; }
+#fact-progress-title { color: #ffd98a; font-size: 28px; }
+#fact-progress-dots { color: #d4af6e; white-space: nowrap; letter-spacing: 4px; }
+#fact-progress-list { display: flex; gap: 5px 16px; flex-wrap: wrap; }
+#fact-progress-list > div { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fact-progress-more { color: #ad9d82; font-size: 22px; white-space: nowrap; }
+#fact-progress.new-fact { animation: factGlow 1.8s ease-out; }
+@keyframes factGlow { from { background: rgba(212,175,110,.28); } to { background: transparent; } }
 /* 问答流(滚动区) */
 #qa {
   flex: 1 1 auto; min-height: 0;
@@ -398,39 +405,22 @@ html, body {
   font-size: 25px; font-style: italic;
 }
 
-#thinking {
-  flex: 0 0 auto; text-align: center;
-  color: rgba(212,175,110,.8); font-size: 30px;
-  animation: pulse 1.4s ease-in-out infinite;
-}
+#thinking { color: #d4af6e; white-space: nowrap; }
 #thinking.hidden { display: none; }
-@keyframes pulse { 50% { opacity: .35; } }
 
-/* 互动提示: 常驻一行, 告诉观众怎么参与 */
-#prompt {
-  flex: 0 0 auto; text-align: center;
-  color: rgba(212,175,110,.8);
-  font-size: 30px; letter-spacing: 1px;
-  padding: 10px 0 2px;
-  overflow-wrap: anywhere;
+/* 单一 Footer：操作、pending、点赞进度共用一行。 */
+#footer-status {
+  flex: 0 0 58px; min-width: 0; display: flex; align-items: center;
+  justify-content: space-between; gap: 14px;
+  border-top: 1px solid rgba(212,175,110,.25);
+  color: rgba(212,175,110,.8); font-size: 26px;
 }
+#footer-status.hidden { display: none; }
+#prompt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #prompt b { color: #f0d9a8; font-weight: 700; }
 #prompt.hidden { display: none; }
-
-#hintbar {
-  flex: 0 0 auto; text-align: center;
-  color: #f0d9a8; font-size: 28px; line-height: 1.5;
-}
-#hintbar.hidden { display: none; }
-
-/* 统计 */
-#stats {
-  flex: 0 0 auto;
-  color: rgba(190,183,170,.6);
-  font-size: 28px; letter-spacing: 1px;
-  text-align: center;
-}
-#stats b { color: #d4af6e; font-weight: 600; }
+#stats { flex: 0 0 auto; color: rgba(190,183,170,.8); white-space: nowrap; }
+#stats.hidden { display: none; }
 
 /* ================= 调试面板 ================= */
 #debug {

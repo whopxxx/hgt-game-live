@@ -14,15 +14,10 @@
       <!-- ============ 上半部: 谜面(大字, 固定) ============ -->
       <section id="top">
         <div id="puzzle-head">
-          <span id="puzzle-index"></span>
-          <!--
-            题目元数据(5 大类协议 v2): "中等 · 悬疑 · 脑洞" 形式。
-            内容完全由服务端 puzzle_meta 下发(中文 label 后端拥有),
-            空时整个元素隐藏 —— 不显示"未知 · 未分类"。
-          -->
-          <span id="puzzle-meta" class="hidden"></span>
+          <div id="puzzle-identity"><span id="puzzle-index"></span>
+          <!-- 只显示服务端下发的 primary category 与难度。 -->
+          <span id="puzzle-meta" class="hidden"></span></div>
           <span id="puzzle-timer"></span>
-          <span id="puzzle-elapsed"></span>
         </div>
         <div id="puzzle-viewport">
           <div id="puzzle"></div>
@@ -31,19 +26,20 @@
 
       <!-- ============ 下半部: 问答流(持续上滚) ============ -->
       <section id="bottom">
-        <div id="announcer" aria-live="polite"><div id="announcer-text"></div></div>
+        <div id="announcer" class="hidden" aria-live="polite"><div id="announcer-text"></div></div>
         <div id="qa-title">问答</div>
         <div id="fact-progress" class="hidden" aria-live="polite">
-          <div id="fact-progress-title"></div>
+          <div id="fact-progress-head"><span id="fact-progress-title"></span><span id="fact-progress-dots"></span></div>
           <div id="fact-progress-list"></div>
         </div>
         <div id="qa">
           <div id="qa-body"></div>
         </div>
-        <div id="prompt">发送 <b>#你的问题</b> 向我提问，猜中汤底我就揭晓</div>
-        <div id="thinking" class="hidden">AI 正在思考…</div>
-        <div id="hintbar" class="hidden"></div>
-        <div id="stats"></div>
+        <div id="footer-status">
+          <span id="prompt">发送 <b>#你的问题</b></span>
+          <span id="thinking" class="hidden"></span>
+          <span id="stats"></span>
+        </div>
       </section>
 
       <!--
@@ -71,7 +67,7 @@
           ⚠️ 前端**只渲染**服务端 reveal_interaction 快照:
             rating_open / theme_vote_open 由 Engine 判,
             前端绝不从 next_puzzle_ms 自行推断窗口。
-          0~30s: 评分+主题并排; 30~60s: 评分弱化, 主题成主 CTA。
+          0~30s: 评分+主题并排; 30~60s: 评分收起, 主题成主 CTA。
           45~60s contribution 内容仍可读(本面板不挤占正文空间)。
         -->
         <div id="reveal-interaction" class="hidden">
