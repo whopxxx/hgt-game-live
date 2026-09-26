@@ -24,7 +24,7 @@
   // 本次不动, 已在 PR 中说明。
   const el = {
     stage: $("stage"),
-    puzzleIndex: $("puzzle-index"), puzzleElapsed: $("puzzle-elapsed"),
+    puzzleIndex: $("puzzle-index"),
     puzzleTimer: $("puzzle-timer"), puzzleMeta: $("puzzle-meta"),
     puzzleViewport: $("puzzle-viewport"), puzzle: $("puzzle"),
     reveal: $("reveal"), revealBody: $("reveal-body"), revealNext: $("reveal-next"),
@@ -43,8 +43,10 @@
     qa: $("qa"), qaBody: $("qa-body"),
     factProgress: $("fact-progress"),
     factProgressTitle: $("fact-progress-title"),
+    factProgressDots: $("fact-progress-dots"),
     factProgressList: $("fact-progress-list"),
-    thinking: $("thinking"), hintbar: $("hintbar"), prompt: $("prompt"),
+    announcer: $("announcer"), footer: $("footer-status"),
+    thinking: $("thinking"), prompt: $("prompt"),
     stats: $("stats"), toast: $("toast"),
     debug: $("debug"), debugBody: $("debug-body"), conn: $("conn"),
   };
@@ -198,17 +200,11 @@
   // 防 stale: 渲染完全依据当前快照的 `puzzle_meta` —— SETTING 阶段
   // 服务端已把它清空, 所以这里**立即**清掉旧题的显示(不能等
   // puzzle_index 变: SETTING 期间下一题还没拿到, 新题号不一定已递增)。
-  // 分类之间用 " · " 分隔, 缺哪段就少哪段, 绝不输出多余分隔符。
+  // 只显示主类与难度，不在直播 header 堆叠 secondary categories。
   function renderPuzzleMeta(s) {
     const meta = (s.puzzle_meta && typeof s.puzzle_meta === "object")
       ? s.puzzle_meta : {};
-    const parts = [];
-    if (meta.difficulty_label) parts.push(meta.difficulty_label);
-    if (Array.isArray(meta.category_labels)) {
-      for (const c of meta.category_labels) {
-        if (c) parts.push(c);
-      }
-    }
+    const parts = [meta.primary_category_label, meta.difficulty_label].filter(Boolean);
     const text = parts.join(" · ");
     if (el.puzzleMeta.textContent !== text) el.puzzleMeta.textContent = text;
     el.puzzleMeta.classList.toggle("hidden", !text);
@@ -233,7 +229,6 @@
     }
     const txt = s.puzzle || "";
     if (el.puzzle.textContent !== txt) el.puzzle.textContent = txt;
-    el.puzzleElapsed.textContent = s.phase === "qa" ? fmtElapsed(s.puzzle_elapsed_ms) : "";
     renderPuzzleMeta(s);
   }
 
@@ -338,7 +333,7 @@
   // 前端只显示服务端权威状态(reveal_interaction), 不自行推断窗口
   // 是否开放 —— 评分/投票开没开, 只认快照, 绝不从 next_puzzle_ms
   // 自算。0~30s 评分+主题并排; 30s 后 rating_open=false 时评分区
-  // 弱化(关闭态), 主题投票成为主要 CTA。45~60s contribution 内容
+  // 收起，主题投票成为主要 CTA。45~60s contribution 内容
   // 仍可读 —— 本面板按行内紧凑布局渲染, 不挤占正文空间。
   function renderRevealInteraction(s) {
     const ri = s.reveal_interaction || null;
@@ -347,7 +342,7 @@
     if (!on) return;
 
     // ---- 评分 ----
-    el.ratingBox.classList.toggle("closed", ri.rating_open === false);
+    el.ratingBox.classList.toggle("hidden", ri.rating_open === false);
     if (ri.rating_open === false && el.ratingTitle.textContent !== "评分已截止") {
       el.ratingTitle.textContent = "评分已截止";
     } else if (ri.rating_open !== false && el.ratingTitle.textContent !== "给本题评分：发送 #1~#5") {
@@ -544,27 +539,44 @@
     requestAnimationFrame(function () { el.qa.scrollTop = el.qa.scrollHeight; });
   }
 
+  let lastFactSig = null, lastFactCount = 0;
   function renderFactProgress(s) {
     const p = s.phase === "qa" ? s.fact_progress : null;
     const visible = p && Number.isInteger(p.total) && p.total > 0;
     el.factProgress.classList.toggle("hidden", !visible);
     if (!visible) {
+      lastFactSig = null;
+      lastFactCount = 0;
       el.factProgressTitle.textContent = "";
+      el.factProgressDots.textContent = "";
       el.factProgressList.replaceChildren();
       return;
     }
-    el.factProgressTitle.textContent = "已确认核心事实 " + p.established + " / " + p.total;
+    el.factProgressTitle.textContent = "🧩 已确认核心事实 " + p.established + " / " + p.total;
+    el.factProgressDots.textContent = "●".repeat(p.established) + "○".repeat(Math.max(0, p.total - p.established));
     el.factProgressList.replaceChildren();
-    for (const fact of (p.facts || [])) {
+    const facts = p.facts || [];
+    const recent = facts.slice(-2);
+    if (facts.length > 2) {
+      const more = document.createElement("span");
+      more.className = "fact-progress-more";
+      more.textContent = "另有 " + (facts.length - 2) + " 条已确认";
+      el.factProgressList.appendChild(more);
+    }
+    for (const fact of recent) {
       const row = document.createElement("div");
       row.textContent = "✓ " + fact.text;
       el.factProgressList.appendChild(row);
     }
-    if (p.established < p.total) {
-      const row = document.createElement("div");
-      row.className = "fact-progress-more";
-      row.textContent = "其余真相继续追问…";
-      el.factProgressList.appendChild(row);
+    const sig = JSON.stringify([s.puzzle_index, p.established, facts]);
+    if (lastFactSig && sig !== lastFactSig && p.established > lastFactCount) {
+      el.factProgress.classList.remove("new-fact");
+      void el.factProgress.offsetWidth;
+      el.factProgress.classList.add("new-fact");
+    }
+    if (sig !== lastFactSig) {
+      lastFactSig = sig;
+      lastFactCount = p.established;
     }
   }
 
@@ -627,18 +639,14 @@
   }
 
   function renderThinking(s) {
-    el.thinking.classList.toggle("hidden", !(s.pending_count > 0));
-    if (s.pending_count > 0) {
-      el.thinking.textContent = "AI 正在思考… (" + s.pending_count + ")";
+    const pending = s.phase === "qa" && s.pending_count > 0;
+    el.thinking.classList.toggle("hidden", !pending);
+    if (pending) {
+      el.thinking.textContent = "AI处理中 ×" + s.pending_count;
     }
   }
 
-  // 提示保留 QA 历史，新提示额外由 announcer 播一次；旧 hintbar 仍隐藏。
-  function renderHint(s) {
-    el.hintbar.classList.add("hidden");
-  }
-
-  // 常驻互动提示: **任何阶段都显示**, 只是文案不同。
+  // Footer 操作提示，揭晓阶段随整个 Footer 隐藏。
   //
   // 早先非 QA 阶段整个隐藏(`if (!inQA) return`), 于是观众在这个阶段
   // 既没有操作指引、打字又收不到反馈 -> 看起来像卡死。出题要 30-45s,
@@ -649,9 +657,9 @@
     el.prompt.classList.remove("hidden");
     if (s.phase === "qa") {
       el.prompt.innerHTML =
-        "发送 <b>#你的问题</b> 向我提问，猜中汤底我就揭晓";
+        "发送 <b>#你的问题</b> 向我提问";
     } else if (s.phase === "setting") {
-      el.prompt.textContent = "AI 正在出题，请稍候…";
+      el.prompt.textContent = "AI 正在准备下一题…";
     } else if (s.phase === "revealing" || s.phase === "revealed") {
       el.prompt.textContent = "本题已结束，稍候将开启新谜题…";
     } else {
@@ -660,23 +668,15 @@
   }
 
   function renderStats(s) {
-    const st = s.stats || {};
     const ai = s.ai_player || {};
-    const parts = [];
-    if (s.ai_player) {
-      // Issue #43: 点赞推进统一文案 —— 只表达"助攻/加速", 绝不显示秒数。
-      // ❤️ 进度由服务端快照给出(likes_progress 是高水位 % 100),
-      // 前端不从 Like.total 自算桶。
+    const on = s.phase === "qa" && !!s.ai_player;
+    el.stats.classList.toggle("hidden", !on);
+    if (on) {
       const per = Number.isFinite(ai.likes_per_progress) ? ai.likes_per_progress : 100;
       const prog = Number.isFinite(ai.likes_progress) ? ai.likes_progress : 0;
-      parts.push((ai.in_flight ? "AI玩家正在推理…" : "每100点赞，AI玩家助攻并加速本题")
-        + "　❤️ " + prog + " / " + per);
+      el.stats.textContent = "❤️ " + prog + "/" + per;
     }
-    if (st.questions) parts.push("本题已问 <b>" + st.questions + "</b>");
-    if (st.answered) parts.push("已答 <b>" + st.answered + "</b>");
-    if (st.viewers_seen) parts.push("观众 <b>" + st.viewers_seen + "</b>");
-    if (st.solved) parts.push("累计猜中 <b>" + st.solved + "</b>");
-    el.stats.innerHTML = parts.join("　·　");
+    el.footer.classList.toggle("hidden", s.phase === "revealing" || s.phase === "revealed");
   }
 
   // ================= 布局 =================
@@ -734,6 +734,10 @@
     L.push("<span class='k'>阶段</span> " + s.phase);
     L.push("<span class='k'>题号</span> " + s.puzzle_index + " (总 " + (d.puzzles_total || 0) + ")");
     L.push("<span class='k'>排队/在途</span> " + s.pending_count);
+    L.push("<span class='k'>已进行</span> " + fmtElapsed(s.puzzle_elapsed_ms));
+    const stats = s.stats || {};
+    L.push("<span class='k'>本题已问/已答</span> " + (stats.questions || 0) + "/" + (stats.answered || 0));
+    L.push("<span class='k'>观众/累计猜中</span> " + (stats.viewers_seen || 0) + "/" + (stats.solved || 0));
     L.push("<span class='k'>提示</span> " + (s.hint_count || 0));
     if (s.next_puzzle_ms != null) L.push("<span class='k'>下一题</span> " + (s.next_puzzle_ms / 1000).toFixed(1) + "s");
     L.push("<span class='k'>发言观众</span> " + (st.viewers_seen || 0));
@@ -759,7 +763,8 @@
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
     let config = null, phase = "", hintPuzzle = null, hintCount = null;
     let active = "", lastPresetId = null;
-    let nextPreset = Infinity, timer = null, animation = null;
+    let nextPreset = Infinity, nextLeaderboard = Infinity;
+    let timer = null, animation = null;
     let currentMessage = "", measuredWidth = 0;
     const pendingHints = [];
     // ---- Issue #43: 点赞推进公告(单一待播槽位, 不做 pendingLikes[]) ----
@@ -780,6 +785,7 @@
       animation = null;
       text.style.transform = "";
       active = "";
+      box.classList.add("hidden");
     }
     function interval() { return (config ? config.interval_seconds : 90) * 1000; }
     // ---- Issue #43(review round 2): round 校验的两个具名判定 ----
@@ -803,6 +809,7 @@
     function show(message, kind, onDone = null) {
       cancel();
       active = kind;
+      box.classList.remove("hidden");
       box.dataset.kind = kind;
       text.textContent = message;
       const width = box.clientWidth, length = text.scrollWidth;
@@ -811,9 +818,9 @@
       const configuredHold = config ? config.hold_seconds : 4;
       // 自定义公告可以停更久；AI / Hint / 排行榜继续保持短促，
       // 避免把 operator 的 15s 配置扩散到所有临时消息。
-      const hold = (kind === "preset"
-        ? configuredHold
-        : Math.min(configuredHold, 5)) * 1000;
+      const hold = (kind === "like" ? 3
+        : kind === "preset" ? Math.max(5, Math.min(8, configuredHold))
+        : 5) * 1000;
       function done() {
         cancel();
         if (onDone) onDone();
@@ -874,36 +881,14 @@
         return;
       }
       const message = leaderboardMessage();
-
-      // Top10 不再拆 1/2、2/2：整榜就是一条消息。
-      // 能完整放下时保持静态常驻；放不下时统一走完整 marquee，
-      // 从第 1 名一直滚到第 10 名，最后一个字符离开视口才算本轮完成。
-      cancel();
-      text.textContent = message;
-      const fits = text.scrollWidth <= box.clientWidth;
-      if (fits) {
-        active = "leaderboard";
-        box.dataset.kind = "leaderboard";
-        box.dataset.motion = "static";
-        currentMessage = message;
-        measuredWidth = box.clientWidth;
-        return;
-      }
-
-      show(message, "leaderboard", () => {
-        // 游戏公告到点只排队，不腰斩这条 Top10；整条自然滚完后
-        // pump() 会优先播放已经到期的公告。
-        pump();
-      });
+      nextLeaderboard = performance.now() + 90000;
+      show(message, "leaderboard");
     }
 
     // Empty leaderboard is a quiet baseline state: keep the scheduler armed
     // without rendering placeholder copy or starting a pointless animation.
     function showEmptyLeaderboard() {
       cancel();
-      active = "leaderboard";
-      box.dataset.kind = "leaderboard";
-      box.dataset.motion = "static";
       text.textContent = "";
       currentMessage = "";
       measuredWidth = box.clientWidth;
@@ -929,10 +914,10 @@
         lastPresetId = items[index].id; // Advance even when interrupted by AI.
         nextPreset = performance.now() + interval();
         show("📢 游戏公告 " + items[index].text, "preset");
-      } else if (leaderboardRows.length) {
+      } else if (leaderboardRows.length && performance.now() >= nextLeaderboard) {
         showLeaderboard();
       } else {
-        showEmptyLeaderboard();
+        box.classList.add("hidden");
       }
     }
     function update(s) {
@@ -995,8 +980,8 @@
         // 合法跨过 setting→qa, 不能一刀切清掉。
         if (likeNoticeStale(likePending, s)) likePending = null;
         nextPreset = performance.now() + interval();
+        nextLeaderboard = performance.now() + 90000;
       }
-      box.classList.toggle("hidden", phase !== "qa");
       if (phase !== "qa") return;
       // ---- 抢占规则(Issue #43 §15) ----
       //   * 提示不被任何东西腰斩: active === "hint" 时谁都不取消,
@@ -1046,6 +1031,7 @@
         if (timer || animation) return;
         cancel(); pump();
       }
+      if (phase === "qa" && !active) pump();
     }, 250);
     reduced.addEventListener("change", () => {
       if (active === "leaderboard") showLeaderboard();
@@ -1085,11 +1071,11 @@
     renderFactProgress(s);
     renderReveal(s);
     renderThinking(s);
-    renderHint(s);
     renderPrompt(s);
     renderStats(s);
     renderDebug(s);
     layout();
+    el.announcer.style.top = el.qa.offsetTop + "px";
     announcer.update(s);
     puzzleScroller.update(
       JSON.stringify([s.puzzle_index, s.puzzle || "", s.phase || ""]),
