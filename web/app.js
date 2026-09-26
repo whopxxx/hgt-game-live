@@ -204,9 +204,19 @@
   function renderPuzzleMeta(s) {
     const meta = (s.puzzle_meta && typeof s.puzzle_meta === "object")
       ? s.puzzle_meta : {};
-    const parts = [meta.primary_category_label, meta.difficulty_label].filter(Boolean);
-    const text = parts.join(" · ");
-    if (el.puzzleMeta.textContent !== text) el.puzzleMeta.textContent = text;
+    const category = meta.primary_category_label || "";
+    const difficulty = meta.difficulty_label || "";
+    const text = [category, difficulty].filter(Boolean).join(" · ");
+    if (el.puzzleMeta.textContent !== text) {
+      el.puzzleMeta.replaceChildren();
+      if (category) {
+        const label = document.createElement("span");
+        label.className = "puzzle-category";
+        label.textContent = category;
+        el.puzzleMeta.append(label);
+      }
+      if (difficulty) el.puzzleMeta.append((category ? " · " : "") + difficulty);
+    }
     el.puzzleMeta.classList.toggle("hidden", !text);
   }
 
